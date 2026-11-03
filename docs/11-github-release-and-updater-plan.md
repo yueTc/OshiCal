@@ -1,9 +1,9 @@
 # OshiCal GitHub 发布与桌面端自动更新方案
 
-> 文档状态：已实施，待 GitHub Release 端到端升级验证  
+> 文档状态：已实施，GitHub Release 端到端升级验证通过  
 > 编写日期：2026-11-03  
 > 适用范围：Windows 桌面端、GitHub 源码发布、GitHub Releases 自动更新  
-> 当前阶段：本地构建、签名产物和设置页界面验证通过；正式发布前仍需完成端到端升级演练
+> 当前阶段：本地构建、GitHub Release、签名校验和 v0.1.0 → v0.1.2 自动升级演练均已通过
 
 ---
 
@@ -11,7 +11,7 @@
 
 本方案使用 **Tauri 2 官方 Updater + GitHub Releases**，为 OshiCal Windows 桌面端提供自动更新能力：
 
-1. 开发者推送版本标签，例如 `v0.1.1`。
+1. 开发者推送版本标签，例如 `v0.1.2`。
 2. GitHub Actions 在 Windows Runner 上构建 NSIS 安装包。
 3. Tauri 生成更新包签名 `.sig` 和 `latest.json`。
 4. 安装包、签名和更新清单上传到 GitHub Release。
@@ -108,7 +108,7 @@ https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
 
 - 应用启动后静默检查更新。
 - 发现新版本时显示轻提示：
-  - `发现新版本 v0.1.1，可在“设置 → 软件更新”中安装`
+  - `发现新版本 v0.1.2，可在“设置 → 软件更新”中安装`
 - 检查失败不弹错误、不阻塞主流程。
 - 不自动下载或安装。
 
@@ -261,7 +261,7 @@ scripts/set-version.mjs
 命令示例：
 
 ```powershell
-node scripts/set-version.mjs 0.1.1
+node scripts/set-version.mjs 0.1.2
 ```
 
 同步修改：
@@ -326,12 +326,12 @@ node scripts/set-version.mjs 0.1.1
 必须实际执行：
 
 1. 安装 `v0.1.0`。
-2. 发布 `v0.1.1`。
+2. 发布 `v0.1.2`。
 3. 启动旧版本。
-4. 检测到 `v0.1.1`。
+4. 检测到 `v0.1.2`。
 5. 下载更新并校验签名。
 6. 安装并自动重启。
-7. 设置页显示 `v0.1.1`。
+7. 设置页显示 `v0.1.2`。
 8. 使用错误签名测试，确认拒绝安装。
 
 未完成以上步骤，不得宣称自动更新已验证。
@@ -430,11 +430,11 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 
 - [x] 仓库使用 `yueTc/OshiCal`
 - [x] 仓库设置为 Public
-- [ ] 本次只更新 Windows 桌面端
+- [x] 本次只更新 Windows 桌面端
 - [x] Release 由显式版本标签触发自动发布
-- [ ] 正式发布前重新生成带密码的更新签名密钥
+- [x] 正式发布前重新生成带密码的更新签名密钥
 - [ ] 服务端 Docker/GHCR 更新作为后续阶段
-- [ ] 同意先完成本地构建和端到端升级演练，再正式推送 GitHub
+- [x] 同意先完成本地构建和端到端升级演练，再正式推送 GitHub
 
 审核通过后回复：
 
@@ -456,3 +456,11 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - 启动时更新提示。
 - 发布与回滚文档。
 - 端到端升级验证记录。
+
+## 14. 验证记录
+
+- 2026-11-03：GitHub CI 通过。
+- 2026-11-03：GitHub Release 工作流成功生成 Windows NSIS 安装包、更新签名和 `latest.json`。
+- 2026-11-03：实际安装 `v0.1.0` 后成功检测并升级到 `v0.1.1`，应用自动退出、安装并重启。
+- 验证中发现 Rustls 网络通道在部分网络环境下下载不稳定，已将 Updater 切换为 Windows 原生 TLS，并增加检查与下载重试。
+- 验证过程中生成的 `v0.1.1` 为升级演练版本；包含网络稳定性修复的正式版本为 `v0.1.2`。

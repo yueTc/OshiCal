@@ -499,7 +499,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     setUpdateInstalled(false);
     setUpdateProgress({ downloaded: 0, total: null });
     try {
-      const update = await checkForUpdate();
+      const update = await checkForUpdate(true);
       setUpdateInfo(update);
       setUpdateStatus(update ? `发现新版本 v${update.version}` : "当前已是最新版本");
     } catch (updateError) {
