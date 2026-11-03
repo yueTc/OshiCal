@@ -1152,7 +1152,7 @@ impl AppService {
                     self.remove_stale_non_live_reserve_schedule(post).await?;
             }
 
-            self.apply_deterministic_reservation_time_change(source_mid, targets, post, now)
+            self.apply_deterministic_reservation_time_change(source_mid, targets, post)
                 .await;
 
             let has_combined_images = post.reserve.is_none()
@@ -1748,7 +1748,6 @@ impl AppService {
         source_mid: &str,
         targets: &[Streamer],
         post: &DynamicPost,
-        now: DateTime<Utc>,
     ) {
         if post.reserve.is_some() || !text_looks_like_schedule_time_change(&post.text) {
             return;
@@ -1756,7 +1755,10 @@ impl AppService {
         let Some(target) = choose_text_target(source_mid, targets, &post.text) else {
             return;
         };
-        let Some(schedule) = parse_text_schedule(&post.text, post.published_at, now, "直播")
+        // Relative dates such as “tomorrow” refer to the post publication date, not
+        // the later refresh time. Matching still requires a unique existing reservation.
+        let Some(schedule) =
+            parse_text_schedule(&post.text, post.published_at, post.published_at, "直播")
         else {
             return;
         };
@@ -3701,9 +3703,6 @@ mod tests {
         });
         let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
             .expect("service");
-        let now = "2026-11-02T10:30:00Z"
-            .parse::<DateTime<Utc>>()
-            .expect("now");
         let reserve_post = DynamicPost {
             id: "reserve-post".to_owned(),
             author_mid: "100".to_owned(),
@@ -3767,7 +3766,6 @@ mod tests {
                 "100",
                 std::slice::from_ref(&streamer),
                 &new_post,
-                now,
             )
             .await;
 
