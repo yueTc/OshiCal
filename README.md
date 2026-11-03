@@ -107,22 +107,39 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
-发布新版本：
+桌面端与服务端使用独立版本和独立标签，互不触发发布：
 
 ```powershell
-node scripts/set-version.mjs 0.1.2
+# 只发布桌面端
+node scripts/set-version.mjs desktop 0.2.0
 git add -A
-git commit -m "release: v0.1.2"
-git tag v0.1.2
-git push origin main --tags
+git commit -m "release(desktop): 0.2.0"
+git tag desktop-v0.2.0
+git push origin main desktop-v0.2.0
+
+# 只发布服务端
+node scripts/set-version.mjs server 0.2.1
+git add -A
+git commit -m "release(server): 0.2.1"
+git tag server-v0.2.1
+git push origin main server-v0.2.1
 ```
 
-推送 `v*` 标签后，`.github/workflows/release.yml` 会运行测试、构建 Windows 安装包、生成更新签名和 `latest.json`，并创建正式 Release。推送版本标签前请确认版本、测试结果和发布说明。
+- `desktop-v*` 只构建 Windows 安装包、更新签名和 `latest.json`。
+- `server-v*` 只构建 GHCR 镜像，并更新固定的 `server-latest` 服务端更新清单。
+- 服务端清单发布为 prerelease，不会覆盖桌面端使用的 GitHub “latest” Release。
+- 核心库版本可用 `node scripts/set-version.mjs core <版本>` 单独维护。
 
-客户端更新地址：
+客户端更新地址保持稳定：
 
 ```text
 https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
+```
+
+服务端更新清单：
+
+```text
+https://github.com/yueTc/OshiCal/releases/download/server-latest/server-latest.json
 ```
 
 详细设计、验收和回滚流程见 `docs/11-github-release-and-updater-plan.md`。
@@ -157,7 +174,7 @@ docker compose up -d --build
 
 ### 服务端镜像更新
 
-GitHub Actions 会在推送 `v*` 标签时构建并发布：
+GitHub Actions 会在推送 `server-v*` 标签时构建并发布：
 
 ```text
 ghcr.io/yuetec/oshical-server:<版本号>

@@ -3,11 +3,11 @@ name: Server Image
 on:
   push:
     tags:
-      - "v*"
+      - "server-v*"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -22,12 +22,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Read application version
+      - name: Read server version
         id: version
         shell: bash
         run: |
-          version="$(python -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")"
+          version="$(python -c "import tomllib; print(tomllib.load(open('server/Cargo.toml', 'rb'))['package']['version'])")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify server tag matches version
+        if: startsWith(github.ref, 'refs/tags/server-v')
+        shell: bash
+        run: |
+          expected="server-v${{ steps.version.outputs.version }}"
+          if [ "${GITHUB_REF_NAME}" != "$expected" ]; then
+            echo "标签 ${GITHUB_REF_NAME} 与服务端版本 $expected 不一致" >&2
+            exit 1
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -59,3 +69,31 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Publish server update manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          repo="${{ github.repository }}"
+          manifest="server-latest.json"
+          jq -n \
+            --arg version "$version" \
+            --arg tag "server-v$version" \
+            --arg image "ghcr.io/${{ github.repository_owner }}/oshical-server:$version" \
+            --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, tag: $tag, image: $image, publishedAt: $publishedAt}' > "$manifest"
+          if gh release view server-latest --repo "$repo" >/dev/null 2>&1; then
+            gh release upload server-latest "$manifest" --repo "$repo" --clobber
+            gh release edit server-latest --repo "$repo" --prerelease --latest=false
+          else
+            gh release create server-latest "$manifest" \
+              --repo "$repo" \
+              --target "$GITHUB_SHA" \
+              --title "OshiCal Server Latest" \
+              --notes "服务端更新代理使用的机器可读清单。请勿手动修改。" \
+              --prerelease \
+              --latest=false
+          fi

@@ -3,7 +3,7 @@
 > 文档状态：已实施，GitHub Release 端到端升级验证通过  
 > 编写日期：2026-11-03  
 > 适用范围：Windows 桌面端、GitHub 源码发布、GitHub Releases 自动更新  
-> 当前阶段：本地构建、GitHub Release、签名校验和 v0.1.0 → v0.1.2 自动升级演练均已通过
+> 当前阶段：桌面端与服务端已拆分独立版本；历史 v0.1.0 → v0.1.2 自动升级演练已通过
 
 ---
 
@@ -11,7 +11,7 @@
 
 本方案使用 **Tauri 2 官方 Updater + GitHub Releases**，为 OshiCal Windows 桌面端提供自动更新能力：
 
-1. 开发者推送版本标签，例如 `v0.1.2`。
+1. 开发者推送桌面端标签，例如 `desktop-v0.2.0`。
 2. GitHub Actions 在 Windows Runner 上构建 NSIS 安装包。
 3. Tauri 生成更新包签名 `.sig` 和 `latest.json`。
 4. 安装包、签名和更新清单上传到 GitHub Release。
@@ -70,7 +70,7 @@
 ## 4. 目标架构
 
 ```text
-开发者推送 v* 标签
+开发者推送 desktop-v* 标签
         |
         v
 GitHub Actions (Windows)
@@ -234,7 +234,7 @@ CI 检查：
 
 Release：
 
-- 触发条件：推送 `v*` 标签，或手动触发。
+- 触发条件：推送 `desktop-v*` 标签，或手动触发。`server-v*` 只触发服务端镜像发布。
 - Windows Runner 构建。
 - 使用 `tauri-apps/tauri-action@v1`。
 - 上传：
@@ -250,26 +250,20 @@ Release：
 - Release 工作流生成完整资产。
 - 显式版本标签是发布门禁；未推送标签不会影响现网用户。
 
-### Wave 5：统一版本管理
+### Wave 5：独立版本管理
 
-建议新增：
-
-```text
-scripts/set-version.mjs
-```
-
-命令示例：
+`scripts/set-version.mjs` 分别管理桌面端、服务端和核心库版本：
 
 ```powershell
-node scripts/set-version.mjs 0.1.2
+node scripts/set-version.mjs desktop 0.2.0
+node scripts/set-version.mjs server 0.2.0
+node scripts/set-version.mjs core 0.1.8
 ```
 
-同步修改：
-
-- `package.json`
-- `package-lock.json`
-- 根目录 `Cargo.toml` workspace version
-- `src-tauri/tauri.conf.json`
+- 桌面端同步 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json` 和 `src-tauri/Cargo.toml`。
+- 服务端同步 `server/Cargo.toml` 与 `Cargo.lock` 中的 `oshical-server`。
+- 核心库只同步 workspace version 与 `oshical-core`。
+- 发布标签分别为 `desktop-v*` 和 `server-v*`。
 
 验收：
 

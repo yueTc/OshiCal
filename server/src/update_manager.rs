@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::fs;
 
 const DIRECT_MANIFEST_URL: &str =
-    "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+    "https://github.com/yueTc/OshiCal/releases/download/server-latest/server-latest.json";
 const CHECK_INTERVAL_MINUTES: i64 = 30;
 const FAILED_RETRY_MINUTES: i64 = 30;
 const AGENT_ONLINE_SECONDS: u64 = 90;
@@ -258,7 +258,7 @@ impl ServerUpdateManager {
             version: version.to_owned(),
             checked_at: Some(Utc::now()),
             release_url: Some(format!(
-                "https://github.com/yueTc/OshiCal/releases/tag/v{version}"
+                "https://github.com/yueTc/OshiCal/releases/tag/server-v{version}"
             )),
         };
         write_json(&self.latest_path(), &release).await?;
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(
             mirror_manifest_url("https://gh-proxy.com"),
             Some(
-                "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+                "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/download/server-latest/server-latest.json"
                     .to_owned()
             )
         );

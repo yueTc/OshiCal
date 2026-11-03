@@ -3,14 +3,14 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "desktop-v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -25,12 +25,13 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Verify tag matches app version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "标签 ${{ github.ref_name }} 与 tauri.conf.json 版本 v$version 不一致"
+          $expected = "desktop-v$version"
+          if ($expected -ne "${{ github.ref_name }}") {
+            throw "标签 ${{ github.ref_name }} 与桌面端版本 $expected 不一致"
           }
 
       - name: Setup Node.js
@@ -66,8 +67,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: "OshiCal v__VERSION__"
+          tagName: desktop-v__VERSION__
+          releaseName: "OshiCal Desktop v__VERSION__"
           releaseBody: |
             Windows 安装包与自动更新清单由 GitHub Actions 自动生成。
 
@@ -87,7 +88,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $tag = "v$version"
+          $tag = "desktop-v$version"
           $repo = "${{ github.repository }}"
           $dir = Join-Path $env:RUNNER_TEMP "oshical-updater"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
