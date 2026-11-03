@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs;
 
-const RELEASE_API_URL: &str = "https://api.github.com/repos/yueTc/OshiCal/releases/latest";
+const DIRECT_MANIFEST_URL: &str =
+    "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
 const CHECK_INTERVAL_MINUTES: i64 = 30;
 const FAILED_RETRY_MINUTES: i64 = 30;
 const AGENT_ONLINE_SECONDS: u64 = 90;
@@ -20,6 +21,7 @@ pub struct ServerUpdateSettings {
     pub auto_update_enabled: bool,
     pub update_window_start: String,
     pub update_window_end: String,
+    pub github_mirror_url: String,
 }
 
 impl Default for ServerUpdateSettings {
@@ -29,6 +31,7 @@ impl Default for ServerUpdateSettings {
             auto_update_enabled: false,
             update_window_start: "03:00".to_owned(),
             update_window_end: "05:00".to_owned(),
+            github_mirror_url: String::new(),
         }
     }
 }
@@ -78,6 +81,7 @@ pub struct ServerUpdateView {
     pub auto_update_enabled: bool,
     pub update_window_start: String,
     pub update_window_end: String,
+    pub github_mirror_url: String,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_updated_at: Option<DateTime<Utc>>,
     pub agent_online: bool,
@@ -140,6 +144,7 @@ impl ServerUpdateManager {
     ) -> AppResult<ServerUpdateView> {
         validate_hhmm(&settings.update_window_start)?;
         validate_hhmm(&settings.update_window_end)?;
+        validate_mirror_url(&settings.github_mirror_url)?;
         let mut settings = settings;
         if settings.auto_update_enabled {
             settings.auto_check_enabled = true;
@@ -175,6 +180,7 @@ impl ServerUpdateManager {
             auto_update_enabled: settings.auto_update_enabled,
             update_window_start: settings.update_window_start,
             update_window_end: settings.update_window_end,
+            github_mirror_url: settings.github_mirror_url,
             last_checked_at: latest.checked_at,
             last_updated_at: status.updated_at,
             agent_online,
@@ -184,13 +190,14 @@ impl ServerUpdateManager {
     }
 
     pub async fn check_now(&self) -> AppResult<ServerUpdateView> {
-        self.check_release().await?;
+        let settings = self.settings().await?;
+        self.check_release(&settings.github_mirror_url).await?;
         self.view().await
     }
 
     pub async fn install_now(&self) -> AppResult<ServerUpdateView> {
-        let latest = self.check_release().await?;
         let settings = self.settings().await?;
+        let latest = self.check_release(&settings.github_mirror_url).await?;
         if latest.version == env!("CARGO_PKG_VERSION") {
             return Err(AppError::validation("服务器已经是最新版本"));
         }
@@ -206,7 +213,7 @@ impl ServerUpdateManager {
             .map(|checked_at| (Utc::now() - checked_at).num_minutes() >= CHECK_INTERVAL_MINUTES)
             .unwrap_or(true);
         if settings.auto_check_enabled && stale {
-            self.check_release().await?;
+            self.check_release(&settings.github_mirror_url).await?;
         }
         if !settings.auto_update_enabled {
             return Ok(());
@@ -238,34 +245,48 @@ impl ServerUpdateManager {
         self.write_request(&latest.version, false, &settings).await
     }
 
-    async fn check_release(&self) -> AppResult<ReleaseInfo> {
-        let response = self.client.get(RELEASE_API_URL).send().await?;
+    async fn check_release(&self, github_mirror_url: &str) -> AppResult<ReleaseInfo> {
+        let body = self.fetch_manifest(github_mirror_url).await?;
+        let version = body
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::validation("更新清单缺少 version"))?
+            .trim_start_matches('v');
+        Version::parse(version)
+            .map_err(|error| AppError::validation(format!("服务器版本号无效: {error}")))?;
+        let release = ReleaseInfo {
+            version: version.to_owned(),
+            checked_at: Some(Utc::now()),
+            release_url: Some(format!(
+                "https://github.com/yueTc/OshiCal/releases/tag/v{version}"
+            )),
+        };
+        write_json(&self.latest_path(), &release).await?;
+        Ok(release)
+    }
+
+    async fn fetch_manifest(&self, github_mirror_url: &str) -> AppResult<Value> {
+        if let Some(mirror) = mirror_manifest_url(github_mirror_url) {
+            match self.fetch_json(&mirror).await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    tracing::warn!(%error, %mirror, "GitHub 镜像检查失败，回退直连");
+                }
+            }
+        }
+        self.fetch_json(DIRECT_MANIFEST_URL).await
+    }
+
+    async fn fetch_json(&self, url: &str) -> AppResult<Value> {
+        let response = self.client.get(url).send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(AppError::External {
                 code: format!("SERVER_RELEASE_{status}"),
-                message: format!("读取 GitHub Release 失败: HTTP {status}"),
+                message: format!("读取更新清单失败: HTTP {status}"),
             });
         }
-        let body: Value = response.json().await?;
-        let tag = body
-            .get("tag_name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::validation("GitHub Release 缺少 tag_name"))?;
-        let version = tag.trim_start_matches('v');
-        Version::parse(version)
-            .map_err(|error| AppError::validation(format!("服务器版本号无效: {error}")))?;
-        let release_url = body
-            .get("html_url")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let release = ReleaseInfo {
-            version: version.to_owned(),
-            checked_at: Some(Utc::now()),
-            release_url,
-        };
-        write_json(&self.latest_path(), &release).await?;
-        Ok(release)
+        Ok(response.json().await?)
     }
 
     async fn write_request(
@@ -365,6 +386,34 @@ async fn write_bytes(path: &Path, value: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
+fn mirror_manifest_url(github_mirror_url: &str) -> Option<String> {
+    let base = github_mirror_url.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let base = if base.ends_with('/') {
+        base.to_owned()
+    } else {
+        format!("{base}/")
+    };
+    Some(format!("{base}{DIRECT_MANIFEST_URL}"))
+}
+
+fn validate_mirror_url(value: &str) -> AppResult<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let url = url::Url::parse(value)
+        .map_err(|error| AppError::validation(format!("GitHub 镜像地址无效: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::validation(
+            "GitHub 镜像地址必须使用 http 或 https",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hhmm(value: &str) -> AppResult<()> {
     parse_hhmm(value)
         .map(|_| ())
@@ -436,7 +485,24 @@ fn effective_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hhmm, window_contains, ServerUpdateManager, ServerUpdateSettings};
+    use super::{
+        mirror_manifest_url, parse_hhmm, validate_mirror_url, window_contains, ServerUpdateManager,
+        ServerUpdateSettings,
+    };
+
+    #[test]
+    fn mirror_url_is_normalized_and_validated() {
+        assert_eq!(mirror_manifest_url(""), None);
+        assert_eq!(
+            mirror_manifest_url("https://gh-proxy.com"),
+            Some(
+                "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+                    .to_owned()
+            )
+        );
+        assert!(validate_mirror_url("https://gh-proxy.com/").is_ok());
+        assert!(validate_mirror_url("ftp://example.com/").is_err());
+    }
 
     #[test]
     fn update_time_validation() {
@@ -449,6 +515,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_check_uses_configured_mirror() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "version": "9.9.9",
+                "notes": "mirror fixture"
+            }))
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("oshical-update-mirror-{}", uuid::Uuid::new_v4()));
+        let manager = ServerUpdateManager::new(dir.clone()).expect("manager");
+        manager
+            .save_settings(ServerUpdateSettings {
+                auto_check_enabled: true,
+                auto_update_enabled: false,
+                update_window_start: "03:00".to_owned(),
+                update_window_end: "05:00".to_owned(),
+                github_mirror_url: format!("http://{address}/mirror/"),
+            })
+            .await
+            .expect("settings");
+        let view = manager.check_now().await.expect("mirror check");
+        assert_eq!(view.latest_version.as_deref(), Some("9.9.9"));
+        assert!(view.update_available);
+        server.abort();
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn update_settings_and_request_round_trip() {
         let dir =
             std::env::temp_dir().join(format!("oshical-update-manager-{}", uuid::Uuid::new_v4()));
@@ -458,6 +560,7 @@ mod tests {
             auto_update_enabled: true,
             update_window_start: "23:30".to_owned(),
             update_window_end: "02:30".to_owned(),
+            github_mirror_url: "https://gh-proxy.com/".to_owned(),
         };
         let view = manager
             .save_settings(settings.clone())

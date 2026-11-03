@@ -123,6 +123,10 @@ echo "$CR_PAT" | sudo docker login ghcr.io -u yueTc --password-stdin
 sudo journalctl -u oshical-updater.service -n 200 --no-pager
 cat data/system/updater.log
 ```
+
+服务端更新设置中可单独填写“服务端 GitHub 镜像加速”，例如 `https://gh-proxy.com/`。它只影响服务器读取 GitHub 更新清单；不会影响桌面客户端的镜像设置。
+
+客户端镜像加速在桌面端设置的“客户端 GitHub 镜像加速”卡片中单独保存，仅作用于当前设备。
 ## 2. 便携服务端
 
 ```powershell

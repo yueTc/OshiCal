@@ -1500,6 +1500,14 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
 .update-status { display: grid; gap: 4px; }
 .update-status strong { color: var(--text); }
 .server-update-error { color: var(--danger); }
+.server-update-mirror { display: grid; gap: 6px; }
+.server-update-mirror label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
+.server-update-mirror small { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.github-mirror-card { background: rgba(252, 250, 255, .88); }
+.github-mirror-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; }
+.github-mirror-input-row input { min-width: 0; }
+.github-mirror-presets { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; color: var(--muted); font-size: 10px; }
+.github-mirror-presets button { padding: 3px 8px; color: var(--primary-strong); background: var(--primary-soft); border: 0; border-radius: 999px; font-size: 10px; cursor: pointer; }
 .device-sync-panel { overflow: hidden; }
 .device-sync-header {
   display: flex !important;

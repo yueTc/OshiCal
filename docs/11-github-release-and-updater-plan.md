@@ -477,3 +477,9 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - 支持手动立即更新、自动检测和可配置时间段的自动更新。
 - 服务端写入受控 `update-request.env`；宿主机 systemd 代理执行 Docker Compose 更新。
 - 应用容器不挂载 Docker Socket。
+
+## 17. 客户端与服务端镜像配置
+
+- 客户端 GitHub 镜像保存在当前设备 localStorage，只影响桌面端更新检查和下载。
+- 服务端 GitHub 镜像保存在服务端更新设置文件中，只影响服务器版本检查。
+- 两端优先走镜像，失败自动回退 GitHub 直连。

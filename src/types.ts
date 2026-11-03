@@ -566,6 +566,7 @@ export interface ServerUpdateSettings {
   autoUpdateEnabled: boolean;
   updateWindowStart: string;
   updateWindowEnd: string;
+  githubMirrorUrl: string;
 }
 
 export interface ServerUpdateInfo extends ServerUpdateSettings {

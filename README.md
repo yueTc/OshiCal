@@ -199,6 +199,12 @@ OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:0.1.2
 - 查看更新代理在线状态、阶段和失败原因。
 
 服务端更新由宿主机 `oshical-updater` systemd 代理执行，应用容器不挂载 Docker Socket。安装步骤见 `docs/06-deployment.md`。
+
+客户端与服务端镜像分开配置：
+
+- 客户端“客户端 GitHub 镜像加速”只保存在当前设备，供桌面端检查与下载更新使用。
+- 服务端“服务端 GitHub 镜像加速”保存在服务器更新设置中，只用于服务器版本检查。
+- 两处均可填写 `https://gh-proxy.com/` 或 `https://gh-proxy.org/`；镜像失败会自动回退 GitHub 直连。
 ## 验证
 
 ```powershell

@@ -109,7 +109,8 @@ async fn server_update_routes_require_auth_and_validate_settings() {
                         "autoCheckEnabled": false,
                         "autoUpdateEnabled": true,
                         "updateWindowStart": "23:30",
-                        "updateWindowEnd": "02:30"
+                        "updateWindowEnd": "02:30",
+                        "githubMirrorUrl": "https://gh-proxy.com/"
                     })
                     .to_string(),
                 ))
@@ -122,6 +123,7 @@ async fn server_update_routes_require_auth_and_validate_settings() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["data"]["autoCheckEnabled"], true);
     assert_eq!(value["data"]["autoUpdateEnabled"], true);
+    assert_eq!(value["data"]["githubMirrorUrl"], "https://gh-proxy.com/");
 
     let response = app
         .oneshot(

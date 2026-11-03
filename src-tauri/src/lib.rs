@@ -20,11 +20,14 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 const KEYRING_SERVICE: &str = "com.oshical.app";
 const KEY_LLM_API_KEY: &str = "llm_api_key";
 const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
+const APP_UPDATE_DIRECT_ENDPOINT: &str =
+    "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
 
 struct DesktopState {
     service: Arc<AppService>,
@@ -198,6 +201,8 @@ pub fn run() {
             clear_bilibili_cookie,
             get_server_token,
             get_device_id,
+            check_app_update,
+            install_app_update,
             get_sync_meta,
             list_sync_devices,
             get_sync_cursor,
@@ -270,6 +275,144 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInfo {
+    current_version: String,
+    version: String,
+    date: Option<String>,
+    body: Option<String>,
+}
+
+fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = mirror_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let url = url::Url::parse(value).map_err(|error| format!("GitHub 镜像地址无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("GitHub 镜像地址必须使用 http 或 https".to_owned());
+    }
+    let base = url.to_string();
+    Ok(Some(if base.ends_with('/') {
+        base
+    } else {
+        format!("{base}/")
+    }))
+}
+
+fn app_update_endpoints(mirror_url: Option<&str>) -> Result<Vec<url::Url>, String> {
+    let direct = url::Url::parse(APP_UPDATE_DIRECT_ENDPOINT)
+        .map_err(|error| format!("更新地址无效: {error}"))?;
+    let Some(base) = normalize_mirror_base(mirror_url)? else {
+        return Ok(vec![direct]);
+    };
+    let mirror = url::Url::parse(&format!("{base}{APP_UPDATE_DIRECT_ENDPOINT}"))
+        .map_err(|error| format!("镜像更新地址无效: {error}"))?;
+    Ok(vec![mirror, direct])
+}
+
+async fn resolve_app_update(
+    app: &AppHandle,
+    mirror_url: Option<&str>,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    let endpoints = app_update_endpoints(mirror_url)?;
+    let updater = app
+        .updater_builder()
+        .endpoints(endpoints)
+        .map_err(|error| format!("配置更新端点失败: {error}"))?
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| format!("初始化更新检查失败: {error}"))?;
+    let mut update = updater
+        .check()
+        .await
+        .map_err(|error| format!("检查更新失败: {error}"))?;
+    if let (Some(update), Some(base)) = (update.as_mut(), normalize_mirror_base(mirror_url)?) {
+        if update.download_url.scheme() == "https"
+            && !update.download_url.as_str().starts_with(&base)
+        {
+            update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
+                .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+        }
+    }
+    Ok(update)
+}
+
+async fn install_resolved_update(
+    app: &AppHandle,
+    update: &tauri_plugin_updater::Update,
+) -> Result<(), String> {
+    let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let chunk_app = app.clone();
+    let chunk_downloaded = downloaded.clone();
+    let finish_app = app.clone();
+    let finish_downloaded = downloaded.clone();
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                let current = chunk_downloaded
+                    .fetch_add(chunk_length as u64, std::sync::atomic::Ordering::Relaxed)
+                    + chunk_length as u64;
+                let _ = chunk_app.emit(
+                    "app-update-progress",
+                    json!({
+                        "downloaded": current,
+                        "total": content_length,
+                        "done": false
+                    }),
+                );
+            },
+            move || {
+                let current = finish_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = finish_app.emit(
+                    "app-update-progress",
+                    json!({
+                        "downloaded": current,
+                        "total": current,
+                        "done": true
+                    }),
+                );
+            },
+        )
+        .await
+        .map_err(|error| format!("下载或安装更新失败: {error}"))
+}
+
+#[tauri::command]
+async fn check_app_update(
+    app: AppHandle,
+    mirror_url: Option<String>,
+) -> Result<Option<AppUpdateInfo>, String> {
+    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+    Ok(update.as_ref().map(|update| AppUpdateInfo {
+        current_version: update.current_version.clone(),
+        version: update.version.clone(),
+        date: update.date.map(|value| value.to_string()),
+        body: update.body.clone(),
+    }))
+}
+
+#[tauri::command]
+async fn install_app_update(app: AppHandle, mirror_url: Option<String>) -> Result<(), String> {
+    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+    let Some(update) = update else {
+        return Err("当前已是最新版本".to_owned());
+    };
+    match install_resolved_update(&app, &update).await {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            let Some(_) = normalize_mirror_base(mirror_url.as_deref())? else {
+                return Err(first_error);
+            };
+            let direct_update = resolve_app_update(&app, None).await?;
+            let Some(direct_update) = direct_update else {
+                return Err(first_error);
+            };
+            install_resolved_update(&app, &direct_update).await
+        }
+    }
 }
 
 async fn run_refresh_action(app: &AppHandle) -> Result<Value, String> {
@@ -2107,7 +2250,10 @@ async fn export_client_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ws_url, cookie_header_from_webview, validate_external_url};
+    use super::{
+        app_update_endpoints, build_ws_url, cookie_header_from_webview, normalize_mirror_base,
+        validate_external_url,
+    };
     use tauri::webview::Cookie;
 
     #[test]
@@ -2120,6 +2266,22 @@ mod tests {
             build_ws_url("https://example.com/", 0, 2).unwrap(),
             "wss://example.com/api/ws?after=0&protocol=2"
         );
+    }
+
+    #[test]
+    fn app_update_endpoints_prefer_mirror_then_direct() {
+        let endpoints = app_update_endpoints(Some("https://gh-proxy.com")).expect("endpoints");
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(
+            endpoints[0].as_str(),
+            "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+        );
+        assert_eq!(
+            endpoints[1].as_str(),
+            "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+        );
+        assert_eq!(normalize_mirror_base(Some("")).unwrap(), None);
+        assert!(app_update_endpoints(Some("ftp://example.com")).is_err());
     }
 
     #[test]
