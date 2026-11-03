@@ -160,7 +160,7 @@ impl ServerUpdateManager {
         let latest_version = Some(latest.version.clone()).filter(|value| !value.is_empty());
         let update_available = latest_version
             .as_deref()
-            .is_some_and(|value| value != env!("CARGO_PKG_VERSION"));
+            .is_some_and(|value| version_is_newer(env!("CARGO_PKG_VERSION"), value));
         let request_pending = fs::try_exists(self.request_path()).await?;
         if request_pending && matches!(status.status.as_str(), "idle" | "succeeded" | "failed") {
             status.status = "requested".to_owned();
@@ -198,7 +198,7 @@ impl ServerUpdateManager {
     pub async fn install_now(&self) -> AppResult<ServerUpdateView> {
         let settings = self.settings().await?;
         let latest = self.check_release(&settings.github_mirror_url).await?;
-        if latest.version == env!("CARGO_PKG_VERSION") {
+        if !version_is_newer(env!("CARGO_PKG_VERSION"), &latest.version) {
             return Err(AppError::validation("服务器已经是最新版本"));
         }
         self.write_request(&latest.version, true, &settings).await?;
@@ -219,7 +219,9 @@ impl ServerUpdateManager {
             return Ok(());
         }
         let latest = self.load_latest().await?;
-        if latest.version.is_empty() || latest.version == env!("CARGO_PKG_VERSION") {
+        if latest.version.is_empty()
+            || !version_is_newer(env!("CARGO_PKG_VERSION"), &latest.version)
+        {
             return Ok(());
         }
         let status = self.load_status().await?;
@@ -453,6 +455,13 @@ fn window_contains(start: &str, end: &str, current: u32) -> bool {
     }
 }
 
+fn version_is_newer(current: &str, candidate: &str) -> bool {
+    match (Version::parse(current), Version::parse(candidate)) {
+        (Ok(current), Ok(candidate)) => candidate > current,
+        _ => false,
+    }
+}
+
 fn is_active_status(status: &str) -> bool {
     matches!(status, "requested" | "waiting_window" | "running")
 }
@@ -486,8 +495,8 @@ fn effective_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        mirror_manifest_url, parse_hhmm, validate_mirror_url, window_contains, ServerUpdateManager,
-        ServerUpdateSettings,
+        mirror_manifest_url, parse_hhmm, validate_mirror_url, version_is_newer, window_contains,
+        ServerUpdateManager, ServerUpdateSettings,
     };
 
     #[test]
@@ -502,6 +511,15 @@ mod tests {
         );
         assert!(validate_mirror_url("https://gh-proxy.com/").is_ok());
         assert!(validate_mirror_url("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn versions_compare_semantically() {
+        assert!(version_is_newer("0.2.0", "0.2.1"));
+        assert!(version_is_newer("0.2.9", "0.3.0"));
+        assert!(!version_is_newer("0.2.1", "0.2.0"));
+        assert!(!version_is_newer("0.2.1", "0.2.1"));
+        assert!(!version_is_newer("0.2.1", "invalid"));
     }
 
     #[test]

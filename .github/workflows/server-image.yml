@@ -79,10 +79,11 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           repo="${{ github.repository }}"
           manifest="server-latest.json"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
           jq -n \
             --arg version "$version" \
             --arg tag "server-v$version" \
-            --arg image "ghcr.io/${{ github.repository_owner }}/oshical-server:$version" \
+            --arg image "ghcr.io/$owner/oshical-server:$version" \
             --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{version: $version, tag: $tag, image: $image, publishedAt: $publishedAt}' > "$manifest"
           if gh release view server-latest --repo "$repo" >/dev/null 2>&1; then
