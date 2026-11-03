@@ -48,6 +48,12 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest
 
+      - name: Make GHCR package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PATCH /user/packages/container/oshical-server -f visibility=public
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
