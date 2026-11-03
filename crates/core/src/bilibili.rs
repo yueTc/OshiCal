@@ -494,6 +494,13 @@ impl BilibiliClient {
         })
     }
 
+    pub async fn fetch_fan_count(&self, mid: &str) -> AppResult<u64> {
+        validate_mid(mid)?;
+        let url = format!("https://api.bilibili.com/x/web-interface/card?mid={mid}");
+        let value = self.get_public(&url, "https://space.bilibili.com/").await?;
+        parse_fan_count(&value)
+    }
+
     pub async fn fetch_avatar_data_url(&self, avatar_url: &str) -> AppResult<String> {
         let avatar_url = normalize_image_url(avatar_url)
             .ok_or_else(|| AppError::validation("头像地址必须是受信任的 B 站图片链接"))?;
@@ -903,6 +910,18 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn parse_fan_count(value: &Value) -> AppResult<u64> {
+    value
+        .get("data")
+        .and_then(|data| data.get("card"))
+        .and_then(|card| card.get("fans"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AppError::External {
+            code: "BILI_FANS".to_owned(),
+            message: "账号卡片缺少粉丝数".to_owned(),
+        })
+}
+
 fn validate_mid(mid: &str) -> AppResult<()> {
     let mid = mid.trim();
     if mid.is_empty() || mid.len() > 32 || !mid.chars().all(|ch| ch.is_ascii_digit()) {
@@ -1157,6 +1176,13 @@ mod tests {
         assert_eq!(reserve.room_id.as_deref(), Some("12345"));
         assert_eq!(reserve.stype, Some(2));
         assert!(reserve.is_live());
+    }
+
+    #[test]
+    fn parses_fan_count_from_account_card() {
+        let value = serde_json::json!({"data": {"card": {"fans": 123456}}});
+        assert_eq!(parse_fan_count(&value).expect("fans"), 123456);
+        assert!(parse_fan_count(&serde_json::json!({"data": {"card": {}}})).is_err());
     }
 
     #[test]

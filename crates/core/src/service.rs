@@ -15,9 +15,9 @@ use crate::llm::{
     LlmEvent, LlmEventAction, LlmTestReport,
 };
 use crate::models::{
-    AddSubscription, DynamicPost, FertilitySnapshot, FertilityStatus, LiveStatus, NewSchedule,
-    NewWeeklyScheduleRule, RefreshProgress, RefreshReport, Schedule, Streamer, UpdateSchedule,
-    UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
+    LiveStatus, NewSchedule, NewWeeklyScheduleRule, RefreshProgress, RefreshReport, Schedule,
+    Streamer, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
@@ -26,6 +26,7 @@ use crate::store::SqliteStore;
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
+pub const FAN_POLL_INTERVAL_SECONDS: u64 = 60 * 60;
 
 #[derive(Clone)]
 pub struct AppService {
@@ -664,6 +665,68 @@ impl AppService {
     }
     pub async fn list_live_statuses(&self) -> AppResult<Vec<LiveStatus>> {
         self.store.list_live_statuses().await
+    }
+
+    pub async fn get_fan_history(&self, streamer_id: i64, days: i64) -> AppResult<FanHistory> {
+        if !(1..=90).contains(&days) {
+            return Err(AppError::validation("粉丝历史范围必须在 1 到 90 天之间"));
+        }
+        let streamer = self.store.get_streamer(streamer_id).await?;
+        let snapshots = self
+            .store
+            .list_fan_snapshots(streamer_id, Utc::now() - Duration::days(days))
+            .await?;
+        let checked_at = snapshots.last().map(|snapshot| snapshot.captured_at);
+        Ok(FanHistory {
+            streamer_id,
+            current_fans: streamer.fans,
+            checked_at,
+            snapshots,
+        })
+    }
+
+    pub async fn refresh_streamer_fans(&self, streamer_id: i64) -> AppResult<FanHistory> {
+        let streamer = self.store.get_streamer(streamer_id).await?;
+        let fans = self.bili_client().fetch_fan_count(&streamer.mid).await?;
+        self.store
+            .record_fan_snapshot(streamer.id, fans, Utc::now())
+            .await?;
+        self.get_fan_history(streamer_id, 30).await
+    }
+
+    pub async fn refresh_all_fans(&self) -> AppResult<FanRefreshReport> {
+        let streamers = self.store.list_streamers().await?;
+        let mut report = FanRefreshReport {
+            refreshed_streamers: 0,
+            failed_streamers: Vec::new(),
+        };
+        let bili = self.bili_client();
+        for (index, streamer) in streamers.iter().enumerate() {
+            match bili.fetch_fan_count(&streamer.mid).await {
+                Ok(fans) => {
+                    match self
+                        .store
+                        .record_fan_snapshot(streamer.id, fans, Utc::now())
+                        .await
+                    {
+                        Ok(_) => report.refreshed_streamers += 1,
+                        Err(error) => report
+                            .failed_streamers
+                            .push(format!("{}: {error}", streamer.name)),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(streamer_id = streamer.id, mid = %streamer.mid, %error, "粉丝数采集失败");
+                    report
+                        .failed_streamers
+                        .push(format!("{}: {error}", streamer.name));
+                }
+            }
+            if index % 5 == 4 && index + 1 < streamers.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        Ok(report)
     }
 
     pub async fn check_live_all(&self) -> AppResult<Vec<LiveStatus>> {
@@ -2913,6 +2976,7 @@ mod tests {
                 schedule_enabled: true,
                 live_notify_enabled: true,
                 live_stats_enabled: false,
+                fans: None,
                 last_error: None,
                 last_refresh_at: None,
                 is_live: false,
@@ -2936,6 +3000,7 @@ mod tests {
                 schedule_enabled: true,
                 live_notify_enabled: true,
                 live_stats_enabled: false,
+                fans: None,
                 last_error: None,
                 last_refresh_at: None,
                 is_live: false,
@@ -3298,6 +3363,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,
@@ -3344,6 +3410,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,
@@ -3386,6 +3453,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,

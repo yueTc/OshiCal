@@ -45,6 +45,8 @@ pub struct Streamer {
     pub live_notify_enabled: bool,
     #[serde(default)]
     pub live_stats_enabled: bool,
+    #[serde(default)]
+    pub fans: Option<u64>,
     pub last_error: Option<String>,
     pub last_refresh_at: Option<DateTime<Utc>>,
     pub is_live: bool,
@@ -414,6 +416,29 @@ pub struct LiveSessionStats {
     pub data_quality: String,
     pub collector_state: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FanSnapshot {
+    pub captured_at: DateTime<Utc>,
+    pub fans: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FanHistory {
+    pub streamer_id: i64,
+    pub current_fans: Option<u64>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub snapshots: Vec<FanSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FanRefreshReport {
+    pub refreshed_streamers: usize,
+    pub failed_streamers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveStatus {

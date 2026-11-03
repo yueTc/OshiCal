@@ -211,6 +211,7 @@ struct SyncStreamerRow {
     schedule_enabled: i64,
     live_notify_enabled: i64,
     live_stats_enabled: i64,
+    fans: Option<i64>,
     aliases_json: String,
     last_error: Option<String>,
     last_refresh_at: Option<String>,
@@ -1044,7 +1045,7 @@ fn map_device(row: sqlx::sqlite::SqliteRow) -> AppResult<DeviceInfo> {
 async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>> {
     let rows = sqlx::query_as::<_, SyncStreamerRow>(
         "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, aliases_json, last_error,
+                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
                 last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
                 live_checked_at, sort_order, created_at, revision
          FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
@@ -1077,7 +1078,7 @@ async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>>
 async fn load_streamer(conn: &mut SqliteConnection, id: i64) -> AppResult<Streamer> {
     let row = sqlx::query_as::<_, SyncStreamerRow>(
         "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, aliases_json, last_error,
+                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
                 last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
                 live_checked_at, sort_order, created_at, revision
          FROM streamers WHERE id = ?",
@@ -1117,6 +1118,7 @@ fn map_streamer_row(
         schedule_enabled: row.schedule_enabled != 0,
         live_notify_enabled: row.live_notify_enabled != 0,
         live_stats_enabled: row.live_stats_enabled != 0,
+        fans: row.fans.and_then(|value| u64::try_from(value).ok()),
         last_error: row.last_error,
         last_refresh_at: parse_opt_ts(row.last_refresh_at.as_deref())?,
         is_live: row.live_is_live != 0,

@@ -4,7 +4,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use oshical_core::{load_settings, save_settings, AppService, SqliteStore, SyncPrunePolicy};
+use oshical_core::{
+    load_settings, save_settings, AppService, SqliteStore, SyncPrunePolicy,
+    FAN_POLL_INTERVAL_SECONDS,
+};
 use tokio::sync::broadcast;
 
 use crate::api::{build_router, AppState};
@@ -126,6 +129,33 @@ pub fn spawn_background_tasks(state: AppState) {
                 async move {
                     if let Err(error) = service.refresh_all().await {
                         tracing::warn!(%error, "动态刷新失败");
+                    }
+                }
+            },
+        )
+        .await;
+    });
+
+    let fan_state = state.clone();
+    tokio::spawn(async move {
+        run_poll_loop(
+            || async { Duration::from_secs(FAN_POLL_INTERVAL_SECONDS) },
+            move |_| {
+                let service = fan_state.service.clone();
+                async move {
+                    match service.refresh_all_fans().await {
+                        Ok(report) if report.failed_streamers.is_empty() => {
+                            tracing::info!(
+                                refreshed = report.refreshed_streamers,
+                                "粉丝数采集完成"
+                            );
+                        }
+                        Ok(report) => tracing::warn!(
+                            refreshed = report.refreshed_streamers,
+                            failed = report.failed_streamers.len(),
+                            "粉丝数采集完成，部分主播失败"
+                        ),
+                        Err(error) => tracing::warn!(%error, "粉丝数采集失败"),
                     }
                 }
             },

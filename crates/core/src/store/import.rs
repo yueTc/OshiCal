@@ -204,18 +204,18 @@ impl SqliteStore {
             let id = if let Some(id) = existing {
                 if strategy == "server" {
                     sqlx::query("UPDATE streamers SET name=?,avatar_url=?,room_id=?,live_url=?,schedule_enabled=?,
-                        live_notify_enabled=?,live_stats_enabled=?,aliases_json=?,updated_at=? WHERE id=?")
+                        live_notify_enabled=?,live_stats_enabled=?,fans=?,aliases_json=?,updated_at=? WHERE id=?")
                         .bind(&remote.name).bind(&remote.avatar_url).bind(&remote.room_id).bind(&remote.live_url)
-                        .bind(remote.schedule_enabled).bind(remote.live_notify_enabled).bind(remote.live_stats_enabled).bind(aliases).bind(&now).bind(id)
+                        .bind(remote.schedule_enabled).bind(remote.live_notify_enabled).bind(remote.live_stats_enabled).bind(remote.fans.and_then(|v| i64::try_from(v).ok())).bind(aliases).bind(&now).bind(id)
                         .execute(&mut *tx).await?;
                 }
                 id
             } else {
                 sqlx::query("INSERT INTO streamers(mid,name,avatar_url,room_id,live_url,schedule_enabled,
-                    live_notify_enabled,live_stats_enabled,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+                    live_notify_enabled,live_stats_enabled,fans,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
                     .bind(&remote.mid).bind(&remote.name).bind(&remote.avatar_url).bind(&remote.room_id)
                     .bind(&remote.live_url).bind(remote.schedule_enabled).bind(remote.live_notify_enabled)
-                    .bind(remote.live_stats_enabled).bind(aliases).bind(&now).bind(&now)
+                    .bind(remote.live_stats_enabled).bind(remote.fans.and_then(|v| i64::try_from(v).ok())).bind(aliases).bind(&now).bind(&now)
                     .execute(&mut *tx).await?.last_insert_rowid()
             };
             ids.insert(remote.id, id);

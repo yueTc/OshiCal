@@ -765,16 +765,17 @@ async fn apply_subscription(
     let created = value.created_at.to_rfc3339();
     sqlx::query(
         "INSERT INTO streamers(id, mid, name, avatar_url, room_id, live_url,
-            schedule_enabled, live_notify_enabled, live_stats_enabled, aliases_json,
+            schedule_enabled, live_notify_enabled, live_stats_enabled, fans, aliases_json,
             last_error, last_refresh_at, live_is_live, live_title, live_cover,
             live_started_at, live_checked_at, sort_order, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             mid = excluded.mid, name = excluded.name, avatar_url = excluded.avatar_url,
             room_id = excluded.room_id, live_url = excluded.live_url,
             schedule_enabled = excluded.schedule_enabled,
             live_notify_enabled = excluded.live_notify_enabled,
             live_stats_enabled = excluded.live_stats_enabled,
+            fans = excluded.fans,
             aliases_json = excluded.aliases_json, last_error = excluded.last_error,
             last_refresh_at = excluded.last_refresh_at, live_is_live = excluded.live_is_live,
             live_title = excluded.live_title, live_cover = excluded.live_cover,
@@ -791,6 +792,7 @@ async fn apply_subscription(
     .bind(value.schedule_enabled)
     .bind(value.live_notify_enabled)
     .bind(value.live_stats_enabled)
+    .bind(value.fans.and_then(|v| i64::try_from(v).ok()))
     .bind(aliases)
     .bind(&value.last_error)
     .bind(value.last_refresh_at.map(|time| time.to_rfc3339()))
@@ -1784,6 +1786,7 @@ mod tests {
                 "scheduleEnabled": true,
                 "liveNotifyEnabled": true,
                 "liveStatsEnabled": false,
+                "fans": 123456,
                 "lastError": null,
                 "lastRefreshAt": null,
                 "isLive": false,
@@ -1823,6 +1826,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(is_live, 1);
+        let fans: Option<i64> = sqlx::query_scalar("SELECT fans FROM streamers WHERE id = 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(fans, Some(123456));
 
         let batch = SyncBatch {
             from_seq: 11,

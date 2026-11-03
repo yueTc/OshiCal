@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use oshical_core::{
     load_settings, save_settings as save_settings_to_store, AppError, AppService, AppSettings,
-    DataMode, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport, NewSchedule,
-    NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule, Streamer,
-    SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    DataMode, FanHistory, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport,
+    NewSchedule, NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule,
+    Streamer, SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule,
+    WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -185,6 +186,8 @@ pub fn run() {
             cancel_schedule,
             list_live_statuses,
             list_live_sessions,
+            get_fan_history,
+            refresh_streamer_fans,
             live_session_for_schedule,
             list_fertility_statuses,
             check_live_now,
@@ -751,6 +754,31 @@ async fn list_live_sessions(
 }
 
 #[tauri::command]
+async fn get_fan_history(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+    days: Option<i64>,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .get_fan_history(streamer_id, days.unwrap_or(30))
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
+async fn refresh_streamer_fans(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .refresh_streamer_fans(streamer_id)
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
 async fn live_session_for_schedule(
     state: State<'_, DesktopState>,
     schedule_id: i64,
@@ -1096,6 +1124,40 @@ fn spawn_local_monitor(app: AppHandle) {
                 previous = Some(Instant::now());
                 if let Err(error) = state.service.refresh_all().await {
                     let _ = dynamic_app.emit("monitor-error", error.to_string());
+                }
+            }
+        }
+    });
+
+    let fan_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut previous = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let state = fan_app.state::<DesktopState>();
+            let settings = match load_settings(state.service.store()).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let _ = fan_app.emit("monitor-error", error.to_string());
+                    continue;
+                }
+            };
+            if settings.data_mode != DataMode::Local {
+                previous = None;
+                continue;
+            }
+            if previous.is_none_or(|started: Instant| {
+                started.elapsed() >= Duration::from_secs(FAN_POLL_INTERVAL_SECONDS)
+            }) {
+                previous = Some(Instant::now());
+                match state.service.refresh_all_fans().await {
+                    Ok(report) if report.refreshed_streamers > 0 => {
+                        let _ = fan_app.emit("fan-count-updated", report);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = fan_app.emit("monitor-error", error.to_string());
+                    }
                 }
             }
         }

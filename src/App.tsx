@@ -70,6 +70,7 @@ import type {
   ImportPreview,
   AppSettings,
   Bootstrap,
+  FanHistory,
   FertilitySnapshot,
   LlmDiscoveryInput,
   LlmTestInput,
@@ -931,6 +932,10 @@ export default function App() {
           showToast(event.payload);
         });
         keepCleanup(offError);
+        const offFanCount = await listen<unknown>("fan-count-updated", () => {
+          void refreshActiveData().catch((error) => showToast(explainError(error)));
+        });
+        keepCleanup(offFanCount);
         const offBiliCookie = await listen<SecretStatus>("bili-cookie-updated", (event) => {
           setSecrets(event.payload);
           showToast("B 站 Cookie 已自动保存");
@@ -1951,6 +1956,30 @@ export default function App() {
           });
           throw error;
         }
+      },
+      fanHistory: async (streamerId: number, days = 30): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.fanHistory(streamerId, days);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.fanHistory(streamerId, days);
+      },
+      refreshFans: async (streamerId: number): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.refreshFans(streamerId);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.refreshFans(streamerId);
       },
       listWeeklyRules: async (streamerId: number): Promise<WeeklyScheduleRule[]> => {
         if (serverMode) {

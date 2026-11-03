@@ -138,6 +138,11 @@ pub fn build_router(state: AppState) -> Router {
             delete(remove_linked_account),
         )
         .route("/api/subscriptions/{id}/refresh", post(refresh_streamer))
+        .route("/api/subscriptions/{id}/fans", get(fan_history))
+        .route(
+            "/api/subscriptions/{id}/fans/refresh",
+            post(refresh_streamer_fans),
+        )
         .route("/api/refresh", post(refresh_all))
         .route("/api/schedules", get(list_schedules).post(create_schedule))
         .route(
@@ -492,6 +497,27 @@ async fn list_llm_models(
 
 async fn list_live_status(State(state): State<AppState>) -> ApiResult {
     ok(state.service.list_live_statuses().await?)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FanHistoryQuery {
+    days: Option<i64>,
+}
+
+async fn fan_history(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<FanHistoryQuery>,
+) -> ApiResult {
+    ok(state
+        .service
+        .get_fan_history(id, query.days.unwrap_or(30))
+        .await?)
+}
+
+async fn refresh_streamer_fans(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    ok(state.service.refresh_streamer_fans(id).await?)
 }
 
 #[derive(Debug, Deserialize)]
