@@ -121,7 +121,7 @@ https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
 1. 使用 `node scripts/set-version.mjs <版本号>` 同步 npm、Cargo 与 Tauri 版本。
 2. 提交改动并推送 `v<版本号>` 标签。
 3. GitHub Actions 构建 NSIS 安装包，生成 `.sig` 与 `latest.json`。
-4. 检查 Draft Release 后发布。
+4. 检查 Release 资产与更新清单。
 5. 安装旧版本，确认客户端能检测、下载、校验、安装并重启到新版本。
 
 签名 Secrets：

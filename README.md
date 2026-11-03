@@ -116,7 +116,7 @@ git tag v0.1.1
 git push origin main --tags
 ```
 
-推送 `v*` 标签后，`.github/workflows/release.yml` 会运行测试、构建 Windows 安装包、生成更新签名和 `latest.json`，并创建 Draft Release。人工检查资产后再发布 Release。
+推送 `v*` 标签后，`.github/workflows/release.yml` 会运行测试、构建 Windows 安装包、生成更新签名和 `latest.json`，并创建正式 Release。推送版本标签前请确认版本、测试结果和发布说明。
 
 客户端更新地址：
 

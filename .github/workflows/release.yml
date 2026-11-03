@@ -61,7 +61,7 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --locked --no-fail-fast
 
-      - name: Build and publish draft release
+      - name: Build and publish release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,7 +74,7 @@ jobs:
             - 普通用户请下载 NSIS 安装包。
             - 已安装 OshiCal 的用户可在“设置 → 软件更新”中检查更新。
             - 更新包使用 Tauri 签名校验；Windows Authenticode 代码签名需另行配置。
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true

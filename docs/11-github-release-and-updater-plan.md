@@ -30,7 +30,7 @@
 | 仓库可见性 | Public | 私有仓库的 Release 无法被客户端安全匿名下载 |
 | 更新范围 | Windows 桌面端 | 服务端镜像更新作为后续独立阶段 |
 | 更新方式 | Tauri 官方 Updater | 下载签名安装包并重启 |
-| 发布方式 | Draft Release | 先构建，人工检查后再发布 |
+| 发布方式 | GitHub Release | 显式推送版本标签后自动构建并发布 |
 | 更新检查 | 启动时自动检查，安装需用户确认 | 不静默安装 |
 | 签名策略 | Tauri 更新签名必填 | 与 Windows Authenticode 代码签名是两套机制 |
 | 回滚策略 | 保留旧安装包 + Hotfix 版本 | GitHub 静态更新源不支持自动降级 |
@@ -82,7 +82,7 @@ GitHub Actions (Windows)
         +-- 生成 latest.json
         |
         v
-GitHub Draft Release
+GitHub Release
         |
         +-- 人工检查资产
         +-- 发布 Release
@@ -241,14 +241,14 @@ Release：
   - NSIS 安装包
   - `.sig`
   - `latest.json`
-- 默认创建 Draft Release。
+- 默认创建正式 Release。
 - 第三方 Action 尽量固定到提交 SHA。
 
 验收：
 
 - CI 工作流通过。
 - Release 工作流生成完整资产。
-- Draft Release 未发布前不影响现网用户。
+- 显式版本标签是发布门禁；未推送标签不会影响现网用户。
 
 ### Wave 5：统一版本管理
 
@@ -283,7 +283,7 @@ node scripts/set-version.mjs 0.1.1
 
 - 完成 `gh auth login`。
 - 确认仓库名和可见性。
-- 确认是否创建 Draft Release。
+- 确认版本号与发布说明。
 - 完成敏感信息清理。
 
 执行步骤：
@@ -294,7 +294,7 @@ node scripts/set-version.mjs 0.1.1
 4. 推送主分支。
 5. 配置 GitHub Secrets。
 6. 推送 `v0.1.0` 标签。
-7. 检查 Draft Release。
+7. 检查正式 Release 资产。
 8. 发布 Release。
 9. 验证匿名访问 `latest.json`。
 
@@ -319,7 +319,7 @@ node scripts/set-version.mjs 0.1.1
 - Release 资产完整。
 - `latest.json` 可匿名下载。
 - 安装包校验和与 Release 一致。
-- 草稿 Release 发布后 Updater 能读取。
+- 正式 Release 发布后 Updater 能读取。
 
 ### 7.3 端到端自动更新验证
 
@@ -346,7 +346,7 @@ node scripts/set-version.mjs 0.1.1
 - 私钥只保存在开发机和 GitHub Secrets。
 - 私钥不得写入仓库、文档、日志或截图。
 - 不把 GitHub Token 内置到客户端。
-- Release 默认 Draft，人工检查后发布。
+- Release 由显式版本标签触发自动发布。
 
 ### 8.2 仓库安全
 
@@ -368,9 +368,9 @@ node scripts/set-version.mjs 0.1.1
 
 ### 9.1 发布前回滚
 
-- 不发布 Draft Release 即不会影响用户。
+- 不推送版本标签即不会影响用户。
 - 发现构建或签名问题，修复后重新构建。
-- 必要时删除 Draft Release 和标签。
+- 必要时删除错误 Release 和标签。
 
 ### 9.2 发布后回滚
 
@@ -401,7 +401,7 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 | 更新包被篡改 | 高 | Tauri 签名校验 |
 | Windows SmartScreen 警告 | 中 | 后续配置 Authenticode 代码签名 |
 | GitHub 网络不可达 | 中 | 检查失败不阻塞应用，提示重试 |
-| 错误 Release 影响用户 | 中 | Draft Release + 人工验收 |
+| 错误 Release 影响用户 | 中 | 版本标签门禁 + 自动验收 + Hotfix |
 | 已更新用户无法自动降级 | 中 | 保留旧安装包，发布 Hotfix |
 | 版本号不一致 | 中 | 统一版本脚本 + CI 校验 |
 
@@ -431,7 +431,7 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - [x] 仓库使用 `yueTc/OshiCal`
 - [x] 仓库设置为 Public
 - [ ] 本次只更新 Windows 桌面端
-- [ ] Release 默认使用 Draft 草稿发布
+- [x] Release 由显式版本标签触发自动发布
 - [ ] 正式发布前重新生成带密码的更新签名密钥
 - [ ] 服务端 Docker/GHCR 更新作为后续阶段
 - [ ] 同意先完成本地构建和端到端升级演练，再正式推送 GitHub
