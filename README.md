@@ -189,6 +189,16 @@ OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:0.1.2
 ```cron
 0 * * * * cd /opt/oshical && ./scripts/update-server.sh >> backups/update.log 2>&1
 ```
+
+客户端服务器模式支持：
+
+- 查看服务器当前版本和最新版本。
+- 手动检查并立即更新服务器。
+- 开启自动检测。
+- 开启自动更新时间段。
+- 查看更新代理在线状态、阶段和失败原因。
+
+服务端更新由宿主机 `oshical-updater` systemd 代理执行，应用容器不挂载 Docker Socket。安装步骤见 `docs/06-deployment.md`。
 ## 验证
 
 ```powershell

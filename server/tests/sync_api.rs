@@ -8,7 +8,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use oshical_core::{AddSubscription, AppService, RefreshReport, RuntimeSecrets, SqliteStore};
-use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault};
+use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault, ServerUpdateManager};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -31,6 +31,10 @@ fn state_with_store(store: SqliteStore) -> AppState {
         secret_vault: SecretVault::from_material("test-master-key"),
         hub,
         jobs: RefreshJobManager::new(),
+        updates: ServerUpdateManager::new(
+            std::env::temp_dir().join(format!("oshical-sync-update-{}", uuid::Uuid::new_v4())),
+        )
+        .expect("updates"),
     }
 }
 

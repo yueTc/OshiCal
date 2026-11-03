@@ -12,6 +12,7 @@ use crate::config::ServerConfig;
 use crate::jobs::RefreshJobManager;
 use crate::secrets::{load_persisted_bili_secret, load_persisted_llm_secret, SecretVault};
 use crate::sync_api;
+use crate::update_manager::ServerUpdateManager;
 
 pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let store = SqliteStore::connect(&config.database_path)
@@ -55,12 +56,15 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let service = AppService::new_with_proxy(store, runtime_secrets, settings.proxy_port)
         .map_err(|error| format!("初始化服务失败: {error}"))?;
     let (hub, _) = broadcast::channel(256);
+    let updates = ServerUpdateManager::new(config.update_dir.clone())
+        .map_err(|error| format!("初始化服务器更新管理器失败: {error}"))?;
     let state = AppState {
         service: Arc::new(service),
         api_token: config.api_token.map(Arc::new),
         secret_vault,
         hub,
         jobs: RefreshJobManager::new(),
+        updates,
     };
     spawn_background_tasks(state.clone());
     let router = build_router(state);
@@ -170,6 +174,17 @@ pub fn spawn_background_tasks(state: AppState) {
             }
         }
     });
+    let update_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        loop {
+            if let Err(error) = update_state.updates.tick().await {
+                tracing::warn!(%error, "服务器更新检查失败");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+
     let prune_state = state.clone();
     tokio::spawn(async move {
         loop {

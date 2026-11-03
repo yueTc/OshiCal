@@ -76,10 +76,53 @@ OSHICAL_BACKUP_DIR=backups
 如果 GHCR 镜像为私有，需要先登录：
 
 ```bash
-echo "$CR_PAT" | docker login ghcr.io -u <GitHub用户名> --password-stdin
+echo "$CR_PAT" | sudo docker login ghcr.io -u <GitHub用户名> --password-stdin
 ```
 
 不建议让应用容器直接挂载 `/var/run/docker.sock`。需要自动更新时，可使用宿主机 cron 定时执行上述脚本。
+
+### 客户端服务器更新
+
+服务端模式设置页可显示：
+
+- 当前服务器版本。
+- 最新 GitHub Release 版本。
+- 自动检测开关。
+- 自动更新开关。
+- 自动更新时间段。
+- 手动立即更新。
+- 更新代理在线状态、当前阶段和错误。
+
+应用容器只写入受控更新请求，不挂载 Docker Socket。实际更新由宿主机 systemd 代理执行。
+
+在服务器仓库目录安装代理：
+
+```bash
+sudo install -m 755 scripts/oshical-updater-agent.sh /opt/oshical/scripts/oshical-updater-agent.sh
+sudo install -m 644 deploy/systemd/oshical-updater.service /etc/systemd/system/oshical-updater.service
+sudo install -m 644 deploy/systemd/oshical-updater.timer /etc/systemd/system/oshical-updater.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now oshical-updater.timer
+```
+
+如果部署目录不是 `/opt/oshical`，先修改 systemd 单元中的 `WorkingDirectory` 和 `OSHICAL_UPDATE_DIR`。
+
+代理每 15 秒检查一次请求。手动更新会立即执行；自动更新只在设置的时间段内执行。更新时间统一按 `Asia/Shanghai` 解释，开始时间晚于结束时间表示跨午夜。
+
+更新代理会调用 `scripts/update-server.sh`，执行镜像比较、数据备份、容器重启、健康检查和失败回滚。
+
+默认 GHCR 镜像可能为私有。服务器需先登录：
+
+```bash
+echo "$CR_PAT" | sudo docker login ghcr.io -u yueTc --password-stdin
+```
+
+日志：
+
+```bash
+sudo journalctl -u oshical-updater.service -n 200 --no-pager
+cat data/system/updater.log
+```
 ## 2. 便携服务端
 
 ```powershell

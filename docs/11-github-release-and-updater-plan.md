@@ -470,3 +470,10 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetec/oshical-server:<版本号>` 和 `latest` 镜像。
 - `scripts/update-server.sh` 负责镜像比较、数据备份、更新、健康检查和失败回滚。
 - 默认不挂载 Docker Socket；自动更新由宿主机 cron 调度更新脚本。
+
+## 16. 客户端控制的服务器更新
+
+- 客户端可查看服务器当前版本、最新版本、更新代理状态和更新阶段。
+- 支持手动立即更新、自动检测和可配置时间段的自动更新。
+- 服务端写入受控 `update-request.env`；宿主机 systemd 代理执行 Docker Compose 更新。
+- 应用容器不挂载 Docker Socket。

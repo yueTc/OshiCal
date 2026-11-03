@@ -1,0 +1,14 @@
+[Unit]
+Description=OshiCal host update agent
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/oshical
+Environment=OSHICAL_UPDATE_DIR=/opt/oshical/data/system
+ExecStart=/opt/oshical/scripts/oshical-updater-agent.sh
+TimeoutStartSec=20min
+Nice=10

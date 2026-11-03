@@ -30,6 +30,8 @@ import type {
   LlmDiscoveryInput,
   ProxyTestReport,
   SecretStatus,
+  ServerUpdateInfo,
+  ServerUpdateSettings,
   DataMode,
 } from "../types";
 import type { SecretInput } from "../lib/secret-types";
@@ -51,6 +53,10 @@ import { ErrorBanner, Modal, Toggle } from "./ui";
 interface SettingsActions {
   save: (settings: AppSettings, secrets: SecretInput, autostart: boolean) => Promise<AppSettings>;
   testServer: (url: string, token: string) => Promise<string>;
+  serverUpdate: () => Promise<ServerUpdateInfo>;
+  saveServerUpdateSettings: (settings: ServerUpdateSettings) => Promise<ServerUpdateInfo>;
+  checkServerUpdate: () => Promise<ServerUpdateInfo>;
+  installServerUpdate: () => Promise<ServerUpdateInfo>;
   testProxy: (proxyPort: number, mode: DataMode) => Promise<ProxyTestReport>;
   testLlm: (input: LlmTestInput) => Promise<LlmTestReport>;
   listLlmModels: (input: LlmDiscoveryInput) => Promise<string[]>;
@@ -157,6 +163,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateInstalled, setUpdateInstalled] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress>({ downloaded: 0, total: null });
+  const [serverUpdate, setServerUpdate] = useState<ServerUpdateInfo | null>(null);
+  const [serverUpdateDraft, setServerUpdateDraft] = useState<ServerUpdateSettings>({
+    autoCheckEnabled: true,
+    autoUpdateEnabled: false,
+    updateWindowStart: "03:00",
+    updateWindowEnd: "05:00",
+  });
+  const [serverUpdateLoading, setServerUpdateLoading] = useState<"load" | "save" | "check" | "install" | null>(null);
+  const [serverUpdateError, setServerUpdateError] = useState<string | null>(null);
+  const serverUpdateDirtyRef = useRef(false);
+  const actionsRef = useRef(actions);
   const qrSessionRef = useRef<string | null>(null);
   const wasBiliConfigured = useRef(biliConfigured);
   const leavePromptOpenRef = useRef(false);
@@ -207,6 +224,48 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setSavedAutoLaunch(autostart);
     }
   }, [autostart]);
+
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
+
+  useEffect(() => {
+    if (!serverMode) {
+      return;
+    }
+    let disposed = false;
+    const apply = (value: ServerUpdateInfo) => {
+      if (disposed) {
+        return;
+      }
+      setServerUpdate(value);
+      if (!serverUpdateDirtyRef.current) {
+        setServerUpdateDraft({
+          autoCheckEnabled: value.autoCheckEnabled,
+          autoUpdateEnabled: value.autoUpdateEnabled,
+          updateWindowStart: value.updateWindowStart,
+          updateWindowEnd: value.updateWindowEnd,
+        });
+      }
+    };
+    const load = async () => {
+      try {
+        const value = await actionsRef.current.serverUpdate();
+        apply(value);
+        setServerUpdateError(null);
+      } catch (updateError) {
+        if (!disposed) {
+          setServerUpdateError(explainError(updateError));
+        }
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [serverMode]);
 
   useEffect(() => {
     if (!tauri) {
@@ -492,6 +551,59 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  function applyServerUpdate(value: ServerUpdateInfo) {
+    setServerUpdate(value);
+    if (!serverUpdateDirtyRef.current) {
+      setServerUpdateDraft({
+        autoCheckEnabled: value.autoCheckEnabled,
+        autoUpdateEnabled: value.autoUpdateEnabled,
+        updateWindowStart: value.updateWindowStart,
+        updateWindowEnd: value.updateWindowEnd,
+      });
+    }
+  }
+
+  async function saveServerUpdateSettings() {
+    setServerUpdateLoading("save");
+    setServerUpdateError(null);
+    try {
+      const value = await actions.saveServerUpdateSettings(serverUpdateDraft);
+      serverUpdateDirtyRef.current = false;
+      applyServerUpdate(value);
+    } catch (updateError) {
+      setServerUpdateError(explainError(updateError));
+    } finally {
+      setServerUpdateLoading(null);
+    }
+  }
+
+  async function checkServerUpdate() {
+    setServerUpdateLoading("check");
+    setServerUpdateError(null);
+    try {
+      applyServerUpdate(await actions.checkServerUpdate());
+    } catch (updateError) {
+      setServerUpdateError(explainError(updateError));
+    } finally {
+      setServerUpdateLoading(null);
+    }
+  }
+
+  async function installServerUpdate() {
+    if (!window.confirm("确定立即更新服务器？更新期间服务会短暂中断，系统会先备份数据，失败时自动回滚。")) {
+      return;
+    }
+    setServerUpdateLoading("install");
+    setServerUpdateError(null);
+    try {
+      applyServerUpdate(await actions.installServerUpdate());
+    } catch (updateError) {
+      setServerUpdateError(explainError(updateError));
+    } finally {
+      setServerUpdateLoading(null);
+    }
+  }
+
   async function checkUpdates() {
     setUpdateChecking(true);
     setUpdateStatus(null);
@@ -620,6 +732,132 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             onMigrateToServer={onMigrateToServer}
             onDeleteDevice={onDeleteDevice}
           />
+        ) : null}
+
+        {serverMode ? (
+          <section className="settings-card span-2 server-update-card">
+            <header>
+              <h2>服务器更新</h2>
+              <span className="setting-scope server">服务器</span>
+              <span className={serverUpdate?.agentOnline ? "update-agent-online" : "update-agent-offline"}>
+                {serverUpdate?.agentOnline ? "更新代理在线" : "更新代理未在线"}
+              </span>
+              <span>由宿主机 systemd 更新代理执行镜像拉取、备份、重启和失败回滚。</span>
+            </header>
+            <div className="server-update-metrics">
+              <div>
+                <span>当前版本</span>
+                <strong>{serverUpdate ? `v${serverUpdate.currentVersion}` : "读取中…"}</strong>
+              </div>
+              <div>
+                <span>最新版本</span>
+                <strong>{serverUpdate?.latestVersion ? `v${serverUpdate.latestVersion}` : "尚未检查"}</strong>
+              </div>
+              <div>
+                <span>更新状态</span>
+                <strong>{serverUpdate?.updateAvailable ? "有可用更新" : serverUpdate ? "已是最新" : "读取中"}</strong>
+              </div>
+            </div>
+            {serverUpdateError ? <ErrorBanner message={serverUpdateError} /> : null}
+            <div className="settings-stack server-update-options">
+              <Toggle
+                checked={serverUpdateDraft.autoCheckEnabled}
+                onChange={(value) => {
+                  serverUpdateDirtyRef.current = true;
+                  setServerUpdateDraft((current) => ({
+                    ...current,
+                    autoCheckEnabled: value,
+                    autoUpdateEnabled: value ? current.autoUpdateEnabled : false,
+                  }));
+                }}
+                label="自动检测服务器新版本"
+              />
+              <Toggle
+                checked={serverUpdateDraft.autoUpdateEnabled}
+                onChange={(value) => {
+                  serverUpdateDirtyRef.current = true;
+                  setServerUpdateDraft((current) => ({
+                    ...current,
+                    autoUpdateEnabled: value,
+                    autoCheckEnabled: value ? true : current.autoCheckEnabled,
+                  }));
+                }}
+                label="在指定时间段自动更新"
+              />
+              <div className="server-update-window">
+                <label>
+                  <span>开始时间</span>
+                  <input
+                    type="time"
+                    value={serverUpdateDraft.updateWindowStart}
+                    disabled={!serverUpdateDraft.autoUpdateEnabled}
+                    onChange={(event) => {
+                      serverUpdateDirtyRef.current = true;
+                      setServerUpdateDraft((current) => ({ ...current, updateWindowStart: event.target.value }));
+                    }}
+                  />
+                </label>
+                <label>
+                  <span>结束时间</span>
+                  <input
+                    type="time"
+                    value={serverUpdateDraft.updateWindowEnd}
+                    disabled={!serverUpdateDraft.autoUpdateEnabled}
+                    onChange={(event) => {
+                      serverUpdateDirtyRef.current = true;
+                      setServerUpdateDraft((current) => ({ ...current, updateWindowEnd: event.target.value }));
+                    }}
+                  />
+                </label>
+                <small>时间按 Asia/Shanghai 解释；开始时间晚于结束时间表示跨午夜。</small>
+              </div>
+            </div>
+            <div className="inline-actions server-update-actions">
+              <button
+                className="button secondary"
+                onClick={() => void saveServerUpdateSettings()}
+                disabled={serverUpdateLoading !== null}
+              >
+                {serverUpdateLoading === "save" ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
+                保存更新设置
+              </button>
+              <button
+                className="button secondary"
+                onClick={() => void checkServerUpdate()}
+                disabled={serverUpdateLoading !== null}
+              >
+                {serverUpdateLoading === "check" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+                手动检查
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void installServerUpdate()}
+                disabled={
+                  serverUpdateLoading !== null ||
+                  !serverUpdate?.updateAvailable ||
+                  !serverUpdate.agentOnline
+                }
+              >
+                {serverUpdateLoading === "install" ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
+                立即更新服务器
+              </button>
+            </div>
+            {serverUpdate ? (
+              <div className="update-status" role="status">
+                <strong>{serverUpdate.message}</strong>
+                <span>阶段：{serverUpdate.phase}</span>
+                {serverUpdate.targetVersion ? <span>目标版本：v{serverUpdate.targetVersion}</span> : null}
+                {serverUpdate.lastCheckedAt ? <span>上次检查：{new Date(serverUpdate.lastCheckedAt).toLocaleString("zh-CN")}</span> : null}
+                {serverUpdate.lastUpdatedAt ? <span>状态时间：{new Date(serverUpdate.lastUpdatedAt).toLocaleString("zh-CN")}</span> : null}
+                {serverUpdate.error ? <span className="server-update-error">{serverUpdate.error}</span> : null}
+              </div>
+            ) : null}
+            {!serverUpdate?.agentOnline ? (
+              <p className="form-hint">
+                宿主机尚未安装或启动更新代理。安装 <code>oshical-updater.timer</code> 后才能执行服务器更新。
+              </p>
+            ) : null}
+          </section>
         ) : null}
 
         <div className="settings-section-heading span-2">

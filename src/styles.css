@@ -1485,6 +1485,21 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
 .update-progress { display: flex; align-items: center; gap: 10px; margin-top: 11px; color: var(--muted); font-size: 10px; }
 .update-progress progress { flex: 1; height: 7px; overflow: hidden; border: 0; border-radius: 999px; }
 .update-progress span { flex: none; font-variant-numeric: tabular-nums; }
+.server-update-card { background: rgba(248, 250, 255, .9); }
+.settings-card header .update-agent-online { color: #126b49; background: rgba(22, 164, 107, .09); }
+.settings-card header .update-agent-offline { color: var(--danger); background: var(--danger-soft); }
+.server-update-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-bottom: 14px; }
+.server-update-metrics > div { display: grid; gap: 3px; padding: 12px; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 12px; }
+.server-update-metrics span { color: var(--muted); font-size: 10px; }
+.server-update-metrics strong { color: var(--text); font-size: 18px; font-variant-numeric: tabular-nums; }
+.server-update-options { margin-top: 12px; }
+.server-update-window { display: grid; grid-template-columns: repeat(2, minmax(0, 180px)) minmax(0, 1fr); align-items: end; gap: 10px; }
+.server-update-window label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
+.server-update-window small { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.server-update-actions { margin-top: 14px; }
+.update-status { display: grid; gap: 4px; }
+.update-status strong { color: var(--text); }
+.server-update-error { color: var(--danger); }
 .device-sync-panel { overflow: hidden; }
 .device-sync-header {
   display: flex !important;

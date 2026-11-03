@@ -560,3 +560,24 @@ export interface SyncAckResult {
   deviceId: string;
   seq: number;
 }
+
+export interface ServerUpdateSettings {
+  autoCheckEnabled: boolean;
+  autoUpdateEnabled: boolean;
+  updateWindowStart: string;
+  updateWindowEnd: string;
+}
+
+export interface ServerUpdateInfo extends ServerUpdateSettings {
+  currentVersion: string;
+  latestVersion: string | null;
+  updateAvailable: boolean;
+  status: string;
+  phase: string;
+  message: string;
+  lastCheckedAt: string | null;
+  lastUpdatedAt: string | null;
+  agentOnline: boolean;
+  targetVersion: string | null;
+  error: string | null;
+}

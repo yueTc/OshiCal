@@ -8,6 +8,7 @@ use oshical_core::RuntimeSecrets;
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub database_path: PathBuf,
+    pub update_dir: PathBuf,
     pub api_token: Option<String>,
     pub secrets: RuntimeSecrets,
     pub llm_base_url: Option<String>,
@@ -34,6 +35,14 @@ impl ServerConfig {
         let database_path = env::var("OSHICAL_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./data/oshical.db"));
+        let update_dir = env::var("OSHICAL_UPDATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                database_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("system")
+            });
         let llm_base_url = env::var("OSHICAL_LLM_BASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -69,6 +78,7 @@ impl ServerConfig {
         Ok(Self {
             bind,
             database_path,
+            update_dir,
             api_token,
             secrets,
             llm_base_url,

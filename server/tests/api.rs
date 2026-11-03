@@ -8,7 +8,7 @@ use http_body_util::BodyExt;
 use oshical_core::{
     AddSubscription, AppService, NewSchedule, NewWeeklyScheduleRule, RuntimeSecrets, SqliteStore,
 };
-use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault};
+use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault, ServerUpdateManager};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -24,6 +24,10 @@ async fn state() -> AppState {
         secret_vault: SecretVault::from_material("test-master-key"),
         hub,
         jobs: RefreshJobManager::new(),
+        updates: ServerUpdateManager::new(
+            std::env::temp_dir().join(format!("oshical-update-{}", uuid::Uuid::new_v4())),
+        )
+        .expect("updates"),
     }
 }
 
@@ -56,6 +60,90 @@ async fn health_is_public_and_protected_routes_require_token() {
         .await
         .expect("unauthorized");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn server_update_routes_require_auth_and_validate_settings() {
+    let app = build_router(state().await);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/system/update")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("unauthorized update response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/system/update")
+                .header(header::AUTHORIZATION, auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("update response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["currentVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(value["data"]["autoCheckEnabled"], true);
+    assert_eq!(value["data"]["autoUpdateEnabled"], false);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/system/update")
+                .header(header::AUTHORIZATION, auth_header())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "autoCheckEnabled": false,
+                        "autoUpdateEnabled": true,
+                        "updateWindowStart": "23:30",
+                        "updateWindowEnd": "02:30"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("save update settings response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["autoCheckEnabled"], true);
+    assert_eq!(value["data"]["autoUpdateEnabled"], true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/system/update")
+                .header(header::AUTHORIZATION, auth_header())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "autoCheckEnabled": true,
+                        "autoUpdateEnabled": false,
+                        "updateWindowStart": "99:99",
+                        "updateWindowEnd": "05:00"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("invalid update settings response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

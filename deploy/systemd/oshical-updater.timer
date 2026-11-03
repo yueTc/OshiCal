@@ -1,0 +1,12 @@
+[Unit]
+Description=Run OshiCal host update agent regularly
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Persistent=true
+Unit=oshical-updater.service
+
+[Install]
+WantedBy=timers.target

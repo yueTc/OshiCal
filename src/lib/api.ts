@@ -30,6 +30,8 @@ import type {
   Schedule,
   SecretStatus,
   ServerSnapshot,
+  ServerUpdateInfo,
+  ServerUpdateSettings,
   Streamer,
   SyncBatch,
   SyncBootstrap,
@@ -254,6 +256,31 @@ export class ServerApi {
     return this.request("/api/settings", {
       method: "PUT",
       body: JSON.stringify(settings),
+    });
+  }
+
+  serverUpdate(): Promise<ServerUpdateInfo> {
+    return this.request("/api/system/update");
+  }
+
+  saveServerUpdateSettings(settings: ServerUpdateSettings): Promise<ServerUpdateInfo> {
+    return this.request("/api/system/update", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    });
+  }
+
+  checkServerUpdate(): Promise<ServerUpdateInfo> {
+    return this.request("/api/system/update/check", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  }
+
+  installServerUpdate(): Promise<ServerUpdateInfo> {
+    return this.request("/api/system/update/install", {
+      method: "POST",
+      body: JSON.stringify({}),
     });
   }
 

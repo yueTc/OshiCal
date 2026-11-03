@@ -8,6 +8,7 @@ use crate::jobs::{
 };
 use crate::secrets::{load_persisted_llm_secret, save_persisted_llm_secret, SecretVault};
 use crate::sync_api;
+use crate::update_manager::{ServerUpdateManager, ServerUpdateSettings, ServerUpdateView};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
@@ -36,6 +37,7 @@ pub struct AppState {
     pub secret_vault: SecretVault,
     pub hub: broadcast::Sender<Value>,
     pub jobs: RefreshJobManager,
+    pub updates: ServerUpdateManager,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +161,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/live-status", get(list_live_status))
         .route("/api/fertility", get(list_fertility_statuses))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route(
+            "/api/system/update",
+            get(get_server_update).put(put_server_update_settings),
+        )
+        .route("/api/system/update/check", post(check_server_update))
+        .route("/api/system/update/install", post(install_server_update))
         .route("/api/secrets/llm", get(get_llm_secret).put(put_llm_secret))
         .route(
             "/api/bilibili/login/qr",
@@ -618,6 +626,44 @@ async fn put_settings(
     save_settings(state.service.store(), &settings).await?;
     state.service.update_proxy_port(settings.proxy_port).await?;
     ok(settings)
+}
+
+async fn get_server_update(State(state): State<AppState>) -> ApiResult {
+    update_view(&state).await
+}
+
+async fn put_server_update_settings(
+    State(state): State<AppState>,
+    Json(settings): Json<ServerUpdateSettings>,
+) -> ApiResult {
+    let update = state.updates.save_settings(settings).await?;
+    emit_server_update(&state, &update);
+    ok(update)
+}
+
+async fn check_server_update(State(state): State<AppState>) -> ApiResult {
+    let update = state.updates.check_now().await?;
+    emit_server_update(&state, &update);
+    ok(update)
+}
+
+async fn install_server_update(State(state): State<AppState>) -> ApiResult {
+    let update = state.updates.install_now().await?;
+    emit_server_update(&state, &update);
+    ok(update)
+}
+
+async fn update_view(state: &AppState) -> ApiResult {
+    ok(state.updates.view().await?)
+}
+
+fn emit_server_update(state: &AppState, update: &ServerUpdateView) {
+    if let Ok(value) = serde_json::to_value(update) {
+        let _ = state.hub.send(json!({
+            "type": "server_update_changed",
+            "data": value
+        }));
+    }
 }
 
 #[derive(Debug, Deserialize)]

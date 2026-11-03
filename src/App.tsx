@@ -85,6 +85,7 @@ import type {
   SecretStatus,
   ServerEvent,
   ServerSnapshot,
+  ServerUpdateSettings,
   Streamer,
   SyncMutation,
   UpdateScheduleInput,
@@ -2351,6 +2352,22 @@ export default function App() {
             actions={{
               save: saveAllSettings,
               testServer: testServerConnection,
+              serverUpdate: async () => {
+                if (!serverApi) throw new Error("服务器未连接");
+                return serverApi.serverUpdate();
+              },
+              saveServerUpdateSettings: async (updateSettings: ServerUpdateSettings) => {
+                if (!serverApi) throw new Error("服务器未连接");
+                return serverApi.saveServerUpdateSettings(updateSettings);
+              },
+              checkServerUpdate: async () => {
+                if (!serverApi) throw new Error("服务器未连接");
+                return serverApi.checkServerUpdate();
+              },
+              installServerUpdate: async () => {
+                if (!serverApi) throw new Error("服务器未连接");
+                return serverApi.installServerUpdate();
+              },
               testProxy,
               testLlm,
               listLlmModels,
