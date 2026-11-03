@@ -1,0 +1,1049 @@
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import QRCode from "qrcode";
+import {
+  Activity,
+  CheckCircle2,
+  Clock3,
+  Cloud,
+  Download,
+  ExternalLink,
+  Globe2,
+  HardDrive,
+  KeyRound,
+  ListChecks,
+  LoaderCircle,
+  LogOut,
+  PlugZap,
+  QrCode,
+  RefreshCw,
+  Save,
+  Search,
+  ShieldCheck,
+  Target,
+} from "lucide-react";
+import type {
+  AppSettings,
+  BiliQrLoginPoll,
+  BiliQrLoginStart,
+  LlmTestInput,
+  LlmTestReport,
+  LlmDiscoveryInput,
+  ProxyTestReport,
+  SecretStatus,
+  DataMode,
+} from "../types";
+import type { SecretInput } from "../lib/secret-types";
+import { explainError } from "../lib/api";
+import { mergeServerSettings } from "../lib/sync";
+import {
+  checkForUpdate,
+  currentAppVersion,
+  downloadAndInstallUpdate,
+  formatBytes,
+  relaunchApplication,
+  type AvailableUpdate,
+  type UpdateProgress,
+} from "../lib/updater";
+import type { DeviceInfo, JobProgress, SyncUiState } from "../lib/sync";
+import DeviceSyncPanel from "./DeviceSyncPanel";
+import { ErrorBanner, Modal, Toggle } from "./ui";
+
+interface SettingsActions {
+  save: (settings: AppSettings, secrets: SecretInput, autostart: boolean) => Promise<AppSettings>;
+  testServer: (url: string, token: string) => Promise<string>;
+  testProxy: (proxyPort: number, mode: DataMode) => Promise<ProxyTestReport>;
+  testLlm: (input: LlmTestInput) => Promise<LlmTestReport>;
+  listLlmModels: (input: LlmDiscoveryInput) => Promise<string[]>;
+  testNotification: () => Promise<void>;
+  openBiliBrowserLogin: () => Promise<void>;
+  startBiliQrLogin: () => Promise<BiliQrLoginStart>;
+  pollBiliQrLogin: (qrcodeKey: string) => Promise<BiliQrLoginPoll>;
+  clearBiliLogin: () => Promise<void>;
+}
+
+export interface SettingsViewHandle {
+  requestLeave: () => Promise<boolean>;
+}
+
+function settingsEqual(left: AppSettings, right: AppSettings): boolean {
+  return (
+    left.dataMode === right.dataMode &&
+    left.serverUrl === right.serverUrl &&
+    left.livePollSeconds === right.livePollSeconds &&
+    left.dynamicPollSeconds === right.dynamicPollSeconds &&
+    left.autoAnalyzeImages === right.autoAnalyzeImages &&
+    left.notificationsEnabled === right.notificationsEnabled &&
+    left.liveStatsEnabled === right.liveStatsEnabled &&
+    left.llmBaseUrl === right.llmBaseUrl &&
+    left.llmModel === right.llmModel &&
+    left.llmPromptVersion === right.llmPromptVersion &&
+    left.proxyPort === right.proxyPort
+  );
+}
+
+interface SettingsViewProps {
+  settings: AppSettings;
+  secrets: SecretStatus;
+  biliConfigured: boolean;
+  autostart: boolean;
+  tauri: boolean;
+  serverMode: boolean;
+  sync: SyncUiState;
+  devices: DeviceInfo[];
+  devicesLoading: boolean;
+  devicesError: string | null;
+  activeJobs: JobProgress[];
+  onRefreshDevices: () => void;
+  onResync: () => void;
+  onImportServer?: () => void;
+  onMigrateToServer?: () => void;
+  onDeleteDevice: (device: DeviceInfo) => Promise<void>;
+  actions: SettingsActions;
+  onError: (message: string) => void;
+}
+
+const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function SettingsView({
+  settings,
+  secrets,
+  biliConfigured,
+  autostart,
+  tauri,
+  serverMode,
+  sync,
+  devices,
+  devicesLoading,
+  devicesError,
+  activeJobs,
+  onRefreshDevices,
+  onResync,
+  onImportServer,
+  onMigrateToServer,
+  onDeleteDevice,
+  actions,
+  onError,
+}, ref) {
+  const [draft, setDraft] = useState<AppSettings>(settings);
+  const [savedDraft, setSavedDraft] = useState<AppSettings>(settings);
+  const [savedAutoLaunch, setSavedAutoLaunch] = useState(autostart);
+  const [llmApiKey, setLlmApiKey] = useState("");
+  const [biliCookie, setBiliCookie] = useState("");
+  const [serverToken, setServerToken] = useState("");
+  const [autoLaunch, setAutoLaunch] = useState(autostart);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [proxyTesting, setProxyTesting] = useState(false);
+  const [proxyReport, setProxyReport] = useState<ProxyTestReport | null>(null);
+  const [llmTesting, setLlmTesting] = useState(false);
+  const [llmReport, setLlmReport] = useState<LlmTestReport | null>(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [modelSearch, setModelSearch] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [connectionText, setConnectionText] = useState<string | null>(null);
+  const [browserLoginOpening, setBrowserLoginOpening] = useState(false);
+  const [browserLoginHint, setBrowserLoginHint] = useState<string | null>(null);
+  const [qrOpen, setQrOpen] = useState(false);
+  const [qrLoading, setQrLoading] = useState(false);
+  const [qrSession, setQrSession] = useState<{ key: string; dataUrl: string } | null>(null);
+  const [qrStatus, setQrStatus] = useState<"waiting" | "scanned" | "confirmed" | "expired" | "error">("waiting");
+  const [qrMessage, setQrMessage] = useState("等待手机扫码");
+  const [leavePromptOpen, setLeavePromptOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<AvailableUpdate | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateInstalled, setUpdateInstalled] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress>({ downloaded: 0, total: null });
+  const qrSessionRef = useRef<string | null>(null);
+  const wasBiliConfigured = useRef(biliConfigured);
+  const leavePromptOpenRef = useRef(false);
+  const pendingLeaveResolveRef = useRef<((allowed: boolean) => void) | null>(null);
+  const dirtyRef = useRef(false);
+  const isDirty =
+    !settingsEqual(draft, savedDraft) ||
+    autoLaunch !== savedAutoLaunch ||
+    Boolean(llmApiKey.trim() || biliCookie.trim() || serverToken.trim());
+
+  useEffect(() => {
+    if (!wasBiliConfigured.current && biliConfigured) {
+      setBrowserLoginHint(
+        serverMode
+          ? "服务器 B 站登录成功，Cookie 已加密保存在服务端。"
+          : "登录成功，B 站 Cookie 已自动保存。",
+      );
+    }
+    wasBiliConfigured.current = biliConfigured;
+  }, [biliConfigured, serverMode]);
+
+  useEffect(() => {
+    dirtyRef.current = isDirty;
+    if (isDirty) {
+      setSaved(false);
+    }
+  }, [isDirty]);
+
+  useEffect(() => {
+    setDraft((current) => mergeServerSettings(current, settings));
+    if (!dirtyRef.current) {
+      setSavedDraft((current) => mergeServerSettings(current, settings));
+    }
+  }, [
+    settings.autoAnalyzeImages,
+    settings.dynamicPollSeconds,
+    settings.livePollSeconds,
+    settings.liveStatsEnabled,
+    settings.llmBaseUrl,
+    settings.llmModel,
+    settings.llmPromptVersion,
+    settings.proxyPort,
+  ]);
+
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      setAutoLaunch(autostart);
+      setSavedAutoLaunch(autostart);
+    }
+  }, [autostart]);
+
+  useEffect(() => {
+    if (!tauri) {
+      return;
+    }
+    let disposed = false;
+    void currentAppVersion()
+      .then((version) => {
+        if (!disposed) {
+          setAppVersion(version);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, [tauri]);
+
+  useImperativeHandle(ref, () => ({
+    requestLeave: () => {
+      if (!isDirty) {
+        return Promise.resolve(true);
+      }
+      if (leavePromptOpenRef.current) {
+        return Promise.resolve(false);
+      }
+      leavePromptOpenRef.current = true;
+      setError(null);
+      setLeavePromptOpen(true);
+      return new Promise<boolean>((resolve) => {
+        pendingLeaveResolveRef.current = resolve;
+      });
+    },
+  }), [isDirty]);
+
+  useEffect(() => () => {
+    qrSessionRef.current = null;
+    pendingLeaveResolveRef.current?.(false);
+    pendingLeaveResolveRef.current = null;
+  }, []);
+
+  function settleLeavePrompt(allowed: boolean) {
+    leavePromptOpenRef.current = false;
+    setLeavePromptOpen(false);
+    const resolve = pendingLeaveResolveRef.current;
+    pendingLeaveResolveRef.current = null;
+    resolve?.(allowed);
+  }
+
+  async function openBrowserLogin() {
+    setBrowserLoginOpening(true);
+    setBrowserLoginHint(null);
+    try {
+      await actions.openBiliBrowserLogin();
+      setBrowserLoginHint("请在 B 站登录窗口完成登录；检测到 Cookie 后会自动保存并关闭窗口。");
+    } catch (loginError) {
+      const message = explainError(loginError);
+      setError(message);
+      onError(message);
+    } finally {
+      setBrowserLoginOpening(false);
+    }
+  }
+
+  async function startQrLogin() {
+    setQrLoading(true);
+    setQrSession(null);
+    setQrStatus("waiting");
+    setQrMessage("正在生成二维码…");
+    try {
+      const login = await actions.startBiliQrLogin();
+      const dataUrl = await QRCode.toDataURL(login.url, {
+        width: 260,
+        margin: 1,
+        errorCorrectionLevel: "M",
+        color: { dark: "#241b25", light: "#fffafc" },
+      });
+      qrSessionRef.current = login.qrcodeKey;
+      setQrSession({ key: login.qrcodeKey, dataUrl });
+      setQrOpen(true);
+      setQrStatus("waiting");
+      setQrMessage("等待手机扫码");
+      void pollQrLogin(login.qrcodeKey);
+    } catch (loginError) {
+      const message = explainError(loginError);
+      setQrStatus("error");
+      setQrMessage(message);
+      setError(message);
+      onError(message);
+    } finally {
+      setQrLoading(false);
+    }
+  }
+
+  async function pollQrLogin(key: string) {
+    let consecutiveErrors = 0;
+    while (qrSessionRef.current === key) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      if (qrSessionRef.current !== key) {
+        return;
+      }
+      try {
+        const result = await actions.pollBiliQrLogin(key);
+        if (qrSessionRef.current !== key) {
+          return;
+        }
+        setQrStatus(result.status);
+        setQrMessage(result.message);
+        consecutiveErrors = 0;
+        if (result.status === "confirmed") {
+          qrSessionRef.current = null;
+          window.setTimeout(() => setQrOpen(false), 1200);
+          return;
+        }
+        if (result.status === "expired") {
+          qrSessionRef.current = null;
+          return;
+        }
+      } catch (pollError) {
+        consecutiveErrors += 1;
+        setQrStatus("error");
+        setQrMessage(explainError(pollError));
+        if (consecutiveErrors >= 3) {
+          qrSessionRef.current = null;
+          return;
+        }
+      }
+    }
+  }
+
+  function closeQrLogin() {
+    qrSessionRef.current = null;
+    setQrOpen(false);
+  }
+
+  async function logoutBili() {
+    const message = serverMode
+      ? "退出服务器 B 站登录并删除服务端保存的 Cookie？"
+      : "退出 B 站登录并删除本机保存的 Cookie？";
+    if (!window.confirm(message)) {
+      return;
+    }
+    try {
+      await actions.clearBiliLogin();
+      setBiliCookie("");
+      setBrowserLoginHint(
+        serverMode ? "已退出服务器 B 站登录。" : "已退出 B 站登录，本机 Cookie 已删除。",
+      );
+    } catch (logoutError) {
+      const message = explainError(logoutError);
+      setError(message);
+      onError(message);
+    }
+  }
+
+  function setMode(dataMode: DataMode) {
+    setDraft({ ...draft, dataMode });
+    setSaved(false);
+  }
+
+  async function testConnection() {
+    if (!draft.serverUrl.trim()) {
+      setError("请先填写服务器地址");
+      return;
+    }
+    setTesting(true);
+    setError(null);
+    try {
+      const token = serverToken || "";
+      setConnectionText(await actions.testServer(draft.serverUrl.trim(), token));
+    } catch (testError) {
+      const message = explainError(testError);
+      setError(message);
+      onError(message);
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function testLlm() {
+    if (!draft.llmBaseUrl.trim() || !draft.llmModel.trim()) {
+      setError("请先填写日程模型的 Base URL 和模型名");
+      return;
+    }
+    setLlmTesting(true);
+    setError(null);
+    setLlmReport(null);
+    try {
+      setLlmReport(await actions.testLlm({
+        baseUrl: draft.llmBaseUrl.trim(),
+        apiKey: llmApiKey.trim() || undefined,
+        model: draft.llmModel.trim(),
+        promptVersion: draft.llmPromptVersion,
+      }));
+    } catch (testError) {
+      const message = explainError(testError);
+      setError(message);
+      onError(message);
+    } finally {
+      setLlmTesting(false);
+    }
+  }
+
+  async function testProxy() {
+    const port = draft.proxyPort;
+    if (port === null || !Number.isInteger(port) || port < 1 || port > 65535) {
+      setError("请填写 1 到 65535 之间的本机代理端口");
+      return;
+    }
+    setProxyTesting(true);
+    setError(null);
+    setProxyReport(null);
+    try {
+      setProxyReport(await actions.testProxy(port, draft.dataMode));
+    } catch (testError) {
+      const message = explainError(testError);
+      setError(message);
+      onError(message);
+    } finally {
+      setProxyTesting(false);
+    }
+  }
+
+  async function pullModels() {
+    if (!draft.llmBaseUrl.trim()) {
+      setError("请先填写日程模型的 Base URL");
+      return;
+    }
+    setModelsLoading(true);
+    setError(null);
+    try {
+      const nextModels = await actions.listLlmModels({
+        baseUrl: draft.llmBaseUrl.trim(),
+        apiKey: llmApiKey.trim() || undefined,
+      });
+      setModels(nextModels);
+      setModelSearch("");
+      setModelsOpen(true);
+    } catch (discoveryError) {
+      const message = explainError(discoveryError);
+      setError(message);
+      onError(message);
+    } finally {
+      setModelsLoading(false);
+    }
+  }
+
+  async function save(): Promise<boolean> {
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const nextSettings = await actions.save(
+        draft,
+        {
+          llmApiKey: llmApiKey.trim() || undefined,
+          biliCookie: biliCookie.trim() || undefined,
+          serverToken: serverToken.trim() || undefined,
+        },
+        autoLaunch,
+      );
+      setLlmApiKey("");
+      setBiliCookie("");
+      setServerToken("");
+      setDraft(nextSettings);
+      setSavedDraft(nextSettings);
+      setSavedAutoLaunch(autoLaunch);
+      setSaved(true);
+      return true;
+    } catch (saveError) {
+      const message = explainError(saveError);
+      setError(message);
+      onError(message);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveAndLeave() {
+    if (await save()) {
+      settleLeavePrompt(true);
+    }
+  }
+
+  async function checkUpdates() {
+    setUpdateChecking(true);
+    setUpdateStatus(null);
+    setUpdateInfo(null);
+    setUpdateInstalled(false);
+    setUpdateProgress({ downloaded: 0, total: null });
+    try {
+      const update = await checkForUpdate();
+      setUpdateInfo(update);
+      setUpdateStatus(update ? `发现新版本 v${update.version}` : "当前已是最新版本");
+    } catch (updateError) {
+      setUpdateStatus(`检查更新失败：${explainError(updateError)}`);
+    } finally {
+      setUpdateChecking(false);
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateInfo) {
+      return;
+    }
+    setUpdateInstalling(true);
+    setUpdateInstalled(false);
+    setUpdateProgress({ downloaded: 0, total: null });
+    setUpdateStatus("正在下载更新…");
+    try {
+      await downloadAndInstallUpdate((progress) => {
+        setUpdateProgress(progress);
+        setUpdateStatus(
+          progress.total
+            ? `正在下载 ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
+            : `已下载 ${formatBytes(progress.downloaded)}`,
+        );
+      });
+      setUpdateInstalled(true);
+      setUpdateStatus("更新已安装，应用即将重启。");
+    } catch (updateError) {
+      setUpdateStatus(`安装更新失败：${explainError(updateError)}`);
+    } finally {
+      setUpdateInstalling(false);
+    }
+  }
+
+  async function restartForUpdate() {
+    try {
+      await relaunchApplication();
+    } catch (updateError) {
+      setUpdateStatus(`重启应用失败：${explainError(updateError)}`);
+    }
+  }
+
+  const visibleModels = models.filter((model) =>
+    model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
+  );
+  const updatePercent =
+    updateProgress.total && updateProgress.total > 0
+      ? Math.min(100, (updateProgress.downloaded / updateProgress.total) * 100)
+      : null;
+
+  return (
+    <section className="page settings-page">
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">PREFERENCES</p>
+          <h1>设置</h1>
+          <p className="page-subtitle">连接与多设备同步、服务端采集参数，以及只属于这台设备的通知和运行偏好。</p>
+        </div>
+        <button className="button primary" onClick={() => void save()} disabled={saving}>
+          <Save size={16} />
+          {saving ? "保存中…" : "保存设置"}
+        </button>
+      </header>
+
+      {error ? <ErrorBanner message={error} /> : null}
+      {saved ? <div className="success-banner"><CheckCircle2 size={16} />设置已保存</div> : null}
+
+      <div className="settings-layout">
+        <section className="settings-card span-2">
+          <header><h2>运行模式</h2><span>抓取任务只在一处运行，避免双写。</span></header>
+          {tauri ? (
+            <div className="mode-grid">
+              <button className={`mode-card ${draft.dataMode === "local" ? "active" : ""}`} onClick={() => setMode("local")}>
+                <HardDrive size={24} />
+                <strong>本地模式</strong>
+                <span>桌面端直接抓取 B 站并调用日程模型。</span>
+              </button>
+              <button className={`mode-card ${draft.dataMode === "server" ? "active" : ""}`} onClick={() => setMode("server")}>
+                <Cloud size={24} />
+                <strong>服务器模式</strong>
+                <span>由服务器抓取，通过 HTTP + WebSocket 同步。</span>
+              </button>
+            </div>
+          ) : (
+            <div className="browser-mode-note"><Cloud size={20} />当前为服务器 Web 管理界面。</div>
+          )}
+          {tauri && draft.dataMode === "server" ? (
+            <div className="form-grid">
+              <label>
+                <span>服务器地址</span>
+                <input value={draft.serverUrl} onChange={(event) => setDraft({ ...draft, serverUrl: event.target.value })} placeholder="https://你的服务器:8787" />
+              </label>
+              <label>
+                <span>访问令牌</span>
+                <input type="password" autoComplete="off" value={serverToken} onChange={(event) => setServerToken(event.target.value)} placeholder={secrets.serverTokenConfigured ? "已配置，留空则沿用" : "Bearer Token"} />
+              </label>
+              <div className="inline-actions span-2">
+                <button className="button secondary" onClick={() => void testConnection()} disabled={testing}>
+                  <PlugZap size={16} />{testing ? "连接中…" : "测试连接"}
+                </button>
+                {connectionText ? <span className="connection-ok"><CheckCircle2 size={15} />{connectionText}</span> : null}
+              </div>
+            </div>
+          ) : null}
+        </section>
+
+        {serverMode ? (
+          <DeviceSyncPanel
+            sync={sync}
+            devices={devices}
+            loading={devicesLoading}
+            error={devicesError}
+            activeJobs={activeJobs}
+            onRefresh={onRefreshDevices}
+            onResync={onResync}
+            onImportServer={onImportServer}
+            onMigrateToServer={onMigrateToServer}
+            onDeleteDevice={onDeleteDevice}
+          />
+        ) : null}
+
+        <div className="settings-section-heading span-2">
+          <strong>{serverMode ? "服务端采集设置" : "本地采集设置"}</strong>
+          <span>
+            {serverMode
+              ? "这些参数由服务器执行并同步到所有设备；密钥仍只来自服务器环境变量。"
+              : "这些参数只在本机执行，不会上传到服务器。"}
+          </span>
+        </div>
+
+        <section className="settings-card span-2">
+          <header><h2>网络代理</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>B 站、日程模型和魔法期等 HTTP 请求统一通过 HTTP 代理。</span></header>
+          <div className="form-grid proxy-grid">
+            <label>
+              <span>本机代理端口</span>
+              <div className="input-suffix">
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  inputMode="numeric"
+                  value={draft.proxyPort ?? ""}
+                  onChange={(event) => {
+                    setDraft({
+                      ...draft,
+                      proxyPort: event.target.value ? Number(event.target.value) : null,
+                    });
+                    setProxyReport(null);
+                  }}
+                  placeholder="例如 7890"
+                />
+                <em>端口</em>
+              </div>
+            </label>
+            <label>
+              <span>测试目标</span>
+              <select defaultValue="google">
+                <option value="google">Google（www.google.com）</option>
+              </select>
+            </label>
+            <div className="proxy-test-actions span-2">
+              <button
+                className="button secondary"
+                type="button"
+                onClick={() => void testProxy()}
+                disabled={proxyTesting}
+              >
+                {proxyTesting ? <LoaderCircle className="spin" size={16} /> : <Globe2 size={16} />}
+                {proxyTesting ? "正在测试 Google…" : "测试代理"}
+              </button>
+              <span className="form-hint">
+                {draft.proxyPort
+                  ? `请求将由${!tauri || draft.dataMode === "server" ? "服务器" : "本机"}发起，代理地址为 127.0.0.1:${draft.proxyPort}。`
+                  : "端口留空表示不使用代理；保存后对后续请求生效。"}
+              </span>
+            </div>
+          </div>
+          {proxyReport ? (
+            <div className={`proxy-test-result ${proxyReport.connected ? "is-connected" : "is-failed"}`} role="status">
+              <Globe2 size={24} />
+              <div className="proxy-test-copy">
+                <strong>{proxyReport.connected ? "代理连接正常" : "代理连接失败"}</strong>
+                <span>{proxyReport.message}</span>
+                <small>{proxyReport.proxyUrl} · {proxyReport.target}</small>
+              </div>
+              <div className="proxy-latency">
+                <Clock3 size={16} />
+                <span>Google 延迟</span>
+                <strong>{proxyReport.latencyMs.toLocaleString()} ms</strong>
+              </div>
+            </div>
+          ) : null}
+        </section>
+
+        <section className="settings-card">
+          <header><h2>刷新与直播统计</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span></header>
+          <div className="form-grid single">
+            <label>
+              <span>开播探测</span>
+              <div className="input-suffix"><input type="number" min={10} max={300} value={draft.livePollSeconds} onChange={(event) => setDraft({ ...draft, livePollSeconds: Number(event.target.value) })} /><em>秒</em></div>
+            </label>
+            <label>
+              <span>动态刷新</span>
+              <div className="input-suffix"><input type="number" min={300} max={3600} step={60} value={draft.dynamicPollSeconds} onChange={(event) => setDraft({ ...draft, dynamicPollSeconds: Number(event.target.value) })} /><em>秒</em></div>
+            </label>
+            <Toggle
+              checked={draft.liveStatsEnabled}
+              onChange={(value) => setDraft({ ...draft, liveStatsEnabled: value })}
+              label="直播数据统计"
+            />
+            <p className="form-hint">开启后可在主播库为单个主播订阅直播数据；原始弹幕和礼物事件不落盘。</p>
+          </div>
+        </section>
+
+        <div className="settings-section-heading span-2">
+          <strong>本设备设置</strong>
+          <span>通知、开机自启、主题、侧栏宽度和窗口状态只保存在这台设备，不写入服务器。</span>
+        </div>
+
+        <section className="settings-card device-local-settings">
+          <header><h2>提醒与运行</h2><span className="setting-scope local">仅本设备</span></header>
+          <div className="settings-stack">
+            <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft({ ...draft, notificationsEnabled: value })} label="Windows 开播通知" />
+            {tauri ? <Toggle checked={autoLaunch} onChange={setAutoLaunch} label="开机自启" /> : null}
+            {tauri ? (
+              <button className="button secondary" onClick={() => void actions.testNotification().catch((notificationError) => onError(explainError(notificationError)))}>
+                发送测试通知
+              </button>
+            ) : null}
+            {tauri ? (
+              <p className="form-hint">通知和窗口偏好不会同步到其他设备。关闭窗口后驻留托盘，不会补发启动时已经在直播的通知。</p>
+            ) : null}
+          </div>
+        </section>
+
+        {tauri ? (
+          <section className="settings-card span-2 software-update-card">
+            <header>
+              <h2>软件更新</h2>
+              <span className="setting-scope local">仅桌面端</span>
+              <span>从 GitHub Releases 检查并安装经过 Tauri 签名校验的更新。</span>
+            </header>
+            <div className="update-version-row">
+              <div className="update-version">
+                <span>当前版本</span>
+                <strong>{appVersion ? `v${appVersion}` : "读取中…"}</strong>
+              </div>
+              <button className="button secondary" onClick={() => void checkUpdates()} disabled={updateChecking || updateInstalling}>
+                <RefreshCw className={updateChecking ? "spin" : undefined} size={16} />
+                {updateChecking ? "检查中…" : "检查更新"}
+              </button>
+            </div>
+            {updateStatus ? <div className="update-status" role="status">{updateStatus}</div> : null}
+            {updateInfo ? (
+              <div className="update-details">
+                <div>
+                  <strong>v{updateInfo.version}</strong>
+                  <span>可更新</span>
+                </div>
+                {updateInfo.body ? <p className="update-notes">{updateInfo.body}</p> : <p className="form-hint">此版本没有提供发布说明。</p>}
+                {updateInfo.date ? <small>发布日期：{updateInfo.date}</small> : null}
+                <div className="inline-actions">
+                  <button
+                    className="button primary"
+                    onClick={() => void installUpdate()}
+                    disabled={updateInstalling || updateInstalled}
+                  >
+                    {updateInstalling ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
+                    {updateInstalling ? "正在安装…" : updateInstalled ? "安装完成" : "下载并安装"}
+                  </button>
+                  {updateInstalled ? (
+                    <button className="button secondary" onClick={() => void restartForUpdate()}>
+                      <RefreshCw size={16} />立即重启
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {updateInstalling ? (
+              <div className="update-progress">
+                <progress value={updatePercent ?? undefined} max={100} />
+                <span>
+                  {updateProgress.total
+                    ? `${formatBytes(updateProgress.downloaded)} / ${formatBytes(updateProgress.total)}`
+                    : `已下载 ${formatBytes(updateProgress.downloaded)}`}
+                </span>
+              </div>
+            ) : null}
+            <p className="form-hint">
+              更新安装需要网络连接。Windows 会在安装完成后自动退出并重新启动；服务器 Web 界面随服务端镜像更新，不在此处处理。
+            </p>
+          </section>
+        ) : null}
+
+        <section className="settings-card span-2">
+          <header><h2>日程识别模型</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>动态文字和图片分别结构化，OpenAI-Compatible 接口。</span></header>
+          <div className="form-grid">
+            <label>
+              <span>Base URL</span>
+              <input value={draft.llmBaseUrl} onChange={(event) => { setDraft({ ...draft, llmBaseUrl: event.target.value }); setLlmReport(null); }} placeholder="https://api.example.com/v1" />
+            </label>
+            <label>
+              <span>模型名</span>
+              <div className="model-field-row">
+                <input value={draft.llmModel} onChange={(event) => { setDraft({ ...draft, llmModel: event.target.value }); setLlmReport(null); }} placeholder="文字/视觉模型名称" />
+                <button className="button secondary small" type="button" onClick={() => void pullModels()} disabled={modelsLoading}>
+                  {modelsLoading ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
+                  {modelsLoading ? "拉取中…" : "拉取模型"}
+                </button>
+              </div>
+            </label>
+            {tauri || serverMode ? (
+              <label>
+                <span>API Key</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={llmApiKey}
+                  onChange={(event) => {
+                    setLlmApiKey(event.target.value);
+                    setLlmReport(null);
+                  }}
+                  placeholder={
+                    secrets.llmConfigured
+                      ? "已配置，留空则沿用"
+                      : serverMode
+                        ? "保存到服务端并同步到其他设备"
+                        : "保存到 Windows 凭据管理器"
+                  }
+                />
+              </label>
+            ) : null}
+            <div className="secret-state">
+              <ShieldCheck size={17} />
+              <span>
+                {serverMode
+                  ? secrets.llmConfigured
+                    ? "模型密钥已由服务端加密保存，并同步到已授权设备"
+                    : "服务端尚未配置模型密钥"
+                  : secrets.llmConfigured
+                    ? "模型密钥已安全保存"
+                    : "尚未配置模型密钥"}
+              </span>
+            </div>
+            <div className="settings-stack span-2">
+              <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft({ ...draft, autoAnalyzeImages: value })} label="自动分析动态文字和日程图片" />
+              <p className="form-hint">动态自由文本只使用大模型分析；带预约卡片的动态不再调用模型；未配置模型时仅处理预约卡片中明确的结构化时间。</p>
+            </div>
+            <div className="llm-test-panel span-2">
+              <div className="inline-actions">
+                <button className="button secondary" onClick={() => void testLlm()} disabled={llmTesting}>
+                  {llmTesting ? <LoaderCircle className="spin" size={16} /> : <PlugZap size={16} />}
+                  {llmTesting ? "正在识别示例图…" : "测试模型"}
+                </button>
+                <span className="form-hint llm-fixture-hint">固定验收图：10.26–11.01 枝江娱乐直播日历</span>
+              </div>
+              {llmReport ? (
+                <div className={`llm-test-result ${llmReport.connected ? "is-connected" : "is-failed"}`} role="status">
+                  <div className="llm-test-metrics">
+                    <div>
+                      <Activity size={16} />
+                      <span>连通性</span>
+                      <strong>{llmReport.connected ? "已连接" : "失败"}</strong>
+                    </div>
+                    <div>
+                      <Clock3 size={16} />
+                      <span>端到端延迟</span>
+                      <strong>{llmReport.latencyMs.toLocaleString()} ms</strong>
+                    </div>
+                    <div>
+                      <ListChecks size={16} />
+                      <span>识别事件</span>
+                      <strong>{llmReport.eventCount}</strong>
+                    </div>
+                    <div>
+                      <Target size={16} />
+                      <span>成功率</span>
+                      <strong>{Math.round(llmReport.successRate * 100)}%</strong>
+                    </div>
+                  </div>
+                  <p>{llmReport.message}</p>
+                  <small>基准匹配 {llmReport.matchedCount}/{llmReport.expectedCount}；匹配口径为开播时间误差不超过 10 分钟，且主播与主题吻合。</small>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </section>
+
+        {tauri || serverMode ? (
+          <section className="settings-card span-2">
+            <header>
+              <h2>B 站登录与 Cookie</h2>
+              <span className={`setting-scope ${serverMode ? "server" : "local"}`}>
+                {serverMode ? "服务器" : "仅本设备"}
+              </span>
+              <span>
+                {serverMode
+                  ? "二维码由服务器生成，Cookie 只加密保存在服务器。"
+                  : "登录后自动保存到 Windows 凭据管理器。"}
+              </span>
+            </header>
+            <div className="bili-login-actions">
+              {!serverMode && tauri ? (
+                <button className="button secondary" onClick={() => void openBrowserLogin()} disabled={browserLoginOpening}>
+                  {browserLoginOpening ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}
+                  登录窗口自动获取
+                </button>
+              ) : null}
+              <button className="button primary" onClick={() => void startQrLogin()} disabled={qrLoading}>
+                {qrLoading ? <LoaderCircle className="spin" size={16} /> : <QrCode size={16} />}
+                {serverMode ? "服务器扫码登录" : "扫码登录"}
+              </button>
+              <button className="button secondary" onClick={() => void logoutBili()} disabled={!biliConfigured}>
+                <LogOut size={16} />退出登录
+              </button>
+            </div>
+            {browserLoginHint ? <p className="form-hint login-hint">{browserLoginHint}</p> : null}
+            {serverMode ? (
+              <p className="form-hint">
+                手机扫码后由服务器直接接收 Cookie；客户端不会收到或保存服务器 Cookie。
+              </p>
+            ) : (
+              <div className="form-grid">
+                <label>
+                  <span>手动填写 SESSDATA / Cookie（可选）</span>
+                  <input type="password" autoComplete="off" value={biliCookie} onChange={(event) => setBiliCookie(event.target.value)} placeholder={biliConfigured ? "已配置，留空则沿用" : "可选的 B 站 Cookie"} />
+                </label>
+                <div className="secret-state span-2">
+                  <KeyRound size={17} />
+                  <span>{biliConfigured ? "B 站 Cookie 已保存" : "使用公开接口 + buvid"}</span>
+                </div>
+              </div>
+            )}
+          </section>
+        ) : null}
+      </div>
+
+      {leavePromptOpen ? (
+        <Modal
+          title="保存设置？"
+          onClose={() => settleLeavePrompt(false)}
+          footer={
+            <>
+              <button
+                className="button secondary"
+                onClick={() => settleLeavePrompt(false)}
+                disabled={saving}
+              >
+                取消
+              </button>
+              <button
+                className="button secondary"
+                onClick={() => settleLeavePrompt(true)}
+                disabled={saving}
+              >
+                不保存
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void saveAndLeave()}
+                disabled={saving}
+              >
+                {saving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
+                {saving ? "保存中…" : "保存并离开"}
+              </button>
+            </>
+          }
+        >
+          <div className="settings-leave-prompt">
+            <strong>当前设置尚未保存</strong>
+            <p>保存后再离开，或者放弃本次修改。选择“不保存”不会更新设置。</p>
+            {error ? <ErrorBanner message={error} /> : null}
+          </div>
+        </Modal>
+      ) : null}
+
+      {qrOpen ? (
+        <Modal
+          title="B 站扫码登录"
+          onClose={closeQrLogin}
+          footer={
+            <>
+              <button className="button secondary" onClick={() => void startQrLogin()} disabled={qrLoading}>
+                <RefreshCw size={16} />重新生成
+              </button>
+              <button className="button secondary" onClick={closeQrLogin}>关闭</button>
+            </>
+          }
+        >
+          <div className="qr-login-panel">
+            {qrSession ? <img src={qrSession.dataUrl} alt="B 站登录二维码" width={260} height={260} /> : <LoaderCircle className="spin" size={34} />}
+            <strong>使用哔哩哔哩手机客户端扫码</strong>
+            <p className={`qr-login-status ${qrStatus}`}>{qrMessage}</p>
+            {qrStatus === "confirmed" ? (
+              <span className="success-inline">
+                <CheckCircle2 size={15} />
+                {serverMode ? "服务器已安全保存 Cookie" : "Cookie 已安全保存"}
+              </span>
+            ) : null}
+          </div>
+        </Modal>
+      ) : null}
+
+      {modelsOpen ? (
+        <Modal
+          title="选择模型"
+          onClose={() => setModelsOpen(false)}
+          wide
+          footer={<button className="button secondary" onClick={() => setModelsOpen(false)}>关闭</button>}
+        >
+          <div className="model-picker">
+            <div className="search-input compact">
+              <Search size={17} />
+              <input
+                autoFocus
+                value={modelSearch}
+                onChange={(event) => setModelSearch(event.target.value)}
+                placeholder="筛选模型 ID"
+              />
+              <span className="muted">{visibleModels.length}/{models.length}</span>
+            </div>
+            <div className="model-picker-list">
+              {visibleModels.map((model) => (
+                <button
+                  key={model}
+                  className={`model-option ${draft.llmModel === model ? "active" : ""}`}
+                  onClick={() => {
+                    setDraft({ ...draft, llmModel: model });
+                    setLlmReport(null);
+                    setModelsOpen(false);
+                  }}
+                >
+                  <span>{model}</span>
+                  {draft.llmModel === model ? <CheckCircle2 size={16} /> : null}
+                </button>
+              ))}
+              {!visibleModels.length ? <p className="muted model-picker-empty">没有匹配的模型</p> : null}
+            </div>
+          </div>
+        </Modal>
+      ) : null}
+    </section>
+  );
+});
+
+export default SettingsView;

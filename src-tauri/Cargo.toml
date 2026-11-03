@@ -1,0 +1,38 @@
+[package]
+name = "oshical-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "oshical_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "oshical"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+oshical-core = { path = "../crates/core" }
+chrono.workspace = true
+futures-util = "0.3"
+keyring = { version = "3", features = ["windows-native"] }
+reqwest.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tokio.workspace = true
+tokio-tungstenite = "0.29"
+tracing.workspace = true
+url.workspace = true

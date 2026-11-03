@@ -1,0 +1,17 @@
+services:
+  oshical:
+    build: .
+    container_name: oshical
+    restart: unless-stopped
+    ports:
+      - "${OSHICAL_PORT:-8787}:8787"
+    environment:
+      OSHICAL_API_TOKEN: ${OSHICAL_API_TOKEN:?set a strong token}
+      OSHICAL_BILI_COOKIE: ${OSHICAL_BILI_COOKIE:-}
+      OSHICAL_LLM_BASE_URL: ${OSHICAL_LLM_BASE_URL:-https://api.openai.com/v1}
+      OSHICAL_LLM_API_KEY: ${OSHICAL_LLM_API_KEY:-}
+      OSHICAL_SECRETS_KEY: ${OSHICAL_SECRETS_KEY:-}
+      OSHICAL_LLM_MODEL: ${OSHICAL_LLM_MODEL:-}
+      OSHICAL_PROXY_PORT: ${OSHICAL_PROXY_PORT:-}
+    volumes:
+      - ./data:/app/data
