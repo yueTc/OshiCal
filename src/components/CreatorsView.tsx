@@ -619,6 +619,15 @@ export default function CreatorsView({
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("application/x-oshical-streamer-id", String(streamerId));
     event.dataTransfer.setData("text/plain", String(streamerId));
+    const card = event.currentTarget.closest(".creator-card");
+    if (card instanceof HTMLElement) {
+      const rect = card.getBoundingClientRect();
+      event.dataTransfer.setDragImage(
+        card,
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      );
+    }
     setDraggingId(streamerId);
   }
 

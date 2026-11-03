@@ -11,6 +11,7 @@ import {
   GripHorizontal,
   List,
   LoaderCircle,
+  Minus,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -70,6 +71,8 @@ const CALENDAR_BUFFER_AFTER = 20;
 const GRID_WINDOW_BEFORE = 14;
 const GRID_WINDOW_DAYS = 35;
 const GRID_GAP = 10;
+const GRID_DAY_COUNT_MAX = 7;
+const GRID_DAY_COUNT_KEY = "oshical.gridDayCount";
 const GRID_DRAG_THRESHOLD = 42;
 
 function visibleDayCountForWidth(width: number): number {
@@ -77,6 +80,12 @@ function visibleDayCountForWidth(width: number): number {
   if (width >= 840) return 5;
   if (width >= 500) return 3;
   return 1;
+}
+
+function readGridDayCountPreference(): number {
+  const stored = Number.parseInt(localStorage.getItem(GRID_DAY_COUNT_KEY) ?? "", 10);
+  if (!Number.isFinite(stored)) return GRID_DAY_COUNT_MAX;
+  return Math.min(GRID_DAY_COUNT_MAX, Math.max(1, stored));
 }
 
 function startOfLocalDay(date: Date): number {
@@ -175,7 +184,9 @@ export default function ScheduleView({
   const gridDragRef = useRef<{ startX: number; deltaX: number } | null>(null);
   const suppressCardClickRef = useRef(false);
   const gridWheelLockRef = useRef(false);
-  const [visibleDayCount, setVisibleDayCount] = useState(7);
+  const [maxVisibleDayCount, setMaxVisibleDayCount] = useState(GRID_DAY_COUNT_MAX);
+  const [preferredGridDayCount, setPreferredGridDayCount] = useState(readGridDayCountPreference);
+  const visibleDayCount = Math.min(preferredGridDayCount, maxVisibleDayCount);
   const [calendarWidth, setCalendarWidth] = useState(0);
   const [gridWindowStart, setGridWindowStart] = useState(() => addDays(new Date(), -GRID_WINDOW_BEFORE));
   const [dragDayDelta, setDragDayDelta] = useState(0);
@@ -206,6 +217,9 @@ export default function ScheduleView({
     ? Math.max(0, (calendarWidth - GRID_GAP * (visibleDayCount - 1)) / visibleDayCount)
     : 160;
   const gridOffset = -visibleStartIndex * (gridDayWidth + GRID_GAP);
+  const setGridDayCount = (next: number) => {
+    setPreferredGridDayCount(Math.min(GRID_DAY_COUNT_MAX, Math.max(1, next)));
+  };
   const liveScheduleIds = useMemo(
     () => matchLiveSchedules(schedules, liveStatuses),
     [schedules, liveStatuses],
@@ -271,6 +285,10 @@ export default function ScheduleView({
     localStorage.setItem("oshical.viewMode", viewMode);
   }, [viewMode]);
 
+  useEffect(() => {
+    localStorage.setItem(GRID_DAY_COUNT_KEY, String(preferredGridDayCount));
+  }, [preferredGridDayCount]);
+
   useLayoutEffect(() => {
     const element = pageRef.current;
     if (!element) return;
@@ -279,7 +297,7 @@ export default function ScheduleView({
       if (width <= 0) return;
       setCalendarWidth(width);
       const next = visibleDayCountForWidth(width);
-      setVisibleDayCount((current) => (current === next ? current : next));
+      setMaxVisibleDayCount((current) => (current === next ? current : next));
     };
     update();
     if (typeof ResizeObserver === "undefined") {
@@ -701,6 +719,38 @@ export default function ScheduleView({
           <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右滑动切换` : "连续 7 天"}</p>
         </div>
         <div className="toolbar-actions">
+          {viewMode === "grid" ? (
+            <div className="calendar-width-control" role="group" aria-label="调整日历每天的宽度">
+              <span className="calendar-width-label">每日栏宽</span>
+              <button
+                type="button"
+                onClick={() => setGridDayCount(visibleDayCount + 1)}
+                disabled={visibleDayCount >= maxVisibleDayCount}
+                title="缩窄每天"
+                aria-label="缩窄每天"
+              >
+                <Minus size={14} />
+              </button>
+              <output aria-live="polite">{Math.round(gridDayWidth)}px</output>
+              <button
+                type="button"
+                onClick={() => setGridDayCount(visibleDayCount - 1)}
+                disabled={visibleDayCount <= 1}
+                title="加宽每天"
+                aria-label="加宽每天"
+              >
+                <Plus size={14} />
+              </button>
+              <button
+                type="button"
+                className="calendar-width-auto"
+                onClick={() => setGridDayCount(GRID_DAY_COUNT_MAX)}
+                title="恢复自动栏宽"
+              >
+                自动
+              </button>
+            </div>
+          ) : null}
           <div className="segmented" aria-label="视图模式">
             <button
               className={viewMode === "timeline" ? "active" : ""}

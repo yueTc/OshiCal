@@ -29,6 +29,8 @@ const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
 const APP_UPDATE_DIRECT_ENDPOINT: &str =
     "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+const APP_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+const APP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 struct DesktopState {
     service: Arc<AppService>,
@@ -325,20 +327,26 @@ async fn resolve_app_update(
         .updater_builder()
         .endpoints(endpoints)
         .map_err(|error| format!("配置更新端点失败: {error}"))?
-        .timeout(Duration::from_secs(45))
+        .timeout(APP_UPDATE_CHECK_TIMEOUT)
         .build()
         .map_err(|error| format!("初始化更新检查失败: {error}"))?;
     let mut update = updater
         .check()
         .await
         .map_err(|error| format!("检查更新失败: {error}"))?;
-    if let (Some(update), Some(base)) = (update.as_mut(), normalize_mirror_base(mirror_url)?) {
-        if update.download_url.scheme() == "https"
-            && !update.download_url.as_str().starts_with(&base)
-        {
-            update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
-                .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+    let mirror_base = normalize_mirror_base(mirror_url)?;
+    if let Some(update) = update.as_mut() {
+        if let Some(base) = mirror_base.as_deref() {
+            if update.download_url.scheme() == "https"
+                && !update.download_url.as_str().starts_with(base)
+            {
+                update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
+                    .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+            }
         }
+        // The updater check timeout also applies to the entire package download. A slow
+        // GitHub mirror can take several minutes to transfer a release installer.
+        update.timeout = Some(APP_UPDATE_DOWNLOAD_TIMEOUT);
     }
     Ok(update)
 }
