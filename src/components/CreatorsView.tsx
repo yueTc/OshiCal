@@ -852,17 +852,6 @@ export default function CreatorsView({
                   <span>UID {streamer.mid}</span>
                   {streamer.isLive ? <span className="live-label">直播中</span> : null}
                 </div>
-                <button
-                  type="button"
-                  className="creator-fan-button"
-                  title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
-                  onClick={() => openFanHistory(streamer)}
-                >
-                  <TrendingUp size={14} />
-                  <strong>{formatFanCount(streamer.fans)}</strong>
-                  <span>粉丝</span>
-                  <em>查看趋势</em>
-                </button>
                 {streamer.lastError ? <p className="inline-error">{streamer.lastError}</p> : null}
                 <div className="creator-toggles">
                   <Toggle
@@ -922,6 +911,18 @@ export default function CreatorsView({
                 </div>
               </div>
               <div className="creator-actions">
+                <button
+                  type="button"
+                  className="creator-fan-button"
+                  title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
+                  onClick={() => openFanHistory(streamer)}
+                >
+                  <TrendingUp size={14} />
+                  <strong>{formatFanCount(streamer.fans)}</strong>
+                  <span>粉丝</span>
+                  <em>查看趋势</em>
+                </button>
+
                 <button
                   className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
                   title={streamer.liveUrl || streamer.roomId

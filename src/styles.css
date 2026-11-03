@@ -1379,7 +1379,7 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
 .linked-pill button { display: grid; place-items: center; padding: 0; color: var(--faint); background: transparent; border: 0; }
 .linked-pill.automatic { color: var(--primary-strong); background: var(--primary-soft); }
 .linked-empty { color: var(--faint); font-size: 11px; }
-.creator-actions { display: flex; gap: 3px; align-self: start; }
+.creator-actions { display: flex; align-items: center; gap: 5px; align-self: start; }
 .creator-fan-button {
   display: inline-flex;
   align-items: center;
