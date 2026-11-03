@@ -1,5 +1,6 @@
 services:
   oshical:
+    image: ${OSHICAL_IMAGE:-ghcr.io/yuetec/oshical-server:latest}
     build: .
     container_name: oshical
     restart: unless-stopped

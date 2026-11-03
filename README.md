@@ -154,6 +154,41 @@ docker compose up -d --build
 
 部署时请使用自有域名、API Token 和 HTTPS 证书；不要把真实 `.env`、Token、服务器路径或内部测试数据提交到仓库。
 
+### 服务端镜像更新
+
+GitHub Actions 会在推送 `v*` 标签时构建并发布：
+
+```text
+ghcr.io/yuetec/oshical-server:<版本号>
+ghcr.io/yuetec/oshical-server:latest
+```
+
+首次使用镜像启动：
+
+```powershell
+docker compose pull
+docker compose up -d --no-deps oshical
+```
+
+更新服务端：
+
+```bash
+./scripts/update-server.sh
+```
+
+脚本会先拉取镜像并比较镜像 ID；有更新时才停止服务、备份 `data/`、重启并检查 `/api/health`。失败时自动恢复上一镜像。
+
+生产环境建议在 `.env` 中固定版本：
+
+```dotenv
+OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:0.1.2
+```
+
+也可以每小时执行一次更新检查，只有镜像变化时才会重启：
+
+```cron
+0 * * * * cd /opt/oshical && ./scripts/update-server.sh >> backups/update.log 2>&1
+```
 ## 验证
 
 ```powershell

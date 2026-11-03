@@ -27,6 +27,20 @@ OSHICAL_PROXY_PORT=7890
 docker compose up -d --build
 ```
 
+也可以直接使用 GitHub Container Registry 镜像：
+
+```powershell
+docker compose pull
+docker compose up -d --no-deps oshical
+```
+
+镜像地址：
+
+```text
+ghcr.io/yuetec/oshical-server:<版本号>
+ghcr.io/yuetec/oshical-server:latest
+```
+
 检查：
 
 ```powershell
@@ -35,6 +49,37 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 
 数据库持久化在 `./data`。
 
+
+### 服务端镜像更新脚本
+
+```bash
+./scripts/update-server.sh
+```
+
+执行顺序：
+
+1. 拉取 `OSHICAL_IMAGE` 对应镜像。
+2. 比较当前容器镜像 ID，没有变化则直接退出，不重启服务。
+3. 有变化时停止服务，生成 `backups/oshical-data-<时间>.tar.gz`。
+4. 使用新镜像启动容器。
+5. 最多等待 60 秒检查 `/api/health`。
+6. 健康检查失败时自动切回上一镜像。
+
+可配置变量：
+
+```dotenv
+OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:latest
+OSHICAL_HEALTH_URL=http://127.0.0.1:8787/api/health
+OSHICAL_BACKUP_DIR=backups
+```
+
+如果 GHCR 镜像为私有，需要先登录：
+
+```bash
+echo "$CR_PAT" | docker login ghcr.io -u <GitHub用户名> --password-stdin
+```
+
+不建议让应用容器直接挂载 `/var/run/docker.sock`。需要自动更新时，可使用宿主机 cron 定时执行上述脚本。
 ## 2. 便携服务端
 
 ```powershell

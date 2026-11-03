@@ -25,3 +25,4 @@ Cargo.lock.bak
 /scripts/build-local-image-20261031-0015.sh
 /scripts/build-server-image-20261030-2210.sh
 /scripts/package-server-20261030-2210.sh
+backups/

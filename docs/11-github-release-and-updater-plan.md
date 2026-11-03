@@ -464,3 +464,9 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - 2026-11-03：实际安装 `v0.1.0` 后成功检测并升级到 `v0.1.1`，应用自动退出、安装并重启。
 - 验证中发现 Rustls 网络通道在部分网络环境下下载不稳定，已将 Updater 切换为 Windows 原生 TLS，并增加检查与下载重试。
 - 验证过程中生成的 `v0.1.1` 为升级演练版本；包含网络稳定性修复的正式版本为 `v0.1.2`。
+
+## 15. 服务端镜像更新
+
+- GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetec/oshical-server:<版本号>` 和 `latest` 镜像。
+- `scripts/update-server.sh` 负责镜像比较、数据备份、更新、健康检查和失败回滚。
+- 默认不挂载 Docker Socket；自动更新由宿主机 cron 调度更新脚本。
