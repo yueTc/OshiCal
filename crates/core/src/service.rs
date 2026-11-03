@@ -1214,7 +1214,9 @@ impl AppService {
                     };
                     for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                         let event = canonicalize_event_participants(event, targets);
-                        if let Some(target) = match_event_target(&event, targets) {
+                        if let Some(target) =
+                            match_event_target_for_post(&event, targets, &post.author_mid)
+                        {
                             if event.action == LlmEventAction::Cancel {
                                 event_state.cancellations.push(PendingCancellation {
                                     target,
@@ -1378,7 +1380,9 @@ impl AppService {
                         analysis_cache.insert(image_cache_key, analysis);
                         for (event_index, event) in events.iter().enumerate() {
                             let event = canonicalize_event_participants(event, targets);
-                            if let Some(target) = match_event_target(&event, targets) {
+                            if let Some(target) =
+                                match_event_target_for_post(&event, targets, &post.author_mid)
+                            {
                                 if event.action == LlmEventAction::Cancel {
                                     event_state.cancellations.push(PendingCancellation {
                                         target,
@@ -1703,6 +1707,39 @@ impl AppService {
         Ok(removed)
     }
 
+    async fn find_reservation_time_change_candidate(
+        &self,
+        target: &Streamer,
+        start_at: DateTime<Utc>,
+        post: &DynamicPost,
+    ) -> Option<Schedule> {
+        if !text_looks_like_schedule_time_change(&post.text) {
+            return None;
+        }
+        let candidates: Vec<Schedule> = self
+            .store
+            .list_all_schedules()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|schedule| {
+                schedule.streamer_id == target.id
+                    && schedule.source_kind == "reserve"
+                    && !schedule.cancelled
+                    && !schedule.manual_locked
+                    && schedule.source_author_mid.as_deref() == Some(post.author_mid.as_str())
+                    && schedule
+                        .source_published_at
+                        .is_none_or(|published_at| published_at <= post.published_at)
+                    && {
+                        let minutes = (schedule.start_at - start_at).num_minutes().abs();
+                        minutes > 0 && minutes <= 240
+                    }
+            })
+            .collect();
+        (candidates.len() == 1).then(|| candidates[0].clone())
+    }
+
     async fn cancel_schedule_from_event(
         &self,
         target: &Streamer,
@@ -1864,6 +1901,25 @@ impl AppService {
                 }
             }
         }
+
+        if source_kind == "text" && post.reserve.is_none() {
+            if let Some(existing) = self
+                .find_reservation_time_change_candidate(target, schedule.start_at, post)
+                .await
+            {
+                if let Err(error) = self.store.attach_schedule_source(existing.id, &input).await {
+                    tracing::warn!(%error, streamer_id = target.id, "attach reservation update source failed");
+                }
+                let mut merged = merge_input_for_existing(&existing, &input);
+                merged.source_published_at = Some(post.published_at);
+                merged.confidence = existing.confidence.max(input.confidence);
+                if let Err(error) = self.store.merge_schedule_auto(existing.id, &merged).await {
+                    tracing::warn!(%error, streamer_id = target.id, "merge reservation time change failed");
+                }
+                return false;
+            }
+        }
+
         if let Ok(Some(existing)) = self
             .store
             .find_schedule_near(target.id, schedule.start_at, 10)
@@ -2160,6 +2216,50 @@ fn canonicalize_event_participants(event: &LlmEvent, targets: &[Streamer]) -> Ll
             names
         });
     canonical
+}
+
+fn match_event_target_for_post(
+    event: &LlmEvent,
+    targets: &[Streamer],
+    author_mid: &str,
+) -> Option<Streamer> {
+    if let Some(target) = match_event_target(event, targets) {
+        return Some(target);
+    }
+    if event.participant_names().len() > 1 || event.confidence < 0.6 {
+        return None;
+    }
+    let author = targets.iter().find(|target| target.mid == author_mid)?;
+    let event_names: Vec<String> = std::iter::once(&event.performer)
+        .chain(event.aliases.iter())
+        .map(|value| normalize_alias(value))
+        .filter(|value| !value.is_empty())
+        .collect();
+    event_identity_matches_target(&event_names, author).then(|| author.clone())
+}
+
+fn event_identity_matches_target(event_names: &[String], target: &Streamer) -> bool {
+    let target_names: Vec<String> = std::iter::once(&target.name)
+        .chain(target.aliases.iter())
+        .map(|value| normalize_alias(value))
+        .filter(|value| !value.is_empty())
+        .collect();
+    event_names.iter().any(|event_name| {
+        target_names.iter().any(|target_name| {
+            event_name == target_name
+                || (event_name.chars().count() >= 2
+                    && target_name.chars().count() >= 2
+                    && (event_name.contains(target_name) || target_name.contains(event_name)))
+        })
+    })
+}
+
+fn text_looks_like_schedule_time_change(text: &str) -> bool {
+    [
+        "就来", "改到", "改成", "提前", "推迟", "延后", "顺延", "调整",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
 }
 
 fn match_event_target(event: &LlmEvent, targets: &[Streamer]) -> Option<Streamer> {
@@ -3415,6 +3515,125 @@ mod tests {
             schedules[0].room_url.as_deref(),
             Some("https://live.bilibili.com/222222")
         );
+        assert_eq!(
+            schedules[0].source_published_at,
+            Some(new_post.published_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_text_can_move_upcoming_reservation_time() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "乃琳Queen"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let old_start = now + Duration::hours(30);
+        let new_start = old_start - Duration::hours(1);
+        let reserve_post = DynamicPost {
+            id: "reserve-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: now - Duration::hours(2),
+            text: "直播预约".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】影之刃零DAY5！".to_owned(),
+                description: "明天 16:00 直播".to_owned(),
+                room_id: Some("5850386".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let reserve_schedule = ParsedSchedule {
+            title: "【突击】影之刃零DAY5！".to_owned(),
+            start_at: old_start,
+            end_at: None,
+            confidence: 1.0,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &reserve_schedule,
+                    "reserve",
+                    &reserve_post,
+                    "",
+                    "reserve:reserve-post",
+                    "reserve-fingerprint",
+                    Some("https://live.bilibili.com/5850386"),
+                    Some("100"),
+                    Some("乃琳Queen"),
+                    &["乃琳Queen".to_owned()],
+                )
+                .await
+        );
+
+        let new_post = DynamicPost {
+            id: "new-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: now,
+            text: "奶淇琳！明天下午3点就来！早点和奶淇琳见面捏".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/new-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let event = LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: "乃琳".to_owned(),
+            aliases: vec!["奶淇琳".to_owned(), "乃宝".to_owned()],
+            participants: Vec::new(),
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: "和奶淇琳见面".to_owned(),
+            start_at: Some(new_start),
+            end_at: None,
+            confidence: 0.7,
+        };
+        assert!(
+            match_event_target_for_post(&event, std::slice::from_ref(&streamer), "100").is_some()
+        );
+        let changed = ParsedSchedule {
+            title: "和奶淇琳见面".to_owned(),
+            start_at: new_start,
+            end_at: None,
+            confidence: 0.7,
+        };
+        assert!(
+            !service
+                .upsert_candidate(
+                    &streamer,
+                    &changed,
+                    "text",
+                    &new_post,
+                    "editor",
+                    "text:new-post",
+                    "new-fingerprint",
+                    Some("https://live.bilibili.com/5850386"),
+                    Some("100"),
+                    Some("乃琳Queen"),
+                    &["乃琳".to_owned()],
+                )
+                .await
+        );
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "【突击】影之刃零DAY5！");
+        assert_eq!(schedules[0].start_at, new_start);
         assert_eq!(
             schedules[0].source_published_at,
             Some(new_post.published_at)
