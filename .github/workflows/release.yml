@@ -80,3 +80,29 @@ jobs:
           updaterJsonPreferNsis: true
           uploadUpdaterSignatures: true
           args: --target x86_64-pc-windows-msvc
+
+      - name: Finalize updater manifest URLs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          $repo = "${{ github.repository }}"
+          $dir = Join-Path $env:RUNNER_TEMP "oshical-updater"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          gh release download $tag --repo $repo --pattern latest.json --dir $dir --clobber
+          if ($LASTEXITCODE -ne 0) { throw "无法下载 latest.json" }
+          $release = gh release view $tag --repo $repo --json assets | ConvertFrom-Json
+          $installer = $release.assets | Where-Object { $_.name -eq "OshiCal_${version}_x64-setup.exe" } | Select-Object -First 1
+          if (-not $installer) { throw "未找到 Windows 安装包资产" }
+          $manifestPath = Join-Path $dir "latest.json"
+          $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+          foreach ($key in @("windows-x86_64", "windows-x86_64-nsis")) {
+            if ($manifest.platforms.PSObject.Properties.Name -contains $key) {
+              $manifest.platforms.$key.url = $installer.url
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+          gh release upload $tag $manifestPath --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "无法更新 latest.json" }
