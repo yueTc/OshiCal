@@ -20,7 +20,7 @@ use crate::models::{
     UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
-use crate::schedule::{parse_reserve_schedule, ParsedSchedule};
+use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::SqliteStore;
 
@@ -1152,6 +1152,9 @@ impl AppService {
                     self.remove_stale_non_live_reserve_schedule(post).await?;
             }
 
+            self.apply_deterministic_reservation_time_change(source_mid, targets, post, now)
+                .await;
+
             let has_combined_images = post.reserve.is_none()
                 && llm_config.is_some()
                 && settings.auto_analyze_images
@@ -1738,6 +1741,49 @@ impl AppService {
             })
             .collect();
         (candidates.len() == 1).then(|| candidates[0].clone())
+    }
+
+    async fn apply_deterministic_reservation_time_change(
+        &self,
+        source_mid: &str,
+        targets: &[Streamer],
+        post: &DynamicPost,
+        now: DateTime<Utc>,
+    ) {
+        if post.reserve.is_some() || !text_looks_like_schedule_time_change(&post.text) {
+            return;
+        }
+        let Some(target) = choose_text_target(source_mid, targets, &post.text) else {
+            return;
+        };
+        let Some(schedule) = parse_text_schedule(&post.text, post.published_at, now, "直播")
+        else {
+            return;
+        };
+        let Some(existing) = self
+            .find_reservation_time_change_candidate(&target, schedule.start_at, post)
+            .await
+        else {
+            return;
+        };
+        let fingerprint = source_fingerprint(post, &schedule.title, "text");
+        let digest = text_digest(post.text.trim());
+        let identity = format!("text:{}:{digest}:0", post.id);
+        let participants = [target.name.clone()];
+        self.upsert_candidate(
+            &target,
+            &schedule,
+            "text",
+            post,
+            "editor",
+            &identity,
+            &fingerprint,
+            target.live_url.as_deref().or(existing.room_url.as_deref()),
+            Some(post.author_mid.as_str()),
+            Some(post.author_name.as_str()),
+            &participants,
+        )
+        .await;
     }
 
     async fn cancel_schedule_from_event(
@@ -3634,6 +3680,106 @@ mod tests {
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].title, "【突击】影之刃零DAY5！");
         assert_eq!(schedules[0].start_at, new_start);
+        assert_eq!(
+            schedules[0].source_published_at,
+            Some(new_post.published_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_text_time_change_updates_reservation_without_llm_event() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "乃琳Queen"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = "2026-11-02T10:30:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("now");
+        let reserve_post = DynamicPost {
+            id: "reserve-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: "2026-11-01T10:42:06Z"
+                .parse::<DateTime<Utc>>()
+                .expect("published"),
+            text: "直播预约".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】影之刃零DAY5！".to_owned(),
+                description: "明天 16:00 直播".to_owned(),
+                room_id: Some("5850386".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let reserve_schedule = ParsedSchedule {
+            title: "【突击】影之刃零DAY5！".to_owned(),
+            start_at: "2026-11-03T08:00:00Z"
+                .parse::<DateTime<Utc>>()
+                .expect("start"),
+            end_at: None,
+            confidence: 1.0,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &reserve_schedule,
+                    "reserve",
+                    &reserve_post,
+                    "editor",
+                    "reserve:reserve-post",
+                    "reserve-fingerprint",
+                    Some("https://live.bilibili.com/5850386"),
+                    Some("100"),
+                    Some("乃琳Queen"),
+                    &["乃琳Queen".to_owned()],
+                )
+                .await
+        );
+
+        let new_post = DynamicPost {
+            id: "time-change-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: "2026-11-02T10:18:34Z"
+                .parse::<DateTime<Utc>>()
+                .expect("published"),
+            text: "奶淇琳！明天下午3点就来！早点和奶淇琳见面捏".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/time-change-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_FORWARD".to_owned(),
+            reserve: None,
+        };
+        service
+            .apply_deterministic_reservation_time_change(
+                "100",
+                std::slice::from_ref(&streamer),
+                &new_post,
+                now,
+            )
+            .await;
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "【突击】影之刃零DAY5！");
+        assert_eq!(
+            schedules[0].start_at,
+            "2026-11-03T07:00:00Z"
+                .parse::<DateTime<Utc>>()
+                .expect("expected start")
+        );
         assert_eq!(
             schedules[0].source_published_at,
             Some(new_post.published_at)

@@ -52,7 +52,7 @@ fs.writeFileSync(cargoPath, cargoLines.join("\n"), "utf8");
 
 const workspaceCrates = new Set(["oshical-core", "oshical-desktop", "oshical-server"]);
 const lockPath = "Cargo.lock";
-const lock = fs.readFileSync(lockPath, "utf8");
+const lock = fs.readFileSync(lockPath, "utf8").replace(/\r\n/g, "\n");
 const blocks = lock.split(/(?=\[\[package\]\]\n)/);
 let lockUpdated = 0;
 for (let index = 0; index < blocks.length; index += 1) {
