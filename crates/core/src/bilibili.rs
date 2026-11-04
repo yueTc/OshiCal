@@ -284,16 +284,47 @@ impl BilibiliClient {
         if room_id.trim().is_empty() || !room_id.chars().all(|ch| ch.is_ascii_digit()) {
             return Err(AppError::validation("直播间号必须是数字"));
         }
+        let referer = format!("https://live.bilibili.com/{room_id}");
         let mut params = BTreeMap::new();
         params.insert("id".to_owned(), room_id.to_owned());
         params.insert("type".to_owned(), "0".to_owned());
-        self.get_signed_host(
-            "https://api.live.bilibili.com",
-            "/xlive/web-room/v1/index/getDanmuInfo",
-            params,
-            &format!("https://live.bilibili.com/{room_id}"),
-        )
-        .await
+        match self
+            .get_signed_host(
+                "https://api.live.bilibili.com",
+                "/xlive/web-room/v1/index/getDanmuInfo",
+                params,
+                &referer,
+            )
+            .await
+        {
+            Ok(value) if danmu_info_has_token(&value) => {
+                return Ok(normalize_danmu_info(value));
+            }
+            Ok(_) => tracing::warn!(%room_id, "WBI 弹幕接口未返回 token，尝试旧版接口"),
+            Err(error) => tracing::warn!(%room_id, %error, "WBI 弹幕接口失败，尝试旧版接口"),
+        }
+
+        let params = BTreeMap::from([
+            ("room_id".to_owned(), room_id.to_owned()),
+            ("platform".to_owned(), "pc".to_owned()),
+            ("player".to_owned(), "web".to_owned()),
+        ]);
+        let query = {
+            let mut serializer = Serializer::new(String::new());
+            for (key, value) in params {
+                serializer.append_pair(&key, &value);
+            }
+            serializer.finish()
+        };
+        let url = format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{query}");
+        let value = self.get_public(&url, &referer).await?;
+        if !danmu_info_has_token(&value) {
+            return Err(AppError::External {
+                code: "BILI_DANMU".to_owned(),
+                message: "弹幕服务器缺少 token".to_owned(),
+            });
+        }
+        Ok(normalize_danmu_info(value))
     }
 
     async fn get_public(&self, url: &str, referer: &str) -> AppResult<Value> {
@@ -916,6 +947,23 @@ fn sanitize_wbi_value(value: &str) -> String {
         .collect()
 }
 
+fn danmu_info_has_token(value: &Value) -> bool {
+    value
+        .pointer("/data/token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+}
+
+fn normalize_danmu_info(mut value: Value) -> Value {
+    let hosts = value.pointer("/data/host_server_list").cloned();
+    if let Some(hosts) = hosts {
+        if let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) {
+            data.entry("host_list".to_owned()).or_insert(hosts);
+        }
+    }
+    value
+}
+
 fn should_refresh_bili_session(error: &AppError) -> bool {
     matches!(
         error,
@@ -1222,6 +1270,23 @@ mod tests {
             );
         }
         assert!(extract_search_mid("嘉然").is_none());
+    }
+
+    #[test]
+    fn legacy_danmu_info_adds_host_list_alias() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "token": "token",
+                "host_server_list": [{"host": "example", "wss_port": 443}]
+            }
+        });
+        assert!(danmu_info_has_token(&value));
+        let normalized = normalize_danmu_info(value);
+        assert_eq!(
+            normalized.pointer("/data/host_list/0/host"),
+            Some(&Value::String("example".to_owned()))
+        );
     }
 
     #[test]
