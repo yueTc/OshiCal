@@ -182,6 +182,7 @@ export interface LiveSession {
   endedAt: string | null;
   durationSeconds: number;
   peakOnline: number;
+  peakHighEnergy: number;
   avgOnline: number;
   onlineSamples: number;
   onlineTotal: number;

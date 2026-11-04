@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     ended_at TEXT,
     duration_seconds INTEGER NOT NULL DEFAULT 0,
     peak_online INTEGER NOT NULL DEFAULT 0,
+    peak_high_energy INTEGER NOT NULL DEFAULT 0,
     avg_online INTEGER NOT NULL DEFAULT 0,
     online_samples INTEGER NOT NULL DEFAULT 0,
     online_total INTEGER NOT NULL DEFAULT 0,
@@ -416,6 +417,7 @@ struct LiveSessionRow {
     ended_at: Option<String>,
     duration_seconds: i64,
     peak_online: i64,
+    peak_high_energy: i64,
     avg_online: i64,
     online_samples: i64,
     online_total: i64,
@@ -2460,7 +2462,7 @@ impl SqliteStore {
     pub async fn get_live_session(&self, id: i64) -> AppResult<LiveSession> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                    duration_seconds, peak_online, avg_online, online_samples, online_total,
+                    duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
                     super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2483,7 +2485,7 @@ impl SqliteStore {
         let rows = if let Some(streamer_id) = streamer_id {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2498,7 +2500,7 @@ impl SqliteStore {
         } else {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2518,7 +2520,7 @@ impl SqliteStore {
     ) -> AppResult<Option<LiveSession>> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT ls.id, ls.streamer_id, ls.streamer_name, ls.room_id, ls.title, ls.cover_url,
-                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.avg_online,
+                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.peak_high_energy, ls.avg_online,
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
                     ls.interactive_user_count, ls.danmaku_count, ls.gift_count, ls.super_chat_count,
@@ -2538,39 +2540,6 @@ impl SqliteStore {
         row.map(map_live_session).transpose()
     }
 
-    pub async fn record_live_online(
-        &self,
-        streamer_id: i64,
-        online: u64,
-        checked_at: DateTime<Utc>,
-    ) -> AppResult<()> {
-        let online = online as i64;
-        let checked = checked_at.to_rfc3339();
-        sqlx::query(
-            "UPDATE live_sessions
-             SET peak_online = MAX(peak_online, ?),
-                 online_total = online_total + ?,
-                 online_samples = online_samples + 1,
-                 avg_online = ((online_total + ?) / (online_samples + 1)),
-                 duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 updated_at = ?
-             WHERE id = (
-                 SELECT id FROM live_sessions
-                 WHERE streamer_id = ? AND ended_at IS NULL
-                 ORDER BY started_at DESC LIMIT 1
-             )",
-        )
-        .bind(online)
-        .bind(online)
-        .bind(online)
-        .bind(&checked)
-        .bind(&checked)
-        .bind(streamer_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn update_live_session_stats(
         &self,
         id: i64,
@@ -2579,13 +2548,14 @@ impl SqliteStore {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE live_sessions
-             SET revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+             SET peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = ?, updated_at = ?,
                  revision = revision + 1
              WHERE id = ?",
         )
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -2623,7 +2593,7 @@ impl SqliteStore {
             "UPDATE live_sessions
              SET ended_at = ?,
                  duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+                 peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = 'finished', updated_at = ?,
@@ -2632,6 +2602,7 @@ impl SqliteStore {
         )
         .bind(&ended)
         .bind(&ended)
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -3007,6 +2978,7 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         ended_at: parse_opt_ts(row.ended_at.as_deref())?,
         duration_seconds: row.duration_seconds,
         peak_online: row.peak_online.max(0) as u64,
+        peak_high_energy: row.peak_high_energy.max(0) as u64,
         avg_online: row.avg_online.max(0) as u64,
         online_samples: row.online_samples,
         online_total: row.online_total,
@@ -3654,15 +3626,8 @@ mod tests {
             )
             .await
             .expect("session");
-        store
-            .record_live_online(streamer.id, 800, start + Duration::minutes(1))
-            .await
-            .expect("online");
-        store
-            .record_live_online(streamer.id, 1200, start + Duration::minutes(2))
-            .await
-            .expect("online");
         let stats = LiveSessionStats {
+            peak_high_energy: 987,
             danmaku_count: 25_000,
             interactive_user_count: 4_014,
             paid_user_count: 977,
@@ -3686,9 +3651,7 @@ mod tests {
             .expect("lookup")
             .expect("matched session");
         assert_eq!(found.id, session.id);
-        assert_eq!(found.peak_online, 1200);
-        assert_eq!(found.avg_online, 1000);
-        assert_eq!(found.online_samples, 2);
+        assert_eq!(found.peak_high_energy, 987);
         assert_eq!(found.revenue_cents, 353_350);
         assert_eq!(found.danmaku_count, 25_000);
         assert_eq!(found.data_quality, "complete");

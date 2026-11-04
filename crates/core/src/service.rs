@@ -808,13 +808,6 @@ impl AppService {
                     .await
                 {
                     Ok(session) => {
-                        if let Err(error) = self
-                            .store
-                            .record_live_online(streamer.id, snapshot.online, snapshot.checked_at)
-                            .await
-                        {
-                            tracing::warn!(%error, streamer_id = streamer.id, "保存直播人气失败");
-                        }
                         self.live_stats
                             .start(self.store.clone(), self.bili_client(), session)
                             .await;

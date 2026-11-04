@@ -21,6 +21,7 @@ use crate::store::SqliteStore;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
@@ -36,6 +37,7 @@ struct TaskHandle {
 
 #[derive(Default)]
 struct CollectorStats {
+    peak_high_energy: i64,
     danmaku_count: i64,
     gift_count: i64,
     super_chat_count: i64,
@@ -50,11 +52,13 @@ struct CollectorStats {
     interactive_users: HashSet<String>,
     paid_users: HashSet<String>,
     dedup: HashSet<String>,
+    connection_established: bool,
 }
 
 impl CollectorStats {
     fn from_session(session: &LiveSession) -> Self {
         Self {
+            peak_high_energy: session.peak_high_energy as i64,
             danmaku_count: session.danmaku_count,
             gift_count: session.gift_count,
             super_chat_count: session.super_chat_count,
@@ -72,6 +76,7 @@ impl CollectorStats {
 
     fn snapshot(&self, quality: &str, state: &str) -> LiveSessionStats {
         LiveSessionStats {
+            peak_high_energy: self.peak_high_energy,
             revenue_cents: self.revenue_cents,
             gift_revenue_cents: self.gift_revenue_cents,
             super_chat_revenue_cents: self.super_chat_revenue_cents,
@@ -134,6 +139,7 @@ async fn run_collector(
     mut stop_rx: oneshot::Receiver<DateTime<Utc>>,
 ) {
     let mut stats = CollectorStats::from_session(&session);
+    let mut retry_delay = RECONNECT_DELAY;
     loop {
         match collect_once(&store, &bili, &session, &mut stats, &mut stop_rx).await {
             CollectResult::Stopped(ended_at) => {
@@ -152,6 +158,13 @@ async fn run_collector(
             }
             CollectResult::Disconnected(error) => {
                 stats.reconnect_count += 1;
+                let current_delay = retry_delay;
+                if stats.connection_established {
+                    retry_delay = RECONNECT_DELAY;
+                } else {
+                    retry_delay = (retry_delay * 2).min(MAX_RECONNECT_DELAY);
+                }
+                stats.connection_established = false;
                 if let Err(store_error) = store
                     .update_live_session_stats(
                         session.id,
@@ -161,7 +174,12 @@ async fn run_collector(
                 {
                     tracing::warn!(%store_error, session_id = session.id, "保存直播采集断点失败");
                 }
-                tracing::warn!(%error, session_id = session.id, "直播数据连接中断，准备重连");
+                tracing::warn!(
+                    %error,
+                    session_id = session.id,
+                    retry_in_seconds = current_delay.as_secs(),
+                    "直播数据连接中断，准备重连"
+                );
                 tokio::select! {
                     _ = &mut stop_rx => {
                         let quality = if stats.reconnect_count == 0 { "complete" } else { "partial" };
@@ -172,7 +190,7 @@ async fn run_collector(
                         ).await;
                         return;
                     }
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(current_delay) => {}
                 }
             }
         }
@@ -204,20 +222,19 @@ async fn collect_once(
         None => return CollectResult::Disconnected("弹幕服务器列表为空".to_owned()),
     };
 
-    for host in hosts {
-        let Some(host_name) = host.get("host").and_then(Value::as_str) else {
-            continue;
-        };
-        let port = host.get("wss_port").and_then(Value::as_u64).unwrap_or(2245);
-        let url = format!("wss://{host_name}:{port}/sub");
+    for url in websocket_endpoints(hosts) {
         let socket = match timeout(Duration::from_secs(12), connect_async(&url)).await {
             Ok(Ok((socket, _))) => socket,
             Ok(Err(error)) => {
                 tracing::debug!(%error, %url, "直播弹幕连接失败");
                 continue;
             }
-            Err(_) => continue,
+            Err(_) => {
+                tracing::debug!(%url, "直播弹幕连接超时");
+                continue;
+            }
         };
+        stats.connection_established = true;
         let (mut writer, mut reader) = socket.split();
         let auth = serde_json::json!({
             "uid": 0,
@@ -298,6 +315,48 @@ async fn collect_once(
     CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
 }
 
+fn websocket_endpoints(hosts: &[Value]) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for host in hosts {
+        let Some(host_name) = host.get("host").and_then(Value::as_str) else {
+            continue;
+        };
+        let wss_port = host.get("wss_port").and_then(Value::as_u64).unwrap_or(2245);
+        append_websocket_endpoint(&mut endpoints, &mut seen, host_name, 443);
+        append_websocket_endpoint(&mut endpoints, &mut seen, host_name, wss_port);
+    }
+    // The regional host can be blocked while Bilibili's shared endpoint remains reachable.
+    append_websocket_endpoint(
+        &mut endpoints,
+        &mut seen,
+        "broadcastlv.chat.bilibili.com",
+        443,
+    );
+    endpoints
+}
+
+fn append_websocket_endpoint(
+    endpoints: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    host: &str,
+    port: u64,
+) {
+    let host = host.trim();
+    if host.is_empty() || port == 0 {
+        return;
+    }
+    let key = format!("{host}:{port}");
+    if !seen.insert(key) {
+        return;
+    }
+    if port == 443 {
+        endpoints.push(format!("wss://{host}/sub"));
+    } else {
+        endpoints.push(format!("wss://{host}:{port}/sub"));
+    }
+}
+
 fn make_packet(operation: u32, body: Vec<u8>) -> Vec<u8> {
     let mut packet = Vec::with_capacity(16 + body.len());
     packet.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
@@ -344,7 +403,15 @@ fn parse_live_packets(stats: &mut CollectorStats, bytes: &[u8], depth: usize) {
                     }
                 }
                 3 => {
-                    tracing::debug!("收到未支持的 brotli 直播弹幕包");
+                    let decoder = brotli::Decompressor::new(body, 4096);
+                    let mut decoded = Vec::new();
+                    if decoder
+                        .take(MAX_DECOMPRESSED_BYTES as u64)
+                        .read_to_end(&mut decoded)
+                        .is_ok()
+                    {
+                        parse_live_packets(stats, &decoded, depth + 1);
+                    }
                 }
                 _ => {
                     if let Ok(value) = serde_json::from_slice::<Value>(body) {
@@ -367,6 +434,16 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
         .unwrap_or_default();
     let data = value.get("data").unwrap_or(&Value::Null);
     match cmd {
+        "ONLINE_RANK_COUNT" => {
+            // B 站公开事件中的高能用户在线上限，不是直播间热度值。
+            let current = data
+                .get("online_count")
+                .and_then(Value::as_i64)
+                .or_else(|| data.get("count").and_then(Value::as_i64))
+                .unwrap_or(0)
+                .max(0);
+            stats.peak_high_energy = stats.peak_high_energy.max(current);
+        }
         "DANMU_MSG" => {
             stats.danmaku_count += 1;
             if let Some(uid) = value.pointer("/info/2/0").and_then(value_to_string) {
@@ -621,6 +698,65 @@ fn decode_send_gift_v2(pb: &str) -> Vec<GiftV2> {
 mod tests {
     use super::*;
     use crate::models::AddSubscription;
+    use std::io::Write;
+
+    #[test]
+    fn websocket_endpoints_prefer_443_and_deduplicate() {
+        let hosts = vec![
+            serde_json::json!({"host": "regional.example", "wss_port": 2245}),
+            serde_json::json!({"host": "regional.example", "wss_port": 2245}),
+            serde_json::json!({"host": "port443.example", "wss_port": 443}),
+        ];
+        assert_eq!(
+            websocket_endpoints(&hosts),
+            vec![
+                "wss://regional.example/sub",
+                "wss://regional.example:2245/sub",
+                "wss://port443.example/sub",
+                "wss://broadcastlv.chat.bilibili.com/sub",
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_peak_high_energy_from_online_rank_count() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "ONLINE_RANK_COUNT",
+                "data": {"online_count": 1234, "count": 1200}
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "ONLINE_RANK_COUNT",
+                "data": {"online_count": 1000, "count": 900}
+            }),
+        );
+        assert_eq!(stats.peak_high_energy, 1234);
+    }
+
+    #[test]
+    fn parses_brotli_live_packets() {
+        let message = serde_json::json!({
+            "cmd": "DANMU_MSG",
+            "info": [[], [], ["42"]]
+        });
+        let inner = make_packet(5, serde_json::to_vec(&message).expect("json"));
+        let mut compressed = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            writer.write_all(&inner).expect("compress");
+        }
+        let mut outer = make_packet(5, compressed);
+        outer[6..8].copy_from_slice(&3u16.to_be_bytes());
+        let mut stats = CollectorStats::default();
+        parse_live_packets(&mut stats, &outer, 0);
+        assert_eq!(stats.danmaku_count, 1);
+        assert!(stats.interactive_users.contains("42"));
+    }
 
     #[tokio::test]
     #[ignore = "requires a live Bilibili room and network"]

@@ -2120,6 +2120,15 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
   background: #fff4dc;
 }
 
+.live-data-quality.failed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.live-stats-error-note {
+  color: var(--danger);
+}
+
 .live-stat-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -3088,6 +3088,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "brotli",
  "chrono",
  "flate2",
  "futures-util",
@@ -3135,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "axum",

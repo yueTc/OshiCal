@@ -141,6 +141,11 @@ pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResu
         ),
         (
             "live_sessions",
+            "peak_high_energy",
+            "ALTER TABLE live_sessions ADD COLUMN peak_high_energy INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "live_sessions",
             "revision",
             "ALTER TABLE live_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
         ),
@@ -1439,7 +1444,7 @@ fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
 async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSession>> {
     let rows = sqlx::query_as::<_, LiveSessionRow>(
         "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                duration_seconds, peak_online, avg_online, online_samples, online_total,
+                duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
                 super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -1454,7 +1459,7 @@ async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSe
 async fn load_live_session_by_id(conn: &mut SqliteConnection, id: i64) -> AppResult<LiveSession> {
     let row = sqlx::query_as::<_, LiveSessionRow>(
         "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                duration_seconds, peak_online, avg_online, online_samples, online_total,
+                duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
                 super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2001,13 +2006,8 @@ mod tests {
             .expect("unchanged session");
         assert_eq!(store.latest_sync_seq().await.unwrap(), after_create);
 
-        store
-            .record_live_online(streamer.id, 321, started_at + Duration::seconds(30))
-            .await
-            .expect("online sample");
-        assert_eq!(store.latest_sync_seq().await.unwrap(), after_create);
-
         let stats = LiveSessionStats {
+            peak_high_energy: 555,
             danmaku_count: 88,
             interactive_user_count: 12,
             paid_user_count: 3,
@@ -2033,8 +2033,8 @@ mod tests {
             88
         );
         assert_eq!(
-            checkpoint.changes[0].payload.as_ref().unwrap()["peakOnline"],
-            321
+            checkpoint.changes[0].payload.as_ref().unwrap()["peakHighEnergy"],
+            555
         );
 
         let finished_stats = LiveSessionStats {

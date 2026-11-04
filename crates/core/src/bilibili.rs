@@ -249,21 +249,35 @@ impl BilibiliClient {
         params: BTreeMap<String, String>,
         referer: &str,
     ) -> AppResult<Value> {
-        let mixin = self.ensure_wbi().await?;
-        let cookie = self.cookie_header().await?;
-        let mut signed = params;
-        signed.insert("wts".to_owned(), Utc::now().timestamp().to_string());
-        let query = signed_query(&signed, &mixin);
-        let url = format!("{base_url}{path}?{query}");
-        let response = send_with_retry(|| {
-            self.http
-                .get(&url)
-                .header(ACCEPT, "application/json, text/plain, */*")
-                .header(REFERER, referer)
-                .header(COOKIE, cookie.clone())
+        for attempt in 0..2 {
+            let mixin = self.ensure_wbi().await?;
+            let cookie = self.cookie_header().await?;
+            let mut signed = params.clone();
+            signed.insert("wts".to_owned(), Utc::now().timestamp().to_string());
+            let query = signed_query(&signed, &mixin);
+            let url = format!("{base_url}{path}?{query}");
+            let response = send_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .header(ACCEPT, "application/json, text/plain, */*")
+                    .header(REFERER, referer)
+                    .header(COOKIE, cookie.clone())
+            })
+            .await?;
+            match self.response_json(response).await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt == 0 && should_refresh_bili_session(&error) => {
+                    *self.session.write().await = None;
+                    *self.wbi.write().await = None;
+                    tracing::debug!(%error, path, "B 站签名请求失败，刷新匿名会话后重试");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::External {
+            code: "BILI_RETRY".to_owned(),
+            message: "B 站签名请求重试后仍未成功".to_owned(),
         })
-        .await?;
-        self.response_json(response).await
     }
 
     pub async fn fetch_live_danmu_info(&self, room_id: &str) -> AppResult<Value> {
@@ -902,6 +916,13 @@ fn sanitize_wbi_value(value: &str) -> String {
         .collect()
 }
 
+fn should_refresh_bili_session(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::External { code, .. } if matches!(code.as_str(), "-352" | "-412" | "-101")
+    )
+}
+
 fn value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
@@ -1201,6 +1222,22 @@ mod tests {
             );
         }
         assert!(extract_search_mid("嘉然").is_none());
+    }
+
+    #[test]
+    fn refreshable_bili_session_errors_are_limited() {
+        for code in ["-352", "-412", "-101"] {
+            let error = AppError::External {
+                code: code.to_owned(),
+                message: "blocked".to_owned(),
+            };
+            assert!(should_refresh_bili_session(&error));
+        }
+        let ordinary = AppError::External {
+            code: "-400".to_owned(),
+            message: "bad request".to_owned(),
+        };
+        assert!(!should_refresh_bili_session(&ordinary));
     }
 
     #[test]

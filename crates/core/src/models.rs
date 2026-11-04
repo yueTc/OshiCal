@@ -378,6 +378,8 @@ pub struct LiveSession {
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_seconds: i64,
     pub peak_online: u64,
+    #[serde(default)]
+    pub peak_high_energy: u64,
     pub avg_online: u64,
     pub online_samples: i64,
     pub online_total: i64,
@@ -402,6 +404,7 @@ pub struct LiveSession {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSessionStats {
+    pub peak_high_energy: i64,
     pub revenue_cents: i64,
     pub gift_revenue_cents: i64,
     pub super_chat_revenue_cents: i64,

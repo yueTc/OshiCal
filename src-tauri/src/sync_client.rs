@@ -1067,18 +1067,19 @@ async fn apply_live_session(
         .map_err(|error| format!("live_session payload 无效: {error}"))?;
     sqlx::query(
         "INSERT INTO live_sessions(id, streamer_id, streamer_name, room_id, title, cover_url,
-            started_at, ended_at, duration_seconds, peak_online, avg_online, online_samples,
-            online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
+            started_at, ended_at, duration_seconds, peak_online, peak_high_energy, avg_online,
+            online_samples, online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
             guard_revenue_cents, paid_user_count, interactive_user_count, danmaku_count,
             gift_count, super_chat_count, guard_count, reconnect_count, data_quality,
             collector_state, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id, streamer_name = excluded.streamer_name,
             room_id = excluded.room_id, title = excluded.title,
             cover_url = excluded.cover_url, started_at = excluded.started_at,
             ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds,
-            peak_online = excluded.peak_online, avg_online = excluded.avg_online,
+            peak_online = excluded.peak_online,
+            peak_high_energy = excluded.peak_high_energy, avg_online = excluded.avg_online,
             online_samples = excluded.online_samples, online_total = excluded.online_total,
             revenue_cents = excluded.revenue_cents,
             gift_revenue_cents = excluded.gift_revenue_cents,
@@ -1103,6 +1104,7 @@ async fn apply_live_session(
     .bind(value.ended_at.map(|time| time.to_rfc3339()))
     .bind(value.duration_seconds)
     .bind(value.peak_online as i64)
+    .bind(value.peak_high_energy as i64)
     .bind(value.avg_online as i64)
     .bind(value.online_samples)
     .bind(value.online_total)

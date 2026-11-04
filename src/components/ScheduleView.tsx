@@ -59,9 +59,19 @@ function formatLiveTime(value: string): string {
   });
 }
 
-function liveQualityLabel(quality: string): string {
-  if (quality === "complete") return "数据完整";
-  if (quality === "partial") return "部分缺失";
+function liveCollectionFailed(session: LiveSession): boolean {
+  return session.reconnectCount > 0
+    && session.peakHighEnergy === 0
+    && session.danmakuCount === 0
+    && session.giftCount === 0
+    && session.superChatCount === 0
+    && session.guardCount === 0;
+}
+
+function liveQualityLabel(session: LiveSession): string {
+  if (liveCollectionFailed(session)) return "采集失败";
+  if (session.dataQuality === "complete") return "数据完整";
+  if (session.dataQuality === "partial") return "部分缺失";
   return "采集中";
 }
 type ViewMode = "timeline" | "grid";
@@ -710,6 +720,7 @@ export default function ScheduleView({
   const rangeText = rangeDays.length === 1
     ? `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日`
     : `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日 - ${rangeDays[rangeDays.length - 1].getMonth() + 1}月${rangeDays[rangeDays.length - 1].getDate()}日`;
+  const liveEventsUnavailable = liveModal?.session ? liveCollectionFailed(liveModal.session) : false;
 
   return (
     <section ref={pageRef} className="page schedule-page" aria-label="直播日程">
@@ -928,26 +939,32 @@ export default function ScheduleView({
                     {liveModal.session.endedAt ? ` - ${formatLiveTime(liveModal.session.endedAt)}` : " · 直播中"}
                   </span>
                 </div>
-                <em className={`live-data-quality ${liveModal.session.dataQuality}`}>
-                  {liveQualityLabel(liveModal.session.dataQuality)}
+                <em className={`live-data-quality ${liveEventsUnavailable ? "failed" : liveModal.session.dataQuality}`}>
+                  {liveQualityLabel(liveModal.session)}
                 </em>
               </div>
               <div className="live-stat-grid">
                 <div><span>时长</span><strong>{formatLiveDuration(liveModal.session.durationSeconds)}</strong></div>
-                <div><span>营收(估)</span><strong>{formatMoney(liveModal.session.revenueCents)}</strong></div>
-                <div><span>付费人数(估)</span><strong>{formatCount(liveModal.session.paidUserCount)}</strong></div>
-                <div><span>峰值人气</span><strong>{formatCount(liveModal.session.peakOnline)}</strong></div>
-                <div><span>互动人数(估)</span><strong>{formatCount(liveModal.session.interactiveUserCount)}</strong></div>
-                <div><span>弹幕</span><strong>{formatCount(liveModal.session.danmakuCount)}</strong></div>
+                <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(liveModal.session.revenueCents)}</strong></div>
+                <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.paidUserCount)}</strong></div>
+                <div><span>最高同时在线</span><strong>{liveModal.session.peakHighEnergy > 0 ? formatCount(liveModal.session.peakHighEnergy) : "—"}</strong></div>
+                <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.interactiveUserCount)}</strong></div>
+                <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.danmakuCount)}</strong></div>
               </div>
               <div className="live-revenue-breakdown">
-                <span>礼物 {formatMoney(liveModal.session.giftRevenueCents)}</span>
-                <span>SC {formatMoney(liveModal.session.superChatRevenueCents)}</span>
-                <span>舰长 {formatMoney(liveModal.session.guardRevenueCents)}</span>
+                <span>礼物 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.giftRevenueCents)}</span>
+                <span>SC {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.superChatRevenueCents)}</span>
+                <span>舰长 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.guardRevenueCents)}</span>
               </div>
-              <p className="form-hint">
-                营收与付费人数由公开直播事件估算，不含平台分成和活动特殊规则；粉丝侧无法获取官方“高能”指标，因此展示峰值人气。
-              </p>
+              {liveEventsUnavailable ? (
+                <p className="form-hint live-stats-error-note">
+                  本次未能建立 B 站弹幕采集连接（重试 {formatCount(liveModal.session.reconnectCount)} 次），事件类指标不可用；时长仍来自直播状态轮询。
+                </p>
+              ) : (
+                <p className="form-hint">
+                  最高同时在线来自公开“高能用户数”事件。营收与付费人数由公开直播事件估算，不含平台分成和活动特殊规则。
+                </p>
+              )}
             </div>
           ) : (
             <EmptyState
