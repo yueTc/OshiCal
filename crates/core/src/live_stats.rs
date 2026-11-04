@@ -234,7 +234,6 @@ async fn collect_once(
                 continue;
             }
         };
-        stats.connection_established = true;
         let (mut writer, mut reader) = socket.split();
         let auth = serde_json::json!({
             "uid": 0,
@@ -389,7 +388,15 @@ fn parse_live_packets(stats: &mut CollectorStats, bytes: &[u8], depth: usize) {
             return;
         }
         let body = &bytes[offset + header_len..offset + packet_len];
-        if operation == 5 {
+        if operation == 8 {
+            if serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|value| value.get("code").and_then(Value::as_i64))
+                == Some(0)
+            {
+                stats.connection_established = true;
+            }
+        } else if operation == 5 {
             match version {
                 2 => {
                     let decoder = ZlibDecoder::new(body);
@@ -736,6 +743,14 @@ mod tests {
             }),
         );
         assert_eq!(stats.peak_high_energy, 1234);
+    }
+
+    #[test]
+    fn successful_auth_response_marks_connection_established() {
+        let packet = make_packet(8, br#"{"code":0}"#.to_vec());
+        let mut stats = CollectorStats::default();
+        parse_live_packets(&mut stats, &packet, 0);
+        assert!(stats.connection_established);
     }
 
     #[test]

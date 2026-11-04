@@ -285,39 +285,39 @@ impl BilibiliClient {
             return Err(AppError::validation("直播间号必须是数字"));
         }
         let referer = format!("https://live.bilibili.com/{room_id}");
+        let legacy_params = BTreeMap::from([
+            ("room_id".to_owned(), room_id.to_owned()),
+            ("platform".to_owned(), "pc".to_owned()),
+            ("player".to_owned(), "web".to_owned()),
+        ]);
+        let legacy_query = {
+            let mut serializer = Serializer::new(String::new());
+            for (key, value) in legacy_params {
+                serializer.append_pair(&key, &value);
+            }
+            serializer.finish()
+        };
+        let legacy_url =
+            format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{legacy_query}");
+        match self.get_public(&legacy_url, &referer).await {
+            Ok(value) if danmu_info_has_token(&value) => {
+                return Ok(normalize_danmu_info(value));
+            }
+            Ok(_) => tracing::warn!(%room_id, "旧版弹幕接口未返回 token，尝试 WBI 接口"),
+            Err(error) => tracing::warn!(%room_id, %error, "旧版弹幕接口失败，尝试 WBI 接口"),
+        }
+
         let mut params = BTreeMap::new();
         params.insert("id".to_owned(), room_id.to_owned());
         params.insert("type".to_owned(), "0".to_owned());
-        match self
+        let value = self
             .get_signed_host(
                 "https://api.live.bilibili.com",
                 "/xlive/web-room/v1/index/getDanmuInfo",
                 params,
                 &referer,
             )
-            .await
-        {
-            Ok(value) if danmu_info_has_token(&value) => {
-                return Ok(normalize_danmu_info(value));
-            }
-            Ok(_) => tracing::warn!(%room_id, "WBI 弹幕接口未返回 token，尝试旧版接口"),
-            Err(error) => tracing::warn!(%room_id, %error, "WBI 弹幕接口失败，尝试旧版接口"),
-        }
-
-        let params = BTreeMap::from([
-            ("room_id".to_owned(), room_id.to_owned()),
-            ("platform".to_owned(), "pc".to_owned()),
-            ("player".to_owned(), "web".to_owned()),
-        ]);
-        let query = {
-            let mut serializer = Serializer::new(String::new());
-            for (key, value) in params {
-                serializer.append_pair(&key, &value);
-            }
-            serializer.finish()
-        };
-        let url = format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{query}");
-        let value = self.get_public(&url, &referer).await?;
+            .await?;
         if !danmu_info_has_token(&value) {
             return Err(AppError::External {
                 code: "BILI_DANMU".to_owned(),
