@@ -28,4 +28,12 @@ $env:CARGO_TARGET_DIR
 $env:TEMP
 ```
 
+## 服务端正式构建位置
+
+- 服务端正式镜像必须由 GitHub Actions 工作流 `.github/workflows/server-image.yml` 构建，运行环境为 `ubuntu-latest`，不得把本地构建产物当作正式发布镜像。
+- 发布标签格式为 `server-v<版本号>`；工作流负责构建 Docker 多阶段镜像并推送到 GHCR：`ghcr.io/<owner>/oshical-server:<版本号>`。
+- 生产服务器只负责拉取并运行 GHCR 中的预构建镜像，不在 VPS 上编译服务端，也不在 VPS 上构建 Web 前端。
+- 本地可以执行服务端检查和测试，但按“本地编译位置”规则必须在 D 盘工作树进行；本地 Docker 构建仅用于排障，不得用于正式发布。
+- 修改 Dockerfile、服务端 Rust 代码或服务端所携带的 Web 前端后，必须通过新的 `server-v<版本号>` 标签重新构建镜像。
+
 GitHub Actions 的托管运行器不受本机目录规则限制；此规范针对本地开发、测试和打包。
