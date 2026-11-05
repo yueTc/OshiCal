@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,18 +9,24 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
+#[cfg(target_os = "linux")]
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
+#[cfg(target_os = "linux")]
+use tokio_openssl::SslStream;
+#[cfg(target_os = "linux")]
+use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{
-    client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::WebSocketStream;
+#[cfg(not(target_os = "linux"))]
+use tokio_tungstenite::{client_async_tls_with_config, connect_async, MaybeTlsStream};
 
 use crate::bilibili::BilibiliClient;
 use crate::error::{AppError, AppResult};
@@ -329,10 +337,9 @@ async fn collect_once(
     CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
 }
 
-async fn connect_live_socket(
+fn live_socket_request(
     url: &str,
-    proxy: Option<&str>,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
     let mut request = url
         .into_client_request()
         .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
@@ -343,14 +350,21 @@ async fn connect_live_socket(
     request
         .headers_mut()
         .insert(USER_AGENT, HeaderValue::from_static(LIVE_WS_USER_AGENT));
+    Ok(request)
+}
 
-    let Some(proxy) = proxy else {
-        return connect_async(request)
-            .await
-            .map(|(socket, _)| socket)
-            .map_err(|error| error.to_string());
-    };
+fn websocket_target(url: &str) -> Result<(String, u16), String> {
+    let target =
+        url::Url::parse(url).map_err(|error| format!("弹幕服务器地址无效（{url}）: {error}"))?;
+    let host = target
+        .host_str()
+        .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?
+        .to_owned();
+    let port = target.port_or_known_default().unwrap_or(443);
+    Ok((host, port))
+}
 
+async fn connect_proxy_tunnel(url: &str, proxy: &str) -> Result<TcpStream, String> {
     let proxy_url =
         url::Url::parse(proxy).map_err(|error| format!("弹幕代理地址无效（{proxy}）: {error}"))?;
     if proxy_url.scheme() != "http" {
@@ -363,12 +377,7 @@ async fn connect_live_socket(
         .host_str()
         .ok_or_else(|| "弹幕代理地址缺少主机名".to_owned())?;
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(8080);
-    let target_url =
-        url::Url::parse(url).map_err(|error| format!("弹幕服务器地址无效（{url}）: {error}"))?;
-    let target_host = target_url
-        .host_str()
-        .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?;
-    let target_port = target_url.port_or_known_default().unwrap_or(443);
+    let (target_host, target_port) = websocket_target(url)?;
 
     let mut stream = TcpStream::connect((proxy_host, proxy_port))
         .await
@@ -411,11 +420,67 @@ async fn connect_live_socket(
     if status != "200" {
         return Err(format!("弹幕代理 CONNECT 被拒绝: {status_line}"));
     }
+    Ok(stream)
+}
 
-    client_async_tls_with_config(request, stream, None, None)
+#[cfg(target_os = "linux")]
+async fn connect_live_socket(
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<WebSocketStream<SslStream<TcpStream>>, String> {
+    let request = live_socket_request(url)?;
+    let (target_host, target_port) = websocket_target(url)?;
+    let tcp = match proxy {
+        Some(proxy) => connect_proxy_tunnel(url, proxy).await?,
+        None => TcpStream::connect((target_host.as_str(), target_port))
+            .await
+            .map_err(|error| format!("连接弹幕服务器 {target_host}:{target_port} 失败: {error}"))?,
+    };
+
+    // Use OpenSSL's TLS client profile. On Linux this produces the
+    // browser-compatible ClientHello expected by Bilibili's live gateway.
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|error| format!("创建弹幕 TLS 客户端失败: {error}"))?;
+    builder.set_verify(SslVerifyMode::PEER);
+    builder
+        .set_default_verify_paths()
+        .map_err(|error| format!("加载弹幕 TLS 根证书失败: {error}"))?;
+    let ssl = builder
+        .build()
+        .configure()
+        .map_err(|error| format!("配置弹幕 TLS 会话失败: {error}"))?
+        .into_ssl(&target_host)
+        .map_err(|error| format!("设置弹幕 TLS 主机名失败: {error}"))?;
+    let mut stream =
+        SslStream::new(ssl, tcp).map_err(|error| format!("创建弹幕 TLS 连接失败: {error}"))?;
+    Pin::new(&mut stream)
+        .connect()
+        .await
+        .map_err(|error| format!("建立弹幕 TLS 连接失败: {error}"))?;
+
+    client_async(request, stream)
         .await
         .map(|(socket, _)| socket)
-        .map_err(|error| format!("经代理建立弹幕 TLS/WebSocket 失败: {error}"))
+        .map_err(|error| format!("建立弹幕 WebSocket 连接失败: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn connect_live_socket(
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
+    let request = live_socket_request(url)?;
+    if let Some(proxy) = proxy {
+        let stream = connect_proxy_tunnel(url, proxy).await?;
+        return client_async_tls_with_config(request, stream, None, None)
+            .await
+            .map(|(socket, _)| socket)
+            .map_err(|error| format!("经代理建立弹幕 TLS/WebSocket 失败: {error}"));
+    }
+    connect_async(request)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|error| error.to_string())
 }
 
 fn websocket_endpoints(hosts: &[Value]) -> Vec<String> {

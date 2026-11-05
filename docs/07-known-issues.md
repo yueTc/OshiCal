@@ -141,6 +141,7 @@
 - “最高同时在线”取公开 `ONLINE_RANK_COUNT.online_count` 事件的峰值，与主播后台官方“高能”统计可能存在口径差异。直播间人气/热度不再采集或展示。
 - 弹幕配置优先使用旧版 `room/v1/Danmu/getConf`，失败时回退 WBI 接口，避免服务器 IP 触发 `-352` 后整场无数据。WebSocket 退避只在认证成功后重置，防止风控期间高频重连。
 - 弹幕 WebSocket 与普通 HTTP 请求复用同一代理配置：显式代理端口优先，其次读取 `HTTPS_PROXY`/`ALL_PROXY`；当前仅支持 HTTP CONNECT 代理。仅放行 HTTP API、未放行 WebSocket 的出网环境仍会表现为事件类指标采集失败。
+- Linux 服务端的弹幕 WebSocket 使用 OpenSSL `tls_client` 配置，避免数据中心出口的 TLS 客户端指纹被 B 站弹幕网关重置；Windows 客户端继续使用 rustls。
 - 原始弹幕、礼物和 SC 事件只在内存聚合，不写入数据库；应用崩溃或断网期间的事件无法补回。
 - 跨应用重启时，付费用户和互动用户集合不持久化，唯一人数可能与整场真实值有少量偏差。
 - `SEND_GIFT_V2`、盲盒活动和舰长价格仍需更多真实样本校验。
