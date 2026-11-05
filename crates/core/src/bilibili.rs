@@ -79,6 +79,7 @@ pub struct BilibiliClient {
     user_cookie: RwLock<Option<String>>,
     session: RwLock<Option<SessionCookies>>,
     wbi: RwLock<Option<WbiKeys>>,
+    websocket_proxy: Option<String>,
 }
 
 impl BilibiliClient {
@@ -87,6 +88,7 @@ impl BilibiliClient {
     }
 
     pub fn new_with_proxy(user_cookie: Option<String>, proxy_port: Option<u16>) -> AppResult<Self> {
+        let websocket_proxy = crate::network::websocket_proxy_url(proxy_port);
         let http = crate::network::client_builder(proxy_port)?
             .timeout(Duration::from_secs(25))
             .connect_timeout(Duration::from_secs(10))
@@ -100,7 +102,12 @@ impl BilibiliClient {
             user_cookie: RwLock::new(user_cookie),
             session: RwLock::new(None),
             wbi: RwLock::new(None),
+            websocket_proxy,
         })
+    }
+
+    pub fn websocket_proxy(&self) -> Option<&str> {
+        self.websocket_proxy.as_deref()
     }
 
     pub async fn set_cookie(&self, user_cookie: Option<String>) {

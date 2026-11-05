@@ -8,10 +8,17 @@ use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{
+    client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::bilibili::BilibiliClient;
 use crate::error::{AppError, AppResult};
@@ -24,6 +31,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024;
+const LIVE_WS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 #[derive(Clone, Default)]
 pub struct LiveStatsManager {
@@ -209,6 +218,7 @@ async fn collect_once(
     stats: &mut CollectorStats,
     stop_rx: &mut oneshot::Receiver<DateTime<Utc>>,
 ) -> CollectResult {
+    let websocket_proxy = bili.websocket_proxy().map(ToOwned::to_owned);
     let info = match bili.fetch_live_danmu_info(&session.room_id).await {
         Ok(value) => value,
         Err(error) => return CollectResult::Disconnected(error.to_string()),
@@ -223,8 +233,13 @@ async fn collect_once(
     };
 
     for url in websocket_endpoints(hosts) {
-        let socket = match timeout(Duration::from_secs(12), connect_async(&url)).await {
-            Ok(Ok((socket, _))) => socket,
+        let socket = match timeout(
+            Duration::from_secs(12),
+            connect_live_socket(&url, websocket_proxy.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => socket,
             Ok(Err(error)) => {
                 tracing::debug!(%error, %url, "直播弹幕连接失败");
                 continue;
@@ -312,6 +327,95 @@ async fn collect_once(
         }
     }
     CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
+}
+
+async fn connect_live_socket(
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
+    request.headers_mut().insert(
+        ORIGIN,
+        HeaderValue::from_static("https://live.bilibili.com"),
+    );
+    request
+        .headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(LIVE_WS_USER_AGENT));
+
+    let Some(proxy) = proxy else {
+        return connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
+            .map_err(|error| error.to_string());
+    };
+
+    let proxy_url =
+        url::Url::parse(proxy).map_err(|error| format!("弹幕代理地址无效（{proxy}）: {error}"))?;
+    if proxy_url.scheme() != "http" {
+        return Err(format!(
+            "弹幕 WebSocket 当前仅支持 HTTP CONNECT 代理，收到 {}",
+            proxy_url.scheme()
+        ));
+    }
+    let proxy_host = proxy_url
+        .host_str()
+        .ok_or_else(|| "弹幕代理地址缺少主机名".to_owned())?;
+    let proxy_port = proxy_url.port_or_known_default().unwrap_or(8080);
+    let target_url =
+        url::Url::parse(url).map_err(|error| format!("弹幕服务器地址无效（{url}）: {error}"))?;
+    let target_host = target_url
+        .host_str()
+        .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?;
+    let target_port = target_url.port_or_known_default().unwrap_or(443);
+
+    let mut stream = TcpStream::connect((proxy_host, proxy_port))
+        .await
+        .map_err(|error| format!("连接弹幕代理 {proxy_host}:{proxy_port} 失败: {error}"))?;
+    let mut connect_request = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n"
+    );
+    if !proxy_url.username().is_empty() {
+        let password = proxy_url.password().unwrap_or_default();
+        let credential = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{password}", proxy_url.username()));
+        connect_request.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
+    }
+    connect_request.push_str("\r\n");
+    stream
+        .write_all(connect_request.as_bytes())
+        .await
+        .map_err(|error| format!("发送弹幕代理 CONNECT 请求失败: {error}"))?;
+
+    let mut response = Vec::new();
+    loop {
+        let byte = stream
+            .read_u8()
+            .await
+            .map_err(|error| format!("读取弹幕代理 CONNECT 响应失败: {error}"))?;
+        response.push(byte);
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if response.len() >= MAX_PROXY_RESPONSE_BYTES {
+            return Err("弹幕代理 CONNECT 响应头过大".to_owned());
+        }
+    }
+    let status_line = String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let status = status_line.split_whitespace().nth(1).unwrap_or_default();
+    if status != "200" {
+        return Err(format!("弹幕代理 CONNECT 被拒绝: {status_line}"));
+    }
+
+    client_async_tls_with_config(request, stream, None, None)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|error| format!("经代理建立弹幕 TLS/WebSocket 失败: {error}"))
 }
 
 fn websocket_endpoints(hosts: &[Value]) -> Vec<String> {
@@ -805,13 +909,17 @@ mod tests {
             )
             .await
             .expect("session");
-        let bili = Arc::new(BilibiliClient::new(None).expect("bili"));
+        let proxy_port = std::env::var("OSHICAL_LIVE_SMOKE_PROXY")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let bili = Arc::new(BilibiliClient::new_with_proxy(None, proxy_port).expect("bili"));
         let manager = LiveStatsManager::default();
         manager.start(store.clone(), bili, session.clone()).await;
         tokio::time::sleep(Duration::from_secs(15)).await;
         manager.stop(streamer.id, Utc::now()).await;
         let saved = store.get_live_session(session.id).await.expect("saved");
         assert_eq!(saved.collector_state, "finished");
+        assert_eq!(saved.reconnect_count, 0, "弹幕连接未成功建立");
         assert!(saved.danmaku_count >= 0);
     }
 }

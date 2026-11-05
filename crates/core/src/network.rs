@@ -37,6 +37,22 @@ pub fn proxy_url(proxy_port: u16) -> String {
     format!("http://{PROXY_HOST}:{proxy_port}")
 }
 
+/// Returns the proxy that should also be used for long-lived WebSocket traffic.
+///
+/// Reqwest honors system proxy environment variables automatically, while
+/// tokio-tungstenite does not. Keeping the selection here makes the live
+/// collector and the regular Bilibili HTTP client use the same route.
+pub fn websocket_proxy_url(proxy_port: Option<u16>) -> Option<String> {
+    if let Some(port) = proxy_port {
+        return Some(proxy_url(port));
+    }
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn client_builder(proxy_port: Option<u16>) -> AppResult<ClientBuilder> {
     validate_proxy_port(proxy_port)?;
     let builder = Client::builder();
@@ -98,6 +114,14 @@ mod tests {
         assert!(validate_proxy_port(Some(0)).is_err());
         assert!(validate_proxy_port(None).is_ok());
         assert!(validate_proxy_port(Some(7890)).is_ok());
+    }
+
+    #[test]
+    fn websocket_proxy_prefers_explicit_port() {
+        assert_eq!(
+            websocket_proxy_url(Some(7890)).as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
     }
 
     #[tokio::test]

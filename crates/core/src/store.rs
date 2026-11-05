@@ -2967,6 +2967,16 @@ impl SqliteStore {
 }
 
 fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
+    let started_at = parse_ts(&row.started_at)?;
+    let ended_at = parse_opt_ts(row.ended_at.as_deref())?;
+    let duration_seconds = if ended_at.is_none() {
+        Utc::now()
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .max(0)
+    } else {
+        row.duration_seconds
+    };
     Ok(LiveSession {
         id: row.id,
         streamer_id: row.streamer_id,
@@ -2974,9 +2984,9 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         room_id: row.room_id,
         title: row.title,
         cover_url: row.cover_url,
-        started_at: parse_ts(&row.started_at)?,
-        ended_at: parse_opt_ts(row.ended_at.as_deref())?,
-        duration_seconds: row.duration_seconds,
+        started_at,
+        ended_at,
+        duration_seconds,
         peak_online: row.peak_online.max(0) as u64,
         peak_high_energy: row.peak_high_energy.max(0) as u64,
         avg_online: row.avg_online.max(0) as u64,
@@ -3613,7 +3623,7 @@ mod tests {
             .add_subscription(&add_input("200", "乃琳"))
             .await
             .expect("streamer");
-        let start = Utc::now();
+        let start = Utc::now() - Duration::minutes(5);
         let session = store
             .ensure_live_session(
                 streamer.id,
@@ -3622,10 +3632,13 @@ mod tests {
                 "测试直播",
                 None,
                 start,
-                start,
+                Utc::now(),
             )
             .await
             .expect("session");
+        let active = store.get_live_session(session.id).await.expect("active");
+        assert!(active.ended_at.is_none());
+        assert!(active.duration_seconds >= 299);
         let stats = LiveSessionStats {
             peak_high_energy: 987,
             danmaku_count: 25_000,
