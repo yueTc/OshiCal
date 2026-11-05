@@ -568,8 +568,8 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
         }
         "DANMU_MSG" => {
             stats.danmaku_count += 1;
-            if let Some(uid) = value.pointer("/info/2/0").and_then(value_to_string) {
-                stats.interactive_users.insert(uid);
+            if let Some(user_key) = danmaku_user_key(value) {
+                stats.interactive_users.insert(user_key);
             }
         }
         "SEND_GIFT" => {
@@ -612,8 +612,14 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
             }
         }
         "SUPER_CHAT_MESSAGE" => {
+            let uid = data.get("uid").and_then(normalized_uid_key);
+            if !stats
+                .dedup
+                .insert(super_chat_event_key(data, uid.as_deref()))
+            {
+                return;
+            }
             stats.super_chat_count += 1;
-            let uid = data.get("uid").and_then(value_to_string);
             if let Some(uid) = uid.as_ref() {
                 stats.interactive_users.insert(uid.clone());
             }
@@ -628,8 +634,11 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
             }
         }
         "GUARD_BUY" => {
+            let uid = data.get("uid").and_then(normalized_uid_key);
+            if !stats.dedup.insert(guard_event_key(data, uid.as_deref())) {
+                return;
+            }
             stats.guard_count += 1;
-            let uid = data.get("uid").and_then(value_to_string);
             if let Some(uid) = uid.as_ref() {
                 stats.interactive_users.insert(uid.clone());
             }
@@ -659,7 +668,7 @@ fn add_gift(
     tid: &str,
     timestamp: i64,
 ) {
-    let Some(uid) = uid else {
+    let Some(uid) = uid.and_then(|value| normalized_uid_value(&value)) else {
         return;
     };
     stats.interactive_users.insert(uid.clone());
@@ -670,7 +679,7 @@ fn add_gift(
     };
     let cents = if coin_type == "silver" { 0 } else { coins / 10 };
     let key = if tid.is_empty() {
-        format!("{uid}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
+        format!("gift:{uid}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
     } else {
         format!("gift:{tid}")
     };
@@ -679,6 +688,78 @@ fn add_gift(
         stats.gift_revenue_cents += cents;
         stats.paid_users.insert(uid);
     }
+}
+
+fn danmaku_user_key(value: &Value) -> Option<String> {
+    value
+        .pointer("/info/2/0")
+        .and_then(normalized_uid_key)
+        .or_else(|| value.pointer("/data/uid").and_then(normalized_uid_key))
+        .or_else(|| {
+            let name = value.pointer("/info/2/1").and_then(value_to_string)?;
+            let name = name.trim();
+            if name.is_empty() || name == "0" {
+                None
+            } else {
+                Some(format!("name:{name}"))
+            }
+        })
+}
+
+fn normalized_uid_key(value: &Value) -> Option<String> {
+    let uid = value_to_string(value)?;
+    normalized_uid_value(&uid)
+}
+
+fn normalized_uid_value(uid: &str) -> Option<String> {
+    let uid = uid.trim();
+    if uid.is_empty() || uid == "0" {
+        None
+    } else {
+        Some(uid.to_owned())
+    }
+}
+
+fn super_chat_event_key(data: &Value, uid: Option<&str>) -> String {
+    if let Some(id) = data.get("id").and_then(value_to_string) {
+        return format!("sc:{id}");
+    }
+    let price = data
+        .get("price")
+        .and_then(value_to_string)
+        .unwrap_or_default();
+    let time = data
+        .get("time")
+        .and_then(value_to_string)
+        .unwrap_or_default();
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("sc:{}:{price}:{time}:{message}", uid.unwrap_or_default())
+}
+
+fn guard_event_key(data: &Value, uid: Option<&str>) -> String {
+    if let Some(id) = data.get("id").and_then(value_to_string) {
+        return format!("guard:{id}");
+    }
+    let level = data
+        .get("guard_level")
+        .and_then(value_to_string)
+        .unwrap_or_default();
+    let started_at = data
+        .get("start_time")
+        .or_else(|| data.get("timestamp"))
+        .and_then(value_to_string)
+        .unwrap_or_default();
+    let price = data
+        .get("price")
+        .and_then(value_to_string)
+        .unwrap_or_default();
+    format!(
+        "guard:{}:{level}:{started_at}:{price}",
+        uid.unwrap_or_default()
+    )
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -886,6 +967,88 @@ mod tests {
         parse_live_packets(&mut stats, &outer, 0);
         assert_eq!(stats.danmaku_count, 1);
         assert!(stats.interactive_users.contains("42"));
+    }
+
+    #[test]
+    fn danmaku_users_are_independent_from_paid_users() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "DANMU_MSG",
+                "info": [[], "hello", ["42", "viewer"]]
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "uid": 99,
+                    "giftId": 1,
+                    "giftName": "gift",
+                    "num": 1,
+                    "price": 1000,
+                    "total_coin": 1000,
+                    "coin_type": "gold",
+                    "tid": "gift-1",
+                    "timestamp": 1
+                }
+            }),
+        );
+
+        assert_eq!(stats.interactive_users.len(), 2);
+        assert_eq!(stats.paid_users.len(), 1);
+        assert!(stats.interactive_users.contains("42"));
+        assert!(stats.interactive_users.contains("99"));
+        assert!(stats.paid_users.contains("99"));
+    }
+
+    #[test]
+    fn danmaku_falls_back_to_username_when_uid_is_missing() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "DANMU_MSG",
+                "info": [[], "hello", [0, "viewer"]]
+            }),
+        );
+
+        assert_eq!(stats.danmaku_count, 1);
+        assert!(stats.interactive_users.contains("name:viewer"));
+    }
+
+    #[test]
+    fn duplicate_super_chat_and_guard_events_do_not_inflate_revenue() {
+        let mut stats = CollectorStats::default();
+        let super_chat = serde_json::json!({
+            "cmd": "SUPER_CHAT_MESSAGE",
+            "data": {"id": 10, "uid": 7, "price": 30}
+        });
+        parse_live_message(&mut stats, &super_chat);
+        parse_live_message(&mut stats, &super_chat);
+
+        let guard = serde_json::json!({
+            "cmd": "GUARD_BUY",
+            "data": {
+                "id": 20,
+                "uid": 8,
+                "guard_level": 3,
+                "start_time": 100,
+                "price": 198000
+            }
+        });
+        parse_live_message(&mut stats, &guard);
+        parse_live_message(&mut stats, &guard);
+
+        assert_eq!(stats.super_chat_count, 1);
+        assert_eq!(stats.guard_count, 1);
+        assert_eq!(stats.super_chat_revenue_cents, 3000);
+        assert_eq!(stats.guard_revenue_cents, 19800);
+        assert_eq!(stats.revenue_cents, 22800);
+        assert_eq!(stats.interactive_users.len(), 2);
+        assert_eq!(stats.paid_users.len(), 2);
     }
 
     #[tokio::test]
