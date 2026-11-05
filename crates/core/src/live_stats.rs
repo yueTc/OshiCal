@@ -229,7 +229,9 @@ async fn collect_once(
         None => return CollectResult::Disconnected("弹幕服务器列表为空".to_owned()),
     };
 
-    for url in websocket_endpoints(hosts) {
+    let mut last_error = None;
+    'endpoints: for url in websocket_endpoints(hosts) {
+        stats.connection_established = false;
         let socket = match timeout(
             Duration::from_secs(12),
             connect_live_socket(&url, websocket_proxy.as_deref()),
@@ -238,10 +240,12 @@ async fn collect_once(
         {
             Ok(Ok(socket)) => socket,
             Ok(Err(error)) => {
+                last_error = Some(error.to_string());
                 tracing::debug!(%error, %url, "直播弹幕连接失败");
                 continue;
             }
             Err(_) => {
+                last_error = Some("直播弹幕连接超时".to_owned());
                 tracing::debug!(%url, "直播弹幕连接超时");
                 continue;
             }
@@ -265,7 +269,9 @@ async fn collect_once(
             ))
             .await
         {
-            return CollectResult::Disconnected(error.to_string());
+            last_error = Some(error.to_string());
+            tracing::warn!(%url, %error, "发送直播弹幕认证失败，尝试下一个服务器");
+            continue 'endpoints;
         }
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
@@ -286,7 +292,9 @@ async fn collect_once(
                 }
                 _ = heartbeat.tick() => {
                     if let Err(error) = socket.send(Message::Binary(make_packet(2, Vec::new()).into())).await {
-                        return CollectResult::Disconnected(error.to_string());
+                        last_error = Some(error.to_string());
+                        tracing::warn!(%url, %error, "发送直播弹幕心跳失败，尝试下一个服务器");
+                        continue 'endpoints;
                     }
                 }
                 _ = checkpoint.tick() => {
@@ -310,7 +318,9 @@ async fn collect_once(
                                     .send(Message::Binary(make_packet(2, Vec::new()).into()))
                                     .await
                                 {
-                                    return CollectResult::Disconnected(error.to_string());
+                                    last_error = Some(error.to_string());
+                                    tracing::warn!(%url, %error, "发送直播弹幕心跳失败，尝试下一个服务器");
+                                    continue 'endpoints;
                                 }
                             }
                         }
@@ -325,10 +335,14 @@ async fn collect_once(
                             let _ = socket.send(Message::Pong(payload)).await;
                         }
                         Some(Ok(Message::Close(_))) | None => {
-                            return CollectResult::Disconnected("直播弹幕连接关闭".to_owned());
+                            last_error = Some("直播弹幕连接关闭".to_owned());
+                            tracing::warn!(%url, "直播弹幕连接关闭，尝试下一个服务器");
+                            continue 'endpoints;
                         }
                         Some(Err(error)) => {
-                            return CollectResult::Disconnected(error.to_string());
+                            last_error = Some(error.to_string());
+                            tracing::warn!(%url, %error, "直播弹幕连接中断，尝试下一个服务器");
+                            continue 'endpoints;
                         }
                         _ => {}
                     }
@@ -336,7 +350,7 @@ async fn collect_once(
             }
         }
     }
-    CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
+    CollectResult::Disconnected(last_error.unwrap_or_else(|| "所有弹幕服务器均连接失败".to_owned()))
 }
 
 fn websocket_target(url: &str) -> Result<(String, u16), String> {
