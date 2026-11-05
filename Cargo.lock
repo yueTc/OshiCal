@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-core"
-version = "0.1.8"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-desktop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "chrono",
  "futures-util",

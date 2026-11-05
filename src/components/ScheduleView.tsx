@@ -82,20 +82,20 @@ const GRID_WINDOW_BEFORE = 14;
 const GRID_WINDOW_DAYS = 35;
 const GRID_GAP = 10;
 const GRID_DAY_COUNT_MAX = 7;
-const GRID_DAY_COUNT_KEY = "oshical.gridDayCount";
+const GRID_DAY_WIDTH_MIN = 120;
+const GRID_DAY_WIDTH_MAX = 360;
+const GRID_DAY_WIDTH_STEP = 20;
+const GRID_DAY_WIDTH_DEFAULT = 180;
+const GRID_DAY_WIDTH_KEY = "oshical.gridDayWidth";
 const GRID_DRAG_THRESHOLD = 42;
 
-function visibleDayCountForWidth(width: number): number {
-  if (width >= 1040) return 7;
-  if (width >= 840) return 5;
-  if (width >= 500) return 3;
-  return 1;
+function clampGridDayWidth(width: number): number {
+  return Math.min(GRID_DAY_WIDTH_MAX, Math.max(GRID_DAY_WIDTH_MIN, width));
 }
 
-function readGridDayCountPreference(): number {
-  const stored = Number.parseInt(localStorage.getItem(GRID_DAY_COUNT_KEY) ?? "", 10);
-  if (!Number.isFinite(stored)) return GRID_DAY_COUNT_MAX;
-  return Math.min(GRID_DAY_COUNT_MAX, Math.max(1, stored));
+function readGridDayWidthPreference(): number {
+  const stored = Number.parseInt(localStorage.getItem(GRID_DAY_WIDTH_KEY) ?? "", 10);
+  return Number.isFinite(stored) ? clampGridDayWidth(stored) : GRID_DAY_WIDTH_DEFAULT;
 }
 
 function startOfLocalDay(date: Date): number {
@@ -194,10 +194,15 @@ export default function ScheduleView({
   const gridDragRef = useRef<{ startX: number; deltaX: number } | null>(null);
   const suppressCardClickRef = useRef(false);
   const gridWheelLockRef = useRef(false);
-  const [maxVisibleDayCount, setMaxVisibleDayCount] = useState(GRID_DAY_COUNT_MAX);
-  const [preferredGridDayCount, setPreferredGridDayCount] = useState(readGridDayCountPreference);
-  const visibleDayCount = Math.min(preferredGridDayCount, maxVisibleDayCount);
+  const [gridDayWidth, setGridDayWidth] = useState(readGridDayWidthPreference);
   const [calendarWidth, setCalendarWidth] = useState(0);
+  const visibleDayCount = useMemo(() => {
+    if (calendarWidth <= 0) return GRID_DAY_COUNT_MAX;
+    return Math.min(
+      GRID_DAY_COUNT_MAX,
+      Math.max(1, Math.floor((calendarWidth + GRID_GAP) / (gridDayWidth + GRID_GAP))),
+    );
+  }, [calendarWidth, gridDayWidth]);
   const [gridWindowStart, setGridWindowStart] = useState(() => addDays(new Date(), -GRID_WINDOW_BEFORE));
   const [dragDayDelta, setDragDayDelta] = useState(0);
   const pendingDragReleaseRef = useRef(false);
@@ -223,12 +228,9 @@ export default function ScheduleView({
     : timelineDays;
   const rangeDays = viewMode === "grid" ? stripDays : timelineDays;
   const displayDays = viewMode === "grid" ? visibleDays : timelineDays;
-  const gridDayWidth = calendarWidth > 0
-    ? Math.max(0, (calendarWidth - GRID_GAP * (visibleDayCount - 1)) / visibleDayCount)
-    : 160;
   const gridOffset = -visibleStartIndex * (gridDayWidth + GRID_GAP);
-  const setGridDayCount = (next: number) => {
-    setPreferredGridDayCount(Math.min(GRID_DAY_COUNT_MAX, Math.max(1, next)));
+  const changeGridDayWidth = (delta: number) => {
+    setGridDayWidth((current) => clampGridDayWidth(current + delta));
   };
   const liveScheduleIds = useMemo(
     () => matchLiveSchedules(schedules, liveStatuses),
@@ -296,8 +298,8 @@ export default function ScheduleView({
   }, [viewMode]);
 
   useEffect(() => {
-    localStorage.setItem(GRID_DAY_COUNT_KEY, String(preferredGridDayCount));
-  }, [preferredGridDayCount]);
+    localStorage.setItem(GRID_DAY_WIDTH_KEY, String(gridDayWidth));
+  }, [gridDayWidth]);
 
   useLayoutEffect(() => {
     const element = pageRef.current;
@@ -306,8 +308,6 @@ export default function ScheduleView({
       const width = element.clientWidth;
       if (width <= 0) return;
       setCalendarWidth(width);
-      const next = visibleDayCountForWidth(width);
-      setMaxVisibleDayCount((current) => (current === next ? current : next));
     };
     update();
     if (typeof ResizeObserver === "undefined") {
@@ -731,34 +731,25 @@ export default function ScheduleView({
         </div>
         <div className="toolbar-actions">
           {viewMode === "grid" ? (
-            <div className="calendar-width-control" role="group" aria-label="调整日历每天的宽度">
-              <span className="calendar-width-label">每日栏宽</span>
+            <div className="calendar-width-control" role="group" aria-label="调整日历栏宽">
+              <span className="calendar-width-label">栏宽</span>
               <button
                 type="button"
-                onClick={() => setGridDayCount(visibleDayCount + 1)}
-                disabled={visibleDayCount >= maxVisibleDayCount}
-                title="缩窄每天"
-                aria-label="缩窄每天"
+                onClick={() => changeGridDayWidth(-GRID_DAY_WIDTH_STEP)}
+                disabled={gridDayWidth <= GRID_DAY_WIDTH_MIN}
+                title="缩窄栏宽"
+                aria-label="缩窄栏宽"
               >
                 <Minus size={14} />
               </button>
-              <output aria-live="polite">{Math.round(gridDayWidth)}px</output>
               <button
                 type="button"
-                onClick={() => setGridDayCount(visibleDayCount - 1)}
-                disabled={visibleDayCount <= 1}
-                title="加宽每天"
-                aria-label="加宽每天"
+                onClick={() => changeGridDayWidth(GRID_DAY_WIDTH_STEP)}
+                disabled={gridDayWidth >= GRID_DAY_WIDTH_MAX}
+                title="加宽栏宽"
+                aria-label="加宽栏宽"
               >
                 <Plus size={14} />
-              </button>
-              <button
-                type="button"
-                className="calendar-width-auto"
-                onClick={() => setGridDayCount(GRID_DAY_COUNT_MAX)}
-                title="恢复自动栏宽"
-              >
-                自动
               </button>
             </div>
           ) : null}

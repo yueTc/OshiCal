@@ -159,6 +159,7 @@ function GithubMirrorCard({
 interface SettingsViewProps {
   settings: AppSettings;
   secrets: SecretStatus;
+  llmApiKeyHint: string;
   biliConfigured: boolean;
   autostart: boolean;
   tauri: boolean;
@@ -180,6 +181,7 @@ interface SettingsViewProps {
 const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function SettingsView({
   settings,
   secrets,
+  llmApiKeyHint,
   biliConfigured,
   autostart,
   tauri,
@@ -1207,7 +1209,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   }}
                   placeholder={
                     secrets.llmConfigured
-                      ? "已配置，留空则沿用"
+                      ? llmApiKeyHint
+                        ? llmApiKeyHint + "（已配置，留空则沿用）"
+                        : "已配置（不会明文回显），留空则沿用"
                       : serverMode
                         ? "保存到服务端并同步到其他设备"
                         : "保存到 Windows 凭据管理器"
@@ -1220,7 +1224,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <span>
                 {serverMode
                   ? secrets.llmConfigured
-                    ? "模型密钥已由服务端加密保存，并同步到已授权设备"
+                    ? "模型密钥已由服务端加密保存，不会明文回显，并同步到已授权设备"
                     : "服务端尚未配置模型密钥"
                   : secrets.llmConfigured
                     ? "模型密钥已安全保存"

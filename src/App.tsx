@@ -206,6 +206,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   proxyPort: null,
 };
 
+function maskLlmApiKey(apiKey: string): string {
+  const value = apiKey.trim();
+  return value ? "••••••••" + value.slice(-4) : "";
+}
+
 const EMPTY_SECRETS: SecretStatus = {
   llmConfigured: false,
   biliConfigured: false,
@@ -260,6 +265,7 @@ export default function App() {
   } | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
   const [authGateError, setAuthGateError] = useState<string | null>(null);
+  const [llmApiKeyHint, setLlmApiKeyHint] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [creatorMenu, setCreatorMenu] = useState<{ streamer: Streamer; x: number; y: number } | null>(null);
@@ -479,6 +485,7 @@ export default function App() {
   const syncServerLlmSecret = useCallback(async (api: ServerApi): Promise<void> => {
     try {
       const secret = await api.llmSecret();
+      setLlmApiKeyHint(maskLlmApiKey(secret.apiKey ?? ""));
       if (isTauri && localApi && secret.apiKey) {
         const status = await localApi.saveSecrets({ llmApiKey: secret.apiKey });
         setSecrets(status);
@@ -494,6 +501,29 @@ export default function App() {
       }
       throw error;
     }
+  }, []);
+
+  const refreshServerSettings = useCallback(
+    async (api: ServerApi, base: AppSettings = settingsRef.current): Promise<AppSettings> => {
+      const serverSettings = await api.settings();
+      const merged = mergeServerSettings(base, serverSettings);
+      settingsRef.current = merged;
+      setSettings(merged);
+      if (isTauri && localApi) {
+        await localApi.saveSettings(merged).catch(() => undefined);
+      }
+      return merged;
+    },
+    [],
+  );
+
+  const reloadLocalSettings = useCallback(async (): Promise<void> => {
+    if (!localApi) {
+      return;
+    }
+    const next = await localApi.settings();
+    settingsRef.current = next;
+    setSettings(next);
   }, []);
 
   const applyFormalChanges = useCallback(async (changes: SyncChange[]) => {
@@ -816,6 +846,7 @@ export default function App() {
         if (boot.settings.dataMode === "server" && boot.settings.serverUrl && token) {
           try {
             const api = await connectServer(boot.settings.serverUrl, token);
+            await refreshServerSettings(api, boot.settings);
             const deviceId = syncStateRef.current.deviceId || (await localApi.deviceId());
             if (!hasCompletedServerOnboarding(resolveHttpBase(api), deviceId)) {
               setPendingServerSetup({ api, token, deviceId });
@@ -836,7 +867,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [connectServer, showToast]);
+  }, [connectServer, refreshServerSettings, showToast]);
   useEffect(() => {
     if (!isTauri) {
       return;
@@ -921,7 +952,10 @@ export default function App() {
         const offBootstrap = await listen<Record<string, unknown>>("sync-bootstrap-applied", (event) => {
           syncEngineRef.current?.acceptAppliedProgress(event.payload);
           setScheduleRevision((value) => value + 1);
-          void refreshActiveData().catch((error) => showToast(explainError(error)));
+          void (async () => {
+            await reloadLocalSettings();
+            await refreshActiveData();
+          })().catch((error) => showToast(explainError(error)));
         });
         keepCleanup(offBootstrap);
         const offJobProgress = await listen<Record<string, unknown>>("job-progress", (event) => {
@@ -959,7 +993,7 @@ export default function App() {
         cleanup();
       }
     };
-  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, showToast]);
+  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, reloadLocalSettings, showToast]);
 
   useEffect(() => {
     if (!serverApi || pendingImport || pendingServerSetup || pendingClientMigration) {
@@ -1132,6 +1166,8 @@ export default function App() {
         if (webCacheAvailable && !restoredFromWebCache) {
           await engine.forceResync("cache_missing");
         }
+        // A cached snapshot can lag behind environment-level server changes.
+        await refreshServerSettings(api);
         if (disposed) {
           return;
         }
@@ -1159,18 +1195,19 @@ export default function App() {
       }
       socket?.close();
     };
-  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, serverApi]);
+  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, refreshServerSettings, serverApi]);
 
   useEffect(() => {
     if (page !== "settings" || !serverApi) {
       return;
     }
     void refreshSyncDevices();
+    void refreshServerSettings(serverApi).catch((error) => showToast(explainError(error)));
     void serverApi
       .serverBiliStatus()
       .then((status) => setServerBiliConfigured(status.configured))
       .catch(() => undefined);
-  }, [page, refreshSyncDevices, serverApi]);
+  }, [page, refreshServerSettings, refreshSyncDevices, serverApi, showToast]);
 
   useEffect(() => {
     if (!ready) {
@@ -1259,16 +1296,11 @@ export default function App() {
     try {
       const api = await connectServer(isTauri ? settings.serverUrl : "", token, isTauri);
       if (!isTauri) {
-        const serverSettings = await api.settings();
-        const merged = mergeServerSettings(
-          {
-            ...settingsRef.current,
-            dataMode: "server",
-            serverUrl: resolveHttpBase(api),
-          },
-          serverSettings,
-        );
-        setSettings(merged);
+        const merged = await refreshServerSettings(api, {
+          ...settingsRef.current,
+          dataMode: "server",
+          serverUrl: resolveHttpBase(api),
+        });
         saveWebDevicePreferences(merged);
         const deviceId = syncStateRef.current.deviceId || await resolveSyncDeviceId();
         const serverUrl = resolveHttpBase(api);
@@ -2317,7 +2349,9 @@ export default function App() {
         {connectionError && (connection === "offline" || connection === "connecting") ? (
           <ErrorBanner message={connectionError} onRetry={() => {
             if (settings.dataMode === "server" && settings.serverUrl && serverToken) {
-              void connectServer(settings.serverUrl, serverToken).catch((error) => showToast(explainError(error)));
+              void connectServer(settings.serverUrl, serverToken)
+                .then((api) => refreshServerSettings(api))
+                .catch((error) => showToast(explainError(error)));
             }
           }} />
         ) : null}
@@ -2333,6 +2367,7 @@ export default function App() {
             ref={settingsViewRef}
             settings={settings}
             secrets={secrets}
+            llmApiKeyHint={llmApiKeyHint}
             biliConfigured={(!isTauri || settings.dataMode === "server") ? serverBiliConfigured : secrets.biliConfigured}
             autostart={autostart}
             tauri={isTauri}

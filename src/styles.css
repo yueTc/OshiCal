@@ -570,22 +570,6 @@ h3 {
   opacity: .35;
 }
 
-.calendar-width-control output {
-  min-width: 44px;
-  color: var(--text);
-  font-size: 11px;
-  font-weight: 750;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-.calendar-width-control .calendar-width-auto {
-  width: auto;
-  padding: 0 6px;
-  font-size: 10px;
-  font-weight: 700;
-}
-
 .day-navigator {
   display: flex;
   align-items: center;
@@ -1436,14 +1420,14 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
 .linked-pill button { display: grid; place-items: center; padding: 0; color: var(--faint); background: transparent; border: 0; }
 .linked-pill.automatic { color: var(--primary-strong); background: var(--primary-soft); }
 .linked-empty { color: var(--faint); font-size: 11px; }
-.creator-actions { display: flex; align-items: center; gap: 5px; align-self: start; }
+.creator-actions { display: flex; align-items: center; gap: 3px; align-self: start; }
 .creator-fan-button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   width: fit-content;
   min-height: 30px;
-  margin-top: 9px;
+  margin-top: 0;
   padding: 4px 10px;
   color: var(--primary-strong);
   background: var(--primary-soft);
@@ -1486,7 +1470,21 @@ input::placeholder, textarea::placeholder { color: #b7a6ae; }
 .fan-chart-grid { stroke: rgba(96, 67, 82, .12); stroke-width: 1; stroke-dasharray: 4 5; }
 .fan-chart-area { fill: url(#fan-chart-area); }
 .fan-chart-line { fill: none; stroke: var(--primary); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
-.fan-chart-point { fill: #fff; stroke: var(--primary); stroke-width: 2; }
+.fan-chart-point { fill: #fff; stroke: var(--primary); stroke-width: 2; pointer-events: none; transition: fill .14s ease, stroke .14s ease; }
+.fan-chart-point.is-active { fill: var(--primary); stroke: #fff; stroke-width: 2.5; filter: drop-shadow(0 2px 5px rgba(233, 79, 136, .35)); }
+.fan-chart-point-halo { fill: rgba(233, 79, 136, .13); stroke: rgba(233, 79, 136, .28); stroke-width: 1; pointer-events: none; }
+.fan-chart-guide { stroke: rgba(233, 79, 136, .32); stroke-width: 1; stroke-dasharray: 3 4; pointer-events: none; }
+.fan-chart-hit { fill: transparent; stroke: none; cursor: pointer; pointer-events: all; }
+.fan-chart-hit:focus { outline: none; }
+.fan-chart-hit:focus-visible { fill: rgba(233, 79, 136, .07); stroke: var(--primary); stroke-width: 1.5; }
+.fan-chart-tooltip { pointer-events: none; }
+.fan-chart-tooltip rect { fill: rgba(255, 255, 255, .98); stroke: rgba(233, 79, 136, .24); filter: drop-shadow(0 6px 12px rgba(84, 48, 65, .16)); }
+.fan-chart-tooltip-label { fill: var(--muted); font-size: 12px; font-weight: 600; }
+.fan-chart-tooltip-value { fill: var(--text); font-size: 14px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.fan-chart-tooltip-change { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.fan-chart-tooltip-change.up { fill: #12865a; }
+.fan-chart-tooltip-change.down { fill: var(--danger); }
+.fan-chart-tooltip-change.flat { fill: var(--muted); }
 .fan-chart-label { fill: var(--faint); font-size: 16px; }
 .fan-chart-empty, .fan-loading {
   display: grid;

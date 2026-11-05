@@ -97,6 +97,8 @@ function formatFanChange(value: number | null): string {
 }
 
 function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
+  const [activeKey, setActiveKey] = useState<string | null>(null);
+
   if (buckets.length < 2) {
     return (
       <div className="fan-chart-empty">
@@ -114,6 +116,8 @@ function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
   const bottom = 34;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
+  const tooltipWidth = 174;
+  const tooltipHeight = 66;
   const values = buckets.map((bucket) => bucket.fans);
   const min = Math.min(...values);
   const max = Math.max(...values);
@@ -123,6 +127,22 @@ function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
     const y = top + ((max - bucket.fans) / span) * (plotHeight - 12) + 6;
     return { ...bucket, x, y };
   });
+  const activePoint = activeKey ? points.find((point) => point.key === activeKey) ?? null : null;
+  const activeTone = activePoint?.change === null
+    ? "flat"
+    : (activePoint?.change ?? 0) > 0
+      ? "up"
+      : (activePoint?.change ?? 0) < 0
+        ? "down"
+        : "flat";
+  const tooltipX = activePoint
+    ? Math.max(8, Math.min(width - tooltipWidth - 8, activePoint.x - tooltipWidth / 2))
+    : 0;
+  const tooltipY = activePoint
+    ? activePoint.y - tooltipHeight - 10 >= 8
+      ? activePoint.y - tooltipHeight - 10
+      : activePoint.y + 14
+    : 0;
   const line = points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
   const area = `${left},${top + plotHeight} ${line} ${left + plotWidth},${top + plotHeight}`;
   const labelIndexes = [...new Set([
@@ -150,11 +170,27 @@ function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
         <line className="fan-chart-grid" x1={left} x2={left + plotWidth} y1={top + plotHeight / 2} y2={top + plotHeight / 2} />
         <line className="fan-chart-grid" x1={left} x2={left + plotWidth} y1={top + plotHeight} y2={top + plotHeight} />
         <polygon className="fan-chart-area" points={area} />
+        {activePoint ? (
+          <line
+            className="fan-chart-guide"
+            x1={activePoint.x}
+            x2={activePoint.x}
+            y1={top}
+            y2={top + plotHeight}
+          />
+        ) : null}
         <polyline className="fan-chart-line" points={line} />
+        {activePoint ? (
+          <circle className="fan-chart-point-halo" cx={activePoint.x} cy={activePoint.y} r={10} />
+        ) : null}
         {points.map((point) => (
-          <circle className="fan-chart-point" key={point.key} cx={point.x} cy={point.y} r={4}>
-            <title>{`${point.label} · ${FAN_COUNT_FORMATTER.format(point.fans)} 粉丝 · ${formatFanChange(point.change)}`}</title>
-          </circle>
+          <circle
+            className={`fan-chart-point${point.key === activeKey ? " is-active" : ""}`}
+            key={point.key}
+            cx={point.x}
+            cy={point.y}
+            r={point.key === activeKey ? 5.5 : 4}
+          />
         ))}
         {labelIndexes.map((index) => (
           <text
@@ -167,11 +203,42 @@ function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
             {points[index].label}
           </text>
         ))}
+        {activePoint ? (
+          <g
+            className="fan-chart-tooltip"
+            transform={`translate(${tooltipX.toFixed(2)} ${tooltipY.toFixed(2)})`}
+            aria-hidden="true"
+          >
+            <rect width={tooltipWidth} height={tooltipHeight} rx={10} />
+            <text className="fan-chart-tooltip-label" x={12} y={19}>{activePoint.label}</text>
+            <text className="fan-chart-tooltip-value" x={12} y={40}>
+              粉丝 {FAN_COUNT_FORMATTER.format(activePoint.fans)}
+            </text>
+            <text className={`fan-chart-tooltip-change ${activeTone}`} x={12} y={57}>
+              变化 {formatFanChange(activePoint.change)}
+            </text>
+          </g>
+        ) : null}
+        {points.map((point) => (
+          <circle
+            className="fan-chart-hit"
+            key={`hit-${point.key}`}
+            cx={point.x}
+            cy={point.y}
+            r={15}
+            tabIndex={0}
+            role="img"
+            aria-label={`${point.label}，粉丝 ${FAN_COUNT_FORMATTER.format(point.fans)}，变化 ${formatFanChange(point.change)}`}
+            onMouseEnter={() => setActiveKey(point.key)}
+            onMouseLeave={() => setActiveKey((current) => current === point.key ? null : current)}
+            onFocus={() => setActiveKey(point.key)}
+            onBlur={() => setActiveKey((current) => current === point.key ? null : current)}
+          />
+        ))}
       </svg>
     </div>
   );
 }
-
 export default function CreatorsView({
   subscriptions,
   refreshProgress,
@@ -931,7 +998,6 @@ export default function CreatorsView({
                   <span>粉丝</span>
                   <em>查看趋势</em>
                 </button>
-
                 <button
                   className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
                   title={streamer.liveUrl || streamer.roomId
