@@ -250,7 +250,7 @@ async fn collect_once(
                 continue;
             }
         };
-        let (mut writer, mut reader) = socket.split();
+        let mut socket = socket;
         let buvid = bili.buvid().await.ok();
         let mut auth = serde_json::json!({
             "uid": 0,
@@ -263,7 +263,7 @@ async fn collect_once(
         if let Some(buvid) = buvid {
             auth["buvid"] = Value::String(buvid);
         }
-        if let Err(error) = writer
+        if let Err(error) = socket
             .send(Message::Binary(
                 make_packet(7, serde_json::to_vec(&auth).unwrap_or_default()).into(),
             ))
@@ -289,7 +289,7 @@ async fn collect_once(
                     return CollectResult::Stopped(ended_at);
                 }
                 _ = heartbeat.tick() => {
-                    if let Err(error) = writer.send(Message::Binary(make_packet(2, Vec::new()).into())).await {
+                    if let Err(error) = socket.send(Message::Binary(make_packet(2, Vec::new()).into())).await {
                         return CollectResult::Disconnected(error.to_string());
                     }
                 }
@@ -304,16 +304,13 @@ async fn collect_once(
                         }
                     }
                 }
-                message = reader.next() => {
+                message = socket.next() => {
                     match message {
                         Some(Ok(Message::Binary(bytes))) => {
                             let was_established = stats.connection_established;
                             parse_live_packets(stats, &bytes, 0);
                             if !was_established && stats.connection_established {
-                                // Bilibili expects a heartbeat right after the auth reply.
-                                // Waiting for the first 30-second tick can cause the gateway
-                                // to drop the connection before the session is usable.
-                                if let Err(error) = writer
+                                if let Err(error) = socket
                                     .send(Message::Binary(make_packet(2, Vec::new()).into()))
                                     .await
                                 {
@@ -329,7 +326,7 @@ async fn collect_once(
                             }
                         }
                         Some(Ok(Message::Ping(payload))) => {
-                            let _ = writer.send(Message::Pong(payload)).await;
+                            let _ = socket.send(Message::Pong(payload)).await;
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             return CollectResult::Disconnected("直播弹幕连接关闭".to_owned());
