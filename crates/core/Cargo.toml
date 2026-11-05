@@ -27,9 +27,6 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = "0.10"
-tokio-openssl = "0.6"
 
 [dev-dependencies]
 axum = "0.8"

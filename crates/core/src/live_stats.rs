@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-#[cfg(target_os = "linux")]
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,24 +7,18 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
-#[cfg(target_os = "linux")]
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
-#[cfg(target_os = "linux")]
-use tokio_openssl::SslStream;
-#[cfg(target_os = "linux")]
-use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
-#[cfg(not(target_os = "linux"))]
-use tokio_tungstenite::{client_async_tls_with_config, connect_async, MaybeTlsStream};
+use tokio_tungstenite::{
+    client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::bilibili::BilibiliClient;
 use crate::error::{AppError, AppResult};
@@ -439,48 +431,6 @@ async fn connect_proxy_tunnel(url: &str, proxy: &str) -> Result<TcpStream, Strin
     Ok(stream)
 }
 
-#[cfg(target_os = "linux")]
-async fn connect_live_socket(
-    url: &str,
-    proxy: Option<&str>,
-) -> Result<WebSocketStream<SslStream<TcpStream>>, String> {
-    let request = live_socket_request(url)?;
-    let (target_host, target_port) = websocket_target(url)?;
-    let tcp = match proxy {
-        Some(proxy) => connect_proxy_tunnel(url, proxy).await?,
-        None => TcpStream::connect((target_host.as_str(), target_port))
-            .await
-            .map_err(|error| format!("连接弹幕服务器 {target_host}:{target_port} 失败: {error}"))?,
-    };
-
-    // Use OpenSSL's TLS client profile. On Linux this produces the
-    // browser-compatible ClientHello expected by Bilibili's live gateway.
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|error| format!("创建弹幕 TLS 客户端失败: {error}"))?;
-    builder.set_verify(SslVerifyMode::PEER);
-    builder
-        .set_default_verify_paths()
-        .map_err(|error| format!("加载弹幕 TLS 根证书失败: {error}"))?;
-    let ssl = builder
-        .build()
-        .configure()
-        .map_err(|error| format!("配置弹幕 TLS 会话失败: {error}"))?
-        .into_ssl(&target_host)
-        .map_err(|error| format!("设置弹幕 TLS 主机名失败: {error}"))?;
-    let mut stream =
-        SslStream::new(ssl, tcp).map_err(|error| format!("创建弹幕 TLS 连接失败: {error}"))?;
-    Pin::new(&mut stream)
-        .connect()
-        .await
-        .map_err(|error| format!("建立弹幕 TLS 连接失败: {error}"))?;
-
-    client_async(request, stream)
-        .await
-        .map(|(socket, _)| socket)
-        .map_err(|error| format!("建立弹幕 WebSocket 连接失败: {error}"))
-}
-
-#[cfg(not(target_os = "linux"))]
 async fn connect_live_socket(
     url: &str,
     proxy: Option<&str>,
