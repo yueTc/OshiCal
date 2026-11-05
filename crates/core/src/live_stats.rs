@@ -224,10 +224,6 @@ async fn collect_once(
         Some(value) => value,
         None => return CollectResult::Disconnected("弹幕服务器缺少 token".to_owned()),
     };
-    let token = std::env::var("OSHICAL_BILI_WS_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| token.to_owned());
     let hosts = match info.pointer("/data/host_list").and_then(Value::as_array) {
         Some(value) => value,
         None => return CollectResult::Disconnected("弹幕服务器列表为空".to_owned()),
