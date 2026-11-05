@@ -34,7 +34,7 @@ use crate::models::{LiveSession, LiveSessionStats};
 use crate::store::SqliteStore;
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
@@ -258,14 +258,18 @@ async fn collect_once(
             }
         };
         let (mut writer, mut reader) = socket.split();
-        let auth = serde_json::json!({
+        let buvid = bili.buvid().await.ok();
+        let mut auth = serde_json::json!({
             "uid": 0,
             "roomid": session.room_id.parse::<u64>().unwrap_or_default(),
-            "protover": 2,
+            "protover": 3,
             "platform": "web",
             "type": 2,
             "key": token,
         });
+        if let Some(buvid) = buvid {
+            auth["buvid"] = Value::String(buvid);
+        }
         if let Err(error) = writer
             .send(Message::Binary(
                 make_packet(7, serde_json::to_vec(&auth).unwrap_or_default()).into(),

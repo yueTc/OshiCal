@@ -110,6 +110,10 @@ impl BilibiliClient {
         self.websocket_proxy.as_deref()
     }
 
+    pub async fn buvid(&self) -> AppResult<String> {
+        Ok(self.ensure_session().await?.buvid3)
+    }
+
     pub async fn set_cookie(&self, user_cookie: Option<String>) {
         let value = user_cookie
             .map(|cookie| cookie.replace(['\r', '\n'], "").trim().to_owned())
