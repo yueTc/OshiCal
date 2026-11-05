@@ -13,8 +13,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
     client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
@@ -32,7 +30,6 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024;
-const LIVE_WS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 #[derive(Clone, Default)]
 pub struct LiveStatsManager {
@@ -345,22 +342,6 @@ async fn collect_once(
     CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
 }
 
-fn live_socket_request(
-    url: &str,
-) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
-    let mut request = url
-        .into_client_request()
-        .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
-    request.headers_mut().insert(
-        ORIGIN,
-        HeaderValue::from_static("https://live.bilibili.com"),
-    );
-    request
-        .headers_mut()
-        .insert(USER_AGENT, HeaderValue::from_static(LIVE_WS_USER_AGENT));
-    Ok(request)
-}
-
 fn websocket_target(url: &str) -> Result<(String, u16), String> {
     let target =
         url::Url::parse(url).map_err(|error| format!("弹幕服务器地址无效（{url}）: {error}"))?;
@@ -435,15 +416,17 @@ async fn connect_live_socket(
     url: &str,
     proxy: Option<&str>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    let request = live_socket_request(url)?;
     if let Some(proxy) = proxy {
+        let request = url
+            .into_client_request()
+            .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
         let stream = connect_proxy_tunnel(url, proxy).await?;
         return client_async_tls_with_config(request, stream, None, None)
             .await
             .map(|(socket, _)| socket)
             .map_err(|error| format!("经代理建立弹幕 TLS/WebSocket 失败: {error}"));
     }
-    connect_async(request)
+    connect_async(url)
         .await
         .map(|(socket, _)| socket)
         .map_err(|error| error.to_string())
