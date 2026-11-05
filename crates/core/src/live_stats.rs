@@ -310,7 +310,19 @@ async fn collect_once(
                 message = reader.next() => {
                     match message {
                         Some(Ok(Message::Binary(bytes))) => {
+                            let was_established = stats.connection_established;
                             parse_live_packets(stats, &bytes, 0);
+                            if !was_established && stats.connection_established {
+                                // Bilibili expects a heartbeat right after the auth reply.
+                                // Waiting for the first 30-second tick can cause the gateway
+                                // to drop the connection before the session is usable.
+                                if let Err(error) = writer
+                                    .send(Message::Binary(make_packet(2, Vec::new()).into()))
+                                    .await
+                                {
+                                    return CollectResult::Disconnected(error.to_string());
+                                }
+                            }
                         }
                         Some(Ok(Message::Text(text))) => {
                             if text.len() <= MAX_MESSAGE_BYTES {
