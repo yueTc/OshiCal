@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as StdRwLock};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -27,6 +27,8 @@ use crate::store::SqliteStore;
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
 pub const FAN_POLL_INTERVAL_SECONDS: u64 = 60 * 60;
+const TITLE_REUSE_LOOKBACK_DAYS: i64 = 56;
+const TITLE_REUSE_SLOT_TOLERANCE_MINUTES: i64 = 30;
 
 #[derive(Clone)]
 pub struct AppService {
@@ -1219,7 +1221,7 @@ impl AppService {
                 let text = post.text.trim();
                 if !has_combined_images && !text.is_empty() {
                     let text_digest = text_digest(text);
-                    let prompt_version = format!("{}-text-v7", config.prompt_version);
+                    let prompt_version = format!("{}-text-v8", config.prompt_version);
                     let cache_key =
                         analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
                     let cached_events = match self.store.get_text_analysis(&cache_key).await? {
@@ -1320,7 +1322,7 @@ impl AppService {
                 if settings.auto_analyze_images && !post.images.is_empty() {
                     let context_digest = text_digest(post.text.trim());
                     let image_prompt_version = format!(
-                        "{}-image-context-v4-{}",
+                        "{}-image-context-v5-{}",
                         config.prompt_version,
                         &context_digest[..12]
                     );
@@ -1905,6 +1907,55 @@ impl AppService {
             .collect())
     }
 
+    async fn resolve_auto_schedule_title(
+        &self,
+        streamer_id: i64,
+        title: &str,
+        start_at: DateTime<Utc>,
+    ) -> String {
+        if !schedule_title_is_placeholder(title) {
+            return title.trim().to_owned();
+        }
+        self.previous_matching_schedule_title(streamer_id, start_at)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "直播".to_owned())
+    }
+
+    async fn previous_matching_schedule_title(
+        &self,
+        streamer_id: i64,
+        start_at: DateTime<Utc>,
+    ) -> AppResult<Option<String>> {
+        let earliest = start_at - Duration::days(TITLE_REUSE_LOOKBACK_DAYS);
+        let schedule_title = self
+            .store
+            .list_all_schedules()
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.streamer_id == streamer_id)
+            .filter(|candidate| candidate.start_at >= earliest && candidate.start_at <= start_at)
+            .filter(|candidate| same_recurring_slot(candidate.start_at, start_at))
+            .filter(|candidate| !schedule_title_is_placeholder(&candidate.title))
+            .max_by_key(|candidate| candidate.start_at)
+            .map(|candidate| candidate.title.trim().to_owned());
+        if schedule_title.is_some() {
+            return Ok(schedule_title);
+        }
+
+        Ok(self
+            .store
+            .list_live_sessions(Some(streamer_id), 200)
+            .await?
+            .into_iter()
+            .filter(|session| session.started_at >= earliest && session.started_at <= start_at)
+            .filter(|session| same_recurring_slot(session.started_at, start_at))
+            .filter(|session| !schedule_title_is_placeholder(&session.title))
+            .max_by_key(|session| session.started_at)
+            .map(|session| session.title.trim().to_owned()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn upsert_candidate(
         &self,
@@ -1920,6 +1971,11 @@ impl AppService {
         room_owner_name: Option<&str>,
         participants: &[String],
     ) -> bool {
+        let mut schedule = schedule.clone();
+        schedule.title = self
+            .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
+            .await;
+        let schedule = &schedule;
         if post.reserve.is_some() && matches!(source_kind, "text" | "image") {
             return false;
         }
@@ -2174,6 +2230,45 @@ fn reserve_context(post: &DynamicPost) -> String {
         context.push_str(&reserve.description);
     }
     context
+}
+
+fn schedule_title_is_placeholder(title: &str) -> bool {
+    let normalized: String = title
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "直播"
+                | "未提供"
+                | "未提供主题"
+                | "主题未提供"
+                | "直播未提供主题"
+                | "未提及"
+                | "未说明"
+                | "暂无主题"
+                | "无主题"
+                | "未知主题"
+                | "待定"
+                | "未命名"
+                | "tbd"
+                | "untitled"
+                | "unknown"
+        )
+}
+
+fn same_recurring_slot(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+    let china = FixedOffset::east_opt(8 * 3600).expect("china offset");
+    let left = left.with_timezone(&china);
+    let right = right.with_timezone(&china);
+    if left.weekday() != right.weekday() {
+        return false;
+    }
+    let left_minute = i64::from(left.hour()) * 60 + i64::from(left.minute());
+    let right_minute = i64::from(right.hour()) * 60 + i64::from(right.minute());
+    (left_minute - right_minute).abs() <= TITLE_REUSE_SLOT_TOLERANCE_MINUTES
 }
 
 fn clean_schedule_title_value(mut title: String, target: &Streamer) -> String {
@@ -2582,6 +2677,10 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
     let incoming_reserve = incoming.source_kind == "reserve" && existing.source_kind != "reserve";
     let title = if keep_existing_reserve {
         existing.title.clone()
+    } else if schedule_title_is_placeholder(&incoming.title) {
+        existing.title.clone()
+    } else if schedule_title_is_placeholder(&existing.title) {
+        incoming.title.clone()
     } else if incoming_reserve || incoming.title.chars().count() > existing.title.chars().count() {
         incoming.title.clone()
     } else {
@@ -2693,6 +2792,11 @@ fn merge_input_for_existing(existing: &Schedule, incoming: &NewSchedule) -> NewS
         merged.source_fingerprint = existing.source_fingerprint.clone();
         merged.source_identity = existing.source_identity.clone();
         merged.source_published_at = existing.source_published_at;
+    }
+    if schedule_title_is_placeholder(&merged.title)
+        && !schedule_title_is_placeholder(&existing.title)
+    {
+        merged.title = existing.title.clone();
     }
     merged
 }
@@ -2834,7 +2938,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use chrono::{Duration, FixedOffset};
+    use chrono::{Duration, FixedOffset, TimeZone};
     use serde_json::Value;
 
     use crate::llm::LlmAnalysis;
@@ -4500,6 +4604,189 @@ mod tests {
             .expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].title, "周五杂谈回");
+    }
+
+    #[test]
+    fn title_reuse_requires_same_weekday_and_close_start_time() {
+        let china = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let base = china
+            .with_ymd_and_hms(2026, 11, 5, 21, 0, 0)
+            .single()
+            .expect("date")
+            .with_timezone(&Utc);
+        assert!(same_recurring_slot(base + Duration::days(7), base));
+        assert!(same_recurring_slot(
+            base + Duration::days(7) + Duration::minutes(20),
+            base
+        ));
+        assert!(!same_recurring_slot(
+            base + Duration::days(7) + Duration::hours(2),
+            base
+        ));
+        assert!(!same_recurring_slot(base + Duration::days(1), base));
+        assert!(schedule_title_is_placeholder("（未提供主题）"));
+        assert!(!schedule_title_is_placeholder("周五杂谈"));
+    }
+
+    #[tokio::test]
+    async fn missing_title_reuses_previous_matching_schedule() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("500", "戊"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let target_start = now + Duration::days(9);
+        let previous_start = target_start - Duration::days(7);
+        let previous_post = DynamicPost {
+            id: "previous-theme".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "下周同一时间".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/previous-theme".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: None,
+        };
+        let previous = ParsedSchedule {
+            title: "固定歌回".to_owned(),
+            start_at: previous_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &previous,
+                    "text",
+                    &previous_post,
+                    "",
+                    "text:previous-theme",
+                    "previous-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+        );
+
+        let current_post = DynamicPost {
+            id: "missing-theme".to_owned(),
+            published_at: now + Duration::minutes(1),
+            ..previous_post.clone()
+        };
+        let current = ParsedSchedule {
+            title: "未提供主题".to_owned(),
+            start_at: target_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &current,
+                    "text",
+                    &current_post,
+                    "",
+                    "text:missing-theme",
+                    "missing-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+        );
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        let reused = schedules
+            .iter()
+            .find(|schedule| schedule.start_at == target_start)
+            .expect("reused schedule");
+        assert_eq!(reused.title, "固定歌回");
+    }
+
+    #[tokio::test]
+    async fn missing_title_reuses_previous_matching_live_session() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("600", "己"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let target_start = now + Duration::days(2);
+        let previous_start = target_start - Duration::days(7);
+        store
+            .ensure_live_session(
+                streamer.id,
+                "600",
+                &streamer.name,
+                "上周歌回",
+                None,
+                previous_start,
+                now,
+            )
+            .await
+            .expect("live session");
+
+        let post = DynamicPost {
+            id: "live-session-theme".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "21:00 直播".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/live-session-theme".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: None,
+        };
+        let schedule = ParsedSchedule {
+            title: "直播".to_owned(),
+            start_at: target_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &schedule,
+                    "text",
+                    &post,
+                    "",
+                    "text:live-session-theme",
+                    "live-session-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+        );
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "上周歌回");
     }
 
     #[tokio::test]
