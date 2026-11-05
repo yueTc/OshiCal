@@ -251,7 +251,7 @@ async fn collect_once(
         let mut auth = serde_json::json!({
             "uid": 0,
             "roomid": session.room_id.parse::<u64>().unwrap_or_default(),
-            "protover": 3,
+            "protover": 2,
             "platform": "web",
             "type": 2,
             "key": token,
