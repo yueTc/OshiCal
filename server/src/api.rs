@@ -1171,10 +1171,13 @@ fn forward_hub_message(protocol_v2: bool, value: &Value) -> bool {
         .unwrap_or_default();
     let sync_message = matches!(message_type, "sync_batch" | "reset_required");
     if protocol_v2 {
+        // Live status transitions are edge notifications, not state snapshots.
+        // V2 still receives state through sync batches, but needs this event to
+        // distinguish a real offline -> live transition from a startup snapshot.
         sync_message
             || matches!(
                 message_type,
-                "job_progress" | "refresh_progress" | "data_imported"
+                "live_status" | "job_progress" | "refresh_progress" | "data_imported"
             )
     } else {
         !sync_message
@@ -1515,6 +1518,20 @@ mod protocol_tests {
             migration_receipt_key("device-a:1"),
             "server:migration_receipt:v1:device-a:1"
         );
+    }
+
+    #[test]
+    fn live_status_is_visible_to_both_websocket_protocols() {
+        let message = json!({
+            "seq": 7,
+            "type": "live_status",
+            "payload": {
+                "previousIsLive": false,
+                "isLive": true
+            }
+        });
+        assert!(forward_hub_message(false, &message));
+        assert!(forward_hub_message(true, &message));
     }
 
     #[test]
