@@ -931,7 +931,7 @@ fn parse_live_packets_inner(
     Ok(())
 }
 
-fn read_decompressed_limited<R: Read>(mut reader: R, limit: usize) -> Result<Vec<u8>, String> {
+fn read_decompressed_limited<R: Read>(reader: R, limit: usize) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::new();
     reader
         .take(limit.saturating_add(1) as u64)
@@ -1274,7 +1274,7 @@ fn take_protobuf_bytes(bytes: &[u8], offset: &mut usize, len: usize) -> AppResul
 }
 
 fn decode_protobuf(bytes: &[u8]) -> AppResult<HashMap<u32, Vec<ProtoValue>>> {
-    let mut fields = HashMap::new();
+    let mut fields: HashMap<u32, Vec<ProtoValue>> = HashMap::new();
     let mut offset = 0;
     while offset < bytes.len() {
         let tag = decode_varint(bytes, &mut offset)

@@ -1999,7 +1999,7 @@ impl AppService {
         };
         let Some(existing) = self
             .find_reservation_time_change_candidate(&target, schedule.start_at, post)
-            .await
+            .await?
         else {
             return Ok(());
         };

@@ -2146,7 +2146,6 @@ impl SqliteStore {
                 .clone()
                 .or_else(|| current.effective_until.clone())
         };
-        let enabled = update.enabled.unwrap_or(current.enabled);
         crate::weekly::validate_rule_fields(
             &title,
             weekdays_mask,

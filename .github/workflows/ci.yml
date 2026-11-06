@@ -35,19 +35,27 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: ". -> target"
+          cache-on-failure: true
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Format, lint and typecheck
-        run: npm run check
+      - name: Frontend typecheck
+        run: npx tsc -b --pretty false
+
+      - name: Rust format and lint
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Frontend tests
+        if: ${{ !cancelled() }}
         run: npm run test:web
 
       - name: Rust tests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --locked --no-fail-fast
 
       - name: Frontend production build
+        if: ${{ !cancelled() }}
         run: npm run build:web

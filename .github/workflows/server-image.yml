@@ -81,11 +81,20 @@ jobs:
           manifest_dir="$RUNNER_TEMP/server-version-check"
           mkdir -p "$manifest_dir"
           if gh release view server-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if ! gh release download server-latest               --repo "$GITHUB_REPOSITORY"               --pattern latest-server.json               --dir "$manifest_dir"; then
+            assets="$(gh release view server-latest --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            if printf '%s\n' "$assets" | grep -Fxq latest-server.json; then
+              manifest_name=latest-server.json
+            elif printf '%s\n' "$assets" | grep -Fxq server-latest.json; then
+              manifest_name=server-latest.json
+            else
+              echo "已发布服务器清单缺失，拒绝继续发布" >&2
+              exit 1
+            fi
+            if ! gh release download server-latest --repo "$GITHUB_REPOSITORY" --pattern "$manifest_name" --dir "$manifest_dir"; then
               echo "无法读取已发布的服务器更新清单，拒绝继续发布" >&2
               exit 1
             fi
-            python - "$VERSION" "$manifest_dir/latest-server.json" <<'PY'
+            python - "$VERSION" "$manifest_dir/$manifest_name" <<'PY'
           import json
           import re
           import sys
@@ -114,7 +123,7 @@ jobs:
           candidate = semver(sys.argv[1])
           with open(sys.argv[2], encoding="utf-8") as handle:
               manifest = json.load(handle)
-          if manifest.get("channel") != "server":
+          if manifest.get("channel", "server") != "server":
               raise SystemExit("published manifest channel is invalid")
           existing = semver(manifest.get("version"))
           if candidate <= existing:
@@ -264,6 +273,34 @@ jobs:
               raise SystemExit("manifest signature self-check failed")
           PY
 
+          # Keep the existing server client channel working while 0.3.0 migrates
+          # to the signed manifest filename and immutable image references.
+          legacy_manifest="$manifest_dir/server-latest.json"
+          python - "$manifest" "$legacy_manifest" "$IMAGE_REPOSITORY" <<'PY'
+          import datetime
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          manifest.update({
+              "tag": "server-v" + manifest["version"],
+              "image": sys.argv[3] + "@" + manifest["imageDigest"],
+              "publishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          })
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, separators=(",", ":"))
+              handle.write("\n")
+          PY
+          version_tag="server-v$VERSION"
+          if gh release view "$version_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "发布 $version_tag 已存在，拒绝覆盖" >&2
+            exit 1
+          fi
+          gh release create "$version_tag" "$manifest" "$legacy_manifest" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+            --title "OshiCal Server v$VERSION" \
+            --notes "服务端 $VERSION。镜像：$IMAGE_REPOSITORY@$DIGEST。宿主更新代理升级前须配置 /etc/oshical/updater-hmac.key。"
+
           if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$release_tag" --repo "$GITHUB_REPOSITORY" \
               --latest=false \
@@ -273,7 +310,7 @@ jobs:
           fi
           # Upload is the publication step. The single signed manifest asset
           # carries version and digest together, so readers never consume half a release.
-          gh release upload "$release_tag" "$manifest" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$release_tag" "$manifest" "$legacy_manifest" --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" \
             --latest=false \
             --title "OshiCal Server latest" \

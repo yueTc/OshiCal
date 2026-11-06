@@ -675,7 +675,7 @@ impl SqliteStore {
         if let Some(existing) =
             sqlx::query_scalar::<_, String>("SELECT value FROM client_sync_state WHERE key = ?")
                 .bind(receipt_key)
-                .fetch_optional(&mut **tx)
+                .fetch_optional(&mut *tx)
                 .await?
         {
             tx.commit().await?;
@@ -705,7 +705,7 @@ impl SqliteStore {
         .bind(serde_json::to_string(&reset_payload)?)
         .bind(migration_id)
         .bind(&now_text)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
         sqlx::query(
             "INSERT INTO sync_feed_meta (key, value, updated_at) VALUES ('latest_seq', ?, ?)
@@ -715,7 +715,7 @@ impl SqliteStore {
         )
         .bind(change.last_insert_rowid())
         .bind(&now_text)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
 
         let mut payload = event_payload.clone();
@@ -729,7 +729,7 @@ impl SqliteStore {
             .bind(event_type)
             .bind(serde_json::to_string(&payload)?)
             .bind(&now_text)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
 
         let receipt = json!({
@@ -742,7 +742,7 @@ impl SqliteStore {
             .bind(receipt_key)
             .bind(serde_json::to_string(&receipt)?)
             .bind(&now_text)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
 
         tx.commit().await?;
