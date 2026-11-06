@@ -80,6 +80,7 @@ export interface Streamer {
   scheduleEnabled: boolean;
   liveNotifyEnabled: boolean;
   liveStatsEnabled: boolean;
+  fans: number | null;
   lastError: string | null;
   lastRefreshAt: string | null;
   isLive: boolean;
@@ -181,6 +182,7 @@ export interface LiveSession {
   endedAt: string | null;
   durationSeconds: number;
   peakOnline: number;
+  peakHighEnergy: number;
   avgOnline: number;
   onlineSamples: number;
   onlineTotal: number;
@@ -200,6 +202,18 @@ export interface LiveSession {
   createdAt: string;
   updatedAt: string;
 }
+export interface FanSnapshot {
+  capturedAt: string;
+  fans: number;
+}
+
+export interface FanHistory {
+  streamerId: number;
+  currentFans: number | null;
+  checkedAt: string | null;
+  snapshots: FanSnapshot[];
+}
+
 export interface LiveStatus {
   streamerId: number;
   mid: string;

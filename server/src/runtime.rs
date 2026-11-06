@@ -4,7 +4,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use oshical_core::{load_settings, save_settings, AppService, SqliteStore, SyncPrunePolicy};
+use oshical_core::{
+    load_settings, save_settings, AppService, SqliteStore, SyncPrunePolicy,
+    FAN_POLL_INTERVAL_SECONDS,
+};
 use tokio::sync::broadcast;
 
 use crate::api::{build_router, AppState};
@@ -133,6 +136,33 @@ pub fn spawn_background_tasks(state: AppState) {
         .await;
     });
 
+    let fan_state = state.clone();
+    tokio::spawn(async move {
+        run_poll_loop(
+            || async { Duration::from_secs(FAN_POLL_INTERVAL_SECONDS) },
+            move |_| {
+                let service = fan_state.service.clone();
+                async move {
+                    match service.refresh_all_fans().await {
+                        Ok(report) if report.failed_streamers.is_empty() => {
+                            tracing::info!(
+                                refreshed = report.refreshed_streamers,
+                                "粉丝数采集完成"
+                            );
+                        }
+                        Ok(report) => tracing::warn!(
+                            refreshed = report.refreshed_streamers,
+                            failed = report.failed_streamers.len(),
+                            "粉丝数采集完成，部分主播失败"
+                        ),
+                        Err(error) => tracing::warn!(%error, "粉丝数采集失败"),
+                    }
+                }
+            },
+        )
+        .await;
+    });
+
     let sync_state = state.clone();
     tokio::spawn(async move {
         // start at current head: new connections replay history themselves, this
@@ -153,7 +183,15 @@ pub fn spawn_background_tasks(state: AppState) {
 
     let event_state = state.clone();
     tokio::spawn(async move {
-        let mut last_seq = 0_i64;
+        // Start at the current head so a server restart does not rebroadcast
+        // historical live transitions as fresh notifications. Reconnecting
+        // clients replay their own cursor or bootstrap from sync state.
+        let mut last_seq = event_state
+            .service
+            .store()
+            .latest_event_seq()
+            .await
+            .unwrap_or(0);
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             match event_state

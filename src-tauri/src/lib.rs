@@ -9,15 +9,16 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use oshical_core::{
     load_settings, save_settings as save_settings_to_store, AppError, AppService, AppSettings,
-    DataMode, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport, NewSchedule,
-    NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule, Streamer,
-    SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    DataMode, FanHistory, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport,
+    NewSchedule, NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule,
+    Streamer, SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule,
+    WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
@@ -28,6 +29,8 @@ const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
 const APP_UPDATE_DIRECT_ENDPOINT: &str =
     "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+const APP_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+const APP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 struct DesktopState {
     service: Arc<AppService>,
@@ -185,6 +188,8 @@ pub fn run() {
             cancel_schedule,
             list_live_statuses,
             list_live_sessions,
+            get_fan_history,
+            refresh_streamer_fans,
             live_session_for_schedule,
             list_fertility_statuses,
             check_live_now,
@@ -243,6 +248,14 @@ fn setup_window(app: &AppHandle) {
     }
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开推历 OshiCal", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "立即刷新", true, None::<&str>)?;
@@ -250,15 +263,22 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &refresh, &quit])?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .tooltip("推历 OshiCal · 直播日程")
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "open" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
                 }
+            ) {
+                show_main_window(tray.app_handle());
             }
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => show_main_window(app),
             "refresh" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -322,20 +342,26 @@ async fn resolve_app_update(
         .updater_builder()
         .endpoints(endpoints)
         .map_err(|error| format!("配置更新端点失败: {error}"))?
-        .timeout(Duration::from_secs(45))
+        .timeout(APP_UPDATE_CHECK_TIMEOUT)
         .build()
         .map_err(|error| format!("初始化更新检查失败: {error}"))?;
     let mut update = updater
         .check()
         .await
         .map_err(|error| format!("检查更新失败: {error}"))?;
-    if let (Some(update), Some(base)) = (update.as_mut(), normalize_mirror_base(mirror_url)?) {
-        if update.download_url.scheme() == "https"
-            && !update.download_url.as_str().starts_with(&base)
-        {
-            update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
-                .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+    let mirror_base = normalize_mirror_base(mirror_url)?;
+    if let Some(update) = update.as_mut() {
+        if let Some(base) = mirror_base.as_deref() {
+            if update.download_url.scheme() == "https"
+                && !update.download_url.as_str().starts_with(base)
+            {
+                update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
+                    .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+            }
         }
+        // The updater check timeout also applies to the entire package download. A slow
+        // GitHub mirror can take several minutes to transfer a release installer.
+        update.timeout = Some(APP_UPDATE_DOWNLOAD_TIMEOUT);
     }
     Ok(update)
 }
@@ -751,6 +777,31 @@ async fn list_live_sessions(
 }
 
 #[tauri::command]
+async fn get_fan_history(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+    days: Option<i64>,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .get_fan_history(streamer_id, days.unwrap_or(30))
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
+async fn refresh_streamer_fans(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .refresh_streamer_fans(streamer_id)
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
 async fn live_session_for_schedule(
     state: State<'_, DesktopState>,
     schedule_id: i64,
@@ -1096,6 +1147,40 @@ fn spawn_local_monitor(app: AppHandle) {
                 previous = Some(Instant::now());
                 if let Err(error) = state.service.refresh_all().await {
                     let _ = dynamic_app.emit("monitor-error", error.to_string());
+                }
+            }
+        }
+    });
+
+    let fan_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut previous = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let state = fan_app.state::<DesktopState>();
+            let settings = match load_settings(state.service.store()).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let _ = fan_app.emit("monitor-error", error.to_string());
+                    continue;
+                }
+            };
+            if settings.data_mode != DataMode::Local {
+                previous = None;
+                continue;
+            }
+            if previous.is_none_or(|started: Instant| {
+                started.elapsed() >= Duration::from_secs(FAN_POLL_INTERVAL_SECONDS)
+            }) {
+                previous = Some(Instant::now());
+                match state.service.refresh_all_fans().await {
+                    Ok(report) if report.refreshed_streamers > 0 => {
+                        let _ = fan_app.emit("fan-count-updated", report);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = fan_app.emit("monitor-error", error.to_string());
+                    }
                 }
             }
         }
@@ -1966,14 +2051,13 @@ async fn remote_monitor_loop(
                                     return;
                                 }
                                 _ => {
-                                    if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
-                                        if legacy_mode && seq <= legacy_seq {
-                                            continue;
-                                        }
-                                        if legacy_mode {
-                                            legacy_seq = seq;
-                                        }
-                                        event["replayed"] = json!(seq <= replay_through);
+                                    if !prepare_forwarded_event(
+                                        legacy_mode,
+                                        &mut legacy_seq,
+                                        replay_through,
+                                        &mut event,
+                                    ) {
+                                        continue;
                                     }
                                     let _ = app.emit("server-event", event);
                                 }
@@ -2216,6 +2300,28 @@ fn emit_job_progress(app: &AppHandle, event: &Value) {
     }
 }
 
+fn prepare_forwarded_event(
+    legacy_mode: bool,
+    legacy_seq: &mut i64,
+    replay_through: i64,
+    event: &mut Value,
+) -> bool {
+    // V2 event-journal sequence numbers are independent from the sync cursor.
+    // Only legacy replay windows may mark an event as replayed.
+    if !legacy_mode {
+        return true;
+    }
+    let Some(seq) = event.get("seq").and_then(Value::as_i64) else {
+        return true;
+    };
+    if seq <= *legacy_seq {
+        return false;
+    }
+    *legacy_seq = seq;
+    event["replayed"] = json!(seq <= replay_through);
+    true
+}
+
 fn build_ws_url(server_url: &str, after: i64, protocol: u32) -> Result<String, String> {
     let mut url = url::Url::parse(server_url).map_err(|error| error.to_string())?;
     let scheme = match url.scheme() {
@@ -2252,8 +2358,9 @@ async fn export_client_snapshot(
 mod tests {
     use super::{
         app_update_endpoints, build_ws_url, cookie_header_from_webview, normalize_mirror_base,
-        validate_external_url,
+        prepare_forwarded_event, validate_external_url,
     };
+    use serde_json::json;
     use tauri::webview::Cookie;
 
     #[test]
@@ -2310,6 +2417,46 @@ mod tests {
                 .build()]),
             None
         );
+    }
+
+    #[test]
+    fn websocket_v2_live_status_is_not_marked_replayed() {
+        let mut event = json!({
+            "seq": 1,
+            "type": "live_status",
+            "payload": {"previousIsLive": false, "isLive": true}
+        });
+        let mut legacy_seq = 0;
+        assert!(prepare_forwarded_event(
+            false,
+            &mut legacy_seq,
+            51_688,
+            &mut event
+        ));
+        assert!(event.get("replayed").is_none());
+        assert_eq!(legacy_seq, 0);
+    }
+
+    #[test]
+    fn websocket_legacy_event_uses_event_journal_replay_window() {
+        let mut event = json!({"seq": 8, "type": "live_status"});
+        let mut legacy_seq = 7;
+        assert!(prepare_forwarded_event(
+            true,
+            &mut legacy_seq,
+            8,
+            &mut event
+        ));
+        assert_eq!(event["replayed"], true);
+        assert_eq!(legacy_seq, 8);
+
+        let mut duplicate = json!({"seq": 8, "type": "live_status"});
+        assert!(!prepare_forwarded_event(
+            true,
+            &mut legacy_seq,
+            8,
+            &mut duplicate
+        ));
     }
 
     #[test]

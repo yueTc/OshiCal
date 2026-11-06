@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+brotli = "9.1"
 chrono.workspace = true
 flate2 = "1.0"
 futures-util = "0.3"

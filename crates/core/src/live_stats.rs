@@ -8,10 +8,17 @@ use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{
+    client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::bilibili::BilibiliClient;
 use crate::error::{AppError, AppResult};
@@ -21,8 +28,11 @@ use crate::store::SqliteStore;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024;
+const LIVE_WS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 #[derive(Clone, Default)]
 pub struct LiveStatsManager {
@@ -36,6 +46,7 @@ struct TaskHandle {
 
 #[derive(Default)]
 struct CollectorStats {
+    peak_high_energy: i64,
     danmaku_count: i64,
     gift_count: i64,
     super_chat_count: i64,
@@ -50,11 +61,13 @@ struct CollectorStats {
     interactive_users: HashSet<String>,
     paid_users: HashSet<String>,
     dedup: HashSet<String>,
+    connection_established: bool,
 }
 
 impl CollectorStats {
     fn from_session(session: &LiveSession) -> Self {
         Self {
+            peak_high_energy: session.peak_high_energy as i64,
             danmaku_count: session.danmaku_count,
             gift_count: session.gift_count,
             super_chat_count: session.super_chat_count,
@@ -72,6 +85,7 @@ impl CollectorStats {
 
     fn snapshot(&self, quality: &str, state: &str) -> LiveSessionStats {
         LiveSessionStats {
+            peak_high_energy: self.peak_high_energy,
             revenue_cents: self.revenue_cents,
             gift_revenue_cents: self.gift_revenue_cents,
             super_chat_revenue_cents: self.super_chat_revenue_cents,
@@ -134,6 +148,7 @@ async fn run_collector(
     mut stop_rx: oneshot::Receiver<DateTime<Utc>>,
 ) {
     let mut stats = CollectorStats::from_session(&session);
+    let mut retry_delay = RECONNECT_DELAY;
     loop {
         match collect_once(&store, &bili, &session, &mut stats, &mut stop_rx).await {
             CollectResult::Stopped(ended_at) => {
@@ -152,6 +167,13 @@ async fn run_collector(
             }
             CollectResult::Disconnected(error) => {
                 stats.reconnect_count += 1;
+                let current_delay = retry_delay;
+                if stats.connection_established {
+                    retry_delay = RECONNECT_DELAY;
+                } else {
+                    retry_delay = (retry_delay * 2).min(MAX_RECONNECT_DELAY);
+                }
+                stats.connection_established = false;
                 if let Err(store_error) = store
                     .update_live_session_stats(
                         session.id,
@@ -161,7 +183,12 @@ async fn run_collector(
                 {
                     tracing::warn!(%store_error, session_id = session.id, "保存直播采集断点失败");
                 }
-                tracing::warn!(%error, session_id = session.id, "直播数据连接中断，准备重连");
+                tracing::warn!(
+                    %error,
+                    session_id = session.id,
+                    retry_in_seconds = current_delay.as_secs(),
+                    "直播数据连接中断，准备重连"
+                );
                 tokio::select! {
                     _ = &mut stop_rx => {
                         let quality = if stats.reconnect_count == 0 { "complete" } else { "partial" };
@@ -172,7 +199,7 @@ async fn run_collector(
                         ).await;
                         return;
                     }
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(current_delay) => {}
                 }
             }
         }
@@ -191,6 +218,7 @@ async fn collect_once(
     stats: &mut CollectorStats,
     stop_rx: &mut oneshot::Receiver<DateTime<Utc>>,
 ) -> CollectResult {
+    let websocket_proxy = bili.websocket_proxy().map(ToOwned::to_owned);
     let info = match bili.fetch_live_danmu_info(&session.room_id).await {
         Ok(value) => value,
         Err(error) => return CollectResult::Disconnected(error.to_string()),
@@ -204,19 +232,22 @@ async fn collect_once(
         None => return CollectResult::Disconnected("弹幕服务器列表为空".to_owned()),
     };
 
-    for host in hosts {
-        let Some(host_name) = host.get("host").and_then(Value::as_str) else {
-            continue;
-        };
-        let port = host.get("wss_port").and_then(Value::as_u64).unwrap_or(2245);
-        let url = format!("wss://{host_name}:{port}/sub");
-        let socket = match timeout(Duration::from_secs(12), connect_async(&url)).await {
-            Ok(Ok((socket, _))) => socket,
+    for url in websocket_endpoints(hosts) {
+        let socket = match timeout(
+            Duration::from_secs(12),
+            connect_live_socket(&url, websocket_proxy.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => socket,
             Ok(Err(error)) => {
                 tracing::debug!(%error, %url, "直播弹幕连接失败");
                 continue;
             }
-            Err(_) => continue,
+            Err(_) => {
+                tracing::debug!(%url, "直播弹幕连接超时");
+                continue;
+            }
         };
         let (mut writer, mut reader) = socket.split();
         let auth = serde_json::json!({
@@ -298,6 +329,137 @@ async fn collect_once(
     CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
 }
 
+async fn connect_live_socket(
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
+    request.headers_mut().insert(
+        ORIGIN,
+        HeaderValue::from_static("https://live.bilibili.com"),
+    );
+    request
+        .headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(LIVE_WS_USER_AGENT));
+
+    let Some(proxy) = proxy else {
+        return connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
+            .map_err(|error| error.to_string());
+    };
+
+    let proxy_url =
+        url::Url::parse(proxy).map_err(|error| format!("弹幕代理地址无效（{proxy}）: {error}"))?;
+    if proxy_url.scheme() != "http" {
+        return Err(format!(
+            "弹幕 WebSocket 当前仅支持 HTTP CONNECT 代理，收到 {}",
+            proxy_url.scheme()
+        ));
+    }
+    let proxy_host = proxy_url
+        .host_str()
+        .ok_or_else(|| "弹幕代理地址缺少主机名".to_owned())?;
+    let proxy_port = proxy_url.port_or_known_default().unwrap_or(8080);
+    let target_url =
+        url::Url::parse(url).map_err(|error| format!("弹幕服务器地址无效（{url}）: {error}"))?;
+    let target_host = target_url
+        .host_str()
+        .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?;
+    let target_port = target_url.port_or_known_default().unwrap_or(443);
+
+    let mut stream = TcpStream::connect((proxy_host, proxy_port))
+        .await
+        .map_err(|error| format!("连接弹幕代理 {proxy_host}:{proxy_port} 失败: {error}"))?;
+    let mut connect_request = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n"
+    );
+    if !proxy_url.username().is_empty() {
+        let password = proxy_url.password().unwrap_or_default();
+        let credential = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{password}", proxy_url.username()));
+        connect_request.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
+    }
+    connect_request.push_str("\r\n");
+    stream
+        .write_all(connect_request.as_bytes())
+        .await
+        .map_err(|error| format!("发送弹幕代理 CONNECT 请求失败: {error}"))?;
+
+    let mut response = Vec::new();
+    loop {
+        let byte = stream
+            .read_u8()
+            .await
+            .map_err(|error| format!("读取弹幕代理 CONNECT 响应失败: {error}"))?;
+        response.push(byte);
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if response.len() >= MAX_PROXY_RESPONSE_BYTES {
+            return Err("弹幕代理 CONNECT 响应头过大".to_owned());
+        }
+    }
+    let status_line = String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let status = status_line.split_whitespace().nth(1).unwrap_or_default();
+    if status != "200" {
+        return Err(format!("弹幕代理 CONNECT 被拒绝: {status_line}"));
+    }
+
+    client_async_tls_with_config(request, stream, None, None)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|error| format!("经代理建立弹幕 TLS/WebSocket 失败: {error}"))
+}
+
+fn websocket_endpoints(hosts: &[Value]) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for host in hosts {
+        let Some(host_name) = host.get("host").and_then(Value::as_str) else {
+            continue;
+        };
+        let wss_port = host.get("wss_port").and_then(Value::as_u64).unwrap_or(2245);
+        append_websocket_endpoint(&mut endpoints, &mut seen, host_name, 443);
+        append_websocket_endpoint(&mut endpoints, &mut seen, host_name, wss_port);
+    }
+    // The regional host can be blocked while Bilibili's shared endpoint remains reachable.
+    append_websocket_endpoint(
+        &mut endpoints,
+        &mut seen,
+        "broadcastlv.chat.bilibili.com",
+        443,
+    );
+    endpoints
+}
+
+fn append_websocket_endpoint(
+    endpoints: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    host: &str,
+    port: u64,
+) {
+    let host = host.trim();
+    if host.is_empty() || port == 0 {
+        return;
+    }
+    let key = format!("{host}:{port}");
+    if !seen.insert(key) {
+        return;
+    }
+    if port == 443 {
+        endpoints.push(format!("wss://{host}/sub"));
+    } else {
+        endpoints.push(format!("wss://{host}:{port}/sub"));
+    }
+}
+
 fn make_packet(operation: u32, body: Vec<u8>) -> Vec<u8> {
     let mut packet = Vec::with_capacity(16 + body.len());
     packet.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
@@ -330,7 +492,15 @@ fn parse_live_packets(stats: &mut CollectorStats, bytes: &[u8], depth: usize) {
             return;
         }
         let body = &bytes[offset + header_len..offset + packet_len];
-        if operation == 5 {
+        if operation == 8 {
+            if serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|value| value.get("code").and_then(Value::as_i64))
+                == Some(0)
+            {
+                stats.connection_established = true;
+            }
+        } else if operation == 5 {
             match version {
                 2 => {
                     let decoder = ZlibDecoder::new(body);
@@ -344,7 +514,15 @@ fn parse_live_packets(stats: &mut CollectorStats, bytes: &[u8], depth: usize) {
                     }
                 }
                 3 => {
-                    tracing::debug!("收到未支持的 brotli 直播弹幕包");
+                    let decoder = brotli::Decompressor::new(body, 4096);
+                    let mut decoded = Vec::new();
+                    if decoder
+                        .take(MAX_DECOMPRESSED_BYTES as u64)
+                        .read_to_end(&mut decoded)
+                        .is_ok()
+                    {
+                        parse_live_packets(stats, &decoded, depth + 1);
+                    }
                 }
                 _ => {
                     if let Ok(value) = serde_json::from_slice::<Value>(body) {
@@ -367,6 +545,16 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
         .unwrap_or_default();
     let data = value.get("data").unwrap_or(&Value::Null);
     match cmd {
+        "ONLINE_RANK_COUNT" => {
+            // B 站公开事件中的高能用户在线上限，不是直播间热度值。
+            let current = data
+                .get("online_count")
+                .and_then(Value::as_i64)
+                .or_else(|| data.get("count").and_then(Value::as_i64))
+                .unwrap_or(0)
+                .max(0);
+            stats.peak_high_energy = stats.peak_high_energy.max(current);
+        }
         "DANMU_MSG" => {
             stats.danmaku_count += 1;
             if let Some(uid) = value.pointer("/info/2/0").and_then(value_to_string) {
@@ -460,25 +648,38 @@ fn add_gift(
     tid: &str,
     timestamp: i64,
 ) {
-    let Some(uid) = uid else {
-        return;
-    };
-    stats.interactive_users.insert(uid.clone());
+    // Anonymous danmaku connections receive `uid = 0`; revenue must still be
+    // counted even though we cannot attribute the gift to a unique user.
+    let uid = uid.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() || value == "0" {
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    });
+    if let Some(uid) = uid.as_ref() {
+        stats.interactive_users.insert(uid.clone());
+    }
+
     let coins = if total_coin > 0 {
         total_coin
     } else {
         price * num
     };
     let cents = if coin_type == "silver" { 0 } else { coins / 10 };
+    let user_key = uid.as_deref().unwrap_or("anonymous");
     let key = if tid.is_empty() {
-        format!("{uid}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
+        format!("gift:{user_key}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
     } else {
         format!("gift:{tid}")
     };
     if cents > 0 && stats.dedup.insert(key) {
         stats.revenue_cents += cents;
         stats.gift_revenue_cents += cents;
-        stats.paid_users.insert(uid);
+        if let Some(uid) = uid {
+            stats.paid_users.insert(uid);
+        }
     }
 }
 
@@ -621,6 +822,117 @@ fn decode_send_gift_v2(pb: &str) -> Vec<GiftV2> {
 mod tests {
     use super::*;
     use crate::models::AddSubscription;
+    use std::io::Write;
+
+    #[test]
+    fn websocket_endpoints_prefer_443_and_deduplicate() {
+        let hosts = vec![
+            serde_json::json!({"host": "regional.example", "wss_port": 2245}),
+            serde_json::json!({"host": "regional.example", "wss_port": 2245}),
+            serde_json::json!({"host": "port443.example", "wss_port": 443}),
+        ];
+        assert_eq!(
+            websocket_endpoints(&hosts),
+            vec![
+                "wss://regional.example/sub",
+                "wss://regional.example:2245/sub",
+                "wss://port443.example/sub",
+                "wss://broadcastlv.chat.bilibili.com/sub",
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_peak_high_energy_from_online_rank_count() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "ONLINE_RANK_COUNT",
+                "data": {"online_count": 1234, "count": 1200}
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "ONLINE_RANK_COUNT",
+                "data": {"online_count": 1000, "count": 900}
+            }),
+        );
+        assert_eq!(stats.peak_high_energy, 1234);
+    }
+
+    #[test]
+    fn successful_auth_response_marks_connection_established() {
+        let packet = make_packet(8, br#"{"code":0}"#.to_vec());
+        let mut stats = CollectorStats::default();
+        parse_live_packets(&mut stats, &packet, 0);
+        assert!(stats.connection_established);
+    }
+
+    #[test]
+    fn parses_brotli_live_packets() {
+        let message = serde_json::json!({
+            "cmd": "DANMU_MSG",
+            "info": [[], [], ["42"]]
+        });
+        let inner = make_packet(5, serde_json::to_vec(&message).expect("json"));
+        let mut compressed = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            writer.write_all(&inner).expect("compress");
+        }
+        let mut outer = make_packet(5, compressed);
+        outer[6..8].copy_from_slice(&3u16.to_be_bytes());
+        let mut stats = CollectorStats::default();
+        parse_live_packets(&mut stats, &outer, 0);
+        assert_eq!(stats.danmaku_count, 1);
+        assert!(stats.interactive_users.contains("42"));
+    }
+
+    #[test]
+    fn anonymous_gifts_still_contribute_revenue() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "uid": 0,
+                    "giftId": 1,
+                    "giftName": "anonymous gift",
+                    "num": 1,
+                    "price": 1000,
+                    "total_coin": 1000,
+                    "coin_type": "gold",
+                    "tid": "anonymous-gift-1",
+                    "timestamp": 1
+                }
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "giftId": 2,
+                    "giftName": "missing uid gift",
+                    "num": 1,
+                    "price": 1000,
+                    "total_coin": 1000,
+                    "coin_type": "gold",
+                    "tid": "anonymous-gift-2",
+                    "timestamp": 2
+                }
+            }),
+        );
+
+        assert_eq!(stats.gift_count, 2);
+        assert_eq!(stats.gift_revenue_cents, 200);
+        assert_eq!(stats.revenue_cents, 200);
+        assert!(stats.interactive_users.is_empty());
+        assert!(stats.paid_users.is_empty());
+    }
 
     #[tokio::test]
     #[ignore = "requires a live Bilibili room and network"]
@@ -654,13 +966,17 @@ mod tests {
             )
             .await
             .expect("session");
-        let bili = Arc::new(BilibiliClient::new(None).expect("bili"));
+        let proxy_port = std::env::var("OSHICAL_LIVE_SMOKE_PROXY")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let bili = Arc::new(BilibiliClient::new_with_proxy(None, proxy_port).expect("bili"));
         let manager = LiveStatsManager::default();
         manager.start(store.clone(), bili, session.clone()).await;
         tokio::time::sleep(Duration::from_secs(15)).await;
         manager.stop(streamer.id, Utc::now()).await;
         let saved = store.get_live_session(session.id).await.expect("saved");
         assert_eq!(saved.collector_state, "finished");
+        assert_eq!(saved.reconnect_count, 0, "弹幕连接未成功建立");
         assert!(saved.danmaku_count >= 0);
     }
 }

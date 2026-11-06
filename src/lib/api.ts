@@ -12,6 +12,7 @@ import type {
   Bootstrap,
   DeviceInfo,
   DeviceRegistration,
+  FanHistory,
   FertilitySnapshot,
   ImportPreview,
   ImportReport,
@@ -231,6 +232,18 @@ export class ServerApi {
 
   liveStatuses(): Promise<LiveStatus[]> {
     return this.request("/api/live-status");
+  }
+
+  fanHistory(streamerId: number, days = 30): Promise<FanHistory> {
+    return this.request(
+      `/api/subscriptions/${streamerId}/fans?days=${encodeURIComponent(days)}`,
+    );
+  }
+
+  refreshFans(streamerId: number): Promise<FanHistory> {
+    return this.request(`/api/subscriptions/${streamerId}/fans/refresh`, {
+      method: "POST",
+    });
   }
 
   liveSessions(streamerId?: number, limit = 50): Promise<LiveSession[]> {
@@ -517,6 +530,14 @@ export class LocalApi {
 
   liveStatuses(): Promise<LiveStatus[]> {
     return invoke("list_live_statuses");
+  }
+
+  fanHistory(streamerId: number, days = 30): Promise<FanHistory> {
+    return invoke("get_fan_history", { streamerId, days });
+  }
+
+  refreshFans(streamerId: number): Promise<FanHistory> {
+    return invoke("refresh_streamer_fans", { streamerId });
   }
 
   liveSessions(streamerId?: number, limit = 50): Promise<LiveSession[]> {

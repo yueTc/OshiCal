@@ -5,6 +5,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   CalendarRange,
   Cloud,
@@ -12,7 +13,10 @@ import {
   Flower2,
   HardDrive,
   LoaderCircle,
+  Minus,
   RefreshCw,
+  Square,
+  X,
   Settings as SettingsIcon,
   Trash2,
   UserRound,
@@ -26,6 +30,12 @@ import MagicPeriodView from "./components/MagicPeriodView";
 import SettingsView, { type SettingsViewHandle } from "./components/SettingsView";
 import { Avatar, ErrorBanner, Modal } from "./components/ui";
 import BrandMark from "./components/BrandMark";
+import {
+  applyAppearance,
+  readAppearanceSettings,
+  saveAppearanceSettings,
+  type AppearanceSettings,
+} from "./lib/appearance";
 import {
   ApiFailure,
   LocalApi,
@@ -70,6 +80,7 @@ import type {
   ImportPreview,
   AppSettings,
   Bootstrap,
+  FanHistory,
   FertilitySnapshot,
   LlmDiscoveryInput,
   LlmTestInput,
@@ -205,6 +216,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   proxyPort: null,
 };
 
+function maskLlmApiKey(apiKey: string): string {
+  const value = apiKey.trim();
+  return value ? "••••••••" + value.slice(-4) : "";
+}
+
 const EMPTY_SECRETS: SecretStatus = {
   llmConfigured: false,
   biliConfigured: false,
@@ -212,6 +228,9 @@ const EMPTY_SECRETS: SecretStatus = {
 };
 
 const localApi = isTauri ? new LocalApi() : null;
+const desktopWindow = isTauri ? getCurrentWindow() : null;
+const initialAppearance = readAppearanceSettings();
+applyAppearance(initialAppearance);
 
 // LAPLACE 正式接口尚未接入，保留页面实现但暂时关闭入口。
 const MAGIC_PERIOD_ENABLED = false;
@@ -222,6 +241,7 @@ export default function App() {
   const [scheduleRevision, setScheduleRevision] = useState(0);
   const [ready, setReady] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [appearance, setAppearance] = useState<AppearanceSettings>(initialAppearance);
   const [subscriptions, setSubscriptions] = useState<Streamer[]>([]);
   const [liveStatuses, setLiveStatuses] = useState<LiveStatus[]>([]);
   const [secrets, setSecrets] = useState<SecretStatus>(EMPTY_SECRETS);
@@ -259,6 +279,7 @@ export default function App() {
   } | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
   const [authGateError, setAuthGateError] = useState<string | null>(null);
+  const [llmApiKeyHint, setLlmApiKeyHint] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [creatorMenu, setCreatorMenu] = useState<{ streamer: Streamer; x: number; y: number } | null>(null);
@@ -281,6 +302,11 @@ export default function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  useEffect(() => {
+    applyAppearance(appearance);
+    saveAppearanceSettings(appearance);
+  }, [appearance]);
 
   useEffect(() => {
     syncStateRef.current = syncState;
@@ -478,6 +504,7 @@ export default function App() {
   const syncServerLlmSecret = useCallback(async (api: ServerApi): Promise<void> => {
     try {
       const secret = await api.llmSecret();
+      setLlmApiKeyHint(maskLlmApiKey(secret.apiKey ?? ""));
       if (isTauri && localApi && secret.apiKey) {
         const status = await localApi.saveSecrets({ llmApiKey: secret.apiKey });
         setSecrets(status);
@@ -493,6 +520,29 @@ export default function App() {
       }
       throw error;
     }
+  }, []);
+
+  const refreshServerSettings = useCallback(
+    async (api: ServerApi, base: AppSettings = settingsRef.current): Promise<AppSettings> => {
+      const serverSettings = await api.settings();
+      const merged = mergeServerSettings(base, serverSettings);
+      settingsRef.current = merged;
+      setSettings(merged);
+      if (isTauri && localApi) {
+        await localApi.saveSettings(merged).catch(() => undefined);
+      }
+      return merged;
+    },
+    [],
+  );
+
+  const reloadLocalSettings = useCallback(async (): Promise<void> => {
+    if (!localApi) {
+      return;
+    }
+    const next = await localApi.settings();
+    settingsRef.current = next;
+    setSettings(next);
   }, []);
 
   const applyFormalChanges = useCallback(async (changes: SyncChange[]) => {
@@ -815,6 +865,7 @@ export default function App() {
         if (boot.settings.dataMode === "server" && boot.settings.serverUrl && token) {
           try {
             const api = await connectServer(boot.settings.serverUrl, token);
+            await refreshServerSettings(api, boot.settings);
             const deviceId = syncStateRef.current.deviceId || (await localApi.deviceId());
             if (!hasCompletedServerOnboarding(resolveHttpBase(api), deviceId)) {
               setPendingServerSetup({ api, token, deviceId });
@@ -835,7 +886,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [connectServer, showToast]);
+  }, [connectServer, refreshServerSettings, showToast]);
   useEffect(() => {
     if (!isTauri) {
       return;
@@ -920,7 +971,10 @@ export default function App() {
         const offBootstrap = await listen<Record<string, unknown>>("sync-bootstrap-applied", (event) => {
           syncEngineRef.current?.acceptAppliedProgress(event.payload);
           setScheduleRevision((value) => value + 1);
-          void refreshActiveData().catch((error) => showToast(explainError(error)));
+          void (async () => {
+            await reloadLocalSettings();
+            await refreshActiveData();
+          })().catch((error) => showToast(explainError(error)));
         });
         keepCleanup(offBootstrap);
         const offJobProgress = await listen<Record<string, unknown>>("job-progress", (event) => {
@@ -931,6 +985,10 @@ export default function App() {
           showToast(event.payload);
         });
         keepCleanup(offError);
+        const offFanCount = await listen<unknown>("fan-count-updated", () => {
+          void refreshActiveData().catch((error) => showToast(explainError(error)));
+        });
+        keepCleanup(offFanCount);
         const offBiliCookie = await listen<SecretStatus>("bili-cookie-updated", (event) => {
           setSecrets(event.payload);
           showToast("B 站 Cookie 已自动保存");
@@ -954,7 +1012,7 @@ export default function App() {
         cleanup();
       }
     };
-  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, showToast]);
+  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, reloadLocalSettings, showToast]);
 
   useEffect(() => {
     if (!serverApi || pendingImport || pendingServerSetup || pendingClientMigration) {
@@ -1127,6 +1185,8 @@ export default function App() {
         if (webCacheAvailable && !restoredFromWebCache) {
           await engine.forceResync("cache_missing");
         }
+        // A cached snapshot can lag behind environment-level server changes.
+        await refreshServerSettings(api);
         if (disposed) {
           return;
         }
@@ -1154,18 +1214,19 @@ export default function App() {
       }
       socket?.close();
     };
-  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, serverApi]);
+  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, refreshServerSettings, serverApi]);
 
   useEffect(() => {
     if (page !== "settings" || !serverApi) {
       return;
     }
     void refreshSyncDevices();
+    void refreshServerSettings(serverApi).catch((error) => showToast(explainError(error)));
     void serverApi
       .serverBiliStatus()
       .then((status) => setServerBiliConfigured(status.configured))
       .catch(() => undefined);
-  }, [page, refreshSyncDevices, serverApi]);
+  }, [page, refreshServerSettings, refreshSyncDevices, serverApi, showToast]);
 
   useEffect(() => {
     if (!ready) {
@@ -1254,16 +1315,11 @@ export default function App() {
     try {
       const api = await connectServer(isTauri ? settings.serverUrl : "", token, isTauri);
       if (!isTauri) {
-        const serverSettings = await api.settings();
-        const merged = mergeServerSettings(
-          {
-            ...settingsRef.current,
-            dataMode: "server",
-            serverUrl: resolveHttpBase(api),
-          },
-          serverSettings,
-        );
-        setSettings(merged);
+        const merged = await refreshServerSettings(api, {
+          ...settingsRef.current,
+          dataMode: "server",
+          serverUrl: resolveHttpBase(api),
+        });
         saveWebDevicePreferences(merged);
         const deviceId = syncStateRef.current.deviceId || await resolveSyncDeviceId();
         const serverUrl = resolveHttpBase(api);
@@ -1952,6 +2008,30 @@ export default function App() {
           throw error;
         }
       },
+      fanHistory: async (streamerId: number, days = 30): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.fanHistory(streamerId, days);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.fanHistory(streamerId, days);
+      },
+      refreshFans: async (streamerId: number): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.refreshFans(streamerId);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.refreshFans(streamerId);
+      },
       listWeeklyRules: async (streamerId: number): Promise<WeeklyScheduleRule[]> => {
         if (serverMode) {
           if (!serverApi) {
@@ -2138,6 +2218,33 @@ export default function App() {
     }
   }
 
+  async function minimizeWindow() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.minimize();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
+  async function toggleWindowMaximize() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.toggleMaximize();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
+  async function closeWindow() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.close();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
   async function navigateToPage(nextPage: Page) {
     if (nextPage === page) {
       return;
@@ -2178,9 +2285,29 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
+      className={`app-shell ${isTauri ? "is-desktop" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
+      {desktopWindow ? (
+        <div className="window-chrome">
+          <div
+            className="window-drag-region"
+            data-tauri-drag-region
+            onDoubleClick={() => void toggleWindowMaximize()}
+          />
+          <div className="window-controls" role="group" aria-label="窗口控制">
+            <button type="button" className="window-control" aria-label="最小化" title="最小化" onClick={() => void minimizeWindow()}>
+              <Minus size={15} />
+            </button>
+            <button type="button" className="window-control" aria-label="最大化或还原" title="最大化或还原" onClick={() => void toggleWindowMaximize()}>
+              <Square size={13} />
+            </button>
+            <button type="button" className="window-control close" aria-label="关闭到托盘" title="关闭到托盘" onClick={() => void closeWindow()}>
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><BrandMark size={27} /></div>
@@ -2288,7 +2415,9 @@ export default function App() {
         {connectionError && (connection === "offline" || connection === "connecting") ? (
           <ErrorBanner message={connectionError} onRetry={() => {
             if (settings.dataMode === "server" && settings.serverUrl && serverToken) {
-              void connectServer(settings.serverUrl, serverToken).catch((error) => showToast(explainError(error)));
+              void connectServer(settings.serverUrl, serverToken)
+                .then((api) => refreshServerSettings(api))
+                .catch((error) => showToast(explainError(error)));
             }
           }} />
         ) : null}
@@ -2303,7 +2432,10 @@ export default function App() {
           <SettingsView
             ref={settingsViewRef}
             settings={settings}
+            appearance={appearance}
+            onAppearanceChange={setAppearance}
             secrets={secrets}
+            llmApiKeyHint={llmApiKeyHint}
             biliConfigured={(!isTauri || settings.dataMode === "server") ? serverBiliConfigured : secrets.biliConfigured}
             autostart={autostart}
             tauri={isTauri}

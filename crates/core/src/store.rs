@@ -15,9 +15,9 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AddSubscription, ClientSyncState, DynamicPost, HealthState, LinkedAccount, LiveSession,
-    LiveSessionStats, LiveSnapshot, LiveStatus, NewSchedule, NewWeeklyScheduleRule, Schedule,
-    SourceSuppression, Streamer, SyncMutation, UpdateSchedule, UpdateSubscription,
+    AddSubscription, ClientSyncState, DynamicPost, FanSnapshot, HealthState, LinkedAccount,
+    LiveSession, LiveSessionStats, LiveSnapshot, LiveStatus, NewSchedule, NewWeeklyScheduleRule,
+    Schedule, SourceSuppression, Streamer, SyncMutation, UpdateSchedule, UpdateSubscription,
     UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::settings::SETTING_KEYS;
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS streamers (
     schedule_enabled INTEGER NOT NULL DEFAULT 1,
     live_notify_enabled INTEGER NOT NULL DEFAULT 1,
     live_stats_enabled INTEGER NOT NULL DEFAULT 0,
+    fans INTEGER,
     aliases_json TEXT NOT NULL DEFAULT '[]',
     last_error TEXT,
     last_refresh_at TEXT,
@@ -50,6 +51,16 @@ CREATE TABLE IF NOT EXISTS streamers (
     live_revision INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS fan_snapshots (
+    streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL,
+    fans INTEGER NOT NULL,
+    PRIMARY KEY(streamer_id, captured_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fan_snapshots_streamer_captured
+ON fan_snapshots(streamer_id, captured_at DESC);
+
 CREATE TABLE IF NOT EXISTS live_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -61,6 +72,7 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     ended_at TEXT,
     duration_seconds INTEGER NOT NULL DEFAULT 0,
     peak_online INTEGER NOT NULL DEFAULT 0,
+    peak_high_energy INTEGER NOT NULL DEFAULT 0,
     avg_online INTEGER NOT NULL DEFAULT 0,
     online_samples INTEGER NOT NULL DEFAULT 0,
     online_total INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +314,7 @@ struct StreamerRow {
     schedule_enabled: i64,
     live_notify_enabled: i64,
     live_stats_enabled: i64,
+    fans: Option<i64>,
     aliases_json: String,
     last_error: Option<String>,
     last_refresh_at: Option<String>,
@@ -404,6 +417,7 @@ struct LiveSessionRow {
     ended_at: Option<String>,
     duration_seconds: i64,
     peak_online: i64,
+    peak_high_energy: i64,
     avg_online: i64,
     online_samples: i64,
     online_total: i64,
@@ -524,6 +538,14 @@ impl SqliteStore {
         }
         if !streamer_columns
             .iter()
+            .any(|row| row.get::<String, _>("name") == "fans")
+        {
+            sqlx::query("ALTER TABLE streamers ADD COLUMN fans INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !streamer_columns
+            .iter()
             .any(|row| row.get::<String, _>("name") == "sort_order")
         {
             sqlx::query("ALTER TABLE streamers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
@@ -633,7 +655,7 @@ impl SqliteStore {
 
     pub async fn list_streamers(&self) -> AppResult<Vec<Streamer>> {
         let rows = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
@@ -645,7 +667,7 @@ impl SqliteStore {
 
     pub async fn get_streamer(&self, id: i64) -> AppResult<Streamer> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE id = ?",
@@ -662,7 +684,7 @@ impl SqliteStore {
 
     pub async fn get_streamer_by_mid(&self, mid: &str) -> AppResult<Option<Streamer>> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE mid = ?",
@@ -715,6 +737,7 @@ impl SqliteStore {
                     schedule_enabled: row.schedule_enabled != 0,
                     live_notify_enabled: row.live_notify_enabled != 0,
                     live_stats_enabled: row.live_stats_enabled != 0,
+                    fans: row.fans.and_then(|value| u64::try_from(value).ok()),
                     last_error: row.last_error,
                     last_refresh_at: parse_opt_ts(row.last_refresh_at.as_deref())?,
                     is_live: row.live_is_live != 0,
@@ -827,6 +850,86 @@ impl SqliteStore {
             .await?;
         tx.commit().await?;
         self.get_streamer(id).await
+    }
+
+    pub async fn record_fan_snapshot(
+        &self,
+        streamer_id: i64,
+        fans: u64,
+        captured_at: DateTime<Utc>,
+    ) -> AppResult<FanSnapshot> {
+        let fans_value =
+            i64::try_from(fans).map_err(|_| AppError::validation("粉丝数超出可存储范围"))?;
+        let captured_at = captured_at.to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(format!("主播 {streamer_id}")));
+        }
+        sqlx::query(
+            "INSERT INTO fan_snapshots(streamer_id, captured_at, fans)
+             VALUES(?, ?, ?)
+             ON CONFLICT(streamer_id, captured_at) DO UPDATE SET fans = excluded.fans",
+        )
+        .bind(streamer_id)
+        .bind(&captured_at)
+        .bind(fans_value)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE streamers SET fans = ?, updated_at = ?, revision = revision + 1
+             WHERE id = ? AND (fans IS NULL OR fans <> ?)
+               AND ? = (
+                   SELECT captured_at FROM fan_snapshots
+                   WHERE streamer_id = ? ORDER BY captured_at DESC LIMIT 1
+               )",
+        )
+        .bind(fans_value)
+        .bind(Utc::now().to_rfc3339())
+        .bind(streamer_id)
+        .bind(fans_value)
+        .bind(&captured_at)
+        .bind(streamer_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() > 0 {
+            self.emit_streamer_change(&mut tx, streamer_id, "upsert", SyncActor::system())
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(FanSnapshot {
+            captured_at: parse_ts(&captured_at)?,
+            fans,
+        })
+    }
+
+    pub async fn list_fan_snapshots(
+        &self,
+        streamer_id: i64,
+        since: DateTime<Utc>,
+    ) -> AppResult<Vec<FanSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT captured_at, fans FROM fan_snapshots
+             WHERE streamer_id = ? AND captured_at >= ?
+             ORDER BY captured_at",
+        )
+        .bind(streamer_id)
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let fans: i64 = row.try_get("fans")?;
+                Ok(FanSnapshot {
+                    captured_at: parse_ts(row.try_get::<String, _>("captured_at")?.as_str())?,
+                    fans: u64::try_from(fans)
+                        .map_err(|_| AppError::validation("粉丝快照数据损坏"))?,
+                })
+            })
+            .collect()
     }
 
     pub async fn update_subscription(
@@ -2359,7 +2462,7 @@ impl SqliteStore {
     pub async fn get_live_session(&self, id: i64) -> AppResult<LiveSession> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                    duration_seconds, peak_online, avg_online, online_samples, online_total,
+                    duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
                     super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2382,7 +2485,7 @@ impl SqliteStore {
         let rows = if let Some(streamer_id) = streamer_id {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2397,7 +2500,7 @@ impl SqliteStore {
         } else {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2417,7 +2520,7 @@ impl SqliteStore {
     ) -> AppResult<Option<LiveSession>> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT ls.id, ls.streamer_id, ls.streamer_name, ls.room_id, ls.title, ls.cover_url,
-                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.avg_online,
+                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.peak_high_energy, ls.avg_online,
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
                     ls.interactive_user_count, ls.danmaku_count, ls.gift_count, ls.super_chat_count,
@@ -2437,39 +2540,6 @@ impl SqliteStore {
         row.map(map_live_session).transpose()
     }
 
-    pub async fn record_live_online(
-        &self,
-        streamer_id: i64,
-        online: u64,
-        checked_at: DateTime<Utc>,
-    ) -> AppResult<()> {
-        let online = online as i64;
-        let checked = checked_at.to_rfc3339();
-        sqlx::query(
-            "UPDATE live_sessions
-             SET peak_online = MAX(peak_online, ?),
-                 online_total = online_total + ?,
-                 online_samples = online_samples + 1,
-                 avg_online = ((online_total + ?) / (online_samples + 1)),
-                 duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 updated_at = ?
-             WHERE id = (
-                 SELECT id FROM live_sessions
-                 WHERE streamer_id = ? AND ended_at IS NULL
-                 ORDER BY started_at DESC LIMIT 1
-             )",
-        )
-        .bind(online)
-        .bind(online)
-        .bind(online)
-        .bind(&checked)
-        .bind(&checked)
-        .bind(streamer_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn update_live_session_stats(
         &self,
         id: i64,
@@ -2478,13 +2548,14 @@ impl SqliteStore {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE live_sessions
-             SET revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+             SET peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = ?, updated_at = ?,
                  revision = revision + 1
              WHERE id = ?",
         )
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -2522,7 +2593,7 @@ impl SqliteStore {
             "UPDATE live_sessions
              SET ended_at = ?,
                  duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+                 peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = 'finished', updated_at = ?,
@@ -2531,6 +2602,7 @@ impl SqliteStore {
         )
         .bind(&ended)
         .bind(&ended)
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -2895,6 +2967,16 @@ impl SqliteStore {
 }
 
 fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
+    let started_at = parse_ts(&row.started_at)?;
+    let ended_at = parse_opt_ts(row.ended_at.as_deref())?;
+    let duration_seconds = if ended_at.is_none() {
+        Utc::now()
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .max(0)
+    } else {
+        row.duration_seconds
+    };
     Ok(LiveSession {
         id: row.id,
         streamer_id: row.streamer_id,
@@ -2902,10 +2984,11 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         room_id: row.room_id,
         title: row.title,
         cover_url: row.cover_url,
-        started_at: parse_ts(&row.started_at)?,
-        ended_at: parse_opt_ts(row.ended_at.as_deref())?,
-        duration_seconds: row.duration_seconds,
+        started_at,
+        ended_at,
+        duration_seconds,
         peak_online: row.peak_online.max(0) as u64,
+        peak_high_energy: row.peak_high_energy.max(0) as u64,
         avg_online: row.avg_online.max(0) as u64,
         online_samples: row.online_samples,
         online_total: row.online_total,
@@ -3183,6 +3266,38 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(list[0].name, "主播A改名");
         assert!(list[0].aliases.iter().any(|value| value == "主播A改名"));
+    }
+
+    #[tokio::test]
+    async fn fan_snapshots_update_current_count_and_do_not_regress_on_old_samples() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("300", "粉丝主播"))
+            .await
+            .expect("streamer");
+        assert_eq!(streamer.fans, None);
+        let start = Utc::now() - Duration::hours(2);
+        store
+            .record_fan_snapshot(streamer.id, 1_000, start)
+            .await
+            .expect("first");
+        store
+            .record_fan_snapshot(streamer.id, 1_100, start + Duration::hours(1))
+            .await
+            .expect("second");
+        store
+            .record_fan_snapshot(streamer.id, 900, start + Duration::minutes(30))
+            .await
+            .expect("older");
+        let current = store.get_streamer(streamer.id).await.expect("current");
+        assert_eq!(current.fans, Some(1_100));
+        let snapshots = store
+            .list_fan_snapshots(streamer.id, start)
+            .await
+            .expect("snapshots");
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].fans, 1_000);
+        assert_eq!(snapshots[2].fans, 1_100);
     }
 
     #[tokio::test]
@@ -3508,7 +3623,7 @@ mod tests {
             .add_subscription(&add_input("200", "乃琳"))
             .await
             .expect("streamer");
-        let start = Utc::now();
+        let start = Utc::now() - Duration::minutes(5);
         let session = store
             .ensure_live_session(
                 streamer.id,
@@ -3517,19 +3632,15 @@ mod tests {
                 "测试直播",
                 None,
                 start,
-                start,
+                Utc::now(),
             )
             .await
             .expect("session");
-        store
-            .record_live_online(streamer.id, 800, start + Duration::minutes(1))
-            .await
-            .expect("online");
-        store
-            .record_live_online(streamer.id, 1200, start + Duration::minutes(2))
-            .await
-            .expect("online");
+        let active = store.get_live_session(session.id).await.expect("active");
+        assert!(active.ended_at.is_none());
+        assert!(active.duration_seconds >= 299);
         let stats = LiveSessionStats {
+            peak_high_energy: 987,
             danmaku_count: 25_000,
             interactive_user_count: 4_014,
             paid_user_count: 977,
@@ -3553,9 +3664,7 @@ mod tests {
             .expect("lookup")
             .expect("matched session");
         assert_eq!(found.id, session.id);
-        assert_eq!(found.peak_online, 1200);
-        assert_eq!(found.avg_online, 1000);
-        assert_eq!(found.online_samples, 2);
+        assert_eq!(found.peak_high_energy, 987);
         assert_eq!(found.revenue_cents, 353_350);
         assert_eq!(found.danmaku_count, 25_000);
         assert_eq!(found.data_quality, "complete");

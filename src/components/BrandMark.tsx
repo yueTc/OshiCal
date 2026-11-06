@@ -12,7 +12,7 @@ export default function BrandMark({ size = 24 }: { size?: number }) {
       <path d="M10 25H54" stroke="currentColor" strokeWidth="4.5" />
       <path d="M20 9V18M44 9V18" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" />
       <path d="M27 34.5L42 40L27 45.5V34.5Z" fill="currentColor" />
-      <circle cx="51" cy="13" r="7" fill="#16A46B" stroke="#FFF8FB" strokeWidth="2.6" />
+      <circle cx="51" cy="13" r="7" fill="#16A46B" stroke="var(--surface, #fff8fb)" strokeWidth="2.6" />
     </svg>
   );
 }

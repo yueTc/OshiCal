@@ -76,7 +76,8 @@ crates/core
 | cover_url | TEXT | 直播封面 |
 | started_at / ended_at | TEXT | 实际开播和结束时间 |
 | duration_seconds | INTEGER | 时长 |
-| peak_online / avg_online | INTEGER | 峰值和平均人气 |
+| peak_online / avg_online | INTEGER | 旧版人气字段，仅为兼容保留；新场次不再采集 |
+| peak_high_energy | INTEGER | 公开高能用户数事件的峰值，用于最高同时在线 |
 | revenue_cents | INTEGER | 公开礼物流水估算；整数分 |
 | paid_user_count | INTEGER | 付费用户去重数 |
 | interactive_user_count | INTEGER | 互动用户去重数 |

@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "server-v*"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +27,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          version="$(python -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")"
+          version="$(python -c "import tomllib; print(tomllib.load(open('server/Cargo.toml','rb'))['package']['version'])")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx

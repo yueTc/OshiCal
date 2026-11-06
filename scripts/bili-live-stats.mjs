@@ -23,7 +23,6 @@ function parseArgs(argv) {
     roomId: DEFAULT_ROOM_ID,
     durationSeconds: 60,
     reportSeconds: 5,
-    pollSeconds: 30,
     systemNetwork: false,
     verbose: false,
   };
@@ -32,7 +31,6 @@ function parseArgs(argv) {
     if (arg === '--room') options.roomId = argv[++index] ?? options.roomId;
     else if (arg === '--duration') options.durationSeconds = Number(argv[++index] ?? options.durationSeconds);
     else if (arg === '--interval') options.reportSeconds = Number(argv[++index] ?? options.reportSeconds);
-    else if (arg === '--poll') options.pollSeconds = Number(argv[++index] ?? options.pollSeconds);
     else if (arg === '--system-network') options.systemNetwork = true;
     else if (arg === '--no-system-network') options.systemNetwork = false;
     else if (arg === '--verbose') options.verbose = true;
@@ -44,12 +42,10 @@ function parseArgs(argv) {
   if (!/^\d+$/.test(options.roomId)) throw new Error('--room 必须是数字直播间号');
   if (!Number.isFinite(options.durationSeconds) || options.durationSeconds <= 0) throw new Error('--duration 必须大于 0 秒');
   if (!Number.isFinite(options.reportSeconds) || options.reportSeconds <= 0) throw new Error('--interval 必须大于 0 秒');
-  if (!Number.isFinite(options.pollSeconds) || options.pollSeconds < 5) throw new Error('--poll 不能小于 5 秒');
   return options;
 }
 
 function printHelp() {
-  console.log(`用法: node scripts/bili-live-stats.mjs [选项]\n\n选项:\n  --room <id>             B 站直播间号，默认 ${DEFAULT_ROOM_ID}\n  --duration <秒>         监控时长，默认 60 秒\n  --interval <秒>         控制台汇报间隔，默认 5 秒\n  --poll <秒>             人气采样间隔，默认 30 秒\n  --system-network        额外采样 Windows 整机网卡流量（含其他程序）\n  --verbose               输出连接诊断\n\n原始事件不落盘；营收为公开礼物/SC/舰长按事件金额折算的估算值。`);
 }
 
 function getWbiKeys(navData) {
@@ -127,13 +123,13 @@ function makePacket(operation, payload = Buffer.alloc(0)) {
 function createState(options) {
   return {
     options, startedAt: performance.now(), roomInfo: null, roomStartText: null,
-    online: 0, peakOnline: 0, danmakuCount: 0, giftCount: 0, superChatCount: 0,
+    highEnergy: 0, peakHighEnergy: 0, danmakuCount: 0, giftCount: 0, superChatCount: 0,
     guardCount: 0, enterCount: 0, revenueCents: 0, giftRevenueCents: 0,
     superChatRevenueCents: 0, guardRevenueCents: 0, interactiveUsers: new Set(),
     paidUsers: new Set(), danmakuUsers: new Set(), eventCounts: new Map(),
     eventDedup: new Map(), appRxBytes: 0, appTxBytes: 0, httpRxBytes: 0,
     wsRxBytes: 0, wsTxBytes: 0, wsFrames: 0, packets: 0, reconnects: 0,
-    socket: null, heartbeatTimer: null, reconnectTimer: null, pollTimer: null,
+    socket: null, heartbeatTimer: null, reconnectTimer: null,
     reportTimer: null, finishTimer: null, finishing: false, systemStart: null, systemEnd: null,
   };
 }
@@ -162,8 +158,6 @@ async function loadRoomInfo(state) {
   state.roomStartText = data.data.live_status === 1 && data.data.live_time && !data.data.live_time.startsWith('0000-00-00')
     ? data.data.live_time
     : null;
-  state.online = Number(data.data.online) || 0;
-  state.peakOnline = Math.max(state.peakOnline, state.online);
   return data.data;
 }
 
@@ -318,7 +312,10 @@ function parseMessage(state, message) {
   if (!cmd) return;
   noteEvent(state, cmd);
   const data = message.data ?? {};
-  if (cmd === 'DANMU_MSG') {
+  if (cmd === 'ONLINE_RANK_COUNT') {
+    state.highEnergy = Math.max(0, Number(data.online_count ?? data.count ?? 0) || 0);
+    state.peakHighEnergy = Math.max(state.peakHighEnergy, state.highEnergy);
+  } else if (cmd === 'DANMU_MSG') {
     state.danmakuCount += 1;
     const uid = message.info?.[2]?.[0];
     if (uid != null) {
@@ -522,17 +519,11 @@ function scheduleReconnect(state) {
   }, 3000);
 }
 
-async function pollOnline(state) {
-  try { await loadRoomInfo(state); } catch (error) {
-    console.warn(`[poll] 人气采样失败: ${error.message}`);
-  }
-}
-
 function printReport(state) {
   const elapsed = (performance.now() - state.startedAt) / 1000;
   console.log(
     `[${formatDuration(elapsed)}] 弹幕 ${state.danmakuCount} | 营收(估) ¥${(state.revenueCents / 100).toFixed(2)} | ` +
-    `付费 ${state.paidUsers.size} | 互动 ${state.interactiveUsers.size} | 人气 ${state.online}`,
+    `付费 ${state.paidUsers.size} | 互动 ${state.interactiveUsers.size} | 同接 ${state.highEnergy}`,
   );
   console.log(
     `         应用层接收 ${formatBytes(state.appRxBytes)} (${formatRate(state.appRxBytes, elapsed)}) | ` +
@@ -556,7 +547,7 @@ function printSummary(state) {
   console.log(`付费人数(估): ${state.paidUsers.size}`);
   console.log(`互动人数(估): ${state.interactiveUsers.size}`);
   console.log(`弹幕用户数: ${state.danmakuUsers.size}`);
-  console.log(`峰值人气: ${state.peakOnline}`);
+  console.log(`最高同时在线: ${state.peakHighEnergy}`);
   console.log(`入场/进场事件: ${state.enterCount}`);
   console.log(`WebSocket 断线次数: ${state.reconnects}`);
   console.log('\n=== 网络带宽 ===');
@@ -584,7 +575,6 @@ function finish(state, code = 0) {
   if (state.finishing) return;
   state.finishing = true;
   clearInterval(state.reportTimer);
-  clearInterval(state.pollTimer);
   clearInterval(state.heartbeatTimer);
   clearTimeout(state.reconnectTimer);
   clearTimeout(state.finishTimer);
@@ -606,15 +596,14 @@ async function main() {
   if (options.systemNetwork && !state.systemStart) console.warn('无法读取 Windows 网卡统计，将只显示应用层流量。');
   console.log('=== B 站直播统计 POC ===');
   console.log(`直播间: ${options.roomId}`);
-  console.log(`采样时长: ${options.durationSeconds}s | 上报间隔: ${options.reportSeconds}s | 人气采样: ${options.pollSeconds}s`);
+  console.log(`采样时长: ${options.durationSeconds}s | 上报间隔: ${options.reportSeconds}s`);
   console.log('原始事件只保存在内存，不写磁盘。\n');
   const room = await loadRoomInfo(state);
   console.log(`房间标题: ${room.title}`);
-  console.log(`直播状态: ${room.live_status === 1 ? '直播中' : '未开播'} | 人气: ${room.online}`);
+  console.log(`直播状态: ${room.live_status === 1 ? '直播中' : '未开播'}`);
   if (room.live_status !== 1) console.warn('当前未开播，WebSocket 可能收不到互动事件。');
   await connectSocket(state, await getDanmuInfo(state));
   state.reportTimer = setInterval(() => printReport(state), options.reportSeconds * 1000);
-  state.pollTimer = setInterval(() => pollOnline(state), options.pollSeconds * 1000);
   state.finishTimer = setTimeout(() => finish(state), options.durationSeconds * 1000);
   printReport(state);
 }

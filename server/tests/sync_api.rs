@@ -372,6 +372,36 @@ async fn websocket_v2_auth_catchup_ack_and_two_clients() {
 }
 
 #[tokio::test]
+async fn websocket_v2_forwards_live_status_notifications() {
+    let state = state().await;
+    let hub = state.hub.clone();
+    let app = build_router(state);
+    let address = serve(app).await;
+
+    let mut socket = connect_v2(address, 0, "device-live-status").await;
+    let auth = next_json(&mut socket).await.expect("auth");
+    assert_eq!(auth["type"], "auth_ok");
+
+    hub.send(json!({
+        "seq": 1,
+        "type": "live_status",
+        "payload": {
+            "streamerId": 1,
+            "streamerName": "开播测试",
+            "previousIsLive": false,
+            "isLive": true,
+            "liveNotifyEnabled": true
+        }
+    }))
+    .expect("broadcast live status");
+
+    let event = next_message_type(&mut socket, "live_status").await;
+    assert_eq!(event["payload"]["previousIsLive"], false);
+    assert_eq!(event["payload"]["isLive"], true);
+    assert_eq!(event["payload"]["liveNotifyEnabled"], true);
+}
+
+#[tokio::test]
 async fn refresh_job_endpoint_returns_background_job_id() {
     let state = state().await;
     let app = build_router(state);

@@ -6,10 +6,9 @@ use tracing_subscriber::EnvFilter;
 async fn main() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("oshical_server=info,tower_http=info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("oshical_server=info,oshical_core=info,tower_http=info")
+        }))
         .init();
     let config = match ServerConfig::from_env() {
         Ok(config) => config,

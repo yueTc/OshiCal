@@ -138,6 +138,11 @@ pub fn build_router(state: AppState) -> Router {
             delete(remove_linked_account),
         )
         .route("/api/subscriptions/{id}/refresh", post(refresh_streamer))
+        .route("/api/subscriptions/{id}/fans", get(fan_history))
+        .route(
+            "/api/subscriptions/{id}/fans/refresh",
+            post(refresh_streamer_fans),
+        )
         .route("/api/refresh", post(refresh_all))
         .route("/api/schedules", get(list_schedules).post(create_schedule))
         .route(
@@ -492,6 +497,27 @@ async fn list_llm_models(
 
 async fn list_live_status(State(state): State<AppState>) -> ApiResult {
     ok(state.service.list_live_statuses().await?)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FanHistoryQuery {
+    days: Option<i64>,
+}
+
+async fn fan_history(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<FanHistoryQuery>,
+) -> ApiResult {
+    ok(state
+        .service
+        .get_fan_history(id, query.days.unwrap_or(30))
+        .await?)
+}
+
+async fn refresh_streamer_fans(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    ok(state.service.refresh_streamer_fans(id).await?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1145,10 +1171,13 @@ fn forward_hub_message(protocol_v2: bool, value: &Value) -> bool {
         .unwrap_or_default();
     let sync_message = matches!(message_type, "sync_batch" | "reset_required");
     if protocol_v2 {
+        // Live status transitions are edge notifications, not state snapshots.
+        // V2 still receives state through sync batches, but needs this event to
+        // distinguish a real offline -> live transition from a startup snapshot.
         sync_message
             || matches!(
                 message_type,
-                "job_progress" | "refresh_progress" | "data_imported"
+                "live_status" | "job_progress" | "refresh_progress" | "data_imported"
             )
     } else {
         !sync_message
@@ -1489,6 +1518,20 @@ mod protocol_tests {
             migration_receipt_key("device-a:1"),
             "server:migration_receipt:v1:device-a:1"
         );
+    }
+
+    #[test]
+    fn live_status_is_visible_to_both_websocket_protocols() {
+        let message = json!({
+            "seq": 7,
+            "type": "live_status",
+            "payload": {
+                "previousIsLive": false,
+                "isLive": true
+            }
+        });
+        assert!(forward_hub_message(false, &message));
+        assert!(forward_hub_message(true, &message));
     }
 
     #[test]

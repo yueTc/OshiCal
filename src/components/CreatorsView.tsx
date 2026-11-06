@@ -5,12 +5,15 @@ import {
   CalendarClock,
   ChevronDown,
   ChevronUp,
+  Clock3,
   ExternalLink,
   GripVertical,
   Link2,
+  LoaderCircle,
   Plus,
   RefreshCw,
   Search,
+  TrendingUp,
   Settings2,
   Trash2,
   UserPlus,
@@ -19,6 +22,7 @@ import {
 } from "lucide-react";
 import type {
   AccountSearchResult,
+  FanHistory,
   LinkedAccount,
   RefreshProgress,
   RefreshReport,
@@ -29,6 +33,8 @@ import type {
   WeeklyScheduleRule,
 } from "../types";
 import { explainError } from "../lib/api";
+import { aggregateFanHistory } from "../lib/fan-history";
+import type { FanBucket, FanGranularity } from "../lib/fan-history";
 import { localDateKey } from "../lib/dates";
 import { Avatar, EmptyState, ErrorBanner, Modal, Toggle } from "./ui";
 
@@ -53,6 +59,8 @@ interface CreatorActions {
   addLink: (id: number, mid: string) => Promise<unknown>;
   removeLink: (id: number, mid: string) => Promise<void>;
   refresh: (id: number) => Promise<RefreshReport>;
+  fanHistory: (streamerId: number, days?: number) => Promise<FanHistory>;
+  refreshFans: (streamerId: number) => Promise<FanHistory>;
   listWeeklyRules: (streamerId: number) => Promise<WeeklyScheduleRule[]>;
   createWeeklyRule: (input: NewWeeklyScheduleRuleInput) => Promise<WeeklyScheduleRule>;
   updateWeeklyRule: (id: number, update: UpdateWeeklyScheduleRuleInput) => Promise<WeeklyScheduleRule>;
@@ -71,6 +79,166 @@ interface WeeklyRuleDraft {
   enabled: boolean;
 }
 
+const FAN_COUNT_FORMATTER = new Intl.NumberFormat("zh-CN");
+const FAN_COMPACT_FORMATTER = new Intl.NumberFormat("zh-CN", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+function formatFanCount(value: number | null | undefined): string {
+  return value === null || value === undefined ? "--" : FAN_COMPACT_FORMATTER.format(value);
+}
+
+function formatFanChange(value: number | null): string {
+  if (value === null) {
+    return "首次采集";
+  }
+  return `${value > 0 ? "+" : ""}${FAN_COUNT_FORMATTER.format(value)}`;
+}
+
+function FanTrendChart({ buckets }: { buckets: FanBucket[] }) {
+  const [activeKey, setActiveKey] = useState<string | null>(null);
+
+  if (buckets.length < 2) {
+    return (
+      <div className="fan-chart-empty">
+        <TrendingUp size={22} />
+        <span>再采集 1 次后即可绘制粉丝走势。</span>
+      </div>
+    );
+  }
+
+  const width = 760;
+  const height = 230;
+  const left = 34;
+  const right = 18;
+  const top = 18;
+  const bottom = 34;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const tooltipWidth = 174;
+  const tooltipHeight = 66;
+  const values = buckets.map((bucket) => bucket.fans);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(1, max - min);
+  const points = buckets.map((bucket, index) => {
+    const x = left + (index * plotWidth) / (buckets.length - 1);
+    const y = top + ((max - bucket.fans) / span) * (plotHeight - 12) + 6;
+    return { ...bucket, x, y };
+  });
+  const activePoint = activeKey ? points.find((point) => point.key === activeKey) ?? null : null;
+  const activeTone = activePoint?.change === null
+    ? "flat"
+    : (activePoint?.change ?? 0) > 0
+      ? "up"
+      : (activePoint?.change ?? 0) < 0
+        ? "down"
+        : "flat";
+  const tooltipX = activePoint
+    ? Math.max(8, Math.min(width - tooltipWidth - 8, activePoint.x - tooltipWidth / 2))
+    : 0;
+  const tooltipY = activePoint
+    ? activePoint.y - tooltipHeight - 10 >= 8
+      ? activePoint.y - tooltipHeight - 10
+      : activePoint.y + 14
+    : 0;
+  const line = points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
+  const area = `${left},${top + plotHeight} ${line} ${left + plotWidth},${top + plotHeight}`;
+  const labelIndexes = [...new Set([
+    0,
+    Math.floor((points.length - 1) / 3),
+    Math.floor(((points.length - 1) * 2) / 3),
+    points.length - 1,
+  ])];
+
+  return (
+    <div className="fan-chart-wrap">
+      <svg
+        className="fan-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={`粉丝趋势，从 ${FAN_COUNT_FORMATTER.format(buckets[0].fans)} 变化到 ${FAN_COUNT_FORMATTER.format(buckets[buckets.length - 1].fans)}`}
+      >
+        <defs>
+          <linearGradient id="fan-chart-area" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--primary)" stopOpacity="0.26" />
+            <stop offset="100%" stopColor="var(--primary)" stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        <line className="fan-chart-grid" x1={left} x2={left + plotWidth} y1={top} y2={top} />
+        <line className="fan-chart-grid" x1={left} x2={left + plotWidth} y1={top + plotHeight / 2} y2={top + plotHeight / 2} />
+        <line className="fan-chart-grid" x1={left} x2={left + plotWidth} y1={top + plotHeight} y2={top + plotHeight} />
+        <polygon className="fan-chart-area" points={area} />
+        {activePoint ? (
+          <line
+            className="fan-chart-guide"
+            x1={activePoint.x}
+            x2={activePoint.x}
+            y1={top}
+            y2={top + plotHeight}
+          />
+        ) : null}
+        <polyline className="fan-chart-line" points={line} />
+        {activePoint ? (
+          <circle className="fan-chart-point-halo" cx={activePoint.x} cy={activePoint.y} r={10} />
+        ) : null}
+        {points.map((point) => (
+          <circle
+            className={`fan-chart-point${point.key === activeKey ? " is-active" : ""}`}
+            key={point.key}
+            cx={point.x}
+            cy={point.y}
+            r={point.key === activeKey ? 5.5 : 4}
+          />
+        ))}
+        {labelIndexes.map((index) => (
+          <text
+            className="fan-chart-label"
+            key={`label-${points[index].key}`}
+            x={points[index].x}
+            y={height - 10}
+            textAnchor={index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"}
+          >
+            {points[index].label}
+          </text>
+        ))}
+        {activePoint ? (
+          <g
+            className="fan-chart-tooltip"
+            transform={`translate(${tooltipX.toFixed(2)} ${tooltipY.toFixed(2)})`}
+            aria-hidden="true"
+          >
+            <rect width={tooltipWidth} height={tooltipHeight} rx={10} />
+            <text className="fan-chart-tooltip-label" x={12} y={19}>{activePoint.label}</text>
+            <text className="fan-chart-tooltip-value" x={12} y={40}>
+              粉丝 {FAN_COUNT_FORMATTER.format(activePoint.fans)}
+            </text>
+            <text className={`fan-chart-tooltip-change ${activeTone}`} x={12} y={57}>
+              变化 {formatFanChange(activePoint.change)}
+            </text>
+          </g>
+        ) : null}
+        {points.map((point) => (
+          <circle
+            className="fan-chart-hit"
+            key={`hit-${point.key}`}
+            cx={point.x}
+            cy={point.y}
+            r={15}
+            tabIndex={0}
+            role="img"
+            aria-label={`${point.label}，粉丝 ${FAN_COUNT_FORMATTER.format(point.fans)}，变化 ${formatFanChange(point.change)}`}
+            onMouseEnter={() => setActiveKey(point.key)}
+            onMouseLeave={() => setActiveKey((current) => current === point.key ? null : current)}
+            onFocus={() => setActiveKey(point.key)}
+            onBlur={() => setActiveKey((current) => current === point.key ? null : current)}
+          />
+        ))}
+      </svg>
+    </div>
+  );
+}
 export default function CreatorsView({
   subscriptions,
   refreshProgress,
@@ -111,6 +279,12 @@ export default function CreatorsView({
   const [weeklyRemovedIds, setWeeklyRemovedIds] = useState<number[]>([]);
   const [weeklyLoading, setWeeklyLoading] = useState(false);
   const [weeklySaving, setWeeklySaving] = useState(false);
+  const [fanTarget, setFanTarget] = useState<Streamer | null>(null);
+  const [fanHistory, setFanHistory] = useState<FanHistory | null>(null);
+  const [fanGranularity, setFanGranularity] = useState<FanGranularity>("hour");
+  const [fanLoading, setFanLoading] = useState(false);
+  const [fanRefreshing, setFanRefreshing] = useState(false);
+  const fanRequestSeq = useRef(0);
   const [reorderBusy, setReorderBusy] = useState(false);
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const draggingIdRef = useRef<number | null>(null);
@@ -132,6 +306,22 @@ export default function CreatorsView({
     });
     return ordered.length === subscriptions.length ? ordered : subscriptions;
   }, [optimisticOrder, subscriptions]);
+
+  const fanBuckets = useMemo(
+    () => aggregateFanHistory(
+      fanHistory?.snapshots ?? [],
+      fanGranularity,
+      fanGranularity === "hour" ? 24 : 30,
+    ),
+    [fanGranularity, fanHistory],
+  );
+  const fanLatest = fanBuckets.at(-1)?.fans
+    ?? fanHistory?.currentFans
+    ?? fanTarget?.fans
+    ?? null;
+  const fanPeriodChange = fanBuckets.length > 1
+    ? fanBuckets[fanBuckets.length - 1].fans - fanBuckets[0].fans
+    : null;
 
   function cancelSearchTimer() {
     if (searchTimerRef.current) {
@@ -496,6 +686,15 @@ export default function CreatorsView({
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("application/x-oshical-streamer-id", String(streamerId));
     event.dataTransfer.setData("text/plain", String(streamerId));
+    const card = event.currentTarget.closest(".creator-card");
+    if (card instanceof HTMLElement) {
+      const rect = card.getBoundingClientRect();
+      event.dataTransfer.setDragImage(
+        card,
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      );
+    }
     setDraggingId(streamerId);
   }
 
@@ -533,12 +732,62 @@ export default function CreatorsView({
     void persistOrder(next);
   }
 
+  async function loadFanHistory(streamer: Streamer) {
+    const requestId = ++fanRequestSeq.current;
+    setFanLoading(true);
+    try {
+      const history = await actions.fanHistory(streamer.id, 30);
+      if (fanRequestSeq.current === requestId) {
+        setFanHistory(history);
+      }
+    } catch (error) {
+      if (fanRequestSeq.current === requestId) {
+        setFanHistory(null);
+        onError(explainError(error));
+      }
+    } finally {
+      if (fanRequestSeq.current === requestId) {
+        setFanLoading(false);
+      }
+    }
+  }
+
+  function openFanHistory(streamer: Streamer) {
+    setFanTarget(streamer);
+    setFanHistory(null);
+    setFanGranularity("hour");
+    void loadFanHistory(streamer);
+  }
+
+  function closeFanHistory() {
+    fanRequestSeq.current += 1;
+    setFanTarget(null);
+    setFanHistory(null);
+    setFanLoading(false);
+    setFanRefreshing(false);
+  }
+
+  async function refreshFanHistory() {
+    if (!fanTarget || fanRefreshing) {
+      return;
+    }
+    setFanRefreshing(true);
+    try {
+      const history = await actions.refreshFans(fanTarget.id);
+      setFanHistory(history);
+      await onChanged();
+    } catch (error) {
+      onError(explainError(error));
+    } finally {
+      setFanRefreshing(false);
+    }
+  }
+
   return (
     <section className="page creators-page">
       <header className="page-header">
         <div>
-          <p className="eyebrow">CREATOR LIBRARY</p>
-          <h1>主播库</h1>
+          <h1 className="schedule-title">主播库</h1>
           <p className="page-subtitle">管理日程订阅、开播通知、直播数据和官号来源。</p>
         </div>
         <div className="stat-chip"><UsersRound size={17} />{subscriptions.length} 位主播</div>
@@ -738,6 +987,17 @@ export default function CreatorsView({
               </div>
               <div className="creator-actions">
                 <button
+                  type="button"
+                  className="creator-fan-button"
+                  title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
+                  onClick={() => openFanHistory(streamer)}
+                >
+                  <TrendingUp size={14} />
+                  <strong>{formatFanCount(streamer.fans)}</strong>
+                  <span>粉丝</span>
+                  <em>查看趋势</em>
+                </button>
+                <button
                   className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
                   title={streamer.liveUrl || streamer.roomId
                     ? `进入 ${streamer.name} 的直播间`
@@ -772,6 +1032,99 @@ export default function CreatorsView({
           ))}
         </div>
       )}
+
+      {fanTarget ? (
+        <Modal title={`粉丝变化 · ${fanTarget.name}`} onClose={closeFanHistory} wide>
+          <div className="fan-modal">
+            <div className="fan-modal-note">
+              <Clock3 size={15} />
+              <span>
+                默认每小时自动采集一次
+                {fanHistory?.checkedAt
+                  ? ` · 最近采集 ${new Date(fanHistory.checkedAt).toLocaleString("zh-CN", { hour12: false })}`
+                  : " · 等待首次采集"}
+              </span>
+            </div>
+            <div className="fan-stat-grid">
+              <div>
+                <span>当前粉丝</span>
+                <strong>{fanLatest === null ? "--" : FAN_COUNT_FORMATTER.format(fanLatest)}</strong>
+              </div>
+              <div>
+                <span>{fanGranularity === "hour" ? "近 24 小时" : "近 30 天"}净增</span>
+                <strong className={`fan-change ${fanPeriodChange === null ? "flat" : fanPeriodChange > 0 ? "up" : fanPeriodChange < 0 ? "down" : "flat"}`}>
+                  {fanPeriodChange === null ? "--" : formatFanChange(fanPeriodChange)}
+                </strong>
+              </div>
+              <div>
+                <span>统计点</span>
+                <strong>{fanBuckets.length}</strong>
+              </div>
+            </div>
+            <div className="fan-toolbar">
+              <div className="fan-segmented" role="group" aria-label="粉丝统计粒度">
+                <button
+                  type="button"
+                  className={fanGranularity === "hour" ? "active" : ""}
+                  aria-pressed={fanGranularity === "hour"}
+                  onClick={() => setFanGranularity("hour")}
+                >
+                  小时统计
+                </button>
+                <button
+                  type="button"
+                  className={fanGranularity === "day" ? "active" : ""}
+                  aria-pressed={fanGranularity === "day"}
+                  onClick={() => setFanGranularity("day")}
+                >
+                  日统计
+                </button>
+              </div>
+              <button
+                type="button"
+                className="button small"
+                onClick={() => void refreshFanHistory()}
+                disabled={fanRefreshing || fanLoading}
+              >
+                <RefreshCw className={fanRefreshing ? "spin" : ""} size={14} />
+                {fanRefreshing ? "采集中…" : "立即采集"}
+              </button>
+            </div>
+            {fanLoading ? (
+              <div className="fan-loading" role="status">
+                <LoaderCircle className="spin" size={20} />
+                正在读取粉丝历史…
+              </div>
+            ) : fanBuckets.length === 0 ? (
+              <div className="fan-chart-empty">
+                <TrendingUp size={22} />
+                <strong>还没有粉丝快照</strong>
+                <span>后台将在启动后及之后每小时自动采集，也可以点击“立即采集”。</span>
+              </div>
+            ) : (
+              <>
+                <FanTrendChart buckets={fanBuckets} />
+                <div className="fan-history-table" aria-label="粉丝历史统计">
+                  <div className="fan-history-row is-head">
+                    <span>时间</span>
+                    <span>粉丝数</span>
+                    <span>变化</span>
+                  </div>
+                  {[...fanBuckets].reverse().map((bucket) => (
+                    <div className="fan-history-row" key={bucket.key}>
+                      <span>{bucket.label}</span>
+                      <strong>{FAN_COUNT_FORMATTER.format(bucket.fans)}</strong>
+                      <em className={bucket.change === null ? "flat" : bucket.change > 0 ? "up" : bucket.change < 0 ? "down" : "flat"}>
+                        {formatFanChange(bucket.change)}
+                      </em>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </Modal>
+      ) : null}
 
       {linkTarget ? (
         <Modal title={`为 ${linkTarget.name} 关联官号`} onClose={() => setLinkTarget(null)}>
