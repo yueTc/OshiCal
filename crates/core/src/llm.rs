@@ -1470,14 +1470,15 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
 }
 
 #[cfg(test)]
+fn allow_local_http_model_endpoints() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| std::env::set_var(LLM_HOST_ALLOWLIST_ENV, "127.0.0.1"));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
-
-    fn allow_local_http_model_endpoints() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| std::env::set_var(LLM_HOST_ALLOWLIST_ENV, "127.0.0.1"));
-    }
 
     fn now() -> DateTime<Utc> {
         FixedOffset::east_opt(8 * 3600)

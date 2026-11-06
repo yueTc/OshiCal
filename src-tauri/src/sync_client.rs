@@ -1038,7 +1038,7 @@ async fn apply_delete(
                     )
                     .bind(server_key)
                     .bind(cache_type)
-                    .bind(cache_id)
+                    .bind(&cache_id)
                     .execute(&mut **tx)
                     .await
                     .map_err(db_error)?;

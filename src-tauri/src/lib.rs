@@ -1538,7 +1538,7 @@ async fn cached_schedules(
     let mut result = Vec::new();
     for schedule in schedules {
         let (remote_id, version) = if server_mode {
-            (schedule.id, Some(schedule.updated_at.to_rfc3339()))
+            (schedule.id, Some(schedule.updated_at))
         } else {
             main_store
                 .remote_entity(

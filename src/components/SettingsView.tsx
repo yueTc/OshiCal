@@ -361,7 +361,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       }
       const next = { ...current };
       const mergeUntouched = <K extends keyof typeof next>(key: K) => {
-        mergeUntouched(key);
+        if (current[key] === previousSaved[key]) {
+          next[key] = merged[key];
+        }
       };
       for (const key of [
         "livePollSeconds",
@@ -373,9 +375,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         "llmPromptVersion",
         "proxyPort",
       ] as const) {
-        if (current[key] === previousSaved[key]) {
-          next[key] = merged[key];
-        }
+        mergeUntouched(key);
       }
       return next;
     });
