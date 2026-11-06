@@ -532,6 +532,8 @@ async fn delete_mutation_replay_is_idempotent() {
 
 #[tokio::test]
 async fn llm_test_endpoint_runs_fixed_calendar_fixture() {
+    // The HTTP fixture is intentionally local; production defaults reject it.
+    std::env::set_var("OSHICAL_LLM_ALLOWED_HOSTS", "127.0.0.1");
     use axum::{
         routing::{get, post},
         Json, Router,

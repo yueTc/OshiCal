@@ -671,7 +671,7 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
-                mid: "offline-rich".into(),
+                mid: "100200300".into(),
                 name: Some("离线主播".into()),
                 avatar_url: None,
                 room_id: None,

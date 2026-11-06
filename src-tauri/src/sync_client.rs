@@ -2374,7 +2374,7 @@ mod tests {
         .unwrap();
 
         let batch = SyncBatch {
-            from_seq: 19,
+            from_seq: 20,
             to_seq: 20,
             latest_seq: 20,
             feed_id: "feed-test".to_owned(),
