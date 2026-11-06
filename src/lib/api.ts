@@ -12,6 +12,7 @@ import type {
   Bootstrap,
   DeviceInfo,
   DeviceRegistration,
+  FanHistory,
   FertilitySnapshot,
   ImportPreview,
   ImportReport,
@@ -21,6 +22,7 @@ import type {
   LlmSecret,
   LlmTestInput,
   LlmTestReport,
+  MigrationPreview,
   NewScheduleInput,
   NewWeeklyScheduleRuleInput,
   ProxyTestReport,
@@ -45,6 +47,8 @@ import type {
 } from "../types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const LONG_REQUEST_TIMEOUT_MS = 180_000;
 
 export class ApiFailure extends Error {
   code: string;
@@ -95,24 +99,52 @@ export class ServerApi {
     return this.token;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(
+    path: string,
+    init?: RequestInit,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const externalSignal = init?.signal;
+    const forwardAbort = () => controller.abort(externalSignal?.reason);
+    if (externalSignal?.aborted) {
+      forwardAbort();
+    } else {
+      externalSignal?.addEventListener("abort", forwardAbort, { once: true });
+    }
+    const timeout = window.setTimeout(() => {
+      controller.abort(new DOMException("请求超时", "TimeoutError"));
+    }, timeoutMs);
     let response: Response;
+    let text: string;
     try {
       response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
+        signal: controller.signal,
         headers: {
           Authorization: `Bearer ${this.token}`,
           "Content-Type": "application/json",
           ...(init?.headers ?? {}),
         },
       });
+      text = await response.text();
     } catch (error) {
+      const timedOut = controller.signal.aborted && !externalSignal?.aborted;
+      const aborted = externalSignal?.aborted === true;
       throw new ApiFailure(
-        error instanceof Error ? error.message : "服务器连接失败",
-        "REMOTE_OFFLINE",
+        aborted
+          ? "请求已取消"
+          : timedOut
+            ? `服务器请求超时（${Math.round(timeoutMs / 1000)} 秒）`
+            : error instanceof Error
+              ? error.message
+              : "服务器连接失败",
+        aborted ? "REQUEST_ABORTED" : timedOut ? "REQUEST_TIMEOUT" : "REMOTE_OFFLINE",
       );
+    } finally {
+      window.clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", forwardAbort);
     }
-    const text = await response.text();
     let envelope: Envelope<T> | null = null;
     try {
       envelope = text ? (JSON.parse(text) as Envelope<T>) : null;
@@ -176,11 +208,11 @@ export class ServerApi {
   }
 
   refresh(): Promise<RefreshReport> {
-    return this.request("/api/refresh", { method: "POST" });
+    return this.request("/api/refresh", { method: "POST" }, LONG_REQUEST_TIMEOUT_MS);
   }
 
   refreshStreamer(id: number): Promise<RefreshReport> {
-    return this.request(`/api/subscriptions/${id}/refresh`, { method: "POST" });
+    return this.request(`/api/subscriptions/${id}/refresh`, { method: "POST" }, LONG_REQUEST_TIMEOUT_MS);
   }
 
   schedules(from: string, to: string): Promise<Schedule[]> {
@@ -233,6 +265,20 @@ export class ServerApi {
     return this.request("/api/live-status");
   }
 
+  fanHistory(streamerId: number, days = 30): Promise<FanHistory> {
+    return this.request(
+      `/api/subscriptions/${streamerId}/fans?days=${encodeURIComponent(days)}`,
+    );
+  }
+
+  refreshFans(streamerId: number): Promise<FanHistory> {
+    return this.request(
+      `/api/subscriptions/${streamerId}/fans/refresh`,
+      { method: "POST" },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
+  }
+
   liveSessions(streamerId?: number, limit = 50): Promise<LiveSession[]> {
     const params = new URLSearchParams({ limit: String(limit) });
     if (streamerId !== undefined) {
@@ -271,27 +317,32 @@ export class ServerApi {
   }
 
   checkServerUpdate(): Promise<ServerUpdateInfo> {
-    return this.request("/api/system/update/check", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
+    return this.request(
+      "/api/system/update/check",
+      { method: "POST", body: JSON.stringify({}) },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
   installServerUpdate(): Promise<ServerUpdateInfo> {
-    return this.request("/api/system/update/install", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
+    return this.request(
+      "/api/system/update/install",
+      { method: "POST", body: JSON.stringify({}) },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
   llmSecret(): Promise<LlmSecret> {
     return this.request("/api/secrets/llm");
   }
 
-  saveLlmSecret(apiKey: string): Promise<LlmSecret> {
+  saveLlmSecret(apiKey: string, baseUrl?: string): Promise<LlmSecret> {
     return this.request("/api/secrets/llm", {
       method: "PUT",
-      body: JSON.stringify({ apiKey }),
+      body: JSON.stringify({
+        apiKey,
+        ...(baseUrl?.trim() ? { baseUrl: baseUrl.trim() } : {}),
+      }),
     });
   }
 
@@ -318,30 +369,33 @@ export class ServerApi {
   }
 
   testProxy(proxyPort: number): Promise<ProxyTestReport> {
-    return this.request("/api/proxy/test", {
-      method: "POST",
-      body: JSON.stringify({ proxyPort }),
-    });
+    return this.request(
+      "/api/proxy/test",
+      { method: "POST", body: JSON.stringify({ proxyPort }) },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
   testLlm(input: LlmTestInput): Promise<LlmTestReport> {
-    return this.request("/api/llm/test", {
-      method: "POST",
-      body: JSON.stringify({ ...input, apiKey: input.apiKey ?? "" }),
-    });
+    return this.request(
+      "/api/llm/test",
+      { method: "POST", body: JSON.stringify({ ...input, apiKey: input.apiKey ?? "" }) },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
   listLlmModels(input: LlmDiscoveryInput): Promise<string[]> {
-    return this.request("/api/llm/models", {
-      method: "POST",
-      body: JSON.stringify({ ...input, apiKey: input.apiKey ?? "" }),
-    });
+    return this.request(
+      "/api/llm/models",
+      { method: "POST", body: JSON.stringify({ ...input, apiKey: input.apiKey ?? "" }) },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
   snapshot(): Promise<ServerSnapshot> {
     return this.request("/api/sync/snapshot");
   }
-  previewMigration(snapshot: ServerSnapshot): Promise<ImportPreview> {
+  previewMigration(snapshot: ServerSnapshot): Promise<MigrationPreview> {
     return this.request("/api/migration/preview", {
       method: "POST",
       body: JSON.stringify(snapshot),
@@ -353,11 +407,22 @@ export class ServerApi {
     strategy: "server" | "client" | "skip",
     clientId: string,
     migrationId: string,
+    expectedServerDigest: string,
   ): Promise<ImportReport> {
-    return this.request("/api/migration/apply", {
-      method: "POST",
-      body: JSON.stringify({ snapshot, strategy, clientId, migrationId }),
-    });
+    return this.request(
+      "/api/migration/apply",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          snapshot,
+          strategy,
+          clientId,
+          migrationId,
+          expectedServerDigest,
+        }),
+      },
+      LONG_REQUEST_TIMEOUT_MS,
+    );
   }
 
 
@@ -519,6 +584,14 @@ export class LocalApi {
     return invoke("list_live_statuses");
   }
 
+  fanHistory(streamerId: number, days = 30): Promise<FanHistory> {
+    return invoke("get_fan_history", { streamerId, days });
+  }
+
+  refreshFans(streamerId: number): Promise<FanHistory> {
+    return invoke("refresh_streamer_fans", { streamerId });
+  }
+
   liveSessions(streamerId?: number, limit = 50): Promise<LiveSession[]> {
     return invoke("list_live_sessions", { streamerId, limit });
   }
@@ -586,15 +659,21 @@ export class LocalApi {
     return invoke("get_server_token");
   }
 
-  startRemoteMonitor(serverUrl: string, token: string): Promise<void> {
+  startRemoteMonitor(
+    serverUrl: string,
+    token: string,
+  ): Promise<{ generation: number }> {
     return invoke("start_remote_monitor", { serverUrl, token });
   }
 
-  stopRemoteMonitor(): Promise<void> {
-    return invoke("stop_remote_monitor");
+  stopRemoteMonitor(expectedGeneration: number): Promise<boolean> {
+    return invoke("stop_remote_monitor", { expectedGeneration });
   }
 
-  rebuildRemoteSync(serverUrl: string, token: string): Promise<number> {
+  rebuildRemoteSync(
+    serverUrl: string,
+    token: string,
+  ): Promise<{ cursorSeq: number; monitorGeneration: number }> {
     return invoke("rebuild_remote_sync", { serverUrl, token });
   }
 

@@ -35,6 +35,7 @@ import type {
   DataMode,
 } from "../types";
 import type { SecretInput } from "../lib/secret-types";
+import type { AppearanceSettings } from "../lib/appearance";
 import { explainError } from "../lib/api";
 import {
   readClientGithubMirror,
@@ -52,6 +53,7 @@ import {
 } from "../lib/updater";
 import type { DeviceInfo, JobProgress, SyncUiState } from "../lib/sync";
 import DeviceSyncPanel from "./DeviceSyncPanel";
+import AppearanceSettingsPanel from "./AppearanceSettings";
 import { ErrorBanner, Modal, Toggle } from "./ui";
 
 interface SettingsActions {
@@ -91,9 +93,100 @@ function settingsEqual(left: AppSettings, right: AppSettings): boolean {
   );
 }
 
+function serverUpdateSettingsFromInfo(info: ServerUpdateInfo): ServerUpdateSettings {
+  return {
+    autoCheckEnabled: info.autoCheckEnabled,
+    autoUpdateEnabled: info.autoUpdateEnabled,
+    updateWindowStart: info.updateWindowStart,
+    updateWindowEnd: info.updateWindowEnd,
+    githubMirrorUrl: info.githubMirrorUrl,
+  };
+}
+
+function serverUpdateAutoSettingsEqual(left: ServerUpdateSettings, right: ServerUpdateSettings): boolean {
+  return left.autoCheckEnabled === right.autoCheckEnabled
+    && left.autoUpdateEnabled === right.autoUpdateEnabled
+    && left.updateWindowStart === right.updateWindowStart
+    && left.updateWindowEnd === right.updateWindowEnd;
+}
+
+function serverUpdateSettingsEqual(left: ServerUpdateSettings, right: ServerUpdateSettings): boolean {
+  return serverUpdateAutoSettingsEqual(left, right)
+    && left.githubMirrorUrl === right.githubMirrorUrl;
+}
+
+interface GithubMirrorCardProps {
+  title: string;
+  scopeLabel: string;
+  scopeClass: "local" | "server";
+  description: string;
+  value: string;
+  effectiveValue: string;
+  saving: boolean;
+  error: string | null;
+  onChange: (value: string) => void;
+  onSave: (value: string) => void;
+  scopeNote: string;
+}
+
+function GithubMirrorCard({
+  title,
+  scopeLabel,
+  scopeClass,
+  description,
+  value,
+  effectiveValue,
+  saving,
+  error,
+  onChange,
+  onSave,
+  scopeNote,
+}: GithubMirrorCardProps) {
+  return (
+    <section className="settings-card span-2 github-mirror-card">
+      <header>
+        <h2>{title}</h2>
+        <span className={`setting-scope ${scopeClass}`}>{scopeLabel}</span>
+        <span>{description}</span>
+      </header>
+      <div className="github-mirror-input-row">
+        <input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="https://gh-proxy.com/"
+          aria-label={`${title}地址`}
+          disabled={saving}
+        />
+        <button className="button primary" onClick={() => onSave(value)} disabled={saving}>
+          {saving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
+          保存
+        </button>
+        <button className="button secondary" onClick={() => onSave("")} disabled={saving || !value.trim()}>
+          清除
+        </button>
+      </div>
+      {error ? <ErrorBanner message={error} /> : null}
+      <div className="github-mirror-presets">
+        <span>常用</span>
+        {["https://gh-proxy.com/", "https://gh-proxy.org/"].map((preset) => (
+          <button type="button" key={preset} onClick={() => onChange(preset)} disabled={saving}>
+            {preset}
+          </button>
+        ))}
+      </div>
+      <p className="form-hint">
+        当前生效：{effectiveValue}。{scopeNote}
+      </p>
+    </section>
+  );
+}
+
 interface SettingsViewProps {
   settings: AppSettings;
+  appearance: AppearanceSettings;
+  onAppearanceChange: (appearance: AppearanceSettings) => void;
   secrets: SecretStatus;
+  llmApiKeyHint: string;
   biliConfigured: boolean;
   autostart: boolean;
   tauri: boolean;
@@ -114,7 +207,10 @@ interface SettingsViewProps {
 
 const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function SettingsView({
   settings,
+  appearance,
+  onAppearanceChange,
   secrets,
+  llmApiKeyHint,
   biliConfigured,
   autostart,
   tauri,
@@ -160,6 +256,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [qrStatus, setQrStatus] = useState<"waiting" | "scanned" | "confirmed" | "expired" | "error">("waiting");
   const [qrMessage, setQrMessage] = useState("等待手机扫码");
   const [leavePromptOpen, setLeavePromptOpen] = useState(false);
+  const [leaveSaving, setLeaveSaving] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<AvailableUpdate | null>(null);
@@ -181,17 +278,58 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [githubMirrorEffective, setGithubMirrorEffective] = useState(readClientGithubMirror);
   const [githubMirrorSaving, setGithubMirrorSaving] = useState(false);
   const [githubMirrorError, setGithubMirrorError] = useState<string | null>(null);
+  const [serverMirrorError, setServerMirrorError] = useState<string | null>(null);
   const serverUpdateDirtyRef = useRef(false);
+  const serverUpdateRef = useRef<ServerUpdateInfo | null>(serverUpdate);
+  const serverUpdateDraftRef = useRef(serverUpdateDraft);
+  const serverUpdateActionRef = useRef<"save" | "check" | "install" | null>(null);
   const actionsRef = useRef(actions);
+  const draftRef = useRef(draft);
+  const savedDraftRef = useRef(savedDraft);
+  const savingRef = useRef(false);
+  const formRevisionRef = useRef(0);
+  const connectionTestSeq = useRef(0);
+  const connectionTestingRef = useRef(false);
+  const llmTestSeq = useRef(0);
+  const llmTestingRef = useRef(false);
+  const modelDiscoverySeq = useRef(0);
+  const modelsLoadingRef = useRef(false);
+  const proxyTestSeq = useRef(0);
+  const proxyTestingRef = useRef(false);
+  const updateActionRef = useRef<"check" | "install" | null>(null);
+  const browserLoginBusyRef = useRef(false);
+  const biliLogoutBusyRef = useRef(false);
+  const qrStartBusyRef = useRef(false);
+  const githubMirrorDraftRef = useRef(githubMirrorDraft);
+  const githubMirrorEffectiveRef = useRef(githubMirrorEffective);
+  const githubMirrorSavingRef = useRef(false);
   const qrSessionRef = useRef<string | null>(null);
+  const qrGenerationRef = useRef(0);
+  const qrCloseTimerRef = useRef<number | null>(null);
   const wasBiliConfigured = useRef(biliConfigured);
   const leavePromptOpenRef = useRef(false);
   const pendingLeaveResolveRef = useRef<((allowed: boolean) => void) | null>(null);
+  const leaveSavingRef = useRef(false);
   const dirtyRef = useRef(false);
+  draftRef.current = draft;
+  savedDraftRef.current = savedDraft;
+  serverUpdateRef.current = serverUpdate;
+  serverUpdateDraftRef.current = serverUpdateDraft;
+  githubMirrorDraftRef.current = githubMirrorDraft;
+  githubMirrorEffectiveRef.current = githubMirrorEffective;
+  const clientMirrorDirty = tauri && githubMirrorDraft !== githubMirrorEffective;
+  const serverUpdateDirty = serverMode && (
+    serverUpdateDirtyRef.current
+    || (serverUpdate !== null
+      && !serverUpdateSettingsEqual(serverUpdateDraft, serverUpdateSettingsFromInfo(serverUpdate)))
+  );
+  serverUpdateDirtyRef.current = serverUpdateDirty;
   const isDirty =
     !settingsEqual(draft, savedDraft) ||
     autoLaunch !== savedAutoLaunch ||
-    Boolean(llmApiKey.trim() || biliCookie.trim() || serverToken.trim());
+    Boolean(llmApiKey.trim() || biliCookie.trim() || serverToken.trim()) ||
+    clientMirrorDirty ||
+    serverUpdateDirty;
 
   useEffect(() => {
     if (!wasBiliConfigured.current && biliConfigured) {
@@ -212,10 +350,34 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }, [isDirty]);
 
   useEffect(() => {
-    setDraft((current) => mergeServerSettings(current, settings));
-    if (!dirtyRef.current) {
-      setSavedDraft((current) => mergeServerSettings(current, settings));
-    }
+    const merged = mergeServerSettings(settings, settings);
+    const previousSaved = savedDraftRef.current;
+    // Background refreshes update fields the user has not touched while
+    // preserving edits in progress. A whole-draft replacement here can submit
+    // stale values back over another device's newer settings.
+    setDraft((current) => {
+      if (!dirtyRef.current) {
+        return merged;
+      }
+      const next = { ...current };
+      for (const key of [
+        "livePollSeconds",
+        "dynamicPollSeconds",
+        "autoAnalyzeImages",
+        "liveStatsEnabled",
+        "llmBaseUrl",
+        "llmModel",
+        "llmPromptVersion",
+        "proxyPort",
+      ] as const) {
+        if (current[key] === previousSaved[key]) {
+          next[key] = merged[key];
+        }
+      }
+      return next;
+    });
+    savedDraftRef.current = merged;
+    setSavedDraft(merged);
   }, [
     settings.autoAnalyzeImages,
     settings.dynamicPollSeconds,
@@ -243,30 +405,36 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       return;
     }
     let disposed = false;
+    let loadInFlight = false;
     const apply = (value: ServerUpdateInfo) => {
       if (disposed) {
         return;
       }
+      serverUpdateRef.current = value;
       setServerUpdate(value);
       if (!serverUpdateDirtyRef.current) {
-        setServerUpdateDraft({
-          autoCheckEnabled: value.autoCheckEnabled,
-          autoUpdateEnabled: value.autoUpdateEnabled,
-          updateWindowStart: value.updateWindowStart,
-          updateWindowEnd: value.updateWindowEnd,
-          githubMirrorUrl: value.githubMirrorUrl,
-        });
+        const nextDraft = serverUpdateSettingsFromInfo(value);
+        serverUpdateDraftRef.current = nextDraft;
+        setServerUpdateDraft(nextDraft);
       }
     };
     const load = async () => {
+      if (loadInFlight) {
+        return;
+      }
+      loadInFlight = true;
       try {
         const value = await actionsRef.current.serverUpdate();
         apply(value);
-        setServerUpdateError(null);
+        if (!disposed && serverUpdateActionRef.current === null) {
+          setServerUpdateError(null);
+        }
       } catch (updateError) {
         if (!disposed) {
           setServerUpdateError(explainError(updateError));
         }
+      } finally {
+        loadInFlight = false;
       }
     };
     void load();
@@ -313,6 +481,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
   useEffect(() => () => {
     qrSessionRef.current = null;
+    qrGenerationRef.current += 1;
+    if (qrCloseTimerRef.current !== null) {
+      window.clearTimeout(qrCloseTimerRef.current);
+      qrCloseTimerRef.current = null;
+    }
     pendingLeaveResolveRef.current?.(false);
     pendingLeaveResolveRef.current = null;
   }, []);
@@ -326,6 +499,10 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }
 
   async function openBrowserLogin() {
+    if (browserLoginBusyRef.current) {
+      return;
+    }
+    browserLoginBusyRef.current = true;
     setBrowserLoginOpening(true);
     setBrowserLoginHint(null);
     try {
@@ -336,11 +513,26 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setError(message);
       onError(message);
     } finally {
+      browserLoginBusyRef.current = false;
       setBrowserLoginOpening(false);
     }
   }
 
+  function clearQrCloseTimer() {
+    if (qrCloseTimerRef.current !== null) {
+      window.clearTimeout(qrCloseTimerRef.current);
+      qrCloseTimerRef.current = null;
+    }
+  }
+
   async function startQrLogin() {
+    if (qrStartBusyRef.current) {
+      return;
+    }
+    qrStartBusyRef.current = true;
+    const generation = ++qrGenerationRef.current;
+    clearQrCloseTimer();
+    qrSessionRef.current = null;
     setQrLoading(true);
     setQrSession(null);
     setQrStatus("waiting");
@@ -353,33 +545,42 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         errorCorrectionLevel: "M",
         color: { dark: "#241b25", light: "#fffafc" },
       });
+      if (qrGenerationRef.current !== generation) {
+        return;
+      }
       qrSessionRef.current = login.qrcodeKey;
       setQrSession({ key: login.qrcodeKey, dataUrl });
       setQrOpen(true);
       setQrStatus("waiting");
       setQrMessage("等待手机扫码");
-      void pollQrLogin(login.qrcodeKey);
+      void pollQrLogin(login.qrcodeKey, generation);
     } catch (loginError) {
+      if (qrGenerationRef.current !== generation) {
+        return;
+      }
       const message = explainError(loginError);
       setQrStatus("error");
       setQrMessage(message);
       setError(message);
       onError(message);
     } finally {
-      setQrLoading(false);
+      qrStartBusyRef.current = false;
+      if (qrGenerationRef.current === generation) {
+        setQrLoading(false);
+      }
     }
   }
 
-  async function pollQrLogin(key: string) {
+  async function pollQrLogin(key: string, generation: number) {
     let consecutiveErrors = 0;
-    while (qrSessionRef.current === key) {
+    while (qrSessionRef.current === key && qrGenerationRef.current === generation) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
-      if (qrSessionRef.current !== key) {
+      if (qrSessionRef.current !== key || qrGenerationRef.current !== generation) {
         return;
       }
       try {
         const result = await actions.pollBiliQrLogin(key);
-        if (qrSessionRef.current !== key) {
+        if (qrSessionRef.current !== key || qrGenerationRef.current !== generation) {
           return;
         }
         setQrStatus(result.status);
@@ -387,7 +588,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         consecutiveErrors = 0;
         if (result.status === "confirmed") {
           qrSessionRef.current = null;
-          window.setTimeout(() => setQrOpen(false), 1200);
+          clearQrCloseTimer();
+          qrCloseTimerRef.current = window.setTimeout(() => {
+            qrCloseTimerRef.current = null;
+            if (qrGenerationRef.current === generation) {
+              setQrOpen(false);
+            }
+          }, 1200);
           return;
         }
         if (result.status === "expired") {
@@ -395,6 +602,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           return;
         }
       } catch (pollError) {
+        if (qrSessionRef.current !== key || qrGenerationRef.current !== generation) {
+          return;
+        }
         consecutiveErrors += 1;
         setQrStatus("error");
         setQrMessage(explainError(pollError));
@@ -407,17 +617,24 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }
 
   function closeQrLogin() {
+    qrGenerationRef.current += 1;
     qrSessionRef.current = null;
+    clearQrCloseTimer();
     setQrOpen(false);
+    setQrLoading(false);
   }
 
   async function logoutBili() {
+    if (biliLogoutBusyRef.current) {
+      return;
+    }
     const message = serverMode
       ? "退出服务器 B 站登录并删除服务端保存的 Cookie？"
       : "退出 B 站登录并删除本机保存的 Cookie？";
     if (!window.confirm(message)) {
       return;
     }
+    biliLogoutBusyRef.current = true;
     try {
       await actions.clearBiliLogin();
       setBiliCookie("");
@@ -428,189 +645,414 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const message = explainError(logoutError);
       setError(message);
       onError(message);
+    } finally {
+      biliLogoutBusyRef.current = false;
     }
   }
 
+  function markFormChanged() {
+    formRevisionRef.current += 1;
+  }
+
   function setMode(dataMode: DataMode) {
-    setDraft({ ...draft, dataMode });
+    markFormChanged();
+    connectionTestSeq.current += 1;
+    connectionTestingRef.current = false;
+    setTesting(false);
+    proxyTestSeq.current += 1;
+    proxyTestingRef.current = false;
+    setProxyTesting(false);
+    setConnectionText(null);
+    setProxyReport(null);
+    setDraft((current) => ({ ...current, dataMode }));
     setSaved(false);
   }
 
   async function testConnection() {
-    if (!draft.serverUrl.trim()) {
+    if (connectionTestingRef.current) {
+      return;
+    }
+    const testedUrl = draftRef.current.serverUrl.trim();
+    if (!testedUrl) {
       setError("请先填写服务器地址");
       return;
     }
+    connectionTestingRef.current = true;
+    const requestId = ++connectionTestSeq.current;
+    const token = serverToken || "";
     setTesting(true);
+    setConnectionText(null);
     setError(null);
     try {
-      const token = serverToken || "";
-      setConnectionText(await actions.testServer(draft.serverUrl.trim(), token));
+      const result = await actions.testServer(testedUrl, token);
+      if (
+        connectionTestSeq.current === requestId
+        && draftRef.current.serverUrl.trim() === testedUrl
+      ) {
+        setConnectionText(result);
+      }
     } catch (testError) {
-      const message = explainError(testError);
-      setError(message);
-      onError(message);
+      if (
+        connectionTestSeq.current === requestId
+        && draftRef.current.serverUrl.trim() === testedUrl
+      ) {
+        const message = explainError(testError);
+        setError(message);
+        onError(message);
+      }
     } finally {
-      setTesting(false);
+      if (connectionTestSeq.current === requestId) {
+        connectionTestingRef.current = false;
+        setTesting(false);
+      }
     }
   }
 
   async function testLlm() {
-    if (!draft.llmBaseUrl.trim() || !draft.llmModel.trim()) {
+    if (llmTestingRef.current) {
+      return;
+    }
+    const current = draftRef.current;
+    if (!current.llmBaseUrl.trim() || !current.llmModel.trim()) {
       setError("请先填写日程模型的 Base URL 和模型名");
       return;
     }
+    const requestId = ++llmTestSeq.current;
+    const input = {
+      baseUrl: current.llmBaseUrl.trim(),
+      apiKey: llmApiKey.trim() || undefined,
+      model: current.llmModel.trim(),
+      promptVersion: current.llmPromptVersion,
+    };
+    llmTestingRef.current = true;
     setLlmTesting(true);
     setError(null);
     setLlmReport(null);
     try {
-      setLlmReport(await actions.testLlm({
-        baseUrl: draft.llmBaseUrl.trim(),
-        apiKey: llmApiKey.trim() || undefined,
-        model: draft.llmModel.trim(),
-        promptVersion: draft.llmPromptVersion,
-      }));
+      const report = await actions.testLlm(input);
+      if (llmTestSeq.current === requestId) {
+        setLlmReport(report);
+      }
     } catch (testError) {
-      const message = explainError(testError);
-      setError(message);
-      onError(message);
+      if (llmTestSeq.current === requestId) {
+        const message = explainError(testError);
+        setError(message);
+        onError(message);
+      }
     } finally {
-      setLlmTesting(false);
+      if (llmTestSeq.current === requestId) {
+        llmTestingRef.current = false;
+        setLlmTesting(false);
+      }
     }
   }
 
   async function testProxy() {
-    const port = draft.proxyPort;
+    if (proxyTestingRef.current) {
+      return;
+    }
+    const current = draftRef.current;
+    const port = current.proxyPort;
     if (port === null || !Number.isInteger(port) || port < 1 || port > 65535) {
       setError("请填写 1 到 65535 之间的本机代理端口");
       return;
     }
+    const requestId = ++proxyTestSeq.current;
+    proxyTestingRef.current = true;
     setProxyTesting(true);
     setError(null);
     setProxyReport(null);
     try {
-      setProxyReport(await actions.testProxy(port, draft.dataMode));
+      const report = await actions.testProxy(port, current.dataMode);
+      if (proxyTestSeq.current === requestId) {
+        setProxyReport(report);
+      }
     } catch (testError) {
-      const message = explainError(testError);
-      setError(message);
-      onError(message);
+      if (proxyTestSeq.current === requestId) {
+        const message = explainError(testError);
+        setError(message);
+        onError(message);
+      }
     } finally {
-      setProxyTesting(false);
+      if (proxyTestSeq.current === requestId) {
+        proxyTestingRef.current = false;
+        setProxyTesting(false);
+      }
     }
   }
 
   async function pullModels() {
-    if (!draft.llmBaseUrl.trim()) {
+    if (modelsLoadingRef.current) {
+      return;
+    }
+    const current = draftRef.current;
+    if (!current.llmBaseUrl.trim()) {
       setError("请先填写日程模型的 Base URL");
       return;
     }
+    const requestId = ++modelDiscoverySeq.current;
+    modelsLoadingRef.current = true;
     setModelsLoading(true);
     setError(null);
     try {
       const nextModels = await actions.listLlmModels({
-        baseUrl: draft.llmBaseUrl.trim(),
+        baseUrl: current.llmBaseUrl.trim(),
         apiKey: llmApiKey.trim() || undefined,
       });
-      setModels(nextModels);
-      setModelSearch("");
-      setModelsOpen(true);
+      if (modelDiscoverySeq.current === requestId) {
+        setModels(nextModels);
+        setModelSearch("");
+        setModelsOpen(true);
+      }
     } catch (discoveryError) {
-      const message = explainError(discoveryError);
-      setError(message);
-      onError(message);
+      if (modelDiscoverySeq.current === requestId) {
+        const message = explainError(discoveryError);
+        setError(message);
+        onError(message);
+      }
     } finally {
-      setModelsLoading(false);
+      if (modelDiscoverySeq.current === requestId) {
+        modelsLoadingRef.current = false;
+        setModelsLoading(false);
+      }
     }
   }
 
   async function save(): Promise<boolean> {
+    if (savingRef.current) {
+      return false;
+    }
+    savingRef.current = true;
+    const submittedRevision = formRevisionRef.current;
+    const submittedLlmApiKey = llmApiKey.trim();
+    const submittedBiliCookie = biliCookie.trim();
+    const submittedServerToken = serverToken.trim();
+    const submittedAutoLaunch = autoLaunch;
+    const submittedDraft = draftRef.current;
     setSaving(true);
     setError(null);
     setSaved(false);
     try {
       const nextSettings = await actions.save(
-        draft,
+        submittedDraft,
         {
-          llmApiKey: llmApiKey.trim() || undefined,
-          biliCookie: biliCookie.trim() || undefined,
-          serverToken: serverToken.trim() || undefined,
+          llmApiKey: submittedLlmApiKey || undefined,
+          biliCookie: submittedBiliCookie || undefined,
+          serverToken: submittedServerToken || undefined,
         },
-        autoLaunch,
+        submittedAutoLaunch,
       );
-      setLlmApiKey("");
-      setBiliCookie("");
-      setServerToken("");
-      setDraft(nextSettings);
+      const formUnchanged = formRevisionRef.current === submittedRevision;
+      savedDraftRef.current = nextSettings;
       setSavedDraft(nextSettings);
-      setSavedAutoLaunch(autoLaunch);
-      setSaved(true);
-      return true;
+      setSavedAutoLaunch(submittedAutoLaunch);
+      setLlmApiKey((current) => current.trim() === submittedLlmApiKey ? "" : current);
+      setBiliCookie((current) => current.trim() === submittedBiliCookie ? "" : current);
+      setServerToken((current) => current.trim() === submittedServerToken ? "" : current);
+      if (formUnchanged) {
+        draftRef.current = nextSettings;
+        setDraft(nextSettings);
+        setSaved(true);
+      }
+      return formUnchanged;
     } catch (saveError) {
       const message = explainError(saveError);
       setError(message);
       onError(message);
       return false;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
 
   async function saveAndLeave() {
-    if (await save()) {
-      settleLeavePrompt(true);
+    if (leaveSavingRef.current) {
+      return;
+    }
+    leaveSavingRef.current = true;
+    setLeaveSaving(true);
+    try {
+      const revision = formRevisionRef.current;
+      if (!(await save())) {
+        return;
+      }
+      if (formRevisionRef.current !== revision) {
+        setError("设置已保存，但保存期间又产生了新修改，请确认后再次保存。");
+        return;
+      }
+      const latestMirror = githubMirrorDraftRef.current;
+      if (
+        latestMirror !== githubMirrorEffectiveRef.current
+        && !(await saveGithubMirror(latestMirror))
+      ) {
+        return;
+      }
+      const currentServerUpdate = serverUpdateRef.current;
+      const latestServerDraft = serverUpdateDraftRef.current;
+      const hasUnsavedServerUpdate = serverMode && (
+        serverUpdateDirtyRef.current
+        || (currentServerUpdate !== null
+          && !serverUpdateSettingsEqual(
+            latestServerDraft,
+            serverUpdateSettingsFromInfo(currentServerUpdate),
+          ))
+      );
+      if (hasUnsavedServerUpdate) {
+        if (currentServerUpdate === null) {
+          setError("服务器更新配置尚未加载完成，暂时无法保存并离开，请稍后重试。");
+          return;
+        }
+        if (!(await saveServerUpdateSettings())) {
+          return;
+        }
+      }
+      if (formRevisionRef.current === revision) {
+        settleLeavePrompt(true);
+      }
+    } finally {
+      leaveSavingRef.current = false;
+      setLeaveSaving(false);
     }
   }
 
   function applyServerUpdate(value: ServerUpdateInfo) {
+    serverUpdateRef.current = value;
     setServerUpdate(value);
     if (!serverUpdateDirtyRef.current) {
-      setServerUpdateDraft({
-        autoCheckEnabled: value.autoCheckEnabled,
-        autoUpdateEnabled: value.autoUpdateEnabled,
-        updateWindowStart: value.updateWindowStart,
-        updateWindowEnd: value.updateWindowEnd,
-        githubMirrorUrl: value.githubMirrorUrl,
-      });
+      const nextDraft = serverUpdateSettingsFromInfo(value);
+      serverUpdateDraftRef.current = nextDraft;
+      setServerUpdateDraft(nextDraft);
     }
   }
 
-  async function saveGithubMirror(value: string) {
+  function updateServerUpdateDraft(
+    updater: (current: ServerUpdateSettings) => ServerUpdateSettings,
+  ) {
+    setServerUpdateDraft((current) => {
+      const next = updater(current);
+      const saved = serverUpdateRef.current;
+      serverUpdateDraftRef.current = next;
+      serverUpdateDirtyRef.current = saved === null
+        || !serverUpdateSettingsEqual(next, serverUpdateSettingsFromInfo(saved));
+      return next;
+    });
+  }
+
+  function beginServerUpdateAction(action: "save" | "check" | "install"): boolean {
+    if (serverUpdateActionRef.current !== null) {
+      return false;
+    }
+    serverUpdateActionRef.current = action;
+    setServerUpdateLoading(action);
+    return true;
+  }
+
+  function finishServerUpdateAction() {
+    serverUpdateActionRef.current = null;
+    setServerUpdateLoading(null);
+  }
+
+  async function saveGithubMirror(value: string): Promise<boolean> {
+    if (githubMirrorSavingRef.current) {
+      return false;
+    }
+    githubMirrorSavingRef.current = true;
     setGithubMirrorSaving(true);
     setGithubMirrorError(null);
     try {
       const normalized = saveClientGithubMirror(value);
-      setGithubMirrorDraft(normalized);
+      githubMirrorEffectiveRef.current = normalized;
       setGithubMirrorEffective(normalized);
+      if (githubMirrorDraftRef.current === value) {
+        githubMirrorDraftRef.current = normalized;
+        setGithubMirrorDraft(normalized);
+      }
+      return true;
     } catch (mirrorError) {
       setGithubMirrorError(explainError(mirrorError));
+      return false;
     } finally {
+      githubMirrorSavingRef.current = false;
       setGithubMirrorSaving(false);
     }
   }
 
-  async function saveServerUpdateSettings() {
-    setServerUpdateLoading("save");
-    setServerUpdateError(null);
+  async function saveServerMirror(mirrorUrl: string) {
+    const currentServerUpdate = serverUpdateRef.current;
+    if (!currentServerUpdate) {
+      setServerMirrorError("服务器更新配置尚未加载，请稍后重试。");
+      return;
+    }
+    if (!beginServerUpdateAction("save")) {
+      return;
+    }
+    setServerMirrorError(null);
+    const savedSettings = serverUpdateSettingsFromInfo(currentServerUpdate);
     try {
-      const value = await actions.saveServerUpdateSettings(serverUpdateDraft);
-      serverUpdateDirtyRef.current = false;
-      applyServerUpdate(value);
+      const value = await actions.saveServerUpdateSettings({
+        ...savedSettings,
+        githubMirrorUrl: mirrorUrl,
+      });
+      const latestDraft = serverUpdateDraftRef.current;
+      const nextDraft = !serverUpdateAutoSettingsEqual(latestDraft, serverUpdateSettingsFromInfo(value))
+        ? { ...latestDraft, githubMirrorUrl: value.githubMirrorUrl }
+        : serverUpdateSettingsFromInfo(value);
+      serverUpdateRef.current = value;
+      serverUpdateDraftRef.current = nextDraft;
+      serverUpdateDirtyRef.current = !serverUpdateSettingsEqual(
+        nextDraft,
+        serverUpdateSettingsFromInfo(value),
+      );
+      setServerUpdate(value);
+      setServerUpdateDraft(nextDraft);
+    } catch (updateError) {
+      setServerMirrorError(explainError(updateError));
+    } finally {
+      finishServerUpdateAction();
+    }
+  }
+
+  async function saveServerUpdateSettings(): Promise<boolean> {
+    if (!beginServerUpdateAction("save")) {
+      return false;
+    }
+    setServerUpdateError(null);
+    const submittedDraft = serverUpdateDraftRef.current;
+    try {
+      const value = await actions.saveServerUpdateSettings(submittedDraft);
+      const latestDraft = serverUpdateDraftRef.current;
+      const nextDraft = serverUpdateSettingsEqual(latestDraft, submittedDraft)
+        ? serverUpdateSettingsFromInfo(value)
+        : latestDraft;
+      serverUpdateRef.current = value;
+      serverUpdateDraftRef.current = nextDraft;
+      serverUpdateDirtyRef.current = !serverUpdateSettingsEqual(
+        nextDraft,
+        serverUpdateSettingsFromInfo(value),
+      );
+      setServerUpdate(value);
+      setServerUpdateDraft(nextDraft);
+      return true;
     } catch (updateError) {
       setServerUpdateError(explainError(updateError));
+      return false;
     } finally {
-      setServerUpdateLoading(null);
+      finishServerUpdateAction();
     }
   }
 
   async function checkServerUpdate() {
-    setServerUpdateLoading("check");
+    if (!beginServerUpdateAction("check")) {
+      return;
+    }
     setServerUpdateError(null);
     try {
       applyServerUpdate(await actions.checkServerUpdate());
     } catch (updateError) {
       setServerUpdateError(explainError(updateError));
     } finally {
-      setServerUpdateLoading(null);
+      finishServerUpdateAction();
     }
   }
 
@@ -618,18 +1060,24 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     if (!window.confirm("确定立即更新服务器？更新期间服务会短暂中断，系统会先备份数据，失败时自动回滚。")) {
       return;
     }
-    setServerUpdateLoading("install");
+    if (!beginServerUpdateAction("install")) {
+      return;
+    }
     setServerUpdateError(null);
     try {
       applyServerUpdate(await actions.installServerUpdate());
     } catch (updateError) {
       setServerUpdateError(explainError(updateError));
     } finally {
-      setServerUpdateLoading(null);
+      finishServerUpdateAction();
     }
   }
 
   async function checkUpdates() {
+    if (updateActionRef.current !== null) {
+      return;
+    }
+    updateActionRef.current = "check";
     setUpdateChecking(true);
     setUpdateStatus(null);
     setUpdateInfo(null);
@@ -642,14 +1090,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     } catch (updateError) {
       setUpdateStatus(`检查更新失败：${explainError(updateError)}`);
     } finally {
+      updateActionRef.current = null;
       setUpdateChecking(false);
     }
   }
 
   async function installUpdate() {
-    if (!updateInfo) {
+    if (!updateInfo || updateActionRef.current !== null) {
       return;
     }
+    updateActionRef.current = "install";
     setUpdateInstalling(true);
     setUpdateInstalled(false);
     setUpdateProgress({ downloaded: 0, total: null });
@@ -668,6 +1118,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     } catch (updateError) {
       setUpdateStatus(`安装更新失败：${explainError(updateError)}`);
     } finally {
+      updateActionRef.current = null;
       setUpdateInstalling(false);
     }
   }
@@ -683,13 +1134,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const visibleModels = models.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
+  const leaveBusy = saving || leaveSaving;
   const updatePercent =
     updateProgress.total && updateProgress.total > 0
       ? Math.min(100, (updateProgress.downloaded / updateProgress.total) * 100)
       : null;
 
   return (
-    <section className="page settings-page">
+    <section className="page settings-page" onChangeCapture={markFormChanged}>
       <header className="page-header">
         <div>
           <p className="eyebrow">PREFERENCES</p>
@@ -728,11 +1180,33 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <div className="form-grid">
               <label>
                 <span>服务器地址</span>
-                <input value={draft.serverUrl} onChange={(event) => setDraft({ ...draft, serverUrl: event.target.value })} placeholder="https://你的服务器:8787" />
+                <input
+                  value={draft.serverUrl}
+                  onChange={(event) => {
+                    connectionTestSeq.current += 1;
+                    connectionTestingRef.current = false;
+                    setTesting(false);
+                    setConnectionText(null);
+                    setDraft((current) => ({ ...current, serverUrl: event.target.value }));
+                  }}
+                  placeholder="https://你的服务器:8787"
+                />
               </label>
               <label>
                 <span>访问令牌</span>
-                <input type="password" autoComplete="off" value={serverToken} onChange={(event) => setServerToken(event.target.value)} placeholder={secrets.serverTokenConfigured ? "已配置，留空则沿用" : "Bearer Token"} />
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={serverToken}
+                  onChange={(event) => {
+                    connectionTestSeq.current += 1;
+                    connectionTestingRef.current = false;
+                    setTesting(false);
+                    setConnectionText(null);
+                    setServerToken(event.target.value);
+                  }}
+                  placeholder={secrets.serverTokenConfigured ? "已配置，留空则沿用" : "Bearer Token"}
+                />
               </label>
               <div className="inline-actions span-2">
                 <button className="button secondary" onClick={() => void testConnection()} disabled={testing}>
@@ -787,9 +1261,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <div className="settings-stack server-update-options">
               <Toggle
                 checked={serverUpdateDraft.autoCheckEnabled}
+                disabled={serverUpdateLoading !== null}
                 onChange={(value) => {
-                  serverUpdateDirtyRef.current = true;
-                  setServerUpdateDraft((current) => ({
+                  updateServerUpdateDraft((current) => ({
                     ...current,
                     autoCheckEnabled: value,
                     autoUpdateEnabled: value ? current.autoUpdateEnabled : false,
@@ -799,9 +1273,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               />
               <Toggle
                 checked={serverUpdateDraft.autoUpdateEnabled}
+                disabled={serverUpdateLoading !== null}
                 onChange={(value) => {
-                  serverUpdateDirtyRef.current = true;
-                  setServerUpdateDraft((current) => ({
+                  updateServerUpdateDraft((current) => ({
                     ...current,
                     autoUpdateEnabled: value,
                     autoCheckEnabled: value ? true : current.autoCheckEnabled,
@@ -815,10 +1289,10 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <input
                     type="time"
                     value={serverUpdateDraft.updateWindowStart}
-                    disabled={!serverUpdateDraft.autoUpdateEnabled}
+                    disabled={serverUpdateLoading !== null || !serverUpdateDraft.autoUpdateEnabled}
                     onChange={(event) => {
-                      serverUpdateDirtyRef.current = true;
-                      setServerUpdateDraft((current) => ({ ...current, updateWindowStart: event.target.value }));
+                      const updateWindowStart = event.target.value;
+                      updateServerUpdateDraft((current) => ({ ...current, updateWindowStart }));
                     }}
                   />
                 </label>
@@ -827,28 +1301,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <input
                     type="time"
                     value={serverUpdateDraft.updateWindowEnd}
-                    disabled={!serverUpdateDraft.autoUpdateEnabled}
+                    disabled={serverUpdateLoading !== null || !serverUpdateDraft.autoUpdateEnabled}
                     onChange={(event) => {
-                      serverUpdateDirtyRef.current = true;
-                      setServerUpdateDraft((current) => ({ ...current, updateWindowEnd: event.target.value }));
+                      const updateWindowEnd = event.target.value;
+                      updateServerUpdateDraft((current) => ({ ...current, updateWindowEnd }));
                     }}
                   />
                 </label>
                 <small>时间按 Asia/Shanghai 解释；开始时间晚于结束时间表示跨午夜。</small>
-              </div>
-              <div className="server-update-mirror">
-                <label>
-                  <span>服务端 GitHub 镜像加速</span>
-                  <input
-                    value={serverUpdateDraft.githubMirrorUrl}
-                    placeholder="https://gh-proxy.com/"
-                    onChange={(event) => {
-                      serverUpdateDirtyRef.current = true;
-                      setServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: event.target.value }));
-                    }}
-                  />
-                </label>
-                <small>仅影响服务器版本检查；留空表示 GitHub 直连，失败会自动回退直连。</small>
               </div>
             </div>
             <div className="inline-actions server-update-actions">
@@ -899,6 +1359,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           </section>
         ) : null}
 
+        {serverMode ? (
+          <GithubMirrorCard
+            title="服务端 GitHub 镜像加速"
+            scopeLabel="服务器"
+            scopeClass="server"
+            description="检查服务器版本时优先使用镜像，失败自动回退 GitHub 直连。"
+            value={serverUpdateDraft.githubMirrorUrl}
+            effectiveValue={serverUpdate ? serverUpdate.githubMirrorUrl || "GitHub 直连" : "读取中…"}
+            saving={serverUpdateLoading === "save"}
+            error={serverMirrorError}
+            onChange={(value) => {
+              setServerMirrorError(null);
+              updateServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: value }));
+            }}
+            onSave={(value) => void saveServerMirror(value)}
+            scopeNote="此设置只影响服务器版本检查，与客户端镜像分开保存。"
+          />
+        ) : null}
+
         <div className="settings-section-heading span-2">
           <strong>{serverMode ? "服务端采集设置" : "本地采集设置"}</strong>
           <span>
@@ -921,10 +1400,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   inputMode="numeric"
                   value={draft.proxyPort ?? ""}
                   onChange={(event) => {
-                    setDraft({
-                      ...draft,
-                      proxyPort: event.target.value ? Number(event.target.value) : null,
-                    });
+                    const proxyPort = event.target.value ? Number(event.target.value) : null;
+                    proxyTestSeq.current += 1;
+                    proxyTestingRef.current = false;
+                    setProxyTesting(false);
+                    setDraft((current) => ({ ...current, proxyPort }));
                     setProxyReport(null);
                   }}
                   placeholder="例如 7890"
@@ -977,15 +1457,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <div className="form-grid single">
             <label>
               <span>开播探测</span>
-              <div className="input-suffix"><input type="number" min={10} max={300} value={draft.livePollSeconds} onChange={(event) => setDraft({ ...draft, livePollSeconds: Number(event.target.value) })} /><em>秒</em></div>
+              <div className="input-suffix"><input type="number" min={10} max={300} value={draft.livePollSeconds} onChange={(event) => setDraft((current) => ({ ...current, livePollSeconds: Number(event.target.value) }))} /><em>秒</em></div>
             </label>
             <label>
               <span>动态刷新</span>
-              <div className="input-suffix"><input type="number" min={300} max={3600} step={60} value={draft.dynamicPollSeconds} onChange={(event) => setDraft({ ...draft, dynamicPollSeconds: Number(event.target.value) })} /><em>秒</em></div>
+              <div className="input-suffix"><input type="number" min={300} max={3600} step={60} value={draft.dynamicPollSeconds} onChange={(event) => setDraft((current) => ({ ...current, dynamicPollSeconds: Number(event.target.value) }))} /><em>秒</em></div>
             </label>
             <Toggle
               checked={draft.liveStatsEnabled}
-              onChange={(value) => setDraft({ ...draft, liveStatsEnabled: value })}
+              onChange={(value) => setDraft((current) => ({ ...current, liveStatsEnabled: value }))}
               label="直播数据统计"
             />
             <p className="form-hint">开启后可在主播库为单个主播订阅直播数据；原始弹幕和礼物事件不落盘。</p>
@@ -994,13 +1474,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
         <div className="settings-section-heading span-2">
           <strong>本设备设置</strong>
-          <span>通知、开机自启、主题、侧栏宽度和窗口状态只保存在这台设备，不写入服务器。</span>
+          <span>配色、通知、开机自启、侧栏宽度和窗口状态只保存在这台设备，不写入服务器。</span>
         </div>
+
+        <AppearanceSettingsPanel value={appearance} onChange={onAppearanceChange} />
 
         <section className="settings-card device-local-settings">
           <header><h2>提醒与运行</h2><span className="setting-scope local">仅本设备</span></header>
           <div className="settings-stack">
-            <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft({ ...draft, notificationsEnabled: value })} label="Windows 开播通知" />
+            <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft((current) => ({ ...current, notificationsEnabled: value }))} label="Windows 开播通知" />
             {tauri ? <Toggle checked={autoLaunch} onChange={setAutoLaunch} label="开机自启" /> : null}
             {tauri ? (
               <button className="button secondary" onClick={() => void actions.testNotification().catch((notificationError) => onError(explainError(notificationError)))}>
@@ -1014,56 +1496,22 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         </section>
 
         {tauri ? (
-          <section className="settings-card span-2 github-mirror-card">
-            <header>
-              <h2>客户端 GitHub 镜像加速</h2>
-              <span className="setting-scope local">仅当前设备</span>
-              <span>检查桌面端更新和下载发布包时优先使用镜像，失败自动回退 GitHub 直连。</span>
-            </header>
-          <div className="github-mirror-input-row">
-            <input
-              value={githubMirrorDraft}
-              onChange={(event) => {
-                setGithubMirrorDraft(event.target.value);
-              }}
-              placeholder="https://gh-proxy.com/"
-              aria-label="GitHub 镜像地址"
-            />
-            <button
-              className="button primary"
-              onClick={() => void saveGithubMirror(githubMirrorDraft)}
-              disabled={githubMirrorSaving}
-            >
-              {githubMirrorSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
-              保存
-            </button>
-            <button
-              className="button secondary"
-              onClick={() => void saveGithubMirror("")}
-              disabled={githubMirrorSaving || !githubMirrorDraft.trim()}
-            >
-              清除
-            </button>
-          </div>
-          {githubMirrorError ? <ErrorBanner message={githubMirrorError} /> : null}
-          <div className="github-mirror-presets">
-            <span>常用</span>
-            {["https://gh-proxy.com/", "https://gh-proxy.org/"].map((preset) => (
-              <button
-                type="button"
-                key={preset}
-                onClick={() => {
-                  setGithubMirrorDraft(preset);
-                }}
-              >
-                {preset}
-              </button>
-            ))}
-          </div>
-          <p className="form-hint">
-            当前生效：{githubMirrorEffective || "GitHub 直连"}。此设置只影响当前设备的桌面端更新，服务端镜像请在服务器更新卡片中单独配置。
-          </p>
-          </section>
+          <GithubMirrorCard
+            title="客户端 GitHub 镜像加速"
+            scopeLabel="仅当前设备"
+            scopeClass="local"
+            description="检查桌面端更新和下载发布包时优先使用镜像，失败自动回退 GitHub 直连。"
+            value={githubMirrorDraft}
+            effectiveValue={githubMirrorEffective || "GitHub 直连"}
+            saving={githubMirrorSaving}
+            error={githubMirrorError}
+            onChange={(value) => {
+              githubMirrorDraftRef.current = value;
+              setGithubMirrorDraft(value);
+            }}
+            onSave={(value) => void saveGithubMirror(value)}
+            scopeNote="此设置只影响当前设备的桌面端更新，与服务器镜像分开保存。"
+          />
         ) : null}
 
         {tauri ? (
@@ -1130,12 +1578,29 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <div className="form-grid">
             <label>
               <span>Base URL</span>
-              <input value={draft.llmBaseUrl} onChange={(event) => { setDraft({ ...draft, llmBaseUrl: event.target.value }); setLlmReport(null); }} placeholder="https://api.example.com/v1" />
+              <input value={draft.llmBaseUrl} onChange={(event) => {
+                const llmBaseUrl = event.target.value;
+                llmTestSeq.current += 1;
+                modelDiscoverySeq.current += 1;
+                llmTestingRef.current = false;
+                modelsLoadingRef.current = false;
+                setLlmTesting(false);
+                setModelsLoading(false);
+                setDraft((current) => ({ ...current, llmBaseUrl }));
+                setLlmReport(null);
+              }} placeholder="https://api.example.com/v1" />
             </label>
             <label>
               <span>模型名</span>
               <div className="model-field-row">
-                <input value={draft.llmModel} onChange={(event) => { setDraft({ ...draft, llmModel: event.target.value }); setLlmReport(null); }} placeholder="文字/视觉模型名称" />
+                <input value={draft.llmModel} onChange={(event) => {
+                  const llmModel = event.target.value;
+                  llmTestSeq.current += 1;
+                  llmTestingRef.current = false;
+                  setLlmTesting(false);
+                  setDraft((current) => ({ ...current, llmModel }));
+                  setLlmReport(null);
+                }} placeholder="文字/视觉模型名称" />
                 <button className="button secondary small" type="button" onClick={() => void pullModels()} disabled={modelsLoading}>
                   {modelsLoading ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
                   {modelsLoading ? "拉取中…" : "拉取模型"}
@@ -1150,12 +1615,20 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   autoComplete="off"
                   value={llmApiKey}
                   onChange={(event) => {
+                    llmTestSeq.current += 1;
+                    modelDiscoverySeq.current += 1;
+                    llmTestingRef.current = false;
+                    modelsLoadingRef.current = false;
+                    setLlmTesting(false);
+                    setModelsLoading(false);
                     setLlmApiKey(event.target.value);
                     setLlmReport(null);
                   }}
                   placeholder={
                     secrets.llmConfigured
-                      ? "已配置，留空则沿用"
+                      ? llmApiKeyHint
+                        ? llmApiKeyHint + "（已配置，留空则沿用）"
+                        : "已配置（不会明文回显），留空则沿用"
                       : serverMode
                         ? "保存到服务端并同步到其他设备"
                         : "保存到 Windows 凭据管理器"
@@ -1168,7 +1641,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <span>
                 {serverMode
                   ? secrets.llmConfigured
-                    ? "模型密钥已由服务端加密保存，并同步到已授权设备"
+                    ? "模型密钥已由服务端加密保存，不会明文回显，并同步到已授权设备"
                     : "服务端尚未配置模型密钥"
                   : secrets.llmConfigured
                     ? "模型密钥已安全保存"
@@ -1176,7 +1649,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </span>
             </div>
             <div className="settings-stack span-2">
-              <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft({ ...draft, autoAnalyzeImages: value })} label="自动分析动态文字和日程图片" />
+              <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft((current) => ({ ...current, autoAnalyzeImages: value }))} label="自动分析动态文字和日程图片" />
               <p className="form-hint">动态自由文本只使用大模型分析；带预约卡片的动态不再调用模型；未配置模型时仅处理预约卡片中明确的结构化时间。</p>
             </div>
             <div className="llm-test-panel span-2">
@@ -1271,30 +1744,34 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       {leavePromptOpen ? (
         <Modal
           title="保存设置？"
-          onClose={() => settleLeavePrompt(false)}
+          onClose={() => {
+            if (!leaveBusy) {
+              settleLeavePrompt(false);
+            }
+          }}
           footer={
             <>
               <button
                 className="button secondary"
                 onClick={() => settleLeavePrompt(false)}
-                disabled={saving}
+                disabled={leaveBusy}
               >
                 取消
               </button>
               <button
                 className="button secondary"
                 onClick={() => settleLeavePrompt(true)}
-                disabled={saving}
+                disabled={leaveBusy}
               >
                 不保存
               </button>
               <button
                 className="button primary"
                 onClick={() => void saveAndLeave()}
-                disabled={saving}
+                disabled={leaveBusy}
               >
-                {saving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
-                {saving ? "保存中…" : "保存并离开"}
+                {leaveBusy ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
+                {leaveBusy ? "保存中…" : "保存并离开"}
               </button>
             </>
           }
@@ -1358,7 +1835,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   key={model}
                   className={`model-option ${draft.llmModel === model ? "active" : ""}`}
                   onClick={() => {
-                    setDraft({ ...draft, llmModel: model });
+                    markFormChanged();
+                    setDraft((current) => ({ ...current, llmModel: model }));
                     setLlmReport(null);
                     setModelsOpen(false);
                   }}

@@ -4,6 +4,14 @@ use std::path::PathBuf;
 
 use oshical_core::RuntimeSecrets;
 
+pub(crate) const ALLOWED_WEB_ORIGINS: [&str; 5] = [
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "tauri://localhost",
+];
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
@@ -28,8 +36,16 @@ impl ServerConfig {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        if !bind.ip().is_loopback() && api_token.is_none() {
-            return Err("服务器绑定非回环地址时必须设置 OSHICAL_API_TOKEN".to_owned());
+        if !bind.ip().is_loopback() {
+            let token = api_token
+                .as_deref()
+                .ok_or_else(|| "服务器绑定非回环地址时必须设置 OSHICAL_API_TOKEN".to_owned())?;
+            if token.len() < 32 || token.chars().any(char::is_control) {
+                return Err(
+                    "非回环部署的 OSHICAL_API_TOKEN 必须至少 32 字节且不能包含控制字符"
+                        .to_owned(),
+                );
+            }
         }
 
         let database_path = env::var("OSHICAL_DB_PATH")

@@ -8,7 +8,36 @@ Wants=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/opt/oshical
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=OSHICAL_UPDATE_DIR=/opt/oshical/data/system
-ExecStart=/opt/oshical/scripts/oshical-updater-agent.sh
-TimeoutStartSec=20min
+EnvironmentFile=-/etc/oshical/updater.env
+# Root-only 64-hex HMAC-SHA256 key shared with the server image release workflow.
+# The updater fails closed when this credential is absent.
+LoadCredential=update-hmac-key:/etc/oshical/updater-hmac.key
+ExecStart=/bin/bash /opt/oshical/scripts/oshical-updater-agent.sh
+TimeoutStartSec=2h
 Nice=10
+UMask=0077
+StateDirectory=oshical-updater
+StateDirectoryMode=0700
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+ReadWritePaths=/run/lock -/opt/oshical
+
+[Install]
+WantedBy=multi-user.target

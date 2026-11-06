@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as StdRwLock};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -11,13 +11,13 @@ use crate::error::{AppError, AppResult};
 use crate::fertility::{parse_fertility_payload, FertilityClient};
 use crate::live_stats::LiveStatsManager;
 use crate::llm::{
-    analysis_cache_key, events_from_raw, ContentAnalyzer, LlmClient, LlmConfig, LlmDiscoveryConfig,
-    LlmEvent, LlmEventAction, LlmTestReport,
+    analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient, LlmConfig,
+    LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
 };
 use crate::models::{
-    AddSubscription, DynamicPost, FertilitySnapshot, FertilityStatus, LiveStatus, NewSchedule,
-    NewWeeklyScheduleRule, RefreshProgress, RefreshReport, Schedule, Streamer, UpdateSchedule,
-    UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
+    LiveStatus, NewSchedule, NewWeeklyScheduleRule, RefreshProgress, RefreshReport, Schedule,
+    Streamer, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, ParsedSchedule};
@@ -26,6 +26,10 @@ use crate::store::SqliteStore;
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
+pub const FAN_POLL_INTERVAL_SECONDS: u64 = 60 * 60;
+const TITLE_REUSE_LOOKBACK_DAYS: i64 = 56;
+const TITLE_REUSE_SLOT_TOLERANCE_MINUTES: i64 = 30;
+const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 
 #[derive(Clone)]
 pub struct AppService {
@@ -36,6 +40,7 @@ pub struct AppService {
     secrets: Arc<RwLock<RuntimeSecrets>>,
     live_stats: LiveStatsManager,
     refresh_lock: Arc<Mutex<()>>,
+    live_check_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
 impl AppService {
@@ -63,6 +68,7 @@ impl AppService {
             secrets: Arc::new(RwLock::new(secrets)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -80,6 +86,7 @@ impl AppService {
             secrets: Arc::new(RwLock::new(secrets)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -136,6 +143,15 @@ impl AppService {
         self.refresh_lock.lock().await
     }
 
+    async fn live_check_lock(&self, streamer_id: i64) -> Arc<Mutex<()>> {
+        self.live_check_locks
+            .lock()
+            .await
+            .entry(streamer_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     async fn capture_avatar_data(&self, avatar_url: &str) -> Option<String> {
         let avatar_url = avatar_url.trim();
         if avatar_url.is_empty() || avatar_url.starts_with("data:image/") {
@@ -144,7 +160,7 @@ impl AppService {
         match self.bili_client().fetch_avatar_data_url(avatar_url).await {
             Ok(value) => Some(value),
             Err(error) => {
-                tracing::warn!(%error, %avatar_url, "capture streamer avatar failed");
+                tracing::warn!(%error, "capture streamer avatar failed");
                 None
             }
         }
@@ -202,26 +218,36 @@ impl AppService {
 
     pub async fn test_llm(&self, mut config: LlmConfig) -> AppResult<LlmTestReport> {
         if config.api_key.trim().is_empty() {
-            config.api_key = self
-                .secrets
-                .read()
-                .await
-                .llm_api_key
-                .clone()
-                .unwrap_or_default();
+            let settings = load_settings(&self.store).await?;
+            if !settings.llm_base_url.trim().is_empty()
+                && llm_base_urls_match(&config.base_url, &settings.llm_base_url)?
+            {
+                config.api_key = self
+                    .secrets
+                    .read()
+                    .await
+                    .llm_api_key
+                    .clone()
+                    .unwrap_or_default();
+            }
         }
         self.llm_analyzer().test_calendar_image(&config).await
     }
 
     pub async fn list_llm_models(&self, mut config: LlmDiscoveryConfig) -> AppResult<Vec<String>> {
         if config.api_key.trim().is_empty() {
-            config.api_key = self
-                .secrets
-                .read()
-                .await
-                .llm_api_key
-                .clone()
-                .unwrap_or_default();
+            let settings = load_settings(&self.store).await?;
+            if !settings.llm_base_url.trim().is_empty()
+                && llm_base_urls_match(&config.base_url, &settings.llm_base_url)?
+            {
+                config.api_key = self
+                    .secrets
+                    .read()
+                    .await
+                    .llm_api_key
+                    .clone()
+                    .unwrap_or_default();
+            }
         }
         self.llm_analyzer().list_models(&config).await
     }
@@ -236,7 +262,7 @@ impl AppService {
                 "搜索关键词长度必须为 1 到 100 字",
             ));
         }
-        let subscriptions = self.store.list_streamers().await.unwrap_or_default();
+        let subscriptions = self.store.list_streamers().await?;
         let local_matches: Vec<crate::models::AccountSearchResult> = subscriptions
             .iter()
             .filter(|streamer| search_matches_subscription(keyword, streamer))
@@ -307,7 +333,11 @@ impl AppService {
         id: i64,
         update: &UpdateSubscription,
     ) -> AppResult<Streamer> {
-        self.store.update_subscription(id, update).await
+        let updated = self.store.update_subscription(id, update).await?;
+        if update.live_stats_enabled == Some(false) {
+            self.live_stats.stop(id, Utc::now()).await;
+        }
+        Ok(updated)
     }
 
     pub async fn reorder_subscriptions(&self, ids: &[i64]) -> AppResult<Vec<Streamer>> {
@@ -315,6 +345,7 @@ impl AppService {
     }
 
     pub async fn delete_subscription(&self, id: i64) -> AppResult<()> {
+        self.live_stats.stop(id, Utc::now()).await;
         self.store.delete_subscription(id).await?;
         if let Err(error) = self
             .store
@@ -398,17 +429,19 @@ impl AppService {
         &self,
         input: &NewWeeklyScheduleRule,
     ) -> AppResult<WeeklyScheduleRule> {
-        let rule = self.store.add_weekly_rule(input).await?;
+        let (rule, created) = self.store.add_weekly_rule_idempotent(input).await?;
         let now = Utc::now();
         self.materialize_weekly_rules(now, now + Duration::days(84))
             .await?;
-        let _ = self
-            .store
-            .append_event(
-                "weekly_rule_changed",
-                &json!({"action": "created", "ruleId": rule.id, "streamerId": rule.streamer_id}),
-            )
-            .await;
+        if created {
+            let _ = self
+                .store
+                .append_event(
+                    "weekly_rule_changed",
+                    &json!({"action": "created", "ruleId": rule.id, "streamerId": rule.streamer_id}),
+                )
+                .await;
+        }
         Ok(rule)
     }
 
@@ -666,6 +699,83 @@ impl AppService {
         self.store.list_live_statuses().await
     }
 
+    pub async fn get_fan_history(&self, streamer_id: i64, days: i64) -> AppResult<FanHistory> {
+        if !(1..=FAN_SNAPSHOT_RETENTION_DAYS).contains(&days) {
+            return Err(AppError::validation("粉丝历史范围必须在 1 到 90 天之间"));
+        }
+        let streamer = self.store.get_streamer(streamer_id).await?;
+        let snapshots = self
+            .store
+            .list_fan_snapshots(streamer_id, Utc::now() - Duration::days(days))
+            .await?;
+        let checked_at = snapshots.last().map(|snapshot| snapshot.captured_at);
+        Ok(FanHistory {
+            streamer_id,
+            current_fans: streamer.fans,
+            checked_at,
+            snapshots,
+        })
+    }
+
+    async fn prune_fan_snapshots(&self) -> AppResult<u64> {
+        let cutoff = (Utc::now() - Duration::days(FAN_SNAPSHOT_RETENTION_DAYS)).to_rfc3339();
+        let result = sqlx::query("DELETE FROM fan_snapshots WHERE captured_at < ?")
+            .bind(cutoff)
+            .execute(self.store.pool())
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn refresh_streamer_fans(&self, streamer_id: i64) -> AppResult<FanHistory> {
+        let streamer = self.store.get_streamer(streamer_id).await?;
+        let fans = self.bili_client().fetch_fan_count(&streamer.mid).await?;
+        self.store
+            .record_fan_snapshot(streamer.id, fans, Utc::now())
+            .await?;
+        self.get_fan_history(streamer_id, 30).await
+    }
+
+    pub async fn refresh_all_fans(&self) -> AppResult<FanRefreshReport> {
+        let streamers = self.store.list_streamers().await?;
+        let mut report = FanRefreshReport {
+            refreshed_streamers: 0,
+            failed_streamers: Vec::new(),
+        };
+        let bili = self.bili_client();
+        for (index, streamer) in streamers.iter().enumerate() {
+            match bili.fetch_fan_count(&streamer.mid).await {
+                Ok(fans) => {
+                    match self
+                        .store
+                        .record_fan_snapshot(streamer.id, fans, Utc::now())
+                        .await
+                    {
+                        Ok(_) => report.refreshed_streamers += 1,
+                        Err(error) => report
+                            .failed_streamers
+                            .push(format!("{}: {error}", streamer.name)),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(streamer_id = streamer.id, mid = %streamer.mid, %error, "粉丝数采集失败");
+                    report
+                        .failed_streamers
+                        .push(format!("{}: {error}", streamer.name));
+                }
+            }
+            if index % 5 == 4 && index + 1 < streamers.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        if let Err(error) = self.prune_fan_snapshots().await {
+            tracing::warn!(%error, "清理过期粉丝快照失败");
+            report
+                .failed_streamers
+                .push(format!("粉丝快照清理: {error}"));
+        }
+        Ok(report)
+    }
+
     pub async fn check_live_all(&self) -> AppResult<Vec<LiveStatus>> {
         self.check_live_all_inner(true).await
     }
@@ -690,6 +800,24 @@ impl AppService {
         let streamers = self.store.list_streamers().await?;
         let live_stats_enabled = load_settings(&self.store).await?.live_stats_enabled;
         for (index, streamer) in streamers.iter().enumerate() {
+            let streamer_lock = self.live_check_lock(streamer.id).await;
+            let _streamer_guard = streamer_lock.lock().await;
+            let stats_enabled = live_stats_enabled && streamer.live_stats_enabled;
+            if !stats_enabled {
+                // Disabling statistics must stop an existing collector even when
+                // the live-status request below fails or no room can be resolved.
+                let disabled_at = Utc::now();
+                let open_session = self
+                    .store
+                    .latest_open_live_session(streamer.id)
+                    .await?;
+                self.live_stats.stop(streamer.id, disabled_at).await;
+                if let Some(session) = open_session {
+                    self.store
+                        .finish_open_live_session(session.id, disabled_at)
+                        .await?;
+                }
+            }
             if index > 0 && index % 5 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
@@ -728,7 +856,6 @@ impl AppService {
                 }
             };
             let previous = self.store.set_live_status(streamer.id, &snapshot).await?;
-            let stats_enabled = live_stats_enabled && streamer.live_stats_enabled;
             if stats_enabled && snapshot.is_live {
                 let started_at = snapshot.started_at.unwrap_or(snapshot.checked_at);
                 match self
@@ -745,13 +872,6 @@ impl AppService {
                     .await
                 {
                     Ok(session) => {
-                        if let Err(error) = self
-                            .store
-                            .record_live_online(streamer.id, snapshot.online, snapshot.checked_at)
-                            .await
-                        {
-                            tracing::warn!(%error, streamer_id = streamer.id, "保存直播人气失败");
-                        }
                         self.live_stats
                             .start(self.store.clone(), self.bili_client(), session)
                             .await;
@@ -760,14 +880,16 @@ impl AppService {
                         tracing::warn!(%error, streamer_id = streamer.id, "创建直播数据场次失败");
                     }
                 }
-            } else if previous && (!snapshot.is_live || !stats_enabled) {
-                self.live_stats.stop(streamer.id, snapshot.checked_at).await;
-                if let Err(error) = self
+            } else if stats_enabled {
+                let open_session = self
                     .store
-                    .finish_open_live_session(streamer.id, snapshot.checked_at)
-                    .await
-                {
-                    tracing::warn!(%error, streamer_id = streamer.id, "结束直播数据场次失败");
+                    .latest_open_live_session(streamer.id)
+                    .await?;
+                self.live_stats.stop(streamer.id, snapshot.checked_at).await;
+                if let Some(session) = open_session {
+                    self.store
+                        .finish_open_live_session(session.id, snapshot.checked_at)
+                        .await?;
                 }
             }
             if emit_transitions
@@ -916,7 +1038,9 @@ impl AppService {
         };
         let mut analysis_cache: HashMap<String, CachedImageAnalysis> = HashMap::new();
         let mut event_state = RefreshEventState::default();
-        let mut refreshed_streamer_ids = HashSet::new();
+        let mut attempted_streamer_ids = HashSet::new();
+        let mut successfully_analyzed_streamer_ids = HashSet::new();
+        let mut streamer_errors: HashMap<i64, String> = HashMap::new();
         for (index, (source_mid, targets)) in sources.iter().enumerate() {
             if index > 0 && index % 5 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(350)).await;
@@ -955,16 +1079,23 @@ impl AppService {
                     report.llm_calls += stats.llm_calls;
                     report.llm_cache_hits += stats.llm_cache_hits;
                     for target in targets {
-                        self.store.record_refresh_result(target.id, None).await?;
-                        refreshed_streamer_ids.insert(target.id);
+                        attempted_streamer_ids.insert(target.id);
+                        if let Some(error) = stats.analysis_errors.get(&target.id) {
+                            streamer_errors
+                                .entry(target.id)
+                                .or_insert_with(|| error.clone());
+                        } else if stats.analyzed_streamer_ids.contains(&target.id) {
+                            successfully_analyzed_streamer_ids.insert(target.id);
+                        }
                     }
                 }
                 Err(error) => {
                     let message = error.to_string();
                     for target in targets {
-                        self.store
-                            .record_refresh_result(target.id, Some(&message))
-                            .await?;
+                        attempted_streamer_ids.insert(target.id);
+                        streamer_errors
+                            .entry(target.id)
+                            .or_insert_with(|| message.clone());
                     }
                     if let Some(streamer) = progress_streamer {
                         emit_progress(
@@ -981,6 +1112,41 @@ impl AppService {
                     report
                         .failed_streamers
                         .push(format!("{source_mid}: {message}"));
+                }
+            }
+        }
+        let mut refreshed_streamer_ids = HashSet::new();
+        let mut recorded_streamer_ids = HashSet::new();
+        for (_, targets) in sources {
+            for target in targets {
+                if !attempted_streamer_ids.contains(&target.id)
+                    || !recorded_streamer_ids.insert(target.id)
+                {
+                    continue;
+                }
+                let error = streamer_errors.get(&target.id).map(String::as_str);
+                match error {
+                    Some(error) => {
+                        self.store
+                            .record_refresh_result(target.id, Some(error))
+                            .await?;
+                        report
+                            .failed_streamers
+                            .push(format!("{}: {error}", target.name));
+                    }
+                    None if successfully_analyzed_streamer_ids.contains(&target.id) => {
+                        self.store.record_refresh_result(target.id, None).await?;
+                        refreshed_streamer_ids.insert(target.id);
+                    }
+                    None => {
+                        // A successful fetch with no analysable content must not erase
+                        // an error from an earlier analysis attempt. Keep it visible
+                        // until this streamer's content is actually analysed again.
+                        self.store
+                            .record_refresh_result_preserving_error(target.id)
+                            .await?;
+                        refreshed_streamer_ids.insert(target.id);
+                    }
                 }
             }
         }
@@ -1138,7 +1304,7 @@ impl AppService {
                             Some(target.name.as_str()),
                             &participants,
                         )
-                        .await
+                        .await?
                     {
                         stats.new_schedules += 1;
                     }
@@ -1160,13 +1326,15 @@ impl AppService {
                 let text = post.text.trim();
                 if !has_combined_images && !text.is_empty() {
                     let text_digest = text_digest(text);
-                    let prompt_version = format!("{}-text-v7", config.prompt_version);
+                    let prompt_version = format!("{}-text-v8", config.prompt_version);
                     let cache_key =
                         analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
+                    let mut analysis_succeeded = false;
                     let cached_events = match self.store.get_text_analysis(&cache_key).await? {
                         Some(raw) => match events_from_raw(&raw, now) {
                             Ok(events) => {
                                 stats.llm_cache_hits += 1;
+                                analysis_succeeded = true;
                                 Some(events)
                             }
                             Err(error) => {
@@ -1185,6 +1353,7 @@ impl AppService {
                         {
                             Ok(analysis) => {
                                 stats.llm_calls += 1;
+                                analysis_succeeded = true;
                                 self.store
                                     .save_text_analysis(
                                         &cache_key,
@@ -1199,22 +1368,31 @@ impl AppService {
                             }
                             Err(error) => {
                                 tracing::warn!(%error, post_id = %post.id, "text analysis failed");
+                                let message = format!("动态文字分析失败: {error}");
                                 for target in targets {
                                     let _ = self
                                         .store
-                                        .record_streamer_error(
-                                            target.id,
-                                            &format!("动态文字分析失败: {error}"),
-                                        )
+                                        .record_streamer_error(target.id, &message)
                                         .await;
+                                    stats
+                                        .analysis_errors
+                                        .entry(target.id)
+                                        .or_insert_with(|| message.clone());
                                 }
                                 None
                             }
                         },
                     };
+                    if analysis_succeeded {
+                        stats
+                            .analyzed_streamer_ids
+                            .extend(targets.iter().map(|target| target.id));
+                    }
                     for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                         let event = canonicalize_event_participants(event, targets);
-                        if let Some(target) = match_event_target(&event, targets) {
+                        if let Some(target) =
+                            match_event_target_for_post(&event, targets, &post.author_mid)
+                        {
                             if event.action == LlmEventAction::Cancel {
                                 event_state.cancellations.push(PendingCancellation {
                                     target,
@@ -1259,7 +1437,7 @@ impl AppService {
                 if settings.auto_analyze_images && !post.images.is_empty() {
                     let context_digest = text_digest(post.text.trim());
                     let image_prompt_version = format!(
-                        "{}-image-context-v4-{}",
+                        "{}-image-context-v5-{}",
                         config.prompt_version,
                         &context_digest[..12]
                     );
@@ -1358,14 +1536,16 @@ impl AppService {
                                     }
                                     Err(error) => {
                                         tracing::warn!(%error, post_id = %post.id, "image analysis failed");
+                                        let message = format!("图片日程分析失败: {error}");
                                         for target in targets {
                                             let _ = self
                                                 .store
-                                                .record_streamer_error(
-                                                    target.id,
-                                                    &format!("图片日程分析失败: {error}"),
-                                                )
+                                                .record_streamer_error(target.id, &message)
                                                 .await;
+                                            stats
+                                                .analysis_errors
+                                                .entry(target.id)
+                                                .or_insert_with(|| message.clone());
                                         }
                                         completed_steps += 1;
                                         continue;
@@ -1373,12 +1553,17 @@ impl AppService {
                                 }
                             }
                         };
+                        stats
+                            .analyzed_streamer_ids
+                            .extend(targets.iter().map(|target| target.id));
                         let digest = analysis.source_digest.clone();
                         let events = analysis.events.clone();
                         analysis_cache.insert(image_cache_key, analysis);
                         for (event_index, event) in events.iter().enumerate() {
                             let event = canonicalize_event_participants(event, targets);
-                            if let Some(target) = match_event_target(&event, targets) {
+                            if let Some(target) =
+                                match_event_target_for_post(&event, targets, &post.author_mid)
+                            {
                                 if event.action == LlmEventAction::Cancel {
                                     event_state.cancellations.push(PendingCancellation {
                                         target,
@@ -1446,26 +1631,23 @@ impl AppService {
                     continue;
                 }
                 let duplicate_input = schedule_to_new_input(duplicate);
-                if let Err(error) = self
+                let merged = (!base.manual_locked)
+                    .then(|| merge_group_schedule(&base, &duplicate_input));
+                if self
                     .store
-                    .attach_schedule_source(base.id, &duplicate_input)
-                    .await
+                    .merge_and_delete_schedule_duplicate(
+                        base.id,
+                        base.revision,
+                        duplicate.id,
+                        duplicate.revision,
+                        &duplicate_input,
+                        merged.as_ref(),
+                    )
+                    .await?
                 {
-                    tracing::warn!(%error, "attach duplicate group source failed");
-                }
-                if !base.manual_locked {
-                    let merged = merge_group_schedule(&base, &duplicate_input);
-                    if let Err(error) = self.store.merge_schedule_auto(base.id, &merged).await {
-                        tracing::warn!(%error, "merge duplicate group schedule failed");
-                    } else if let Ok(updated) = self.store.get_schedule(base.id).await {
-                        base = updated;
-                    }
-                }
-                if let Err(error) = self.store.delete_schedule(duplicate.id).await {
-                    tracing::warn!(%error, "delete duplicate group schedule failed");
-                } else {
                     removed_ids.insert(duplicate.id);
                     removed += 1;
+                    base = self.store.get_schedule(base.id).await?;
                 }
             }
         }
@@ -1536,7 +1718,7 @@ impl AppService {
                 resolved_room.owner_name.as_deref(),
                 &participants,
             )
-            .await;
+            .await?;
         Ok((inserted, false))
     }
 
@@ -1703,6 +1885,38 @@ impl AppService {
         Ok(removed)
     }
 
+    async fn find_reservation_time_change_candidate(
+        &self,
+        target: &Streamer,
+        start_at: DateTime<Utc>,
+        post: &DynamicPost,
+    ) -> AppResult<Option<Schedule>> {
+        if !text_looks_like_schedule_time_change(&post.text) {
+            return Ok(None);
+        }
+        let candidates: Vec<Schedule> = self
+            .store
+            .list_all_schedules()
+            .await?
+            .into_iter()
+            .filter(|schedule| {
+                schedule.streamer_id == target.id
+                    && schedule.source_kind == "reserve"
+                    && !schedule.cancelled
+                    && !schedule.manual_locked
+                    && schedule.source_author_mid.as_deref() == Some(post.author_mid.as_str())
+                    && schedule
+                        .source_published_at
+                        .is_none_or(|published_at| published_at <= post.published_at)
+                    && {
+                        let minutes = (schedule.start_at - start_at).num_minutes().abs();
+                        minutes > 0 && minutes <= 240
+                    }
+            })
+            .collect();
+        Ok((candidates.len() == 1).then(|| candidates[0].clone()))
+    }
+
     async fn cancel_schedule_from_event(
         &self,
         target: &Streamer,
@@ -1764,6 +1978,54 @@ impl AppService {
             .collect())
     }
 
+    async fn resolve_auto_schedule_title(
+        &self,
+        streamer_id: i64,
+        title: &str,
+        start_at: DateTime<Utc>,
+    ) -> AppResult<String> {
+        if !schedule_title_is_placeholder(title) {
+            return Ok(title.trim().to_owned());
+        }
+        Ok(self
+            .previous_matching_schedule_title(streamer_id, start_at)
+            .await?
+            .unwrap_or_else(|| "直播".to_owned()))
+    }
+
+    async fn previous_matching_schedule_title(
+        &self,
+        streamer_id: i64,
+        start_at: DateTime<Utc>,
+    ) -> AppResult<Option<String>> {
+        let earliest = start_at - Duration::days(TITLE_REUSE_LOOKBACK_DAYS);
+        let schedule_title = self
+            .store
+            .list_all_schedules()
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.streamer_id == streamer_id)
+            .filter(|candidate| candidate.start_at >= earliest && candidate.start_at <= start_at)
+            .filter(|candidate| same_recurring_slot(candidate.start_at, start_at))
+            .filter(|candidate| !schedule_title_is_placeholder(&candidate.title))
+            .max_by_key(|candidate| candidate.start_at)
+            .map(|candidate| candidate.title.trim().to_owned());
+        if schedule_title.is_some() {
+            return Ok(schedule_title);
+        }
+
+        Ok(self
+            .store
+            .list_live_sessions(Some(streamer_id), 200)
+            .await?
+            .into_iter()
+            .filter(|session| session.started_at >= earliest && session.started_at <= start_at)
+            .filter(|session| same_recurring_slot(session.started_at, start_at))
+            .filter(|session| !schedule_title_is_placeholder(&session.title))
+            .max_by_key(|session| session.started_at)
+            .map(|session| session.title.trim().to_owned()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn upsert_candidate(
         &self,
@@ -1778,17 +2040,21 @@ impl AppService {
         room_owner_mid: Option<&str>,
         room_owner_name: Option<&str>,
         participants: &[String],
-    ) -> bool {
+    ) -> AppResult<bool> {
+        let mut schedule = schedule.clone();
+        schedule.title = self
+            .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
+            .await?;
+        let schedule = &schedule;
         if post.reserve.is_some() && matches!(source_kind, "text" | "image") {
-            return false;
+            return Ok(false);
         }
         if self
             .store
             .is_source_suppressed(target.id, &post.id, source_fingerprint)
-            .await
-            .unwrap_or(false)
+            .await?
         {
-            return false;
+            return Ok(false);
         }
         let input = NewSchedule {
             streamer_id: target.id,
@@ -1811,77 +2077,77 @@ impl AppService {
             confidence: schedule.confidence,
         };
         if participants.len() > 1 || source_kind == "reserve" {
-            if let Ok(candidates) = self
+            let candidates = self
                 .store
                 .list_schedules_near_all(schedule.start_at, 10)
-                .await
-            {
-                let mut duplicates = group_duplicates(
-                    &candidates,
-                    schedule,
-                    participants,
-                    room_owner_mid,
-                    room_url,
-                    source_kind,
-                );
-                if !duplicates.is_empty() {
-                    duplicates.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
-                    let existing = duplicates.remove(0);
-                    let mut base = existing.clone();
-                    for duplicate in duplicates {
-                        let duplicate_input = schedule_to_new_input(duplicate);
-                        if let Err(error) = self
-                            .store
-                            .attach_schedule_source(base.id, &duplicate_input)
-                            .await
-                        {
-                            tracing::warn!(%error, streamer_id = target.id, "attach duplicate group source failed");
-                        }
-                        if !base.manual_locked {
-                            let merged = merge_group_schedule(&base, &duplicate_input);
-                            if let Err(error) =
-                                self.store.merge_schedule_auto(base.id, &merged).await
-                            {
-                                tracing::warn!(%error, streamer_id = target.id, "merge duplicate group schedule failed");
-                            } else if let Ok(updated) = self.store.get_schedule(base.id).await {
-                                base = updated;
-                            }
-                        }
-                        if let Err(error) = self.store.delete_schedule(duplicate.id).await {
-                            tracing::warn!(%error, streamer_id = target.id, "delete duplicate group schedule failed");
-                        }
+                .await?;
+            let mut duplicates = group_duplicates(
+                &candidates,
+                schedule,
+                participants,
+                room_owner_mid,
+                room_url,
+                source_kind,
+            );
+            if !duplicates.is_empty() {
+                duplicates.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
+                let existing = duplicates.remove(0);
+                let mut base = existing.clone();
+                for duplicate in duplicates {
+                    let duplicate_input = schedule_to_new_input(duplicate);
+                    let merged = (!base.manual_locked)
+                        .then(|| merge_group_schedule(&base, &duplicate_input));
+                    if self
+                        .store
+                        .merge_and_delete_schedule_duplicate(
+                            base.id,
+                            base.revision,
+                            duplicate.id,
+                            duplicate.revision,
+                            &duplicate_input,
+                            merged.as_ref(),
+                        )
+                        .await?
+                    {
+                        base = self.store.get_schedule(base.id).await?;
                     }
-                    if let Err(error) = self.store.attach_schedule_source(base.id, &input).await {
-                        tracing::warn!(%error, streamer_id = target.id, "attach group source failed");
-                    }
-                    if !base.manual_locked {
-                        let merged = merge_group_schedule(&base, &input);
-                        if let Err(error) = self.store.merge_schedule_auto(base.id, &merged).await {
-                            tracing::warn!(%error, streamer_id = target.id, "merge group schedule failed");
-                        }
-                    }
-                    return false;
                 }
+                self.store.attach_schedule_source(base.id, &input).await?;
+                if !base.manual_locked {
+                    let merged = merge_group_schedule(&base, &input);
+                    self.store.merge_schedule_auto(base.id, &merged).await?;
+                }
+                return Ok(false);
             }
         }
-        if let Ok(Some(existing)) = self
+        if source_kind == "text" && post.reserve.is_none() {
+            if let Some(existing) = self
+                .find_reservation_time_change_candidate(target, schedule.start_at, post)
+                .await?
+            {
+                self.store.attach_schedule_source(existing.id, &input).await?;
+                let mut merged = merge_input_for_existing(&existing, &input);
+                merged.source_published_at = Some(post.published_at);
+                merged.confidence = existing.confidence.max(input.confidence);
+                self.store.merge_schedule_auto(existing.id, &merged).await?;
+                return Ok(false);
+            }
+        }
+        if let Some(existing) = self
             .store
             .find_schedule_near(target.id, schedule.start_at, 10)
-            .await
+            .await?
         {
             if existing.source_identity.as_deref() != Some(source_identity) {
                 let incompatible_reservation = (existing.source_kind == "reserve"
                     || input.source_kind == "reserve")
                     && !cancellation_titles_match(&existing.title, &input.title);
                 if !incompatible_reservation {
-                    if let Err(error) = self.store.attach_schedule_source(existing.id, &input).await
-                    {
-                        tracing::warn!(%error, streamer_id = target.id, "attach schedule source failed");
-                    }
+                    self.store.attach_schedule_source(existing.id, &input).await?;
                     if existing.weekly_rule_id.is_some()
                         && normalize_alias(&existing.title) != normalize_alias(&schedule.title)
                     {
-                        let _ = self.store.mark_schedule_source_changed(existing.id).await;
+                        self.store.mark_schedule_source_changed(existing.id).await?;
                     }
                     let incoming_wins = match existing.source_published_at {
                         Some(existing_published_at) => post.published_at >= existing_published_at,
@@ -1889,24 +2155,15 @@ impl AppService {
                     };
                     if !existing.manual_locked && incoming_wins {
                         let merged = merge_input_for_existing(&existing, &input);
-                        if let Err(error) =
-                            self.store.merge_schedule_auto(existing.id, &merged).await
-                        {
-                            tracing::warn!(%error, streamer_id = target.id, "merge newer schedule failed");
-                        }
-                        return false;
+                        self.store.merge_schedule_auto(existing.id, &merged).await?;
+                        return Ok(false);
                     }
-                    return false;
+                    return Ok(false);
                 }
             }
         }
-        match self.store.upsert_schedule(&input).await {
-            Ok((_, inserted)) => inserted,
-            Err(error) => {
-                tracing::warn!(%error, streamer_id = target.id, "upsert schedule failed");
-                false
-            }
-        }
+        let (_, inserted) = self.store.upsert_schedule(&input).await?;
+        Ok(inserted)
     }
 }
 
@@ -1958,6 +2215,8 @@ struct ProcessStats {
     cancelled_schedules: usize,
     llm_calls: usize,
     llm_cache_hits: usize,
+    analysis_errors: HashMap<i64, String>,
+    analyzed_streamer_ids: HashSet<i64>,
 }
 
 fn is_asoul_member(mid: &str) -> bool {
@@ -2014,6 +2273,45 @@ fn reserve_context(post: &DynamicPost) -> String {
         context.push_str(&reserve.description);
     }
     context
+}
+
+fn schedule_title_is_placeholder(title: &str) -> bool {
+    let normalized: String = title
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "直播"
+                | "未提供"
+                | "未提供主题"
+                | "主题未提供"
+                | "直播未提供主题"
+                | "未提及"
+                | "未说明"
+                | "暂无主题"
+                | "无主题"
+                | "未知主题"
+                | "待定"
+                | "未命名"
+                | "tbd"
+                | "untitled"
+                | "unknown"
+        )
+}
+
+fn same_recurring_slot(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+    let china = FixedOffset::east_opt(8 * 3600).expect("china offset");
+    let left = left.with_timezone(&china);
+    let right = right.with_timezone(&china);
+    if left.weekday() != right.weekday() {
+        return false;
+    }
+    let left_minute = i64::from(left.hour()) * 60 + i64::from(left.minute());
+    let right_minute = i64::from(right.hour()) * 60 + i64::from(right.minute());
+    (left_minute - right_minute).abs() <= TITLE_REUSE_SLOT_TOLERANCE_MINUTES
 }
 
 fn clean_schedule_title_value(mut title: String, target: &Streamer) -> String {
@@ -2160,6 +2458,50 @@ fn canonicalize_event_participants(event: &LlmEvent, targets: &[Streamer]) -> Ll
             names
         });
     canonical
+}
+
+fn match_event_target_for_post(
+    event: &LlmEvent,
+    targets: &[Streamer],
+    author_mid: &str,
+) -> Option<Streamer> {
+    if let Some(target) = match_event_target(event, targets) {
+        return Some(target);
+    }
+    if event.participant_names().len() > 1 || event.confidence < 0.6 {
+        return None;
+    }
+    let author = targets.iter().find(|target| target.mid == author_mid)?;
+    let event_names: Vec<String> = std::iter::once(&event.performer)
+        .chain(event.aliases.iter())
+        .map(|value| normalize_alias(value))
+        .filter(|value| !value.is_empty())
+        .collect();
+    event_identity_matches_target(&event_names, author).then(|| author.clone())
+}
+
+fn event_identity_matches_target(event_names: &[String], target: &Streamer) -> bool {
+    let target_names: Vec<String> = std::iter::once(&target.name)
+        .chain(target.aliases.iter())
+        .map(|value| normalize_alias(value))
+        .filter(|value| !value.is_empty())
+        .collect();
+    event_names.iter().any(|event_name| {
+        target_names.iter().any(|target_name| {
+            event_name == target_name
+                || (event_name.chars().count() >= 2
+                    && target_name.chars().count() >= 2
+                    && (event_name.contains(target_name) || target_name.contains(event_name)))
+        })
+    })
+}
+
+fn text_looks_like_schedule_time_change(text: &str) -> bool {
+    [
+        "就来", "改到", "改成", "提前", "推迟", "延后", "顺延", "调整",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
 }
 
 fn match_event_target(event: &LlmEvent, targets: &[Streamer]) -> Option<Streamer> {
@@ -2376,9 +2718,12 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
     let keep_existing_reserve =
         existing.source_kind == "reserve" && incoming.source_kind != "reserve";
     let incoming_reserve = incoming.source_kind == "reserve" && existing.source_kind != "reserve";
-    let title = if keep_existing_reserve {
-        existing.title.clone()
-    } else if incoming_reserve || incoming.title.chars().count() > existing.title.chars().count() {
+    let use_incoming_title = !keep_existing_reserve
+        && !schedule_title_is_placeholder(&incoming.title)
+        && (schedule_title_is_placeholder(&existing.title)
+            || incoming_reserve
+            || incoming.title.chars().count() > existing.title.chars().count());
+    let title = if use_incoming_title {
         incoming.title.clone()
     } else {
         existing.title.clone()
@@ -2489,6 +2834,11 @@ fn merge_input_for_existing(existing: &Schedule, incoming: &NewSchedule) -> NewS
         merged.source_fingerprint = existing.source_fingerprint.clone();
         merged.source_identity = existing.source_identity.clone();
         merged.source_published_at = existing.source_published_at;
+    }
+    if schedule_title_is_placeholder(&merged.title)
+        && !schedule_title_is_placeholder(&existing.title)
+    {
+        merged.title = existing.title.clone();
     }
     merged
 }
@@ -2630,7 +2980,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use chrono::{Duration, FixedOffset};
+    use chrono::{Duration, FixedOffset, TimeZone};
     use serde_json::Value;
 
     use crate::llm::LlmAnalysis;
@@ -2765,6 +3115,7 @@ mod tests {
                 schedule_enabled: true,
                 live_notify_enabled: true,
                 live_stats_enabled: false,
+                fans: None,
                 last_error: None,
                 last_refresh_at: None,
                 is_live: false,
@@ -2788,6 +3139,7 @@ mod tests {
                 schedule_enabled: true,
                 live_notify_enabled: true,
                 live_stats_enabled: false,
+                fans: None,
                 last_error: None,
                 last_refresh_at: None,
                 is_live: false,
@@ -2909,6 +3261,7 @@ mod tests {
                     &participants,
                 )
                 .await
+                .expect("upsert candidate")
         );
         let short = ParsedSchedule {
             title: "书梦之旅".to_owned(),
@@ -2930,6 +3283,7 @@ mod tests {
                     &participants,
                 )
                 .await
+                .expect("upsert candidate")
         );
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
@@ -3019,6 +3373,7 @@ mod tests {
                     &participants,
                 )
                 .await
+                .expect("upsert candidate")
         );
 
         let mut cache = HashMap::new();
@@ -3150,6 +3505,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,
@@ -3196,6 +3552,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,
@@ -3238,6 +3595,7 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+            fans: None,
             last_error: None,
             last_refresh_at: None,
             is_live: false,
@@ -3356,6 +3714,7 @@ mod tests {
                     &["甲".to_owned(), "乙".to_owned()],
                 )
                 .await
+                .expect("upsert candidate")
         );
         assert!(
             !service
@@ -3373,6 +3732,7 @@ mod tests {
                     &["甲".to_owned(), "乙".to_owned(), "外部嘉宾".to_owned()],
                 )
                 .await
+                .expect("upsert candidate")
         );
         let schedules = store
             .list_all_schedules()
@@ -3406,6 +3766,7 @@ mod tests {
                     &["甲".to_owned()],
                 )
                 .await
+                .expect("upsert candidate")
         );
         let schedules = store
             .list_all_schedules()
@@ -3415,6 +3776,127 @@ mod tests {
             schedules[0].room_url.as_deref(),
             Some("https://live.bilibili.com/222222")
         );
+        assert_eq!(
+            schedules[0].source_published_at,
+            Some(new_post.published_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_text_can_move_upcoming_reservation_time() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "乃琳Queen"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let old_start = now + Duration::hours(30);
+        let new_start = old_start - Duration::hours(1);
+        let reserve_post = DynamicPost {
+            id: "reserve-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: now - Duration::hours(2),
+            text: "直播预约".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】影之刃零DAY5！".to_owned(),
+                description: "明天 16:00 直播".to_owned(),
+                room_id: Some("5850386".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let reserve_schedule = ParsedSchedule {
+            title: "【突击】影之刃零DAY5！".to_owned(),
+            start_at: old_start,
+            end_at: None,
+            confidence: 1.0,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &reserve_schedule,
+                    "reserve",
+                    &reserve_post,
+                    "",
+                    "reserve:reserve-post",
+                    "reserve-fingerprint",
+                    Some("https://live.bilibili.com/5850386"),
+                    Some("100"),
+                    Some("乃琳Queen"),
+                    &["乃琳Queen".to_owned()],
+                )
+                .await
+                .expect("upsert candidate")
+        );
+
+        let new_post = DynamicPost {
+            id: "new-post".to_owned(),
+            author_mid: "100".to_owned(),
+            author_name: "乃琳Queen".to_owned(),
+            published_at: now,
+            text: "奶淇琳！明天下午3点就来！早点和奶淇琳见面捏".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/new-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let event = LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: "乃琳".to_owned(),
+            aliases: vec!["奶淇琳".to_owned(), "乃宝".to_owned()],
+            participants: Vec::new(),
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: "和奶淇琳见面".to_owned(),
+            start_at: Some(new_start),
+            end_at: None,
+            confidence: 0.7,
+        };
+        assert!(
+            match_event_target_for_post(&event, std::slice::from_ref(&streamer), "100").is_some()
+        );
+        let changed = ParsedSchedule {
+            title: "和奶淇琳见面".to_owned(),
+            start_at: new_start,
+            end_at: None,
+            confidence: 0.7,
+        };
+        assert!(
+            !service
+                .upsert_candidate(
+                    &streamer,
+                    &changed,
+                    "text",
+                    &new_post,
+                    "editor",
+                    "text:new-post",
+                    "new-fingerprint",
+                    Some("https://live.bilibili.com/5850386"),
+                    Some("100"),
+                    Some("乃琳Queen"),
+                    &["乃琳".to_owned()],
+                )
+                .await
+                .expect("upsert candidate")
+        );
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "【突击】影之刃零DAY5！");
+        assert_eq!(schedules[0].start_at, new_start);
         assert_eq!(
             schedules[0].source_published_at,
             Some(new_post.published_at)
@@ -3694,6 +4176,62 @@ mod tests {
                 && schedule.source_kind == "reserve"
                 && schedule.title == "【突击】电台电台！"
         }));
+    }
+
+    #[tokio::test]
+    async fn group_dedupe_prefers_and_preserves_manual_schedule() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let first = store.add_subscription(&subscription("301", "团播甲")).await.expect("first");
+        let second = store.add_subscription(&subscription("302", "团播乙")).await.expect("second");
+        let service = AppService::new(store.clone(), RuntimeSecrets::default()).expect("service");
+        let start = Utc::now() + Duration::days(1);
+        let participants = vec!["团播甲".to_owned(), "团播乙".to_owned()];
+        let (manual, _) = store.upsert_schedule(&NewSchedule {
+            streamer_id: first.id,
+            participants: participants.clone(),
+            title: "手工锁定团播".to_owned(),
+            start_at: start,
+            end_at: Some(start + Duration::hours(2)),
+            room_url: Some("https://live.bilibili.com/12345".to_owned()),
+            room_owner_mid: Some(first.mid.clone()),
+            room_owner_name: Some(first.name.clone()),
+            source_kind: "manual".to_owned(),
+            source_post_id: None,
+            source_image_url: None,
+            source_author_mid: None,
+            source_fingerprint: None,
+            source_identity: None,
+            source_published_at: None,
+            confidence: 1.0,
+        }).await.expect("manual schedule");
+        store.update_schedule(manual.id, &UpdateSchedule {
+            title: Some("手工锁定团播".to_owned()),
+            start_at: None,
+            end_at: None,
+            room_url: None,
+        }).await.expect("lock manual schedule");
+        let (automatic, _) = store.upsert_schedule(&NewSchedule {
+            streamer_id: second.id,
+            participants,
+            title: "自动识别团播".to_owned(),
+            start_at: start + Duration::minutes(5),
+            end_at: Some(start + Duration::hours(2)),
+            room_url: Some("https://live.bilibili.com/12345".to_owned()),
+            room_owner_mid: Some(first.mid.clone()),
+            room_owner_name: Some(first.name.clone()),
+            source_kind: "text".to_owned(),
+            source_post_id: Some("group-dedupe-post".to_owned()),
+            source_image_url: None,
+            source_author_mid: Some(first.mid.clone()),
+            source_fingerprint: Some("group-dedupe-fingerprint".to_owned()),
+            source_identity: Some("text:group-dedupe-post".to_owned()),
+            source_published_at: Some(Utc::now()),
+            confidence: 0.95,
+        }).await.expect("automatic schedule");
+
+        assert_eq!(service.dedupe_group_schedules().await.expect("dedupe"), 1);
+        assert!(store.get_schedule(manual.id).await.expect("manual remains").manual_locked);
+        assert!(store.get_schedule(automatic.id).await.is_err());
     }
 
     #[test]
@@ -4052,6 +4590,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
         assert!(
             !service
@@ -4069,6 +4608,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
         let schedules = store
             .list_schedules(now, now + Duration::days(3), false)
@@ -4076,6 +4616,192 @@ mod tests {
             .expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].title, "周五杂谈回");
+    }
+
+    #[test]
+    fn title_reuse_requires_same_weekday_and_close_start_time() {
+        let china = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let base = china
+            .with_ymd_and_hms(2026, 11, 5, 21, 0, 0)
+            .single()
+            .expect("date")
+            .with_timezone(&Utc);
+        assert!(same_recurring_slot(base + Duration::days(7), base));
+        assert!(same_recurring_slot(
+            base + Duration::days(7) + Duration::minutes(20),
+            base
+        ));
+        assert!(!same_recurring_slot(
+            base + Duration::days(7) + Duration::hours(2),
+            base
+        ));
+        assert!(!same_recurring_slot(base + Duration::days(1), base));
+        assert!(schedule_title_is_placeholder("（未提供主题）"));
+        assert!(!schedule_title_is_placeholder("周五杂谈"));
+    }
+
+    #[tokio::test]
+    async fn missing_title_reuses_previous_matching_schedule() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("500", "戊"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let target_start = now + Duration::days(9);
+        let previous_start = target_start - Duration::days(7);
+        let previous_post = DynamicPost {
+            id: "previous-theme".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "下周同一时间".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/previous-theme".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: None,
+        };
+        let previous = ParsedSchedule {
+            title: "固定歌回".to_owned(),
+            start_at: previous_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &previous,
+                    "text",
+                    &previous_post,
+                    "",
+                    "text:previous-theme",
+                    "previous-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .expect("upsert candidate")
+        );
+
+        let current_post = DynamicPost {
+            id: "missing-theme".to_owned(),
+            published_at: now + Duration::minutes(1),
+            ..previous_post.clone()
+        };
+        let current = ParsedSchedule {
+            title: "未提供主题".to_owned(),
+            start_at: target_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &current,
+                    "text",
+                    &current_post,
+                    "",
+                    "text:missing-theme",
+                    "missing-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .expect("upsert candidate")
+        );
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        let reused = schedules
+            .iter()
+            .find(|schedule| schedule.start_at == target_start)
+            .expect("reused schedule");
+        assert_eq!(reused.title, "固定歌回");
+    }
+
+    #[tokio::test]
+    async fn missing_title_reuses_previous_matching_live_session() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("600", "己"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let now = Utc::now();
+        let target_start = now + Duration::days(2);
+        let previous_start = target_start - Duration::days(7);
+        store
+            .ensure_live_session(
+                streamer.id,
+                "600",
+                &streamer.name,
+                "上周歌回",
+                None,
+                previous_start,
+                now,
+            )
+            .await
+            .expect("live session");
+
+        let post = DynamicPost {
+            id: "live-session-theme".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "21:00 直播".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/live-session-theme".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: None,
+        };
+        let schedule = ParsedSchedule {
+            title: "直播".to_owned(),
+            start_at: target_start,
+            end_at: None,
+            confidence: 0.9,
+        };
+        assert!(
+            service
+                .upsert_candidate(
+                    &streamer,
+                    &schedule,
+                    "text",
+                    &post,
+                    "",
+                    "text:live-session-theme",
+                    "live-session-theme-fingerprint",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .expect("upsert candidate")
+        );
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "上周歌回");
     }
 
     #[tokio::test]
@@ -4133,6 +4859,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
 
         let mut cache = HashMap::new();
@@ -4264,6 +4991,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
 
         let config = LlmConfig {
@@ -4358,6 +5086,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
 
         let llm_schedule = ParsedSchedule {
@@ -4382,6 +5111,7 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("upsert candidate")
         );
 
         let schedules = store

@@ -5,6 +5,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   CalendarRange,
   Cloud,
@@ -12,7 +13,10 @@ import {
   Flower2,
   HardDrive,
   LoaderCircle,
+  Minus,
   RefreshCw,
+  Square,
+  X,
   Settings as SettingsIcon,
   Trash2,
   UserRound,
@@ -26,6 +30,12 @@ import MagicPeriodView from "./components/MagicPeriodView";
 import SettingsView, { type SettingsViewHandle } from "./components/SettingsView";
 import { Avatar, ErrorBanner, Modal } from "./components/ui";
 import BrandMark from "./components/BrandMark";
+import {
+  applyAppearance,
+  readAppearanceSettings,
+  saveAppearanceSettings,
+  type AppearanceSettings,
+} from "./lib/appearance";
 import {
   ApiFailure,
   LocalApi,
@@ -68,8 +78,10 @@ import { isWebSyncCacheUsable, loadWebSyncCache } from "./lib/syncStorage";
 import type {
   AccountSearchResult,
   ImportPreview,
+  MigrationPreview,
   AppSettings,
   Bootstrap,
+  FanHistory,
   FertilitySnapshot,
   LlmDiscoveryInput,
   LlmTestInput,
@@ -205,6 +217,16 @@ const DEFAULT_SETTINGS: AppSettings = {
   proxyPort: null,
 };
 
+function maskLlmApiKey(apiKey: string): string {
+  const value = apiKey.trim();
+  return value ? "••••••••" + value.slice(-4) : "";
+}
+
+function isRemoteUncertain(error: unknown): error is ApiFailure {
+  return error instanceof ApiFailure
+    && (error.code === "REMOTE_OFFLINE" || error.code === "REQUEST_TIMEOUT");
+}
+
 const EMPTY_SECRETS: SecretStatus = {
   llmConfigured: false,
   biliConfigured: false,
@@ -212,6 +234,9 @@ const EMPTY_SECRETS: SecretStatus = {
 };
 
 const localApi = isTauri ? new LocalApi() : null;
+const desktopWindow = isTauri ? getCurrentWindow() : null;
+const initialAppearance = readAppearanceSettings();
+applyAppearance(initialAppearance);
 
 // LAPLACE 正式接口尚未接入，保留页面实现但暂时关闭入口。
 const MAGIC_PERIOD_ENABLED = false;
@@ -222,6 +247,7 @@ export default function App() {
   const [scheduleRevision, setScheduleRevision] = useState(0);
   const [ready, setReady] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [appearance, setAppearance] = useState<AppearanceSettings>(initialAppearance);
   const [subscriptions, setSubscriptions] = useState<Streamer[]>([]);
   const [liveStatuses, setLiveStatuses] = useState<LiveStatus[]>([]);
   const [secrets, setSecrets] = useState<SecretStatus>(EMPTY_SECRETS);
@@ -252,21 +278,37 @@ export default function App() {
   } | null>(null);
   const [pendingClientMigration, setPendingClientMigration] = useState<{
     snapshot: ServerSnapshot;
-    preview: ImportPreview;
+    preview: MigrationPreview;
     api: ServerApi;
     deviceId: string;
     migrationId: string;
   } | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
   const [authGateError, setAuthGateError] = useState<string | null>(null);
+  const [llmApiKeyHint, setLlmApiKeyHint] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [creatorMenu, setCreatorMenu] = useState<{ streamer: Streamer; x: number; y: number } | null>(null);
   const [sidebarRefreshingId, setSidebarRefreshingId] = useState<number | null>(null);
   const settingsRef = useRef(settings);
+  const connectionRef = useRef(connection);
   const syncStateRef = useRef(syncState);
   const syncEngineRef = useRef<SyncProtocolEngine | null>(null);
+  const serverApiRef = useRef<ServerApi | null>(serverApi);
+  const serverTokenRef = useRef(serverToken);
+  const connectionEpochRef = useRef(0);
+  const activeDataRequestSeq = useRef(0);
+  const syncDevicesRequestSeq = useRef(0);
+  const settingsRequestSeq = useRef(0);
+  const llmSecretRequestSeq = useRef(0);
+  const migrationBusyRef = useRef(false);
+  const importBusyRef = useRef(false);
+  const importPreviewBusyRef = useRef(false);
+  const resyncInFlightRef = useRef(false);
   const mutationResyncInFlightRef = useRef(false);
+  const remoteMonitorGenerationRef = useRef<number | null>(null);
+  const remoteMonitorTransitionRef = useRef<Promise<void>>(Promise.resolve());
   const jobClearTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const legacyRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seenLiveSeq = useRef(0);
@@ -278,13 +320,83 @@ export default function App() {
     [subscriptions],
   );
 
+  // Remote monitor commands have backend-side generations. Serializing them in
+  // the UI preserves the order implied by connectionEpochRef, so a stale
+  // connect cannot start after a newer one and replace its monitor.
+  const enqueueRemoteMonitorTransition = useCallback(
+    (operation: () => Promise<void>): Promise<void> => {
+      const next = remoteMonitorTransitionRef.current
+        .catch(() => undefined)
+        .then(operation);
+      remoteMonitorTransitionRef.current = next;
+      return next;
+    },
+    [],
+  );
+
+  const startRemoteMonitorForEpoch = useCallback(
+    async (epoch: number, serverUrl: string, token: string): Promise<void> => {
+      if (!localApi) {
+        throw new Error("桌面 API 未初始化");
+      }
+      await enqueueRemoteMonitorTransition(async () => {
+        if (epoch !== connectionEpochRef.current) {
+          return;
+        }
+        const session = await localApi.startRemoteMonitor(serverUrl, token);
+        remoteMonitorGenerationRef.current = session.generation;
+        if (epoch !== connectionEpochRef.current) {
+          await localApi.stopRemoteMonitor(session.generation).catch(() => false);
+          if (remoteMonitorGenerationRef.current === session.generation) {
+            // The backend only stops this exact generation. A false result means
+            // a newer connection already owns the monitor.
+            remoteMonitorGenerationRef.current = null;
+          }
+        }
+      });
+    },
+    [enqueueRemoteMonitorTransition],
+  );
+
+  const stopRemoteMonitorGeneration = useCallback(
+    async (generation: number | null): Promise<void> => {
+      if (!localApi || generation === null) {
+        return;
+      }
+      await enqueueRemoteMonitorTransition(async () => {
+        await localApi.stopRemoteMonitor(generation).catch(() => false);
+        if (remoteMonitorGenerationRef.current === generation) {
+          remoteMonitorGenerationRef.current = null;
+        }
+      });
+    },
+    [enqueueRemoteMonitorTransition],
+  );
+
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
 
   useEffect(() => {
+    applyAppearance(appearance);
+    saveAppearanceSettings(appearance);
+  }, [appearance]);
+
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
+
+  useEffect(() => {
     syncStateRef.current = syncState;
   }, [syncState]);
+
+  useEffect(() => {
+    serverApiRef.current = serverApi;
+  }, [serverApi]);
+
+  useEffect(() => {
+    serverTokenRef.current = serverToken;
+  }, [serverToken]);
 
   useEffect(() => {
     try {
@@ -379,32 +491,41 @@ export default function App() {
   }, []);
 
   const refreshActiveData = useCallback(async () => {
-    if (!isTauri) {
-      if (!serverApi) {
+    const requestId = ++activeDataRequestSeq.current;
+    const api = serverApiRef.current;
+    if (!isTauri || settingsRef.current.dataMode === "server") {
+      if (!api) {
         return;
       }
       const [nextSubscriptions, nextLive] = await Promise.all([
-        serverApi.subscriptions(),
-        serverApi.liveStatuses(),
+        api.subscriptions(),
+        api.liveStatuses(),
       ]);
+      if (
+        requestId !== activeDataRequestSeq.current ||
+        serverApiRef.current !== api
+      ) {
+        return;
+      }
       setSubscriptions(nextSubscriptions);
       setLiveStatuses(nextLive);
       return;
     }
-    if (settingsRef.current.dataMode === "server" && serverApi) {
-      const [nextSubscriptions, nextLive] = await Promise.all([
-        serverApi.subscriptions(),
-        serverApi.liveStatuses(),
-      ]);
-      setSubscriptions(nextSubscriptions);
-      setLiveStatuses(nextLive);
-    } else if (localApi) {
+    if (localApi) {
+      const epoch = connectionEpochRef.current;
       const boot = await localApi.bootstrap();
+      if (
+        requestId !== activeDataRequestSeq.current ||
+        epoch !== connectionEpochRef.current ||
+        settingsRef.current.dataMode !== "local"
+      ) {
+        return;
+      }
       setSubscriptions(boot.subscriptions);
       setLiveStatuses(boot.liveStatuses);
       setSecrets(boot.secrets);
     }
-  }, [serverApi]);
+  }, []);
 
   const applyJobProgress = useCallback((progress: JobProgress) => {
     setActiveJobs((current) => ({ ...current, [progress.jobId]: progress }));
@@ -438,27 +559,36 @@ export default function App() {
   }, [applyRefreshProgress]);
 
   const refreshSyncDevices = useCallback(async () => {
-    if (!serverApi) {
+    const api = serverApiRef.current;
+    if (!api) {
       setSyncDevices([]);
       setSyncDevicesError(null);
       return;
     }
+    const requestId = ++syncDevicesRequestSeq.current;
     setSyncDevicesLoading(true);
     setSyncDevicesError(null);
     try {
-      const baseUrl = resolveHttpBase(serverApi);
-      setSyncDevices(
-        isTauri && localApi
-          ? await localApi.listSyncDevices(baseUrl, serverApi.eventToken())
-          : await fetchSyncDevices(baseUrl, serverApi.eventToken()),
-      );
+      const baseUrl = resolveHttpBase(api);
+      const devices = isTauri && localApi
+        ? await localApi.listSyncDevices(baseUrl, api.eventToken())
+        : await fetchSyncDevices(baseUrl, api.eventToken());
+      if (requestId !== syncDevicesRequestSeq.current || serverApiRef.current !== api) {
+        return;
+      }
+      setSyncDevices(devices);
     } catch (error) {
+      if (requestId !== syncDevicesRequestSeq.current || serverApiRef.current !== api) {
+        return;
+      }
       setSyncDevices([]);
       setSyncDevicesError(`设备列表暂不可用：${explainError(error)}`);
     } finally {
-      setSyncDevicesLoading(false);
+      if (requestId === syncDevicesRequestSeq.current) {
+        setSyncDevicesLoading(false);
+      }
     }
-  }, [serverApi]);
+  }, []);
 
   const deleteSyncDeviceLog = useCallback(async (device: DeviceInfo) => {
     if (!serverApi) {
@@ -476,11 +606,22 @@ export default function App() {
   }, [refreshSyncDevices, serverApi, showToast]);
 
   const syncServerLlmSecret = useCallback(async (api: ServerApi): Promise<void> => {
+    const requestId = ++llmSecretRequestSeq.current;
     try {
       const secret = await api.llmSecret();
+      if (requestId !== llmSecretRequestSeq.current || serverApiRef.current !== api) {
+        return;
+      }
+      if (secret.apiKey) {
+        setLlmApiKeyHint(maskLlmApiKey(secret.apiKey));
+      } else if (!secret.configured) {
+        setLlmApiKeyHint("");
+      }
       if (isTauri && localApi && secret.apiKey) {
         const status = await localApi.saveSecrets({ llmApiKey: secret.apiKey });
-        setSecrets(status);
+        if (requestId === llmSecretRequestSeq.current && serverApiRef.current === api) {
+          setSecrets(status);
+        }
       } else {
         setSecrets((current) => ({
           ...current,
@@ -493,6 +634,43 @@ export default function App() {
       }
       throw error;
     }
+  }, []);
+
+  const refreshServerSettings = useCallback(
+    async (api: ServerApi, base: AppSettings = settingsRef.current): Promise<AppSettings> => {
+      const requestId = ++settingsRequestSeq.current;
+      const serverSettings = await api.settings();
+      if (requestId !== settingsRequestSeq.current || serverApiRef.current !== api) {
+        return base;
+      }
+      const merged = mergeServerSettings(base, serverSettings);
+      settingsRef.current = merged;
+      setSettings(merged);
+      if (isTauri && localApi) {
+        await localApi.saveSettings(merged).catch(() => undefined);
+        // A server push or a newer settings request can land while the local
+        // write is in flight. Persist the newest committed value afterwards so
+        // the on-disk desktop setting cannot remain on the stale response.
+        if (requestId !== settingsRequestSeq.current || serverApiRef.current !== api) {
+          await localApi.saveSettings(settingsRef.current).catch(() => undefined);
+        }
+      }
+      return merged;
+    },
+    [],
+  );
+
+  const reloadLocalSettings = useCallback(async (): Promise<void> => {
+    if (!localApi) {
+      return;
+    }
+    const requestId = ++settingsRequestSeq.current;
+    const next = await localApi.settings();
+    if (requestId !== settingsRequestSeq.current) {
+      return;
+    }
+    settingsRef.current = next;
+    setSettings(next);
   }, []);
 
   const applyFormalChanges = useCallback(async (changes: SyncChange[]) => {
@@ -596,7 +774,12 @@ export default function App() {
 
     for (const change of changes) {
       if (change.entityType === "server_settings") {
-        setSettings((current) => mergeServerSettings(current, change.payload));
+        settingsRequestSeq.current += 1;
+        setSettings((current) => {
+          const next = mergeServerSettings(current, change.payload);
+          settingsRef.current = next;
+          return next;
+        });
       } else if (change.entityType === "server_secret") {
         serverSecretChanged = true;
       } else if (change.entityType === "link" || change.entityType === "linked_account") {
@@ -618,25 +801,35 @@ export default function App() {
     if (refreshSubscriptions) {
       await refreshActiveData();
     }
-    if (serverSecretChanged && serverApi) {
-      await syncServerLlmSecret(serverApi);
+    const currentApi = serverApiRef.current;
+    if (serverSecretChanged && currentApi) {
+      await syncServerLlmSecret(currentApi);
     }
-  }, [refreshActiveData, serverApi, syncServerLlmSecret]);
+  }, [refreshActiveData, syncServerLlmSecret]);
 
   const applySyncSnapshot = useCallback(async (snapshot: SyncBootstrap) => {
     setSubscriptions(snapshot.subscriptions);
     setLiveStatuses(snapshot.liveStatuses);
-    setSettings((current) => mergeServerSettings(current, snapshot.serverSettings));
+    settingsRequestSeq.current += 1;
+    setSettings((current) => {
+      const next = mergeServerSettings(current, snapshot.serverSettings);
+      settingsRef.current = next;
+      return next;
+    });
     setScheduleRevision((value) => value + 1);
   }, []);
 
-  const handleServerEvent = useCallback(async (payload: ServerEvent) => {
+  const handleServerEvent = useCallback(async (
+    payload: ServerEvent,
+    engineOverride?: SyncProtocolEngine | null,
+  ) => {
     const message = payload as unknown as Record<string, unknown>;
-    const engine = syncEngineRef.current;
+    const engine = engineOverride === undefined ? syncEngineRef.current : engineOverride;
     if (engine && await engine.handleMessage(message)) {
       return;
     }
     if (message.type === "auth_ok") {
+      connectionRef.current = "connected";
       setConnection("connected");
       setConnectionError(null);
       return;
@@ -740,51 +933,85 @@ export default function App() {
 
   const connectServer = useCallback(
     async (url: string, token: string, keepSettings = true): Promise<ServerApi> => {
+      const epoch = ++connectionEpochRef.current;
+      settingsRequestSeq.current += 1;
+      llmSecretRequestSeq.current += 1;
+      const previousApi = serverApiRef.current;
+      const previousSyncState = syncStateRef.current;
+      const previousToken = serverTokenRef.current;
+      const previousConnection = connectionRef.current;
+      connectionRef.current = "connecting";
       setConnection("connecting");
-      seenLiveSeq.current = 0;
       setConnectionError(null);
-      setSyncDevices([]);
-      setSyncDevicesError(null);
       setServerBiliConfigured(false);
-      setSyncState((current) => ({ ...idleSyncState(current.deviceId), status: "connecting" }));
+      setLlmApiKeyHint("");
       const api = new ServerApi({ baseUrl: url, token });
-      setServerApi(api);
       try {
-        const [nextSubscriptions, nextLive] = await Promise.all([
+        const [nextSubscriptions, nextLive, biliStatus] = await Promise.all([
           api.subscriptions(),
           api.liveStatuses(),
+          api.serverBiliStatus().catch(() => null),
         ]);
+        if (epoch !== connectionEpochRef.current) {
+          throw new Error("连接请求已被更新的操作替代");
+        }
+        const serverSettings = keepSettings ? null : await api.settings();
+        if (epoch !== connectionEpochRef.current) {
+          throw new Error("连接请求已被更新的操作替代");
+        }
+        if (isTauri && localApi) {
+          await startRemoteMonitorForEpoch(epoch, url, token);
+          if (epoch !== connectionEpochRef.current) {
+            throw new Error("连接请求已被更新的操作替代");
+          }
+        }
+
+        serverApiRef.current = api;
+        serverTokenRef.current = token;
         setSubscriptions(nextSubscriptions);
         setLiveStatuses(nextLive);
         setServerApi(api);
         setServerToken(token);
+        setServerBiliConfigured(biliStatus?.configured === true);
+        connectionRef.current = "connected";
         setConnection("connected");
-        try {
-          const biliStatus = await api.serverBiliStatus();
-          setServerBiliConfigured(biliStatus.configured);
-        } catch {
-          // Bilibili login is optional; do not fail the server connection.
+        setSyncDevices([]);
+        setSyncDevicesError(null);
+        seenLiveSeq.current = 0;
+        setSyncState((current) => ({ ...idleSyncState(current.deviceId), status: "connecting" }));
+        if (serverSettings) {
+          settingsRequestSeq.current += 1;
+          const merged = mergeServerSettings(
+            { ...settingsRef.current, dataMode: "server" as const },
+            serverSettings,
+          );
+          settingsRef.current = merged;
+          setSettings(merged);
         }
-        try {
-          await syncServerLlmSecret(api);
-        } catch (error) {
-          showToast(explainError(error));
-        }
-        if (!keepSettings) {
-          const serverSettings = await api.settings();
-          setSettings({ ...serverSettings, dataMode: "server" });
-        }
-        if (isTauri && localApi) {
-          await localApi.startRemoteMonitor(url, token);
-        }
+        void syncServerLlmSecret(api).catch((error) => showToast(explainError(error)));
         return api;
       } catch (error) {
-        setConnection("offline");
-        setConnectionError(explainError(error));
+        if (epoch === connectionEpochRef.current) {
+          serverApiRef.current = previousApi;
+          serverTokenRef.current = previousToken;
+          setServerApi(previousApi);
+          setServerToken(previousToken);
+          setSyncState(previousSyncState);
+          connectionRef.current = previousConnection;
+          setConnection(previousConnection);
+          setConnectionError(explainError(error));
+          if (previousApi && isTauri && localApi && previousToken) {
+            void startRemoteMonitorForEpoch(
+              epoch,
+              resolveHttpBase(previousApi),
+              previousToken,
+            ).catch(() => undefined);
+          }
+        }
         throw error;
       }
     },
-    [showToast, syncServerLlmSecret],
+    [showToast, startRemoteMonitorForEpoch, syncServerLlmSecret],
   );
 
   useEffect(() => {
@@ -792,7 +1019,9 @@ export default function App() {
     async function initialize() {
       try {
         if (!isTauri) {
-          setSettings(readWebDevicePreferences());
+          const nextSettings = readWebDevicePreferences();
+          settingsRef.current = nextSettings;
+          setSettings(nextSettings);
           setReady(true);
           return;
         }
@@ -805,16 +1034,20 @@ export default function App() {
         if (cancelled) {
           return;
         }
+        settingsRef.current = boot.settings;
         setSettings(boot.settings);
         setSubscriptions(boot.subscriptions);
         setLiveStatuses(boot.liveStatuses);
         setSecrets(boot.secrets);
+        serverTokenRef.current = token;
         setServerToken(token);
         setAutostart(auto);
+        connectionRef.current = boot.settings.dataMode === "local" ? "local" : "offline";
         setConnection(boot.settings.dataMode === "local" ? "local" : "offline");
         if (boot.settings.dataMode === "server" && boot.settings.serverUrl && token) {
           try {
             const api = await connectServer(boot.settings.serverUrl, token);
+            await refreshServerSettings(api, boot.settings);
             const deviceId = syncStateRef.current.deviceId || (await localApi.deviceId());
             if (!hasCompletedServerOnboarding(resolveHttpBase(api), deviceId)) {
               setPendingServerSetup({ api, token, deviceId });
@@ -835,7 +1068,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [connectServer, showToast]);
+  }, [connectServer, refreshServerSettings, showToast]);
   useEffect(() => {
     if (!isTauri) {
       return;
@@ -853,7 +1086,11 @@ export default function App() {
         }
         keepCleanup(await installNotificationActionHandler());
         const offEvent = await listen<ServerEvent>("server-event", (event) => {
-          handleServerEvent(event.payload);
+          void handleServerEvent(event.payload).catch((error) => {
+            const message = explainError(error);
+            setConnectionError(message);
+            showToast(message);
+          });
         });
         keepCleanup(offEvent);
         const offProgress = await listen<RefreshProgress>("refresh-progress", (event) => {
@@ -872,6 +1109,7 @@ export default function App() {
           syncing?: boolean;
         }>("remote-status", (event) => {
           if (event.payload.error) {
+            connectionRef.current = "offline";
             setConnection("offline");
             setConnectionError(event.payload.error);
             syncEngineRef.current?.markOffline();
@@ -879,13 +1117,18 @@ export default function App() {
             return;
           }
           if (event.payload.connected) {
+            connectionRef.current = "connected";
             setConnection("connected");
             setConnectionError(null);
             syncEngineRef.current?.acceptRemoteStatus(
               event.payload as unknown as Record<string, unknown>,
             );
-
+            // The event itself is not durable. Re-read the local mirror after
+            // every connection/apply-status transition so a missed UI event
+            // cannot leave React showing a stale cursor view.
+            scheduleCacheRefresh();
           } else if (event.payload.connecting) {
+            connectionRef.current = "connecting";
             setConnection("connecting");
             syncEngineRef.current?.markConnecting();
 
@@ -906,21 +1149,17 @@ export default function App() {
               showToast(explainError(error));
             });
           } else {
-            setScheduleRevision((value) => value + 1);
-            if (legacyRefreshTimer.current) {
-              clearTimeout(legacyRefreshTimer.current);
-            }
-            legacyRefreshTimer.current = setTimeout(() => {
-              legacyRefreshTimer.current = null;
-              void refreshActiveData().catch(() => undefined);
-            }, 120);
+            scheduleCacheRefresh();
           }
         });
         keepCleanup(offSyncApplied);
         const offBootstrap = await listen<Record<string, unknown>>("sync-bootstrap-applied", (event) => {
           syncEngineRef.current?.acceptAppliedProgress(event.payload);
           setScheduleRevision((value) => value + 1);
-          void refreshActiveData().catch((error) => showToast(explainError(error)));
+          void (async () => {
+            await reloadLocalSettings();
+            await refreshActiveData();
+          })().catch((error) => showToast(explainError(error)));
         });
         keepCleanup(offBootstrap);
         const offJobProgress = await listen<Record<string, unknown>>("job-progress", (event) => {
@@ -931,6 +1170,10 @@ export default function App() {
           showToast(event.payload);
         });
         keepCleanup(offError);
+        const offFanCount = await listen<unknown>("fan-count-updated", () => {
+          void refreshActiveData().catch((error) => showToast(explainError(error)));
+        });
+        keepCleanup(offFanCount);
         const offBiliCookie = await listen<SecretStatus>("bili-cookie-updated", (event) => {
           setSecrets(event.payload);
           showToast("B 站 Cookie 已自动保存");
@@ -954,7 +1197,7 @@ export default function App() {
         cleanup();
       }
     };
-  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, showToast]);
+  }, [applyFormalChanges, applyJobProgress, applyRefreshProgress, handleServerEvent, refreshActiveData, reloadLocalSettings, showToast]);
 
   useEffect(() => {
     if (!serverApi || pendingImport || pendingServerSetup || pendingClientMigration) {
@@ -968,29 +1211,62 @@ export default function App() {
     let deliberateReconnect = false;
     let engine: SyncProtocolEngine | null = null;
 
+    const scheduleCacheRefresh = () => {
+      if (legacyRefreshTimer.current) {
+        clearTimeout(legacyRefreshTimer.current);
+      }
+      legacyRefreshTimer.current = setTimeout(() => {
+        legacyRefreshTimer.current = null;
+        if (disposed) {
+          return;
+        }
+        setScheduleRevision((value) => value + 1);
+        void refreshActiveData().catch((error) => {
+          if (!disposed) {
+            setConnectionError(explainError(error));
+          }
+        });
+      }, 120);
+    };
+
     function connectSocket() {
       if (disposed || isTauri || !engine) {
         return;
       }
       engine.markConnecting();
+      connectionRef.current = "connecting";
       setConnection("connecting");
       const url = new URL(api.eventSocketUrl(engine.currentCursor));
       url.searchParams.set("protocol", "2");
-      socket = new WebSocket(url.toString());
+      const currentSocket = new WebSocket(url.toString());
+      socket = currentSocket;
       engine.setAckTransport((message) => {
-        if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify(message));
+        if (currentSocket.readyState !== WebSocket.OPEN) {
+          return false;
+        }
+        try {
+          currentSocket.send(JSON.stringify(message));
+          return true;
+        } catch {
+          return false;
         }
       });
-      socket.onopen = () => {
-        socket?.send(JSON.stringify({
+      currentSocket.onopen = () => {
+        if (disposed || socket !== currentSocket) {
+          currentSocket.close();
+          return;
+        }
+        currentSocket.send(JSON.stringify({
           type: "auth",
           token: api.eventToken(),
           deviceId: engine?.state.deviceId,
           protocolVersion: 2,
         }));
       };
-      socket.onmessage = (event) => {
+      currentSocket.onmessage = (event) => {
+        if (disposed || socket !== currentSocket || !engine) {
+          return;
+        }
         let message: unknown;
         try {
           message = JSON.parse(String(event.data));
@@ -1003,30 +1279,41 @@ export default function App() {
         const value = message as Record<string, unknown>;
         if (value.type === "auth_ok") {
           attempts = 0;
+          connectionRef.current = "connected";
           setConnection("connected");
           setConnectionError(null);
         } else if (value.type === "error") {
+          connectionRef.current = "offline";
           setConnection("offline");
           setConnectionError(String(value.code ?? "服务器 WebSocket 鉴权失败"));
           return;
         }
-        void handleServerEvent(value as unknown as ServerEvent).catch((error) => {
-          setConnectionError(explainError(error));
+        void engine.handleMessage(value).then((handled) => {
+          if (!handled) {
+            return handleServerEvent(value as unknown as ServerEvent, engine);
+          }
+          return undefined;
+        }).catch((error) => {
+          if (!disposed && socket === currentSocket) {
+            setConnectionError(explainError(error));
+          }
         });
       };
-      socket.onerror = () => {
-        if (!disposed) {
+      currentSocket.onerror = () => {
+        if (!disposed && socket === currentSocket) {
           engine?.markOffline();
+          connectionRef.current = "offline";
           setConnection("offline");
           setConnectionError("服务器实时连接失败，正在重试");
         }
       };
-      socket.onclose = () => {
-        if (disposed) {
+      currentSocket.onclose = () => {
+        if (disposed || socket !== currentSocket) {
           return;
         }
         socket = null;
         engine?.markOffline();
+        connectionRef.current = "offline";
         setConnection("offline");
         if (deliberateReconnect) {
           deliberateReconnect = false;
@@ -1059,6 +1346,7 @@ export default function App() {
             return;
           }
           initial = {
+            feedId: cached.cache.meta.feedId,
             cursorSeq: cached.cache.meta.cursorSeq,
             latestSeq: cached.cache.meta.latestSeq,
             minRetainedSeq: cached.cache.meta.minRetainedSeq,
@@ -1069,6 +1357,7 @@ export default function App() {
           restoredFromWebCache = true;
         } else if (cached.available) {
           initial = {
+            feedId: "",
             cursorSeq: 0,
             latestSeq: 0,
             minRetainedSeq: 0,
@@ -1082,6 +1371,7 @@ export default function App() {
         try {
           const meta = await localApi.syncMeta(settingsRef.current.serverUrl || baseUrl);
           initial = {
+            feedId: meta.feedId ?? initial.feedId,
             cursorSeq: meta.cursorSeq,
             latestSeq: meta.latestSeq,
             minRetainedSeq: initial.minRetainedSeq,
@@ -1102,6 +1392,8 @@ export default function App() {
           setSyncState(state);
           if (state.status === "error" && state.lastError) {
             setConnectionError(state.lastError);
+            connectionRef.current = "offline";
+            setConnection("offline");
           }
         },
         onChanges: applyFormalChanges,
@@ -1125,7 +1417,23 @@ export default function App() {
       }
       if (!isTauri) {
         if (webCacheAvailable && !restoredFromWebCache) {
-          await engine.forceResync("cache_missing");
+          try {
+            await engine.forceResync("cache_missing");
+          } catch (error) {
+            if (!disposed) {
+              showToast(`同步快照暂不可用：${explainError(error)}`);
+            }
+          }
+        }
+        // Settings are environment metadata, not a prerequisite for the realtime
+        // protocol. A transient GET failure must not permanently prevent the
+        // WebSocket from opening; server_settings changes still arrive via sync.
+        try {
+          await refreshServerSettings(api);
+        } catch (error) {
+          if (!disposed && serverApiRef.current === api) {
+            showToast(`服务器设置暂不可用：${explainError(error)}`);
+          }
         }
         if (disposed) {
           return;
@@ -1148,24 +1456,29 @@ export default function App() {
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
       }
+      if (legacyRefreshTimer.current) {
+        clearTimeout(legacyRefreshTimer.current);
+        legacyRefreshTimer.current = null;
+      }
       engine?.dispose();
       if (syncEngineRef.current === engine) {
         syncEngineRef.current = null;
       }
       socket?.close();
     };
-  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, serverApi]);
+  }, [applyFormalChanges, applyJobProgress, applySyncSnapshot, handleServerEvent, pendingImport, pendingServerSetup, pendingClientMigration, refreshActiveData, refreshServerSettings, serverApi, showToast]);
 
   useEffect(() => {
     if (page !== "settings" || !serverApi) {
       return;
     }
     void refreshSyncDevices();
+    void refreshServerSettings(serverApi).catch((error) => showToast(explainError(error)));
     void serverApi
       .serverBiliStatus()
       .then((status) => setServerBiliConfigured(status.configured))
       .catch(() => undefined);
-  }, [page, refreshSyncDevices, serverApi]);
+  }, [page, refreshServerSettings, refreshSyncDevices, serverApi, showToast]);
 
   useEffect(() => {
     if (!ready) {
@@ -1252,17 +1565,14 @@ export default function App() {
   async function connectFromGate(token: string) {
     setAuthGateError(null);
     try {
-      const api = await connectServer(isTauri ? settings.serverUrl : "", token, isTauri);
+      const api = await connectServer(isTauri ? settings.serverUrl : "", token, false);
       if (!isTauri) {
-        const serverSettings = await api.settings();
-        const merged = mergeServerSettings(
-          {
-            ...settingsRef.current,
-            dataMode: "server",
-            serverUrl: resolveHttpBase(api),
-          },
-          serverSettings,
-        );
+        const merged = {
+          ...settingsRef.current,
+          dataMode: "server" as const,
+          serverUrl: resolveHttpBase(api),
+        };
+        settingsRef.current = merged;
         setSettings(merged);
         saveWebDevicePreferences(merged);
         const deviceId = syncStateRef.current.deviceId || await resolveSyncDeviceId();
@@ -1281,19 +1591,29 @@ export default function App() {
     secretInput: SecretInput,
     autoLaunch: boolean,
   ): Promise<AppSettings> {
+    // Any explicit save supersedes an older background settings GET.
+    settingsRequestSeq.current += 1;
+    llmSecretRequestSeq.current += 1;
     if (!isTauri) {
       if (!serverApi) {
         throw new Error("服务器未连接");
       }
       const remote = await serverApi.settings();
-      const saved = await serverApi.saveSettings(serverSettingsForSave(draft, remote));
       if (secretInput.llmApiKey?.trim()) {
-        const savedSecret = await serverApi.saveLlmSecret(secretInput.llmApiKey.trim());
+        const savedSecret = await serverApi.saveLlmSecret(
+          secretInput.llmApiKey.trim(),
+          draft.llmBaseUrl,
+        );
+        setLlmApiKeyHint(maskLlmApiKey(secretInput.llmApiKey));
         setSecrets((current) => ({ ...current, llmConfigured: savedSecret.configured }));
-      } else {
+      }
+      const saved = await serverApi.saveSettings(serverSettingsForSave(draft, remote));
+      if (!secretInput.llmApiKey?.trim()) {
         await syncServerLlmSecret(serverApi);
       }
       const merged = mergeServerSettings({ ...draft, dataMode: "server" }, saved);
+      settingsRequestSeq.current += 1;
+      settingsRef.current = merged;
       setSettings(merged);
       saveWebDevicePreferences(merged);
       return merged;
@@ -1301,34 +1621,41 @@ export default function App() {
     if (!localApi) {
       throw new Error("桌面 API 未初始化");
     }
-    const nextSecrets = await localApi.saveSecrets(secretInput);
-    setSecrets(nextSecrets);
-    await applyAutostart(autoLaunch);
-    setAutostart(autoLaunch);
-    await localApi.saveSettings(draft);
-    setSettings(draft);
     if (draft.dataMode === "server") {
       const token =
         secretInput.serverToken?.trim() ||
-        serverToken ||
+        serverTokenRef.current ||
         (await localApi.serverToken()) ||
         "";
       if (!token) {
         throw new Error("服务器模式需要访问令牌");
       }
-      const api = await connectServer(draft.serverUrl, token);
-      setServerToken(token);
-      const remoteSettings = await api.settings();
-      const savedServerSettings = await api.saveSettings(
+
+      // Validate and stage remote changes with a temporary API. Local settings
+      // are not committed until the destination has authenticated successfully.
+      const validationApi = new ServerApi({ baseUrl: draft.serverUrl, token });
+      await Promise.all([validationApi.subscriptions(), validationApi.liveStatuses()]);
+      const remoteSettings = await validationApi.settings();
+      await applyAutostart(autoLaunch);
+      setAutostart(autoLaunch);
+      if (secretInput.llmApiKey?.trim()) {
+        await validationApi.saveLlmSecret(secretInput.llmApiKey.trim(), draft.llmBaseUrl);
+        setLlmApiKeyHint(maskLlmApiKey(secretInput.llmApiKey));
+      }
+      const savedServerSettings = await validationApi.saveSettings(
         serverSettingsForSave(draft, remoteSettings),
       );
-      if (secretInput.llmApiKey?.trim()) {
-        await api.saveLlmSecret(secretInput.llmApiKey.trim());
-      }
-      await syncServerLlmSecret(api);
       const merged = mergeServerSettings({ ...draft, dataMode: "server" }, savedServerSettings);
-      setSettings(merged);
+      const nextSecrets = await localApi.saveSecrets(secretInput);
       await localApi.saveSettings(merged);
+      settingsRequestSeq.current += 1;
+      settingsRef.current = merged;
+      setSecrets(nextSecrets);
+      setSettings(merged);
+      serverTokenRef.current = token;
+      setServerToken(token);
+      const api = await connectServer(draft.serverUrl, token);
+      void syncServerLlmSecret(api).catch((error) => showToast(explainError(error)));
       const deviceId = syncStateRef.current.deviceId || (await localApi.deviceId());
       const serverUrl = resolveHttpBase(api);
       setPendingServerSetup(
@@ -1337,16 +1664,43 @@ export default function App() {
           : { api, token, deviceId },
       );
       return merged;
-    } else {
-      await localApi.stopRemoteMonitor();
-      setServerApi(null);
-      setConnection("local");
-      const boot = await localApi.bootstrap();
-      setSubscriptions(boot.subscriptions);
-      setLiveStatuses(boot.liveStatuses);
-      seenLiveSeq.current = 0;
+    }
+
+    await applyAutostart(autoLaunch);
+    setAutostart(autoLaunch);
+    const localEpoch = ++connectionEpochRef.current;
+    activeDataRequestSeq.current += 1;
+    syncDevicesRequestSeq.current += 1;
+    const monitorGenerationToStop = remoteMonitorGenerationRef.current;
+    const nextSecrets = await localApi.saveSecrets(secretInput);
+    if (localEpoch !== connectionEpochRef.current) {
       return draft;
     }
+    await localApi.saveSettings(draft);
+    if (localEpoch !== connectionEpochRef.current) {
+      return draft;
+    }
+    await stopRemoteMonitorGeneration(monitorGenerationToStop);
+    if (localEpoch !== connectionEpochRef.current) {
+      return draft;
+    }
+    serverApiRef.current = null;
+    setServerApi(null);
+    setLlmApiKeyHint("");
+    connectionRef.current = "local";
+    setConnection("local");
+    const boot = await localApi.bootstrap();
+    if (localEpoch !== connectionEpochRef.current) {
+      return draft;
+    }
+    settingsRequestSeq.current += 1;
+    settingsRef.current = draft;
+    setSecrets(nextSecrets);
+    setSettings(draft);
+    setSubscriptions(boot.subscriptions);
+    setLiveStatuses(boot.liveStatuses);
+    seenLiveSeq.current = 0;
+    return draft;
   }
 
   function useServerDataForSetup() {
@@ -1374,9 +1728,10 @@ export default function App() {
   }
 
   async function prepareClientMigration(setup = pendingServerSetup) {
-    if (!setup || !localApi) {
+    if (!setup || !localApi || migrationBusyRef.current) {
       return;
     }
+    migrationBusyRef.current = true;
     setMigrationBusy(true);
     try {
       const snapshot = await localApi.exportSnapshot();
@@ -1392,6 +1747,7 @@ export default function App() {
     } catch (error) {
       showToast(explainError(error));
     } finally {
+      migrationBusyRef.current = false;
       setMigrationBusy(false);
     }
   }
@@ -1409,17 +1765,23 @@ export default function App() {
   }
 
   async function applyClientMigration(strategy: "server" | "client" | "skip") {
-    if (!pendingClientMigration || !localApi) {
+    if (!pendingClientMigration || !localApi || migrationBusyRef.current) {
       return;
     }
+    migrationBusyRef.current = true;
     setMigrationBusy(true);
     try {
       const migration = pendingClientMigration;
+      const expectedServerDigest = migration.preview.serverStateDigest.trim();
+      if (!expectedServerDigest) {
+        throw new Error("迁移预览缺少服务器状态摘要，请重新生成预览");
+      }
       const report = await migration.api.applyMigration(
         migration.snapshot,
         strategy,
         migration.deviceId,
         migration.migrationId,
+        expectedServerDigest,
       );
       markServerOnboardingComplete(
         resolveHttpBase(migration.api),
@@ -1427,14 +1789,34 @@ export default function App() {
       );
       setPendingClientMigration(null);
       setPendingServerSetup(null);
+      await refreshActiveData();
       setScheduleRevision((value) => value + 1);
       showToast(
         "迁移完成：订阅 " + report.subscriptions + "，日程 " + report.schedules +
           "，周表 " + report.weeklyRules + "，跳过 " + report.skipped,
       );
     } catch (error) {
-      showToast(explainError(error));
+      if (error instanceof ApiFailure && error.code === "MIGRATION_STALE_PREVIEW") {
+        const migration = pendingClientMigration;
+        try {
+          if (!migration) {
+            throw error;
+          }
+          const preview = await migration.api.previewMigration(migration.snapshot);
+          setPendingClientMigration({
+            ...migration,
+            preview,
+            migrationId: crypto.randomUUID(),
+          });
+          showToast("服务器数据已变化，已重新生成迁移预览，请重新确认");
+        } catch (refreshError) {
+          showToast(`迁移预览已过期，请重新打开迁移：${explainError(refreshError)}`);
+        }
+      } else {
+        showToast(explainError(error));
+      }
     } finally {
+      migrationBusyRef.current = false;
       setMigrationBusy(false);
     }
   }
@@ -1447,7 +1829,7 @@ export default function App() {
       const health = await serverApi.health();
       return `已连接 v${health.version}`;
     }
-    const effectiveToken = token.trim() || serverToken;
+    const effectiveToken = token.trim() || serverTokenRef.current;
     const api = new ServerApi({ baseUrl: url, token: effectiveToken });
     const health = await api.health();
     return `已连接 v${health.version}`;
@@ -1512,19 +1894,24 @@ export default function App() {
     });
   }
   async function completeImport(strategy: "server" | "client" | "skip") {
-    if (!pendingImport || !localApi) {
-      setPendingImport(null);
+    if (!pendingImport || !localApi || importBusyRef.current) {
       return;
     }
+    importBusyRef.current = true;
+    setImportBusy(true);
     try {
       const report = await localApi.importSnapshot(pendingImport.snapshot, strategy);
       setPendingImport(null);
       await refreshActiveData();
+      setScheduleRevision((value) => value + 1);
       showToast(
         `导入完成：订阅 ${report.subscriptions}，日程 ${report.schedules}，跳过 ${report.skipped}`,
       );
     } catch (error) {
       showToast(explainError(error));
+    } finally {
+      importBusyRef.current = false;
+      setImportBusy(false);
     }
   }
 
@@ -1532,9 +1919,21 @@ export default function App() {
     if (!isTauri || !localApi || !serverApi) {
       throw new Error("仅桌面端可把服务端数据导入本地缓存");
     }
-    const snapshot = await serverApi.snapshot();
-    const preview = await localApi.previewSnapshot(snapshot);
-    setPendingImport({ snapshot, preview, api: serverApi });
+    if (importPreviewBusyRef.current) {
+      return;
+    }
+    importPreviewBusyRef.current = true;
+    const api = serverApi;
+    try {
+      const snapshot = await api.snapshot();
+      const preview = await localApi.previewSnapshot(snapshot);
+      if (serverApiRef.current !== api) {
+        throw new Error("服务器连接已切换，请重新生成导入预览");
+      }
+      setPendingImport({ snapshot, preview, api });
+    } finally {
+      importPreviewBusyRef.current = false;
+    }
   }
 
   const scheduleActions = useMemo(() => {
@@ -1576,7 +1975,6 @@ export default function App() {
       if (!localApi) {
         throw new Error("本地缓存不可用");
       }
-      const schedule = await localApi.createCachedSchedule(input);
       const mutation: SyncMutation = {
         mutationId: crypto.randomUUID(),
         operation: "create",
@@ -1590,8 +1988,10 @@ export default function App() {
         createdAt: new Date().toISOString(),
         appliedAt: null,
       };
+      // Persist the durable intent first. If the mirror write then fails, the
+      // queued mutation still reconciles the operation on the next sync.
       await localApi.enqueueMutation(mutation);
-      return schedule;
+      return localApi.createCachedSchedule(input);
     }
 
     return {
@@ -1637,7 +2037,7 @@ export default function App() {
           try {
             return await serverApi.schedules(from, to);
           } catch (error) {
-            if (isTauri && localApi && error instanceof ApiFailure && error.code === "REMOTE_OFFLINE") {
+            if (isTauri && localApi && isRemoteUncertain(error)) {
               setConnection("offline");
               return localApi.cachedSchedules(from, to);
             }
@@ -1662,7 +2062,7 @@ export default function App() {
         try {
           return await serverApi.createSchedule(input);
         } catch (error) {
-          if (isTauri && error instanceof ApiFailure && error.code === "REMOTE_OFFLINE") {
+          if (isTauri && isRemoteUncertain(error)) {
             setConnection("offline");
             return localFallbackForCreate(input);
           }
@@ -1686,12 +2086,8 @@ export default function App() {
         try {
           return await serverApi.updateSchedule(remoteId, update);
         } catch (error) {
-          if (isTauri && localApi && error instanceof ApiFailure && error.code === "REMOTE_OFFLINE") {
+          if (isTauri && localApi && isRemoteUncertain(error)) {
             setConnection("offline");
-            const updated = await localApi.updateCachedSchedule(
-              schedule.cachedLocalId ?? schedule.id,
-              update,
-            );
             await localApi.enqueueMutation({
               mutationId: crypto.randomUUID(),
               operation: "update",
@@ -1705,7 +2101,10 @@ export default function App() {
               createdAt: new Date().toISOString(),
               appliedAt: null,
             });
-            return updated;
+            return localApi.updateCachedSchedule(
+              schedule.cachedLocalId ?? schedule.id,
+              update,
+            );
           }
           throw error;
         }
@@ -1718,12 +2117,15 @@ export default function App() {
           await localApi.deleteSchedule(schedule.id);
           return;
         }
-        if (!serverApi || !localApi) {
-          throw new Error("服务器或本地缓存未连接");
+        if (!serverApi) {
+          throw new Error("服务器未连接");
         }
         const remoteId = remoteScheduleId(schedule);
-        const cachedId = schedule.cachedLocalId ?? schedule.id;
         if (!remoteId) {
+          if (!localApi) {
+            throw new Error("该日程尚未同步到服务器，请等待新增同步完成后再删除");
+          }
+          const cachedId = schedule.cachedLocalId ?? schedule.id;
           const blockedMutationId = await blockPendingCreateForSchedule(schedule);
           try {
             await localApi.deleteCachedSchedule(cachedId);
@@ -1736,12 +2138,19 @@ export default function App() {
           showToast("已移除尚未同步到服务器的临时日程");
           return;
         }
+        if (!isTauri) {
+          await serverApi.deleteSchedule(remoteId);
+          return;
+        }
+        if (!localApi) {
+          throw new Error("本地缓存未连接");
+        }
+        const cachedId = schedule.cachedLocalId ?? schedule.id;
         try {
           await serverApi.deleteSchedule(remoteId);
         } catch (error) {
-          if (isTauri && error instanceof ApiFailure && error.code === "REMOTE_OFFLINE") {
+          if (isTauri && isRemoteUncertain(error)) {
             setConnection("offline");
-            await localApi.deleteCachedSchedule(cachedId);
             await localApi.enqueueMutation({
               mutationId: crypto.randomUUID(),
               operation: "delete",
@@ -1755,6 +2164,7 @@ export default function App() {
               createdAt: new Date().toISOString(),
               appliedAt: null,
             });
+            await localApi.deleteCachedSchedule(cachedId);
             return;
           }
           throw error;
@@ -1952,6 +2362,30 @@ export default function App() {
           throw error;
         }
       },
+      fanHistory: async (streamerId: number, days = 30): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.fanHistory(streamerId, days);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.fanHistory(streamerId, days);
+      },
+      refreshFans: async (streamerId: number): Promise<FanHistory> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.refreshFans(streamerId);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.refreshFans(streamerId);
+      },
       listWeeklyRules: async (streamerId: number): Promise<WeeklyScheduleRule[]> => {
         if (serverMode) {
           if (!serverApi) {
@@ -2138,6 +2572,33 @@ export default function App() {
     }
   }
 
+  async function minimizeWindow() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.minimize();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
+  async function toggleWindowMaximize() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.toggleMaximize();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
+  async function closeWindow() {
+    if (!desktopWindow) return;
+    try {
+      await desktopWindow.close();
+    } catch (error) {
+      showToast(explainError(error));
+    }
+  }
+
   async function navigateToPage(nextPage: Page) {
     if (nextPage === page) {
       return;
@@ -2178,9 +2639,29 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
+      className={`app-shell ${isTauri ? "is-desktop" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
+      {desktopWindow ? (
+        <div className="window-chrome">
+          <div
+            className="window-drag-region"
+            data-tauri-drag-region
+            onDoubleClick={() => void toggleWindowMaximize()}
+          />
+          <div className="window-controls" role="group" aria-label="窗口控制">
+            <button type="button" className="window-control" aria-label="最小化" title="最小化" onClick={() => void minimizeWindow()}>
+              <Minus size={15} />
+            </button>
+            <button type="button" className="window-control" aria-label="最大化或还原" title="最大化或还原" onClick={() => void toggleWindowMaximize()}>
+              <Square size={13} />
+            </button>
+            <button type="button" className="window-control close" aria-label="关闭到托盘" title="关闭到托盘" onClick={() => void closeWindow()}>
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><BrandMark size={27} /></div>
@@ -2288,12 +2769,22 @@ export default function App() {
         {connectionError && (connection === "offline" || connection === "connecting") ? (
           <ErrorBanner message={connectionError} onRetry={() => {
             if (settings.dataMode === "server" && settings.serverUrl && serverToken) {
-              void connectServer(settings.serverUrl, serverToken).catch((error) => showToast(explainError(error)));
+              void connectServer(settings.serverUrl, serverToken)
+                .then((api) => refreshServerSettings(api))
+                .catch((error) => showToast(explainError(error)));
             }
           }} />
         ) : null}
         <div hidden={page !== "schedule"}>
-          <ScheduleView active={page === "schedule"} subscriptions={orderedSubscriptions} liveStatuses={liveStatuses} actions={scheduleActions} revision={scheduleRevision} onError={showToast} />
+          <ScheduleView
+            key={`schedule-source:${isTauri ? settings.dataMode : "server"}:${isTauri ? settings.serverUrl : window.location.origin}`}
+            active={page === "schedule"}
+            subscriptions={orderedSubscriptions}
+            liveStatuses={liveStatuses}
+            actions={scheduleActions}
+            revision={scheduleRevision}
+            onError={showToast}
+          />
         </div>
         {MAGIC_PERIOD_ENABLED && page === "fertility" ? (
           <MagicPeriodView subscriptions={orderedSubscriptions} actions={fertilityActions} onError={showToast} />
@@ -2303,7 +2794,10 @@ export default function App() {
           <SettingsView
             ref={settingsViewRef}
             settings={settings}
+            appearance={appearance}
+            onAppearanceChange={setAppearance}
             secrets={secrets}
+            llmApiKeyHint={llmApiKeyHint}
             biliConfigured={(!isTauri || settings.dataMode === "server") ? serverBiliConfigured : secrets.biliConfigured}
             autostart={autostart}
             tauri={isTauri}
@@ -2315,24 +2809,41 @@ export default function App() {
             activeJobs={Object.values(activeJobs)}
             onRefreshDevices={() => void refreshSyncDevices()}
             onResync={() => {
+              if (resyncInFlightRef.current) {
+                return;
+              }
+              const epoch = connectionEpochRef.current;
               if (isTauri && localApi) {
                 const serverUrl = settingsRef.current.serverUrl.trim();
-                if (!serverUrl || !serverToken) {
+                const token = serverTokenRef.current;
+                if (!serverUrl || !token) {
                   showToast("服务器连接信息不完整");
                   return;
                 }
+                resyncInFlightRef.current = true;
+                connectionRef.current = "connecting";
                 setConnection("connecting");
-                void localApi
-                  .rebuildRemoteSync(serverUrl, serverToken)
-                  .then(async () => {
+                void (async () => {
+                  try {
+                    const result = await localApi.rebuildRemoteSync(serverUrl, token);
+                    if (epoch !== connectionEpochRef.current) {
+                      await stopRemoteMonitorGeneration(result.monitorGeneration);
+                      return;
+                    }
+                    remoteMonitorGenerationRef.current = result.monitorGeneration;
                     await refreshActiveData();
                     setScheduleRevision((value) => value + 1);
                     showToast("同步缓存已重建");
-                  })
-                  .catch((error) => {
-                    setConnection("offline");
-                    showToast(explainError(error));
-                  });
+                  } catch (error) {
+                    if (epoch === connectionEpochRef.current) {
+                      connectionRef.current = "offline";
+                      setConnection("offline");
+                      showToast(explainError(error));
+                    }
+                  } finally {
+                    resyncInFlightRef.current = false;
+                  }
+                })();
                 return;
               }
               const engine = syncEngineRef.current;
@@ -2340,7 +2851,13 @@ export default function App() {
                 showToast("同步引擎尚未就绪");
                 return;
               }
-              void engine.forceResync().catch((error) => showToast(explainError(error)));
+              resyncInFlightRef.current = true;
+              void engine
+                .forceResync()
+                .catch((error) => showToast(explainError(error)))
+                .finally(() => {
+                  resyncInFlightRef.current = false;
+                });
             }}
             onImportServer={isTauri ? () => {
               void openServerImport().catch((error) => showToast(explainError(error)));
@@ -2445,11 +2962,11 @@ export default function App() {
       {pendingServerSetup ? (
         <Modal
           title="初始化服务端数据"
-          onClose={deferServerSetup}
+          onClose={migrationBusy ? () => undefined : deferServerSetup}
           wide
           footer={
             <>
-              <button className="button secondary" onClick={deferServerSetup}>稍后</button>
+              <button className="button secondary" disabled={migrationBusy} onClick={deferServerSetup}>稍后</button>
               <button
                 className="button secondary"
                 disabled={migrationBusy || !isTauri}
@@ -2457,7 +2974,7 @@ export default function App() {
               >
                 迁移本机数据到服务端
               </button>
-              <button className="button primary" onClick={useServerDataForSetup}>
+              <button className="button primary" disabled={migrationBusy} onClick={useServerDataForSetup}>
                 使用服务端数据
               </button>
             </>
@@ -2477,11 +2994,11 @@ export default function App() {
       {pendingClientMigration ? (
         <Modal
           title="迁移本机数据到服务端"
-          onClose={() => setPendingClientMigration(null)}
+          onClose={migrationBusy ? () => undefined : () => setPendingClientMigration(null)}
           wide
           footer={
             <>
-              <button className="button secondary" onClick={() => setPendingClientMigration(null)}>取消</button>
+              <button className="button secondary" disabled={migrationBusy} onClick={() => setPendingClientMigration(null)}>取消</button>
               <button
                 className="button secondary"
                 disabled={migrationBusy}
@@ -2525,13 +3042,13 @@ export default function App() {
       {pendingImport ? (
         <Modal
           title="用服务端数据覆盖本地"
-          onClose={() => setPendingImport(null)}
+          onClose={importBusy ? () => undefined : () => setPendingImport(null)}
           wide
           footer={
             <>
-              <button className="button secondary" onClick={() => void completeImport("client")}>保留客户端</button>
-              <button className="button secondary" onClick={() => void completeImport("skip")}>只导入不冲突项</button>
-              <button className="button primary" onClick={() => void completeImport("server")}>服务器覆盖客户端</button>
+              <button className="button secondary" disabled={importBusy} onClick={() => void completeImport("client")}>保留客户端</button>
+              <button className="button secondary" disabled={importBusy} onClick={() => void completeImport("skip")}>只导入不冲突项</button>
+              <button className="button primary" disabled={importBusy} onClick={() => void completeImport("server")}>服务器覆盖客户端</button>
             </>
           }
         >

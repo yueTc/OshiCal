@@ -1,5 +1,7 @@
 mod import;
-pub use import::{ImportConflict, ImportPreview, ImportReport, ServerSnapshot};
+pub use import::{
+    ImportConflict, ImportPreview, ImportReport, ServerSnapshot, SERVER_SNAPSHOT_SCHEMA_VERSION,
+};
 mod sync;
 mod sync_feed;
 use sync_feed::SyncActor;
@@ -15,9 +17,9 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AddSubscription, ClientSyncState, DynamicPost, HealthState, LinkedAccount, LiveSession,
-    LiveSessionStats, LiveSnapshot, LiveStatus, NewSchedule, NewWeeklyScheduleRule, Schedule,
-    SourceSuppression, Streamer, SyncMutation, UpdateSchedule, UpdateSubscription,
+    AddSubscription, ClientSyncState, DynamicPost, FanSnapshot, HealthState, LinkedAccount,
+    LiveSession, LiveSessionStats, LiveSnapshot, LiveStatus, NewSchedule, NewWeeklyScheduleRule,
+    Schedule, SourceSuppression, Streamer, SyncMutation, UpdateSchedule, UpdateSubscription,
     UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::settings::SETTING_KEYS;
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS streamers (
     schedule_enabled INTEGER NOT NULL DEFAULT 1,
     live_notify_enabled INTEGER NOT NULL DEFAULT 1,
     live_stats_enabled INTEGER NOT NULL DEFAULT 0,
+    fans INTEGER,
     aliases_json TEXT NOT NULL DEFAULT '[]',
     last_error TEXT,
     last_refresh_at TEXT,
@@ -50,6 +53,16 @@ CREATE TABLE IF NOT EXISTS streamers (
     live_revision INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS fan_snapshots (
+    streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL,
+    fans INTEGER NOT NULL,
+    PRIMARY KEY(streamer_id, captured_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fan_snapshots_streamer_captured
+ON fan_snapshots(streamer_id, captured_at DESC);
+
 CREATE TABLE IF NOT EXISTS live_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -61,6 +74,7 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     ended_at TEXT,
     duration_seconds INTEGER NOT NULL DEFAULT 0,
     peak_online INTEGER NOT NULL DEFAULT 0,
+    peak_high_energy INTEGER NOT NULL DEFAULT 0,
     avg_online INTEGER NOT NULL DEFAULT 0,
     online_samples INTEGER NOT NULL DEFAULT 0,
     online_total INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +316,7 @@ struct StreamerRow {
     schedule_enabled: i64,
     live_notify_enabled: i64,
     live_stats_enabled: i64,
+    fans: Option<i64>,
     aliases_json: String,
     last_error: Option<String>,
     last_refresh_at: Option<String>,
@@ -404,6 +419,7 @@ struct LiveSessionRow {
     ended_at: Option<String>,
     duration_seconds: i64,
     peak_online: i64,
+    peak_high_energy: i64,
     avg_online: i64,
     online_samples: i64,
     online_total: i64,
@@ -524,6 +540,14 @@ impl SqliteStore {
         }
         if !streamer_columns
             .iter()
+            .any(|row| row.get::<String, _>("name") == "fans")
+        {
+            sqlx::query("ALTER TABLE streamers ADD COLUMN fans INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !streamer_columns
+            .iter()
             .any(|row| row.get::<String, _>("name") == "sort_order")
         {
             sqlx::query("ALTER TABLE streamers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
@@ -633,7 +657,7 @@ impl SqliteStore {
 
     pub async fn list_streamers(&self) -> AppResult<Vec<Streamer>> {
         let rows = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
@@ -645,7 +669,7 @@ impl SqliteStore {
 
     pub async fn get_streamer(&self, id: i64) -> AppResult<Streamer> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE id = ?",
@@ -662,7 +686,7 @@ impl SqliteStore {
 
     pub async fn get_streamer_by_mid(&self, mid: &str) -> AppResult<Option<Streamer>> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
                     live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE mid = ?",
@@ -715,6 +739,7 @@ impl SqliteStore {
                     schedule_enabled: row.schedule_enabled != 0,
                     live_notify_enabled: row.live_notify_enabled != 0,
                     live_stats_enabled: row.live_stats_enabled != 0,
+                    fans: row.fans.and_then(|value| u64::try_from(value).ok()),
                     last_error: row.last_error,
                     last_refresh_at: parse_opt_ts(row.last_refresh_at.as_deref())?,
                     is_live: row.live_is_live != 0,
@@ -829,39 +854,134 @@ impl SqliteStore {
         self.get_streamer(id).await
     }
 
+    pub async fn record_fan_snapshot(
+        &self,
+        streamer_id: i64,
+        fans: u64,
+        captured_at: DateTime<Utc>,
+    ) -> AppResult<FanSnapshot> {
+        let fans_value =
+            i64::try_from(fans).map_err(|_| AppError::validation("粉丝数超出可存储范围"))?;
+        let captured_at = captured_at.to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(format!("主播 {streamer_id}")));
+        }
+        sqlx::query(
+            "INSERT INTO fan_snapshots(streamer_id, captured_at, fans)
+             VALUES(?, ?, ?)
+             ON CONFLICT(streamer_id, captured_at) DO UPDATE SET fans = excluded.fans",
+        )
+        .bind(streamer_id)
+        .bind(&captured_at)
+        .bind(fans_value)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE streamers SET fans = ?, updated_at = ?, revision = revision + 1
+             WHERE id = ? AND (fans IS NULL OR fans <> ?)
+               AND ? = (
+                   SELECT captured_at FROM fan_snapshots
+                   WHERE streamer_id = ? ORDER BY captured_at DESC LIMIT 1
+               )",
+        )
+        .bind(fans_value)
+        .bind(Utc::now().to_rfc3339())
+        .bind(streamer_id)
+        .bind(fans_value)
+        .bind(&captured_at)
+        .bind(streamer_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() > 0 {
+            self.emit_streamer_change(&mut tx, streamer_id, "upsert", SyncActor::system())
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(FanSnapshot {
+            captured_at: parse_ts(&captured_at)?,
+            fans,
+        })
+    }
+
+    pub async fn list_fan_snapshots(
+        &self,
+        streamer_id: i64,
+        since: DateTime<Utc>,
+    ) -> AppResult<Vec<FanSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT captured_at, fans FROM fan_snapshots
+             WHERE streamer_id = ? AND captured_at >= ?
+             ORDER BY captured_at",
+        )
+        .bind(streamer_id)
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let fans: i64 = row.try_get("fans")?;
+                Ok(FanSnapshot {
+                    captured_at: parse_ts(row.try_get::<String, _>("captured_at")?.as_str())?,
+                    fans: u64::try_from(fans)
+                        .map_err(|_| AppError::validation("粉丝快照数据损坏"))?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn update_subscription(
         &self,
         id: i64,
         update: &UpdateSubscription,
     ) -> AppResult<Streamer> {
-        let mut streamer = self.get_streamer(id).await?;
-        if let Some(value) = update.schedule_enabled {
-            streamer.schedule_enabled = value;
-        }
-        if let Some(value) = update.live_notify_enabled {
-            streamer.live_notify_enabled = value;
-        }
-        if let Some(value) = update.live_stats_enabled {
-            streamer.live_stats_enabled = value;
-        }
-        if let Some(aliases) = &update.aliases {
-            streamer.aliases = normalize_aliases(aliases.clone(), &streamer.name);
-        }
-        let aliases_json = serde_json::to_string(&streamer.aliases)?;
-        let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
-            "UPDATE streamers SET schedule_enabled = ?, live_notify_enabled = ?,
-                    live_stats_enabled = ?, aliases_json = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
+        let current = sqlx::query("SELECT name, revision FROM streamers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("主播 {id}")))?;
+        let current_name: String = current.try_get("name")?;
+        let current_revision: i64 = current.try_get("revision")?;
+        let changed = update.schedule_enabled.is_some()
+            || update.live_notify_enabled.is_some()
+            || update.live_stats_enabled.is_some()
+            || update.aliases.is_some();
+        if !changed {
+            tx.commit().await?;
+            return self.get_streamer(id).await;
+        }
+        let aliases_json = update
+            .aliases
+            .as_ref()
+            .map(|aliases| normalize_aliases(aliases.clone(), &current_name))
+            .map(|aliases| serde_json::to_string(&aliases))
+            .transpose()?;
+        let updated = sqlx::query(
+            "UPDATE streamers SET
+                    schedule_enabled = COALESCE(?, schedule_enabled),
+                    live_notify_enabled = COALESCE(?, live_notify_enabled),
+                    live_stats_enabled = COALESCE(?, live_stats_enabled),
+                    aliases_json = COALESCE(?, aliases_json),
+                    updated_at = ?, revision = revision + 1
+             WHERE id = ? AND revision = ?",
         )
-        .bind(streamer.schedule_enabled)
-        .bind(streamer.live_notify_enabled)
-        .bind(streamer.live_stats_enabled)
-        .bind(aliases_json)
-        .bind(now)
+        .bind(update.schedule_enabled)
+        .bind(update.live_notify_enabled)
+        .bind(update.live_stats_enabled)
+        .bind(aliases_json.as_deref())
+        .bind(Utc::now().to_rfc3339())
         .bind(id)
+        .bind(current_revision)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::validation("主播设置在更新期间已被修改"));
+        }
         self.emit_streamer_change(&mut tx, id, "upsert", SyncActor::system())
             .await?;
         tx.commit().await?;
@@ -1494,6 +1614,113 @@ impl SqliteStore {
         tx.commit().await?;
         self.get_schedule(schedule_id).await
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_and_delete_schedule_duplicate(
+        &self,
+        canonical_id: i64,
+        canonical_revision: i64,
+        duplicate_id: i64,
+        duplicate_revision: i64,
+        duplicate_input: &NewSchedule,
+        merge_input: Option<&NewSchedule>,
+    ) -> AppResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let canonical = sqlx::query(
+            "SELECT manual_locked, revision FROM schedules WHERE id = ?",
+        )
+        .bind(canonical_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("日程 {canonical_id}")))?;
+        let canonical_locked: i64 = canonical.try_get("manual_locked")?;
+        let current_canonical_revision: i64 = canonical.try_get("revision")?;
+
+        let duplicate = sqlx::query(
+            "SELECT manual_locked, revision FROM schedules WHERE id = ?",
+        )
+        .bind(duplicate_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("日程 {duplicate_id}")))?;
+        let duplicate_locked: i64 = duplicate.try_get("manual_locked")?;
+        let current_duplicate_revision: i64 = duplicate.try_get("revision")?;
+
+        if duplicate_locked != 0
+            || current_duplicate_revision != duplicate_revision
+            || current_canonical_revision != canonical_revision
+            || (merge_input.is_some() && canonical_locked != 0)
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        if let Some(merge_input) = merge_input {
+            let updated = sqlx::query(
+                "UPDATE schedules SET participants_json = ?, title = ?, start_at = ?, end_at = ?,
+                        room_url = ?, room_owner_mid = ?, room_owner_name = ?, confidence = ?,
+                        source_kind = ?, source_post_id = ?, source_image_url = ?,
+                        source_author_mid = ?, source_fingerprint = ?, source_published_at = ?,
+                        updated_at = ?, revision = revision + 1
+                 WHERE id = ? AND manual_locked = 0 AND revision = ?",
+            )
+            .bind(serde_json::to_string(&merge_input.participants)?)
+            .bind(&merge_input.title)
+            .bind(merge_input.start_at.to_rfc3339())
+            .bind(merge_input.end_at.map(|value| value.to_rfc3339()))
+            .bind(&merge_input.room_url)
+            .bind(&merge_input.room_owner_mid)
+            .bind(&merge_input.room_owner_name)
+            .bind(merge_input.confidence)
+            .bind(&merge_input.source_kind)
+            .bind(&merge_input.source_post_id)
+            .bind(&merge_input.source_image_url)
+            .bind(&merge_input.source_author_mid)
+            .bind(&merge_input.source_fingerprint)
+            .bind(merge_input.source_published_at.map(|value| value.to_rfc3339()))
+            .bind(Utc::now().to_rfc3339())
+            .bind(canonical_id)
+            .bind(canonical_revision)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(AppError::validation("团播日程在合并期间已被修改"));
+            }
+            self.emit_schedule_change(&mut tx, canonical_id, "upsert", SyncActor::collector())
+                .await?;
+            self.attach_schedule_source_on(
+                &mut tx,
+                canonical_id,
+                merge_input,
+                SyncActor::collector(),
+            )
+            .await?;
+        } else {
+            self.attach_schedule_source_on(
+                &mut tx,
+                canonical_id,
+                duplicate_input,
+                SyncActor::collector(),
+            )
+            .await?;
+        }
+
+        if !self
+            .delete_schedule_on(
+                &mut tx,
+                duplicate_id,
+                true,
+                Some(duplicate_revision),
+                SyncActor::collector(),
+            )
+            .await?
+        {
+            return Err(AppError::validation("团播日程在删除期间已被修改"));
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn get_schedule(&self, id: i64) -> AppResult<Schedule> {
         let row = sqlx::query_as::<_, ScheduleRow>(
             "SELECT s.id, s.streamer_id, st.name AS streamer_name, st.avatar_url AS streamer_avatar,
@@ -1556,11 +1783,90 @@ impl SqliteStore {
         .await?;
         rows.into_iter().map(map_schedule).collect()
     }
+    async fn get_schedule_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        id: i64,
+    ) -> AppResult<Schedule> {
+        let row = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT s.id, s.streamer_id, st.name AS streamer_name, st.avatar_url AS streamer_avatar,
+                    s.participants_json, s.title, s.start_at, s.end_at, s.room_url,
+                    s.room_owner_mid, s.room_owner_name, s.source_kind, s.source_post_id,
+                    s.source_image_url, s.source_author_mid, s.source_fingerprint, s.source_identity,
+                    s.source_published_at, s.weekly_rule_id, s.weekly_occurrence_date, s.confidence,
+                    s.manual_locked, s.source_changed, s.cancelled, s.created_at, s.updated_at,
+                    s.revision
+             FROM schedules s JOIN streamers st ON st.id = s.streamer_id WHERE s.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("日程 {id}")))?;
+        map_schedule(row)
+    }
+
+    async fn weekly_rule_exists_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        rule_id: i64,
+    ) -> AppResult<bool> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM weekly_schedule_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        Ok(id.is_some())
+    }
+
+    async fn clear_orphan_weekly_schedule_links_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> AppResult<()> {
+        let schedule_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT s.id FROM schedules s
+             WHERE (s.weekly_rule_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM weekly_schedule_rules r WHERE r.id = s.weekly_rule_id
+                    ))
+                OR (s.weekly_rule_id IS NULL AND s.weekly_occurrence_date IS NOT NULL)
+             ORDER BY s.id",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        for schedule_id in schedule_ids {
+            sqlx::query(
+                "UPDATE schedules SET weekly_rule_id = NULL, weekly_occurrence_date = NULL,
+                        updated_at = ?, revision = revision + 1 WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(schedule_id)
+            .execute(&mut *conn)
+            .await?;
+            self.emit_schedule_change(conn, schedule_id, "upsert", SyncActor::system())
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn update_schedule(&self, id: i64, update: &UpdateSchedule) -> AppResult<Schedule> {
-        let current = self.get_schedule(id).await?;
-        let weekly_scope = current
-            .weekly_rule_id
-            .zip(current.weekly_occurrence_date.clone());
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = self.get_schedule_on(&mut tx, id).await?;
+        let current_revision = current.revision;
+        let weekly_scope = if let (Some(rule_id), Some(occurrence_date)) = (
+            current.weekly_rule_id,
+            current.weekly_occurrence_date.clone(),
+        ) {
+            if self.weekly_rule_exists_on(&mut tx, rule_id).await? {
+                Some((rule_id, occurrence_date))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let clear_orphan_weekly_link = match current.weekly_rule_id {
+            Some(_) => weekly_scope.is_none(),
+            None => current.weekly_occurrence_date.is_some(),
+        };
         let title = update
             .title
             .as_deref()
@@ -1583,26 +1889,37 @@ impl SqliteStore {
             validate_live_url(url)?;
         }
         if let Some((rule_id, occurrence_date)) = weekly_scope {
-            self.save_weekly_exception(rule_id, &occurrence_date, "override", Some(id))
-                .await?;
+            self.save_weekly_exception_on(
+                &mut tx,
+                rule_id,
+                &occurrence_date,
+                "override",
+                Some(id),
+                SyncActor::system(),
+            )
+            .await?;
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE schedules SET title = ?, start_at = ?, end_at = ?, room_url = ?,
                     room_owner_mid = NULL, room_owner_name = NULL,
+                    weekly_rule_id = CASE WHEN ? THEN NULL ELSE weekly_rule_id END,
+                    weekly_occurrence_date = CASE WHEN ? THEN NULL ELSE weekly_occurrence_date END,
                     manual_locked = 1, source_changed = 0, updated_at = ?, revision = revision + 1
-             WHERE id = ?",
+             WHERE id = ? AND revision = ?",
         )
         .bind(title)
         .bind(start_at.to_rfc3339())
         .bind(end_at.map(|value| value.to_rfc3339()))
         .bind(room_url)
+        .bind(clear_orphan_weekly_link)
+        .bind(clear_orphan_weekly_link)
         .bind(Utc::now().to_rfc3339())
         .bind(id)
+        .bind(current_revision)
         .execute(&mut *tx)
         .await?;
-        if updated.rows_affected() == 0 {
-            return Err(AppError::not_found(format!("日程 {id}")));
+        if updated.rows_affected() != 1 {
+            return Err(AppError::validation("日程在更新期间已被修改"));
         }
         self.emit_schedule_change(&mut tx, id, "upsert", SyncActor::system())
             .await?;
@@ -1707,6 +2024,15 @@ impl SqliteStore {
         &self,
         input: &NewWeeklyScheduleRule,
     ) -> AppResult<WeeklyScheduleRule> {
+        self.add_weekly_rule_idempotent(input)
+            .await
+            .map(|(rule, _)| rule)
+    }
+
+    pub async fn add_weekly_rule_idempotent(
+        &self,
+        input: &NewWeeklyScheduleRule,
+    ) -> AppResult<(WeeklyScheduleRule, bool)> {
         crate::weekly::validate_rule_fields(
             &input.title,
             input.weekdays_mask,
@@ -1726,6 +2052,23 @@ impl SqliteStore {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query(
+            "SELECT id, streamer_id FROM weekly_schedule_rules WHERE rule_key = ?",
+        )
+        .bind(&rule_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = existing {
+            let id: i64 = row.try_get("id")?;
+            let existing_streamer_id: i64 = row.try_get("streamer_id")?;
+            if existing_streamer_id != input.streamer_id {
+                return Err(AppError::validation(format!(
+                    "周表 ruleKey 已被主播 {existing_streamer_id} 使用"
+                )));
+            }
+            tx.commit().await?;
+            return Ok((self.get_weekly_rule(id).await?, false));
+        }
         let id = sqlx::query(
             "INSERT INTO weekly_schedule_rules
              (rule_key, streamer_id, title, weekdays_mask, start_time, end_time, timezone,
@@ -1751,7 +2094,7 @@ impl SqliteStore {
         self.emit_weekly_rule_change(&mut tx, id, "upsert", SyncActor::system())
             .await?;
         tx.commit().await?;
-        self.get_weekly_rule(id).await
+        Ok((self.get_weekly_rule(id).await?, true))
     }
 
     pub async fn update_weekly_rule(
@@ -1759,28 +2102,46 @@ impl SqliteStore {
         id: i64,
         update: &UpdateWeeklyScheduleRule,
     ) -> AppResult<WeeklyScheduleRule> {
-        let current = self.get_weekly_rule(id).await?;
-        let title = update.title.clone().unwrap_or(current.title);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current_row = sqlx::query_as::<_, WeeklyScheduleRuleRow>(
+            "SELECT id, rule_key, streamer_id, title, weekdays_mask, start_time, end_time,
+                    timezone, room_url, effective_from, effective_until, enabled,
+                    created_at, updated_at, revision
+             FROM weekly_schedule_rules WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("固定周表 {id}")))?;
+        let current = map_weekly_rule(current_row)?;
+        let current_revision = current.revision;
+        let title = update.title.clone().unwrap_or_else(|| current.title.clone());
         let weekdays_mask = update.weekdays_mask.unwrap_or(current.weekdays_mask);
-        let start_time = update.start_time.clone().unwrap_or(current.start_time);
+        let start_time = update
+            .start_time
+            .clone()
+            .unwrap_or_else(|| current.start_time.clone());
         let end_time = if update.clear_end_time {
             None
         } else {
-            update.end_time.clone().or(current.end_time)
+            update.end_time.clone().or_else(|| current.end_time.clone())
         };
         let room_url = if update.clear_room_url {
             None
         } else {
-            update.room_url.clone().or(current.room_url)
+            update.room_url.clone().or_else(|| current.room_url.clone())
         };
         let effective_from = update
             .effective_from
             .clone()
-            .unwrap_or(current.effective_from);
+            .unwrap_or_else(|| current.effective_from.clone());
         let effective_until = if update.clear_effective_until {
             None
         } else {
-            update.effective_until.clone().or(current.effective_until)
+            update
+                .effective_until
+                .clone()
+                .or_else(|| current.effective_until.clone())
         };
         let enabled = update.enabled.unwrap_or(current.enabled);
         crate::weekly::validate_rule_fields(
@@ -1793,24 +2154,53 @@ impl SqliteStore {
             &effective_from,
             effective_until.as_deref(),
         )?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
-            "UPDATE weekly_schedule_rules SET title = ?, weekdays_mask = ?, start_time = ?,
-                    end_time = ?, room_url = ?, effective_from = ?, effective_until = ?,
-                    enabled = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
+        let changed = update.title.is_some()
+            || update.weekdays_mask.is_some()
+            || update.start_time.is_some()
+            || update.end_time.is_some()
+            || update.clear_end_time
+            || update.room_url.is_some()
+            || update.clear_room_url
+            || update.effective_from.is_some()
+            || update.effective_until.is_some()
+            || update.clear_effective_until
+            || update.enabled.is_some();
+        if !changed {
+            tx.commit().await?;
+            return Ok(current);
+        }
+        let updated = sqlx::query(
+            "UPDATE weekly_schedule_rules SET
+                    title = COALESCE(?, title),
+                    weekdays_mask = COALESCE(?, weekdays_mask),
+                    start_time = COALESCE(?, start_time),
+                    end_time = CASE WHEN ? THEN NULL ELSE COALESCE(?, end_time) END,
+                    room_url = CASE WHEN ? THEN NULL ELSE COALESCE(?, room_url) END,
+                    effective_from = COALESCE(?, effective_from),
+                    effective_until = CASE WHEN ? THEN NULL ELSE COALESCE(?, effective_until) END,
+                    enabled = COALESCE(?, enabled),
+                    updated_at = ?, revision = revision + 1
+             WHERE id = ? AND revision = ?",
         )
-        .bind(title.trim())
-        .bind(weekdays_mask)
-        .bind(start_time.trim())
-        .bind(end_time.as_deref().map(str::trim))
-        .bind(room_url.as_deref())
-        .bind(&effective_from)
-        .bind(effective_until.as_deref())
-        .bind(enabled)
+        .bind(update.title.as_deref().map(str::trim))
+        .bind(update.weekdays_mask)
+        .bind(update.start_time.as_deref().map(str::trim))
+        .bind(update.clear_end_time)
+        .bind(update.end_time.as_deref().map(str::trim))
+        .bind(update.clear_room_url)
+        .bind(update.room_url.as_deref())
+        .bind(update.effective_from.as_deref())
+        .bind(update.clear_effective_until)
+        .bind(update.effective_until.as_deref())
+        .bind(update.enabled)
         .bind(Utc::now().to_rfc3339())
         .bind(id)
+        .bind(current_revision)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::validation("固定周表在更新期间已被修改"));
+        }
         self.emit_weekly_rule_change(&mut tx, id, "upsert", SyncActor::system())
             .await?;
         tx.commit().await?;
@@ -1819,6 +2209,7 @@ impl SqliteStore {
 
     pub async fn delete_weekly_rule(&self, id: i64) -> AppResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.clear_orphan_weekly_schedule_links_on(&mut tx).await?;
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT id FROM weekly_schedule_rules WHERE id = ?")
                 .bind(id)
@@ -1865,10 +2256,15 @@ impl SqliteStore {
             .bind(Utc::now().to_rfc3339())
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM weekly_schedule_exceptions WHERE rule_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM weekly_schedule_rules WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        self.clear_orphan_weekly_schedule_links_on(&mut tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2012,29 +2408,58 @@ impl SqliteStore {
         Ok(id)
     }
 
-    pub async fn delete_schedule(&self, id: i64) -> AppResult<()> {
-        let schedule = self.get_schedule(id).await?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let (Some(rule_id), Some(occurrence_date)) = (
-            schedule.weekly_rule_id,
-            schedule.weekly_occurrence_date.as_deref(),
-        ) {
-            self.save_weekly_exception_on(
-                &mut tx,
-                rule_id,
-                occurrence_date,
-                "skip",
-                None,
-                SyncActor::system(),
-            )
-            .await?;
+    async fn delete_schedule_on(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        require_unlocked: bool,
+        expected_revision: Option<i64>,
+        actor: SyncActor<'_>,
+    ) -> AppResult<bool> {
+        let state = sqlx::query(
+            "SELECT streamer_id, source_kind, source_post_id, source_fingerprint,
+                    weekly_rule_id, weekly_occurrence_date, manual_locked, revision
+             FROM schedules WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("日程 {id}")))?;
+        let streamer_id: i64 = state.try_get("streamer_id")?;
+        let source_kind: String = state.try_get("source_kind")?;
+        let source_post_id: Option<String> = state.try_get("source_post_id")?;
+        let source_fingerprint: Option<String> = state.try_get("source_fingerprint")?;
+        let weekly_rule_id: Option<i64> = state.try_get("weekly_rule_id")?;
+        let weekly_occurrence_date: Option<String> = state.try_get("weekly_occurrence_date")?;
+        let manual_locked: i64 = state.try_get("manual_locked")?;
+        let revision: i64 = state.try_get("revision")?;
+        if (require_unlocked && manual_locked != 0)
+            || expected_revision.is_some_and(|expected| expected != revision)
+        {
+            return Ok(false);
         }
-        if schedule.source_kind != "manual" {
+
+        if let (Some(rule_id), Some(occurrence_date)) =
+            (weekly_rule_id, weekly_occurrence_date.as_deref())
+        {
+            if self.weekly_rule_exists_on(tx, rule_id).await? {
+                self.save_weekly_exception_on(
+                    tx,
+                    rule_id,
+                    occurrence_date,
+                    "skip",
+                    None,
+                    SyncActor::system(),
+                )
+                .await?;
+            }
+        }
+        if source_kind != "manual" {
             let mut suppressions = Vec::new();
             if let (Some(post_id), Some(fingerprint)) =
-                (&schedule.source_post_id, &schedule.source_fingerprint)
+                (source_post_id.as_deref(), source_fingerprint.as_deref())
             {
-                suppressions.push((post_id.clone(), fingerprint.clone()));
+                suppressions.push((post_id.to_owned(), fingerprint.to_owned()));
             }
             let source_rows = sqlx::query(
                 "SELECT source_post_id, source_fingerprint FROM schedule_sources
@@ -2054,8 +2479,8 @@ impl SqliteStore {
             suppressions.dedup();
             for (post_id, fingerprint) in suppressions {
                 self.add_source_suppression_on(
-                    &mut tx,
-                    schedule.streamer_id,
+                    tx,
+                    streamer_id,
                     &post_id,
                     &fingerprint,
                     SyncActor::collector(),
@@ -2069,15 +2494,52 @@ impl SqliteStore {
                 .fetch_all(&mut *tx)
                 .await?;
         for source_id in source_ids {
-            self.emit_schedule_source_change(&mut tx, source_id, "delete", SyncActor::system())
+            self.emit_schedule_source_change(tx, source_id, "delete", SyncActor::system())
                 .await?;
         }
-        self.emit_schedule_change(&mut tx, id, "delete", SyncActor::system())
-            .await?;
-        sqlx::query("DELETE FROM schedules WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        self.emit_schedule_change(tx, id, "delete", actor).await?;
+        let deleted = match (require_unlocked, expected_revision) {
+            (true, Some(expected_revision)) => {
+                sqlx::query(
+                    "DELETE FROM schedules
+                     WHERE id = ? AND manual_locked = 0 AND revision = ?",
+                )
+                .bind(id)
+                .bind(expected_revision)
+                .execute(&mut *tx)
+                .await?
+            }
+            (true, None) => {
+                sqlx::query("DELETE FROM schedules WHERE id = ? AND manual_locked = 0")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?
+            }
+            (false, Some(expected_revision)) => {
+                sqlx::query("DELETE FROM schedules WHERE id = ? AND revision = ?")
+                    .bind(id)
+                    .bind(expected_revision)
+                    .execute(&mut *tx)
+                    .await?
+            }
+            (false, None) => {
+                sqlx::query("DELETE FROM schedules WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?
+            }
+        };
+        Ok(deleted.rows_affected() == 1)
+    }
+
+    pub async fn delete_schedule(&self, id: i64) -> AppResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !self
+            .delete_schedule_on(&mut tx, id, false, None, SyncActor::system())
+            .await?
+        {
+            return Err(AppError::not_found(format!("日程 {id}")));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -2218,29 +2680,85 @@ impl SqliteStore {
     }
 
     pub async fn record_streamer_error(&self, streamer_id: i64, error: &str) -> AppResult<()> {
-        sqlx::query("UPDATE streamers SET last_error = ?, updated_at = ? WHERE id = ?")
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = sqlx::query("SELECT last_error FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("主播 {streamer_id}")))?;
+        let previous_error: Option<String> = current.try_get("last_error")?;
+        if previous_error.as_deref() != Some(error) {
+            sqlx::query(
+                "UPDATE streamers SET last_error = ?, updated_at = ?,
+                        revision = revision + 1 WHERE id = ?",
+            )
             .bind(error)
             .bind(Utc::now().to_rfc3339())
             .bind(streamer_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+            self.emit_streamer_change(&mut tx, streamer_id, "upsert", SyncActor::collector())
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
+
     pub async fn record_refresh_result(
         &self,
         streamer_id: i64,
         error: Option<&str>,
     ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(format!("主播 {streamer_id}")));
+        }
         sqlx::query(
-            "UPDATE streamers SET last_refresh_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            "UPDATE streamers SET last_refresh_at = ?, last_error = ?, updated_at = ?,
+                    revision = revision + 1 WHERE id = ?",
         )
         .bind(&now)
         .bind(error)
         .bind(&now)
         .bind(streamer_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        self.emit_streamer_change(&mut tx, streamer_id, "upsert", SyncActor::collector())
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_refresh_result_preserving_error(
+        &self,
+        streamer_id: i64,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(format!("主播 {streamer_id}")));
+        }
+        sqlx::query(
+            "UPDATE streamers SET last_refresh_at = ?, updated_at = ?,
+                    revision = revision + 1 WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(streamer_id)
+        .execute(&mut *tx)
+        .await?;
+        self.emit_streamer_change(&mut tx, streamer_id, "upsert", SyncActor::collector())
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2291,7 +2809,7 @@ impl SqliteStore {
         let room_id = room_id.trim();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
-            "SELECT id, streamer_name, room_id, title, cover_url, collector_state
+            "SELECT id, streamer_name, room_id, title, cover_url, collector_state, ended_at
              FROM live_sessions WHERE streamer_id = ? AND started_at = ?",
         )
         .bind(streamer_id)
@@ -2305,12 +2823,37 @@ impl SqliteStore {
             let existing_title: String = row.try_get("title")?;
             let existing_cover: Option<String> = row.try_get("cover_url")?;
             let existing_state: String = row.try_get("collector_state")?;
+            let existing_ended_at: Option<String> = row.try_get("ended_at")?;
+            let reset_for_new_run = existing_ended_at.is_some() || existing_state != "active";
             let changed = existing_room_id != room_id
                 || existing_streamer_name != streamer_name
                 || existing_title != title
                 || (cover_url.is_some() && existing_cover.as_deref() != cover_url)
-                || existing_state != "active";
-            if changed {
+                || reset_for_new_run;
+            if reset_for_new_run {
+                sqlx::query(
+                    "UPDATE live_sessions
+                     SET streamer_name = ?, room_id = ?, title = ?,
+                         cover_url = COALESCE(?, cover_url), ended_at = NULL,
+                         duration_seconds = 0, peak_online = 0, peak_high_energy = 0,
+                         avg_online = 0, online_samples = 0, online_total = 0,
+                         revenue_cents = 0, gift_revenue_cents = 0,
+                         super_chat_revenue_cents = 0, guard_revenue_cents = 0,
+                         paid_user_count = 0, interactive_user_count = 0,
+                         danmaku_count = 0, gift_count = 0, super_chat_count = 0,
+                         guard_count = 0, reconnect_count = 0, data_quality = 'collecting',
+                         collector_state = 'active', updated_at = ?, revision = revision + 1
+                     WHERE id = ?",
+                )
+                .bind(streamer_name)
+                .bind(room_id)
+                .bind(title)
+                .bind(cover_url)
+                .bind(&now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            } else if changed {
                 sqlx::query(
                     "UPDATE live_sessions
                      SET streamer_name = ?, room_id = ?, title = ?,
@@ -2359,7 +2902,7 @@ impl SqliteStore {
     pub async fn get_live_session(&self, id: i64) -> AppResult<LiveSession> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                    duration_seconds, peak_online, avg_online, online_samples, online_total,
+                    duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
                     super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2382,7 +2925,7 @@ impl SqliteStore {
         let rows = if let Some(streamer_id) = streamer_id {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2397,7 +2940,7 @@ impl SqliteStore {
         } else {
             sqlx::query_as::<_, LiveSessionRow>(
                 "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                        duration_seconds, peak_online, avg_online, online_samples, online_total,
+                        duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
                         super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -2417,7 +2960,7 @@ impl SqliteStore {
     ) -> AppResult<Option<LiveSession>> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT ls.id, ls.streamer_id, ls.streamer_name, ls.room_id, ls.title, ls.cover_url,
-                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.avg_online,
+                    ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.peak_high_energy, ls.avg_online,
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
                     ls.interactive_user_count, ls.danmaku_count, ls.gift_count, ls.super_chat_count,
@@ -2437,39 +2980,6 @@ impl SqliteStore {
         row.map(map_live_session).transpose()
     }
 
-    pub async fn record_live_online(
-        &self,
-        streamer_id: i64,
-        online: u64,
-        checked_at: DateTime<Utc>,
-    ) -> AppResult<()> {
-        let online = online as i64;
-        let checked = checked_at.to_rfc3339();
-        sqlx::query(
-            "UPDATE live_sessions
-             SET peak_online = MAX(peak_online, ?),
-                 online_total = online_total + ?,
-                 online_samples = online_samples + 1,
-                 avg_online = ((online_total + ?) / (online_samples + 1)),
-                 duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 updated_at = ?
-             WHERE id = (
-                 SELECT id FROM live_sessions
-                 WHERE streamer_id = ? AND ended_at IS NULL
-                 ORDER BY started_at DESC LIMIT 1
-             )",
-        )
-        .bind(online)
-        .bind(online)
-        .bind(online)
-        .bind(&checked)
-        .bind(&checked)
-        .bind(streamer_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn update_live_session_stats(
         &self,
         id: i64,
@@ -2478,13 +2988,14 @@ impl SqliteStore {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE live_sessions
-             SET revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+             SET peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = ?, updated_at = ?,
                  revision = revision + 1
-             WHERE id = ?",
+             WHERE id = ? AND ended_at IS NULL",
         )
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -2522,7 +3033,7 @@ impl SqliteStore {
             "UPDATE live_sessions
              SET ended_at = ?,
                  duration_seconds = CAST(MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS INTEGER),
-                 revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
+                 peak_high_energy = ?, revenue_cents = ?, gift_revenue_cents = ?, super_chat_revenue_cents = ?,
                  guard_revenue_cents = ?, paid_user_count = ?, interactive_user_count = ?,
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = 'finished', updated_at = ?,
@@ -2531,6 +3042,7 @@ impl SqliteStore {
         )
         .bind(&ended)
         .bind(&ended)
+        .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
         .bind(stats.gift_revenue_cents)
         .bind(stats.super_chat_revenue_cents)
@@ -2554,25 +3066,34 @@ impl SqliteStore {
         tx.commit().await?;
         Ok(())
     }
-    pub async fn finish_open_live_session(
+    pub async fn latest_open_live_session(
         &self,
         streamer_id: i64,
-        ended_at: DateTime<Utc>,
-    ) -> AppResult<()> {
-        let ended = ended_at.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM live_sessions
+    ) -> AppResult<Option<LiveSession>> {
+        let row = sqlx::query_as::<_, LiveSessionRow>(
+            "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+                    duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
+                    revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
+                    paid_user_count, interactive_user_count, danmaku_count, gift_count,
+                    super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                    created_at, updated_at, revision
+             FROM live_sessions
              WHERE streamer_id = ? AND ended_at IS NULL
              ORDER BY started_at DESC LIMIT 1",
         )
         .bind(streamer_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await?;
-        let Some(id) = id else {
-            tx.commit().await?;
-            return Ok(());
-        };
+        row.map(map_live_session).transpose()
+    }
+
+    pub async fn finish_open_live_session(
+        &self,
+        id: i64,
+        ended_at: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let ended = ended_at.to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE live_sessions
              SET ended_at = ?,
@@ -2668,32 +3189,42 @@ impl SqliteStore {
 
     pub async fn set_settings(&self, values: &[(&str, String)]) -> AppResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed_at = Utc::now().to_rfc3339();
         let mut server_settings_changed = false;
         for (key, value) in values {
             ensure_setting_key_allowed(key)?;
-            server_settings_changed |= matches!(
-                *key,
-                "live_poll_seconds"
-                    | "dynamic_poll_seconds"
-                    | "auto_analyze_images"
-                    | "live_stats_enabled"
-                    | "llm_base_url"
-                    | "llm_model"
-                    | "llm_prompt_version"
-                    | "proxy_port"
-            );
-            sqlx::query(
-                "INSERT INTO settings (key, value, updated_at, revision) VALUES (?, ?, ?, 1)
+            let server_key = is_server_setting_key(key);
+            let revision = if server_key {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(MAX(revision), 0) + 1 FROM settings
+                     WHERE key IN (
+                        'live_poll_seconds', 'dynamic_poll_seconds', 'auto_analyze_images',
+                        'live_stats_enabled', 'llm_base_url', 'llm_model',
+                        'llm_prompt_version', 'proxy_port'
+                     )",
+                )
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                1
+            };
+            let changed = sqlx::query(
+                "INSERT INTO settings (key, value, updated_at, revision) VALUES (?, ?, ?, ?)
                  ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value,
                     updated_at = excluded.updated_at,
-                    revision = settings.revision + 1",
+                    revision = MAX(settings.revision + 1, excluded.revision)
+                 WHERE settings.value <> excluded.value",
             )
             .bind(*key)
             .bind(value)
-            .bind(Utc::now().to_rfc3339())
+            .bind(&changed_at)
+            .bind(revision)
             .execute(&mut *tx)
             .await?;
+            if changed.rows_affected() > 0 && server_key {
+                server_settings_changed = true;
+            }
         }
         if server_settings_changed {
             self.emit_server_settings_change(&mut tx, SyncActor::system())
@@ -2895,6 +3426,16 @@ impl SqliteStore {
 }
 
 fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
+    let started_at = parse_ts(&row.started_at)?;
+    let ended_at = parse_opt_ts(row.ended_at.as_deref())?;
+    let duration_seconds = if ended_at.is_none() {
+        Utc::now()
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .max(0)
+    } else {
+        row.duration_seconds
+    };
     Ok(LiveSession {
         id: row.id,
         streamer_id: row.streamer_id,
@@ -2902,10 +3443,11 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         room_id: row.room_id,
         title: row.title,
         cover_url: row.cover_url,
-        started_at: parse_ts(&row.started_at)?,
-        ended_at: parse_opt_ts(row.ended_at.as_deref())?,
-        duration_seconds: row.duration_seconds,
+        started_at,
+        ended_at,
+        duration_seconds,
         peak_online: row.peak_online.max(0) as u64,
+        peak_high_energy: row.peak_high_energy.max(0) as u64,
         avg_online: row.avg_online.max(0) as u64,
         online_samples: row.online_samples,
         online_total: row.online_total,
@@ -3097,6 +3639,20 @@ fn validate_live_url(url: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn is_server_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "live_poll_seconds"
+            | "dynamic_poll_seconds"
+            | "auto_analyze_images"
+            | "live_stats_enabled"
+            | "llm_base_url"
+            | "llm_model"
+            | "llm_prompt_version"
+            | "proxy_port"
+    )
+}
+
 fn ensure_setting_key_allowed(key: &str) -> AppResult<()> {
     let lower = key.to_ascii_lowercase();
     if lower.contains("cookie")
@@ -3186,6 +3742,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fan_snapshots_update_current_count_and_do_not_regress_on_old_samples() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("300", "粉丝主播"))
+            .await
+            .expect("streamer");
+        assert_eq!(streamer.fans, None);
+        let start = Utc::now() - Duration::hours(2);
+        store
+            .record_fan_snapshot(streamer.id, 1_000, start)
+            .await
+            .expect("first");
+        store
+            .record_fan_snapshot(streamer.id, 1_100, start + Duration::hours(1))
+            .await
+            .expect("second");
+        store
+            .record_fan_snapshot(streamer.id, 900, start + Duration::minutes(30))
+            .await
+            .expect("older");
+        let current = store.get_streamer(streamer.id).await.expect("current");
+        assert_eq!(current.fans, Some(1_100));
+        let snapshots = store
+            .list_fan_snapshots(streamer.id, start)
+            .await
+            .expect("snapshots");
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].fans, 1_000);
+        assert_eq!(snapshots[2].fans, 1_100);
+    }
+
+    #[tokio::test]
     async fn consistent_backup_restores_subscriptions_and_schedules() {
         let directory =
             std::env::temp_dir().join(format!("oshical-backup-{}", uuid::Uuid::new_v4()));
@@ -3271,6 +3859,24 @@ mod tests {
         assert!(!loaded.live_notify_enabled);
         assert!(loaded.aliases.iter().any(|value| value == "B酱"));
         assert_eq!(loaded.linked_accounts.len(), 1);
+
+        let partially_updated = store
+            .update_subscription(
+                streamer.id,
+                &UpdateSubscription {
+                    live_stats_enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("partial update");
+        assert!(!partially_updated.schedule_enabled);
+        assert!(!partially_updated.live_notify_enabled);
+        assert!(partially_updated.live_stats_enabled);
+        assert!(partially_updated
+            .aliases
+            .iter()
+            .any(|value| value == "B酱"));
     }
 
     #[tokio::test]
@@ -3471,6 +4077,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamer_refresh_metadata_emits_sync_changes() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("204", "同步元数据主播"))
+            .await
+            .expect("streamer");
+        let before = store.sync_changes_after(0, 1000).await.expect("initial feed");
+        store
+            .record_streamer_error(streamer.id, "network failed")
+            .await
+            .expect("record error");
+        let after_error = store
+            .sync_changes_after(before.latest_seq, 10)
+            .await
+            .expect("error feed");
+        let change = after_error.changes.last().expect("error change");
+        assert_eq!(change.entity_type, "subscription");
+        assert_eq!(change.entity_id, streamer.id.to_string());
+        assert_eq!(
+            change
+                .payload
+                .as_ref()
+                .and_then(|value| value.get("lastError"))
+                .and_then(Value::as_str),
+            Some("network failed")
+        );
+
+        store
+            .record_streamer_error(streamer.id, "network failed")
+            .await
+            .expect("unchanged error");
+        let unchanged = store
+            .sync_changes_after(after_error.latest_seq, 10)
+            .await
+            .expect("unchanged feed");
+        assert!(unchanged.changes.is_empty());
+
+        store
+            .record_refresh_result(streamer.id, None)
+            .await
+            .expect("refresh result");
+        let refreshed = store
+            .sync_changes_after(unchanged.latest_seq, 10)
+            .await
+            .expect("refresh feed");
+        let change = refreshed.changes.last().expect("refresh change");
+        assert!(change.payload.as_ref().is_some_and(|value| {
+            value.get("lastRefreshAt").is_some_and(|value| !value.is_null())
+        }));
+    }
+
+    #[tokio::test]
     async fn sync_queue_is_idempotent() {
         let store = SqliteStore::in_memory().await.expect("db");
         let mutation = SyncMutation {
@@ -3502,13 +4160,119 @@ mod tests {
             .is_empty());
     }
     #[tokio::test]
+    async fn weekly_rule_creation_is_idempotent_by_caller_key() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let first_streamer = store
+            .add_subscription(&add_input("201", "周表甲"))
+            .await
+            .expect("first streamer");
+        let second_streamer = store
+            .add_subscription(&add_input("202", "周表乙"))
+            .await
+            .expect("second streamer");
+        let input = NewWeeklyScheduleRule {
+            rule_key: Some("client-weekly-key".to_owned()),
+            streamer_id: first_streamer.id,
+            title: "固定周表".to_owned(),
+            weekdays_mask: 0b0000_0001,
+            start_time: "20:00".to_owned(),
+            end_time: Some("22:00".to_owned()),
+            timezone: "Asia/Shanghai".to_owned(),
+            room_url: None,
+            effective_from: "2026-01-01".to_owned(),
+            effective_until: None,
+            enabled: true,
+        };
+        let (first, created) = store
+            .add_weekly_rule_idempotent(&input)
+            .await
+            .expect("first rule");
+        assert!(created);
+        let (retry, created_again) = store
+            .add_weekly_rule_idempotent(&input)
+            .await
+            .expect("retry rule");
+        assert!(!created_again);
+        assert_eq!(first.id, retry.id);
+        let updated = store
+            .update_weekly_rule(
+                first.id,
+                &UpdateWeeklyScheduleRule {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("partial weekly update");
+        assert_eq!(updated.title, first.title);
+        assert_eq!(updated.weekdays_mask, first.weekdays_mask);
+        assert_eq!(updated.start_time, first.start_time);
+        assert!(!updated.enabled);
+        assert_eq!(updated.revision, first.revision + 1);
+        let conflicting = NewWeeklyScheduleRule {
+            streamer_id: second_streamer.id,
+            ..input
+        };
+        assert!(store
+            .add_weekly_rule_idempotent(&conflicting)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn update_schedule_clears_dangling_weekly_reference() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("205", "悬空周表主播"))
+            .await
+            .expect("streamer");
+        let (schedule, _) = store
+            .upsert_schedule(&new_schedule(
+                streamer.id,
+                Utc::now() + Duration::days(1),
+            ))
+            .await
+            .expect("schedule");
+        {
+            let mut conn = store.pool.acquire().await.expect("connection");
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *conn)
+                .await
+                .expect("disable foreign keys");
+            sqlx::query(
+                "UPDATE schedules SET weekly_rule_id = 999999,
+                        weekly_occurrence_date = '2026-11-07' WHERE id = ?",
+            )
+            .bind(schedule.id)
+            .execute(&mut *conn)
+            .await
+            .expect("inject dangling reference");
+        }
+        let updated = store
+            .update_schedule(
+                schedule.id,
+                &UpdateSchedule {
+                    title: Some("清理悬空引用".to_owned()),
+                    start_at: None,
+                    end_at: None,
+                    room_url: None,
+                },
+            )
+            .await
+            .expect("update schedule");
+        assert_eq!(updated.title, "清理悬空引用");
+        assert!(updated.weekly_rule_id.is_none());
+        assert!(updated.weekly_occurrence_date.is_none());
+    }
+
+    #[tokio::test]
     async fn live_session_and_schedule_lookup() {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = store
             .add_subscription(&add_input("200", "乃琳"))
             .await
             .expect("streamer");
-        let start = Utc::now();
+        let start = Utc::now() - Duration::minutes(5);
         let session = store
             .ensure_live_session(
                 streamer.id,
@@ -3517,19 +4281,15 @@ mod tests {
                 "测试直播",
                 None,
                 start,
-                start,
+                Utc::now(),
             )
             .await
             .expect("session");
-        store
-            .record_live_online(streamer.id, 800, start + Duration::minutes(1))
-            .await
-            .expect("online");
-        store
-            .record_live_online(streamer.id, 1200, start + Duration::minutes(2))
-            .await
-            .expect("online");
+        let active = store.get_live_session(session.id).await.expect("active");
+        assert!(active.ended_at.is_none());
+        assert!(active.duration_seconds >= 299);
         let stats = LiveSessionStats {
+            peak_high_energy: 987,
             danmaku_count: 25_000,
             interactive_user_count: 4_014,
             paid_user_count: 977,
@@ -3553,11 +4313,60 @@ mod tests {
             .expect("lookup")
             .expect("matched session");
         assert_eq!(found.id, session.id);
-        assert_eq!(found.peak_online, 1200);
-        assert_eq!(found.avg_online, 1000);
-        assert_eq!(found.online_samples, 2);
+        assert_eq!(found.peak_high_energy, 987);
         assert_eq!(found.revenue_cents, 353_350);
         assert_eq!(found.danmaku_count, 25_000);
         assert_eq!(found.data_quality, "complete");
+    }
+
+    #[tokio::test]
+    async fn reopening_finished_live_session_resets_end_and_counters() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let streamer = store
+            .add_subscription(&add_input("203", "重开主播"))
+            .await
+            .expect("streamer");
+        let start = Utc::now() - Duration::minutes(10);
+        let session = store
+            .ensure_live_session(
+                streamer.id,
+                "12345",
+                &streamer.name,
+                "第一场",
+                None,
+                start,
+                Utc::now(),
+            )
+            .await
+            .expect("session");
+        store
+            .finish_open_live_session(session.id, start + Duration::minutes(5))
+            .await
+            .expect("finish");
+        let reopened = store
+            .ensure_live_session(
+                streamer.id,
+                "12345",
+                &streamer.name,
+                "重新开播",
+                None,
+                start,
+                Utc::now(),
+            )
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.id, session.id);
+        assert!(reopened.ended_at.is_none());
+        let stored_duration: i64 = sqlx::query_scalar(
+            "SELECT duration_seconds FROM live_sessions WHERE id = ?",
+        )
+        .bind(session.id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("stored duration");
+        assert_eq!(stored_duration, 0);
+        assert_eq!(reopened.danmaku_count, 0);
+        assert_eq!(reopened.revenue_cents, 0);
+        assert_eq!(reopened.collector_state, "active");
     }
 }

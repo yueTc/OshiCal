@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS sync_feed_meta (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sync_feed_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    feed_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -92,6 +98,7 @@ impl<'a> SyncActor<'a> {
 
 pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResult<()> {
     sqlx::raw_sql(SYNC_FEED_SCHEMA).execute(&mut *conn).await?;
+    sync_feed_id_on(conn).await?;
 
     for (table, column, definition) in [
         (
@@ -138,6 +145,11 @@ pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResu
             "settings",
             "revision",
             "ALTER TABLE settings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "live_sessions",
+            "peak_high_energy",
+            "ALTER TABLE live_sessions ADD COLUMN peak_high_energy INTEGER NOT NULL DEFAULT 0",
         ),
         (
             "live_sessions",
@@ -211,6 +223,7 @@ struct SyncStreamerRow {
     schedule_enabled: i64,
     live_notify_enabled: i64,
     live_stats_enabled: i64,
+    fans: Option<i64>,
     aliases_json: String,
     last_error: Option<String>,
     last_refresh_at: Option<String>,
@@ -270,6 +283,11 @@ struct SyncSuppressionRow {
     created_at: String,
 }
 impl SqliteStore {
+    pub async fn sync_feed_id(&self) -> AppResult<String> {
+        let mut conn = self.pool.acquire().await?;
+        sync_feed_id_on(&mut conn).await
+    }
+
     pub async fn append_sync_change(
         &self,
         entity_type: &str,
@@ -336,10 +354,13 @@ impl SqliteStore {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let boundary: Option<i64> = match policy {
             SyncPrunePolicy::Before(before_created_at) => {
-                sqlx::query_scalar("SELECT MAX(seq) FROM sync_changes WHERE created_at < ?")
-                    .bind(before_created_at.to_rfc3339())
-                    .fetch_one(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT MAX(seq) FROM sync_changes
+                     WHERE julianday(created_at) < julianday(?)",
+                )
+                .bind(before_created_at.to_rfc3339())
+                .fetch_one(&mut *tx)
+                .await?
             }
             SyncPrunePolicy::KeepLatest(max_rows) => {
                 if max_rows < 0 {
@@ -375,12 +396,14 @@ impl SqliteStore {
         }
         let limit = limit.clamp(1, SYNC_PAGE_MAX);
         let mut tx = self.pool.begin().await?;
+        let feed_id = sync_feed_id_on(&mut tx).await?;
         let latest_seq = latest_sync_seq_on(&mut tx).await?;
         let min_retained_seq = min_retained_sync_seq_on(&mut tx).await?;
-        if after < min_retained_seq.saturating_sub(1) {
+        if after < min_retained_seq.saturating_sub(1) || after > latest_seq {
             tx.commit().await?;
             return Ok(SyncChangesPage {
                 schema_version: SYNC_SCHEMA_VERSION,
+                feed_id,
                 from_seq: after.saturating_add(1),
                 to_seq: after,
                 latest_seq,
@@ -403,10 +426,37 @@ impl SqliteStore {
             .into_iter()
             .map(map_sync_change)
             .collect::<AppResult<Vec<_>>>()?;
+        // Seq values are a contiguous log contract. A missing row in the
+        // requested range means a client must rebuild from a snapshot rather
+        // than silently skip data. This also covers a meta/latest cursor that
+        // is ahead of the physical table after an interrupted/manual repair.
+        let has_gap = changes
+            .windows(2)
+            .any(|pair| pair[1].seq != pair[0].seq.saturating_add(1));
+        let starts_after_cursor = changes
+            .first()
+            .map_or(true, |change| change.seq == after.saturating_add(1));
+        let empty_before_latest = changes.is_empty() && after < latest_seq;
+        if has_gap || !starts_after_cursor || empty_before_latest {
+            tx.commit().await?;
+            return Ok(SyncChangesPage {
+                schema_version: SYNC_SCHEMA_VERSION,
+                feed_id,
+                from_seq: after.saturating_add(1),
+                to_seq: after,
+                latest_seq,
+                min_retained_seq,
+                has_more: false,
+                reset_required: true,
+                changes: Vec::new(),
+            });
+        }
+
         let to_seq = changes.last().map_or(after, |change| change.seq);
         tx.commit().await?;
         Ok(SyncChangesPage {
             schema_version: SYNC_SCHEMA_VERSION,
+            feed_id,
             from_seq: after.saturating_add(1),
             to_seq,
             latest_seq,
@@ -419,6 +469,7 @@ impl SqliteStore {
 
     pub async fn sync_bootstrap(&self) -> AppResult<SyncBootstrap> {
         let mut tx = self.pool.begin().await?;
+        let feed_id = sync_feed_id_on(&mut tx).await?;
         let snapshot_revision = latest_sync_seq_on(&mut tx).await?;
         let min_retained_seq = min_retained_sync_seq_on(&mut tx).await?;
         let subscriptions = load_streamers(&mut tx).await?;
@@ -433,6 +484,7 @@ impl SqliteStore {
         tx.commit().await?;
         Ok(SyncBootstrap {
             schema_version: SYNC_SCHEMA_VERSION,
+            feed_id,
             snapshot_revision,
             min_retained_seq,
             server_time: Utc::now(),
@@ -465,8 +517,7 @@ impl SqliteStore {
                 name = excluded.name,
                 platform = excluded.platform,
                 app_version = excluded.app_version,
-                last_seen_at = excluded.last_seen_at,
-                revoked_at = NULL",
+                last_seen_at = excluded.last_seen_at",
         )
         .bind(device_id)
         .bind(name.trim())
@@ -542,9 +593,18 @@ impl SqliteStore {
     }
 
     pub async fn ack_device(&self, device_id: &str, seq: i64) -> AppResult<DeviceInfo> {
+        let device_id = device_id.trim();
+        if device_id.is_empty() || device_id.chars().count() > 128 {
+            return Err(AppError::validation("设备 ID 长度必须为 1 到 128 字"));
+        }
         if seq < 0 {
             return Err(AppError::validation("设备确认序号不能为负数"));
         }
+
+        // Return the same snapshot that persisted the ACK. Reading through the
+        // pool after the UPDATE allowed a concurrent ACK/re-registration to
+        // change the response between write and read.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now().to_rfc3339();
         let updated = sqlx::query(
             "UPDATE devices SET last_seen_at = ?, last_ack_seq = MAX(last_ack_seq, ?)
@@ -553,12 +613,22 @@ impl SqliteStore {
         .bind(&now)
         .bind(seq)
         .bind(device_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if updated.rows_affected() == 0 {
             return Err(AppError::not_found(format!("设备 {device_id}")));
         }
-        self.get_device(device_id).await
+        let row = sqlx::query(
+            "SELECT device_id, name, platform, app_version, last_seen_at, last_ack_seq
+             FROM devices WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("设备 {device_id}")))?;
+        let device = map_device(row)?;
+        tx.commit().await?;
+        Ok(device)
     }
     pub(crate) async fn emit_streamer_change(
         &self,
@@ -604,10 +674,12 @@ impl SqliteStore {
         } else {
             None
         };
+        // Keep linked-account entity IDs stable across mirror rebuilds.
+        let entity_id = format!("{}:{}", row.streamer_id, row.mid);
         append_sync_change_on(
             conn,
             "linked_account",
-            &id.to_string(),
+            &entity_id,
             operation,
             row.revision,
             payload,
@@ -967,6 +1039,36 @@ async fn min_retained_sync_seq_on(conn: &mut SqliteConnection) -> AppResult<i64>
     })
 }
 
+async fn sync_feed_id_on(conn: &mut SqliteConnection) -> AppResult<String> {
+    if let Some(feed_id) = sqlx::query_scalar::<_, String>(
+        "SELECT feed_id FROM sync_feed_identity WHERE singleton = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(feed_id);
+    }
+
+    let feed_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO sync_feed_identity(singleton, feed_id, created_at) VALUES(1, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+             feed_id = CASE
+                 WHEN TRIM(sync_feed_identity.feed_id) = '' THEN excluded.feed_id
+                 ELSE sync_feed_identity.feed_id
+             END",
+    )
+    .bind(&feed_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query_scalar("SELECT feed_id FROM sync_feed_identity WHERE singleton = 1")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(AppError::from)
+}
+
 async fn feed_meta_on(conn: &mut SqliteConnection, key: &str) -> AppResult<Option<i64>> {
     Ok(
         sqlx::query_scalar("SELECT value FROM sync_feed_meta WHERE key = ?")
@@ -1012,16 +1114,16 @@ fn validate_device_input(
     platform: &str,
     app_version: &str,
 ) -> AppResult<()> {
-    if device_id.trim().is_empty() || device_id.len() > 128 {
+    if device_id.trim().is_empty() || device_id.chars().count() > 128 {
         return Err(AppError::validation("设备 ID 长度必须为 1 到 128 字"));
     }
     if name.trim().is_empty() || name.chars().count() > 80 {
         return Err(AppError::validation("设备名称长度必须为 1 到 80 字"));
     }
-    if platform.trim().is_empty() || platform.len() > 32 {
+    if platform.trim().is_empty() || platform.chars().count() > 32 {
         return Err(AppError::validation("设备平台长度必须为 1 到 32 字"));
     }
-    if app_version.trim().is_empty() || app_version.len() > 64 {
+    if app_version.trim().is_empty() || app_version.chars().count() > 64 {
         return Err(AppError::validation("应用版本长度必须为 1 到 64 字"));
     }
     Ok(())
@@ -1044,7 +1146,7 @@ fn map_device(row: sqlx::sqlite::SqliteRow) -> AppResult<DeviceInfo> {
 async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>> {
     let rows = sqlx::query_as::<_, SyncStreamerRow>(
         "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, aliases_json, last_error,
+                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
                 last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
                 live_checked_at, sort_order, created_at, revision
          FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
@@ -1077,7 +1179,7 @@ async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>>
 async fn load_streamer(conn: &mut SqliteConnection, id: i64) -> AppResult<Streamer> {
     let row = sqlx::query_as::<_, SyncStreamerRow>(
         "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, aliases_json, last_error,
+                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
                 last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
                 live_checked_at, sort_order, created_at, revision
          FROM streamers WHERE id = ?",
@@ -1117,6 +1219,7 @@ fn map_streamer_row(
         schedule_enabled: row.schedule_enabled != 0,
         live_notify_enabled: row.live_notify_enabled != 0,
         live_stats_enabled: row.live_stats_enabled != 0,
+        fans: row.fans.and_then(|value| u64::try_from(value).ok()),
         last_error: row.last_error,
         last_refresh_at: parse_opt_ts(row.last_refresh_at.as_deref())?,
         is_live: row.live_is_live != 0,
@@ -1437,7 +1540,7 @@ fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
 async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSession>> {
     let rows = sqlx::query_as::<_, LiveSessionRow>(
         "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                duration_seconds, peak_online, avg_online, online_samples, online_total,
+                duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
                 super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -1452,7 +1555,7 @@ async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSe
 async fn load_live_session_by_id(conn: &mut SqliteConnection, id: i64) -> AppResult<LiveSession> {
     let row = sqlx::query_as::<_, LiveSessionRow>(
         "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
-                duration_seconds, peak_online, avg_online, online_samples, online_total,
+                duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
                 super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
@@ -1694,6 +1797,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_feed_identity_is_stable_and_included_in_protocol_payloads() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let first = store.sync_feed_id().await.expect("feed id");
+        let second = store.sync_feed_id().await.expect("feed id");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 36);
+
+        let page = store.sync_changes_after(0, 10).await.expect("changes");
+        let bootstrap = store.sync_bootstrap().await.expect("bootstrap");
+        assert_eq!(page.feed_id, first);
+        assert_eq!(bootstrap.feed_id, first);
+    }
+
+    #[tokio::test]
+    async fn linked_account_changes_use_stable_entity_ids() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let streamer = add_streamer(&store, "100", "官号同步主播").await;
+        store
+            .add_linked_account(streamer.id, "200", "官号", "")
+            .await
+            .expect("link");
+        store
+            .remove_linked_account(streamer.id, "200")
+            .await
+            .expect("delete link");
+
+        let page = store
+            .sync_changes_after(0, 100)
+            .await
+            .expect("changes");
+        let changes: Vec<_> = page
+            .changes
+            .iter()
+            .filter(|change| change.entity_type == "linked_account")
+            .collect();
+        assert_eq!(changes.len(), 2);
+        let expected = format!("{}:200", streamer.id);
+        assert_eq!(changes[0].entity_id, expected);
+        assert_eq!(changes[0].operation, "upsert");
+        assert!(changes[0].payload.is_some());
+        assert_eq!(changes[1].entity_id, expected);
+        assert_eq!(changes[1].operation, "delete");
+        assert!(changes[1].payload.is_none());
+    }
+
+    #[tokio::test]
     async fn deleting_schedule_writes_a_tombstone() {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = add_streamer(&store, "101", "删除主播").await;
@@ -1894,6 +2043,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_ahead_of_latest_requires_reset() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let latest = store.latest_sync_seq().await.expect("latest");
+        let page = store
+            .sync_changes_after(latest.saturating_add(1), 100)
+            .await
+            .expect("page");
+        assert!(page.reset_required);
+        assert!(page.changes.is_empty());
+        assert_eq!(page.latest_seq, latest);
+    }
+
+    #[tokio::test]
     async fn retained_sequence_metadata_survives_reopen() {
         let directory =
             std::env::temp_dir().join(format!("oshical-sync-prune-{}", uuid::Uuid::new_v4()));
@@ -1903,6 +2065,7 @@ mod tests {
         let path = directory.join("sync.db");
 
         let store = SqliteStore::connect(&path).await.expect("store");
+        let feed_id = store.sync_feed_id().await.expect("feed id");
         for index in 0..3 {
             store
                 .append_sync_change(
@@ -1931,6 +2094,7 @@ mod tests {
         drop(store);
 
         let reopened = SqliteStore::connect(&path).await.expect("reopen");
+        assert_eq!(reopened.sync_feed_id().await.unwrap(), feed_id);
         assert_eq!(reopened.latest_sync_seq().await.unwrap(), latest);
         assert_eq!(reopened.min_retained_sync_seq().await.unwrap(), latest + 1);
         let next_seq = reopened
@@ -1944,6 +2108,7 @@ mod tests {
             .await
             .expect("changes");
         assert!(!changes.reset_required);
+        assert_eq!(changes.feed_id, feed_id);
         assert_eq!(changes.changes.len(), 1);
         assert_eq!(changes.changes[0].seq, latest + 1);
 
@@ -1999,13 +2164,8 @@ mod tests {
             .expect("unchanged session");
         assert_eq!(store.latest_sync_seq().await.unwrap(), after_create);
 
-        store
-            .record_live_online(streamer.id, 321, started_at + Duration::seconds(30))
-            .await
-            .expect("online sample");
-        assert_eq!(store.latest_sync_seq().await.unwrap(), after_create);
-
         let stats = LiveSessionStats {
+            peak_high_energy: 555,
             danmaku_count: 88,
             interactive_user_count: 12,
             paid_user_count: 3,
@@ -2031,8 +2191,8 @@ mod tests {
             88
         );
         assert_eq!(
-            checkpoint.changes[0].payload.as_ref().unwrap()["peakOnline"],
-            321
+            checkpoint.changes[0].payload.as_ref().unwrap()["peakHighEnergy"],
+            555
         );
 
         let finished_stats = LiveSessionStats {

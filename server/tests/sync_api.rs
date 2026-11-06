@@ -372,6 +372,36 @@ async fn websocket_v2_auth_catchup_ack_and_two_clients() {
 }
 
 #[tokio::test]
+async fn websocket_v2_forwards_live_status_notifications() {
+    let state = state().await;
+    let hub = state.hub.clone();
+    let app = build_router(state);
+    let address = serve(app).await;
+
+    let mut socket = connect_v2(address, 0, "device-live-status").await;
+    let auth = next_json(&mut socket).await.expect("auth");
+    assert_eq!(auth["type"], "auth_ok");
+
+    hub.send(json!({
+        "seq": 1,
+        "type": "live_status",
+        "payload": {
+            "streamerId": 1,
+            "streamerName": "开播测试",
+            "previousIsLive": false,
+            "isLive": true,
+            "liveNotifyEnabled": true
+        }
+    }))
+    .expect("broadcast live status");
+
+    let event = next_message_type(&mut socket, "live_status").await;
+    assert_eq!(event["payload"]["previousIsLive"], false);
+    assert_eq!(event["payload"]["isLive"], true);
+    assert_eq!(event["payload"]["liveNotifyEnabled"], true);
+}
+
+#[tokio::test]
 async fn refresh_job_endpoint_returns_background_job_id() {
     let state = state().await;
     let app = build_router(state);
@@ -514,6 +544,10 @@ async fn migration_preview_apply_and_event_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     assert_eq!(preview["data"]["conflicts"], json!([]));
+    let expected_digest = preview["data"]["serverStateDigest"]
+        .as_str()
+        .expect("preview server state digest")
+        .to_owned();
 
     let (status, applied) = call_json(
         &app,
@@ -523,6 +557,7 @@ async fn migration_preview_apply_and_event_round_trip() {
             "clientId": "device-a",
             "migrationId": "migration:device-a:1",
             "strategy": "server",
+            "expectedServerDigest": expected_digest,
             "snapshot": snapshot.clone()
         })),
         true,
@@ -539,6 +574,7 @@ async fn migration_preview_apply_and_event_round_trip() {
             "clientId": "device-a",
             "migrationId": "migration:device-a:1",
             "strategy": "server",
+            "expectedServerDigest": expected_digest,
             "snapshot": snapshot.clone()
         })),
         true,
@@ -597,6 +633,7 @@ async fn migration_preview_apply_and_event_round_trip() {
             "clientId": "device-a",
             "migrationId": "migration:device-a:1",
             "strategy": "server",
+            "expectedServerDigest": expected_digest,
             "snapshot": changed_snapshot
         })),
         true,
@@ -605,6 +642,23 @@ async fn migration_preview_apply_and_event_round_trip() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{conflict}");
     assert_eq!(conflict["error"]["code"], "MIGRATION_ID_CONFLICT");
 
+    let (status, stale) = call_json(
+        &app,
+        Method::POST,
+        "/api/migration/apply",
+        Some(json!({
+            "clientId": "device-a",
+            "migrationId": "migration:device-a:stale",
+            "strategy": "server",
+            "expectedServerDigest": expected_digest,
+            "snapshot": snapshot.clone()
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["error"]["code"], "MIGRATION_STALE_PREVIEW");
+
     let (status, invalid) = call_json(
         &app,
         Method::POST,
@@ -612,6 +666,7 @@ async fn migration_preview_apply_and_event_round_trip() {
         Some(json!({
             "clientId": "device-a",
             "strategy": "server",
+            "expectedServerDigest": expected_digest,
             "snapshot": snapshot
         })),
         true,
@@ -642,16 +697,18 @@ async fn migration_receipt_survives_store_reopen() {
     std::fs::create_dir_all(&directory).expect("temp directory");
     let database_path = directory.join("server.db");
     let snapshot = json!({
+        "schemaVersion": 1,
         "subscriptions": [],
         "schedules": [],
         "weeklyRules": [],
         "latestEventSeq": 0,
         "exportedAt": Utc::now()
     });
-    let payload = json!({
+    let mut payload = json!({
         "clientId": "device-persistent",
         "migrationId": "migration:persistent:1",
         "strategy": "server",
+        "expectedServerDigest": "",
         "snapshot": snapshot
     });
 
@@ -660,6 +717,9 @@ async fn migration_receipt_survives_store_reopen() {
         let store = SqliteStore::connect_path(database_path.clone())
             .await
             .expect("first db");
+        payload["expectedServerDigest"] = json!(
+            store.migration_state_digest().await.expect("initial digest")
+        );
         let app = build_router(state_with_store(store));
         let (status, applied) = call_json(
             &app,
@@ -709,12 +769,20 @@ async fn migration_receipt_survives_store_reopen() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_migration_retries_apply_once() {
     let state = state().await;
+    let expected_digest = state
+        .service
+        .store()
+        .migration_state_digest()
+        .await
+        .expect("initial digest");
     let app = build_router(state);
     let payload = json!({
         "clientId": "device-concurrent",
         "migrationId": "migration:concurrent:1",
         "strategy": "server",
+        "expectedServerDigest": expected_digest,
         "snapshot": {
+            "schemaVersion": 1,
             "subscriptions": [],
             "schedules": [],
             "weeklyRules": [],
@@ -776,8 +844,9 @@ async fn llm_secret_round_trip_is_encrypted_and_never_enters_sync_payload() {
 
     let (status, loaded) = call_json(&app, Method::GET, "/api/secrets/llm", None, true).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(loaded["data"]["apiKey"], "sk-fixture-super-secret");
+    assert_eq!(loaded["data"]["configured"], true);
     assert_eq!(loaded["data"]["revision"], 1);
+    assert!(loaded["data"].get("apiKey").is_none());
 
     let raw = store
         .get_client_sync_state("server:secret:llm_api_key:v1")

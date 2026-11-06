@@ -2,6 +2,7 @@ mod sync_client;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,15 +10,16 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use oshical_core::{
     load_settings, save_settings as save_settings_to_store, AppError, AppService, AppSettings,
-    DataMode, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport, NewSchedule,
-    NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule, Streamer,
-    SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    DataMode, FanHistory, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport,
+    NewSchedule, NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule,
+    Streamer, SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule,
+    WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
@@ -28,10 +30,91 @@ const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
 const APP_UPDATE_DIRECT_ENDPOINT: &str =
     "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+const APP_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+const APP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct RemoteMonitorState {
+    generation: u64,
+    task: Option<tauri::async_runtime::JoinHandle<()>>,
+    cancel_rebuild: Option<Arc<AtomicBool>>,
+}
+
+impl RemoteMonitorState {
+    fn begin_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(cancel) = self.cancel_rebuild.take() {
+            cancel.store(true, AtomicOrdering::Release);
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.generation
+    }
+
+    fn set_rebuild_cancel(
+        &mut self,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+    ) -> bool {
+        if !self.is_current(generation) {
+            cancel.store(true, AtomicOrdering::Release);
+            return false;
+        }
+        self.cancel_rebuild = Some(cancel);
+        true
+    }
+
+    fn clear_rebuild_cancel(&mut self, generation: u64) {
+        if self.is_current(generation) {
+            self.cancel_rebuild = None;
+        }
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    fn stop_if_current(&mut self, expected_generation: u64) -> bool {
+        if !self.is_current(expected_generation) {
+            return false;
+        }
+        self.begin_generation();
+        true
+    }
+
+    fn install_if_current(
+        &mut self,
+        generation: u64,
+        task: tauri::async_runtime::JoinHandle<()>,
+    ) -> bool {
+        if !self.is_current(generation) {
+            task.abort();
+            return false;
+        }
+        if let Some(previous) = self.task.replace(task) {
+            previous.abort();
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMonitorSession {
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteRebuildResult {
+    cursor_seq: i64,
+    monitor_generation: u64,
+}
 
 struct DesktopState {
     service: Arc<AppService>,
-    remote_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    remote_monitor: Arc<Mutex<RemoteMonitorState>>,
     sync_stores: Arc<std::sync::Mutex<HashMap<String, oshical_core::SqliteStore>>>,
     server_cache_root: PathBuf,
 }
@@ -154,7 +237,7 @@ pub fn run() {
             );
             app.manage(DesktopState {
                 service: service.clone(),
-                remote_task: Arc::new(Mutex::new(None)),
+                remote_monitor: Arc::new(Mutex::new(RemoteMonitorState::default())),
                 sync_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 server_cache_root,
             });
@@ -185,6 +268,8 @@ pub fn run() {
             cancel_schedule,
             list_live_statuses,
             list_live_sessions,
+            get_fan_history,
+            refresh_streamer_fans,
             live_session_for_schedule,
             list_fertility_statuses,
             check_live_now,
@@ -243,6 +328,14 @@ fn setup_window(app: &AppHandle) {
     }
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开推历 OshiCal", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "立即刷新", true, None::<&str>)?;
@@ -250,15 +343,22 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &refresh, &quit])?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .tooltip("推历 OshiCal · 直播日程")
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "open" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
                 }
+            ) {
+                show_main_window(tray.app_handle());
             }
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => show_main_window(app),
             "refresh" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -291,8 +391,17 @@ fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, Str
         return Ok(None);
     };
     let url = url::Url::parse(value).map_err(|error| format!("GitHub 镜像地址无效: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("GitHub 镜像地址必须使用 http 或 https".to_owned());
+    if url.scheme() != "https" {
+        return Err("GitHub 镜像地址必须使用 https".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("GitHub 镜像地址不能包含用户名或密码".to_owned());
+    }
+    if url.query().is_some() {
+        return Err("GitHub 镜像地址不能包含 query 参数".to_owned());
+    }
+    if url.fragment().is_some() {
+        return Err("GitHub 镜像地址不能包含 fragment".to_owned());
     }
     let base = url.to_string();
     Ok(Some(if base.ends_with('/') {
@@ -305,7 +414,8 @@ fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, Str
 fn app_update_endpoints(mirror_url: Option<&str>) -> Result<Vec<url::Url>, String> {
     let direct = url::Url::parse(APP_UPDATE_DIRECT_ENDPOINT)
         .map_err(|error| format!("更新地址无效: {error}"))?;
-    let Some(base) = normalize_mirror_base(mirror_url)? else {
+    // Invalid mirror configuration must not disable the built-in direct path.
+    let Some(base) = normalize_mirror_base(mirror_url).ok().flatten() else {
         return Ok(vec![direct]);
     };
     let mirror = url::Url::parse(&format!("{base}{APP_UPDATE_DIRECT_ENDPOINT}"))
@@ -322,20 +432,26 @@ async fn resolve_app_update(
         .updater_builder()
         .endpoints(endpoints)
         .map_err(|error| format!("配置更新端点失败: {error}"))?
-        .timeout(Duration::from_secs(45))
+        .timeout(APP_UPDATE_CHECK_TIMEOUT)
         .build()
         .map_err(|error| format!("初始化更新检查失败: {error}"))?;
     let mut update = updater
         .check()
         .await
         .map_err(|error| format!("检查更新失败: {error}"))?;
-    if let (Some(update), Some(base)) = (update.as_mut(), normalize_mirror_base(mirror_url)?) {
-        if update.download_url.scheme() == "https"
-            && !update.download_url.as_str().starts_with(&base)
-        {
-            update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
-                .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+    let mirror_base = normalize_mirror_base(mirror_url).ok().flatten();
+    if let Some(update) = update.as_mut() {
+        if let Some(base) = mirror_base.as_deref() {
+            if update.download_url.scheme() == "https"
+                && !update.download_url.as_str().starts_with(base)
+            {
+                update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
+                    .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+            }
         }
+        // The updater check timeout also applies to the entire package download. A slow
+        // GitHub mirror can take several minutes to transfer a release installer.
+        update.timeout = Some(APP_UPDATE_DOWNLOAD_TIMEOUT);
     }
     Ok(update)
 }
@@ -403,9 +519,13 @@ async fn install_app_update(app: AppHandle, mirror_url: Option<String>) -> Resul
     match install_resolved_update(&app, &update).await {
         Ok(()) => Ok(()),
         Err(first_error) => {
-            let Some(_) = normalize_mirror_base(mirror_url.as_deref())? else {
+            let configured_mirror = normalize_mirror_base(mirror_url.as_deref())
+                .ok()
+                .flatten()
+                .is_some();
+            if !configured_mirror {
                 return Err(first_error);
-            };
+            }
             let direct_update = resolve_app_update(&app, None).await?;
             let Some(direct_update) = direct_update else {
                 return Err(first_error);
@@ -751,6 +871,31 @@ async fn list_live_sessions(
 }
 
 #[tauri::command]
+async fn get_fan_history(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+    days: Option<i64>,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .get_fan_history(streamer_id, days.unwrap_or(30))
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
+async fn refresh_streamer_fans(
+    state: State<'_, DesktopState>,
+    streamer_id: i64,
+) -> Result<FanHistory, String> {
+    state
+        .service
+        .refresh_streamer_fans(streamer_id)
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
 async fn live_session_for_schedule(
     state: State<'_, DesktopState>,
     schedule_id: i64,
@@ -912,11 +1057,44 @@ async fn poll_bilibili_qr_login(
     })
 }
 
+fn is_bilibili_cookie_domain(domain: &str) -> bool {
+    domain == "bilibili.com"
+        || domain.ends_with(".bilibili.com")
+        || domain == "biligame.com"
+        || domain.ends_with(".biligame.com")
+}
+
+async fn clear_bilibili_webview_cookies(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("bilibili-login") {
+        let _ = window.close();
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let cookies = window
+            .cookies()
+            .map_err(|error| format!("读取 B 站登录 Cookie 失败: {error}"))?;
+        for cookie in cookies {
+            if !is_bilibili_cookie_domain(cookie.domain().unwrap_or_default()) {
+                continue;
+            }
+            window
+                .delete_cookie(cookie)
+                .map_err(|error| format!("清除 B 站登录 Cookie 失败: {error}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|error| format!("清理 B 站登录 Cookie 任务失败: {error}"))?
+}
+
 #[tauri::command]
 async fn clear_bilibili_cookie(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<SecretStatus, String> {
+    clear_bilibili_webview_cookies(&app).await?;
     set_secret(KEY_BILI_COOKIE, None)?;
     state
         .service
@@ -950,12 +1128,7 @@ fn cookie_header_from_webview(cookies: &[Cookie<'static>]) -> Option<String> {
     ];
     let mut values = BTreeMap::new();
     for cookie in cookies {
-        let domain = cookie.domain().unwrap_or_default();
-        if domain != "bilibili.com"
-            && !domain.ends_with(".bilibili.com")
-            && domain != "biligame.com"
-            && !domain.ends_with(".biligame.com")
-        {
+        if !is_bilibili_cookie_domain(cookie.domain().unwrap_or_default()) {
             continue;
         }
         let name = cookie.name();
@@ -1101,19 +1274,72 @@ fn spawn_local_monitor(app: AppHandle) {
         }
     });
 
+    let fan_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut previous = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let state = fan_app.state::<DesktopState>();
+            let settings = match load_settings(state.service.store()).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let _ = fan_app.emit("monitor-error", error.to_string());
+                    continue;
+                }
+            };
+            if settings.data_mode != DataMode::Local {
+                previous = None;
+                continue;
+            }
+            if previous.is_none_or(|started: Instant| {
+                started.elapsed() >= Duration::from_secs(FAN_POLL_INTERVAL_SECONDS)
+            }) {
+                previous = Some(Instant::now());
+                match state.service.refresh_all_fans().await {
+                    Ok(report) if report.refreshed_streamers > 0 => {
+                        let _ = fan_app.emit("fan-count-updated", report);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = fan_app.emit("monitor-error", error.to_string());
+                    }
+                }
+            }
+        }
+    });
+
     let pump_app = app;
     tauri::async_runtime::spawn(async move {
-        let state = pump_app.state::<DesktopState>();
-        let mut last_seq = state.service.store().latest_event_seq().await.unwrap_or(0);
+        let mut last_seq = loop {
+            let state = pump_app.state::<DesktopState>();
+            match state.service.store().latest_event_seq().await {
+                Ok(seq) => break seq,
+                Err(error) => {
+                    let _ = pump_app.emit(
+                        "monitor-error",
+                        format!("读取本地事件游标失败，稍后重试: {error}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let state = pump_app.state::<DesktopState>();
-            if let Ok(events) = state.service.store().events_after(last_seq, 200).await {
-                for event in events {
-                    if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
-                        last_seq = last_seq.max(seq);
+            match state.service.store().events_after(last_seq, 200).await {
+                Ok(events) => {
+                    for event in events {
+                        if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
+                            last_seq = last_seq.max(seq);
+                        }
+                        let _ = pump_app.emit("server-event", event);
                     }
-                    let _ = pump_app.emit("server-event", event);
+                }
+                Err(error) => {
+                    let _ = pump_app.emit(
+                        "monitor-error",
+                        format!("读取本地事件失败，稍后重试: {error}"),
+                    );
                 }
             }
         }
@@ -1126,12 +1352,16 @@ async fn start_remote_monitor(
     state: State<'_, DesktopState>,
     server_url: String,
     token: String,
-) -> Result<(), String> {
+) -> Result<RemoteMonitorSession, String> {
     url::Url::parse(&server_url).map_err(|error| format!("服务器地址无效: {error}"))?;
     let sync_stores = state.sync_stores.clone();
     let cache_root = state.server_cache_root.clone();
     let main_store = state.service.store().clone();
-    let remote_task = state.remote_task.clone();
+    let remote_monitor = state.remote_monitor.clone();
+    let generation = {
+        let mut runtime = remote_monitor.lock().await;
+        runtime.begin_generation()
+    };
     let monitor_store = server_cache_store(
         sync_stores,
         cache_root,
@@ -1140,9 +1370,9 @@ async fn start_remote_monitor(
     )
     .await?;
     let device_id = sync_client::device_id(&main_store).await?;
-    let mut guard = remote_task.lock().await;
-    if let Some(task) = guard.take() {
-        task.abort();
+    let mut runtime = remote_monitor.lock().await;
+    if !runtime.is_current(generation) {
+        return Err("远端监控启动已被更新的操作取消".to_owned());
     }
     let task = tauri::async_runtime::spawn(remote_monitor_loop(
         app,
@@ -1151,8 +1381,10 @@ async fn start_remote_monitor(
         monitor_store,
         device_id,
     ));
-    *guard = Some(task);
-    Ok(())
+    if !runtime.install_if_current(generation, task) {
+        return Err("远端监控启动已被更新的操作取消".to_owned());
+    }
+    Ok(RemoteMonitorSession { generation })
 }
 
 #[tauri::command]
@@ -1161,12 +1393,19 @@ async fn rebuild_remote_sync(
     state: State<'_, DesktopState>,
     server_url: String,
     token: String,
-) -> Result<i64, String> {
+) -> Result<RemoteRebuildResult, String> {
     url::Url::parse(&server_url).map_err(|error| format!("服务器地址无效: {error}"))?;
     let sync_stores = state.sync_stores.clone();
     let cache_root = state.server_cache_root.clone();
     let main_store = state.service.store().clone();
-    let remote_task = state.remote_task.clone();
+    let remote_monitor = state.remote_monitor.clone();
+    let rebuild_cancel = Arc::new(AtomicBool::new(false));
+    let generation = {
+        let mut runtime = remote_monitor.lock().await;
+        let generation = runtime.begin_generation();
+        runtime.set_rebuild_cancel(generation, rebuild_cancel.clone());
+        generation
+    };
     let monitor_store = server_cache_store(
         sync_stores,
         cache_root,
@@ -1175,11 +1414,8 @@ async fn rebuild_remote_sync(
     )
     .await?;
     let device_id = sync_client::device_id(&main_store).await?;
-    {
-        let mut guard = remote_task.lock().await;
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
+    if !remote_monitor.lock().await.is_current(generation) {
+        return Err("远端同步重建已被更新的操作取消".to_owned());
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1188,7 +1424,7 @@ async fn rebuild_remote_sync(
     let previous_cursor = current_cursor(&monitor_store, &server_url)
         .await
         .unwrap_or_default();
-    let cursor = bootstrap_remote(
+    let cursor = bootstrap_remote_checked(
         &app,
         &client,
         &monitor_store,
@@ -1196,8 +1432,13 @@ async fn rebuild_remote_sync(
         &token,
         &device_id,
         previous_cursor,
+        Some(rebuild_cancel.clone()),
     )
     .await?;
+    let mut runtime = remote_monitor.lock().await;
+    if !runtime.is_current(generation) {
+        return Err("远端同步重建已被更新的操作取消".to_owned());
+    }
     let task = tauri::async_runtime::spawn(remote_monitor_loop(
         app,
         server_url,
@@ -1205,17 +1446,23 @@ async fn rebuild_remote_sync(
         monitor_store,
         device_id,
     ));
-    *remote_task.lock().await = Some(task);
-    Ok(cursor)
+    runtime.clear_rebuild_cancel(generation);
+    if !runtime.install_if_current(generation, task) {
+        return Err("远端同步重建已被更新的操作取消".to_owned());
+    }
+    Ok(RemoteRebuildResult {
+        cursor_seq: cursor,
+        monitor_generation: generation,
+    })
 }
 
 #[tauri::command]
-async fn stop_remote_monitor(state: State<'_, DesktopState>) -> Result<(), String> {
-    let mut guard = state.remote_task.lock().await;
-    if let Some(task) = guard.take() {
-        task.abort();
-    }
-    Ok(())
+async fn stop_remote_monitor(
+    state: State<'_, DesktopState>,
+    expected_generation: u64,
+) -> Result<bool, String> {
+    let mut runtime = state.remote_monitor.lock().await;
+    Ok(runtime.stop_if_current(expected_generation))
 }
 
 #[tauri::command]
@@ -1294,15 +1541,19 @@ async fn cached_schedules(
     };
     let mut result = Vec::new();
     for schedule in schedules {
-        let mapping = main_store
-            .remote_entity(
-                settings.server_url.trim_end_matches('/'),
-                "schedule",
-                schedule.id,
-            )
-            .await
-            .map_err(map_error)?;
-        let (remote_id, version) = mapping.unwrap_or((schedule.id, None));
+        let (remote_id, version) = if server_mode {
+            (schedule.id, Some(schedule.updated_at.to_rfc3339()))
+        } else {
+            main_store
+                .remote_entity(
+                    settings.server_url.trim_end_matches('/'),
+                    "schedule",
+                    schedule.id,
+                )
+                .await
+                .map_err(map_error)?
+                .unwrap_or((schedule.id, None))
+        };
         let mut value = serde_json::to_value(&schedule).map_err(|error| error.to_string())?;
         value["cachedLocalId"] = json!(schedule.id);
         value["remoteId"] = json!(remote_id);
@@ -1624,7 +1875,7 @@ async fn remote_monitor_loop(
 
     let mut backoff = 1_u64;
     let mut legacy_mode = false;
-    let mut legacy_seq = 0_i64;
+    let mut legacy_seq = -1_i64;
 
     loop {
         let meta = match sync_client::get_sync_meta(&store, &server_url).await {
@@ -1640,7 +1891,7 @@ async fn remote_monitor_loop(
             }
         };
         let after = if legacy_mode {
-            legacy_seq
+            legacy_seq.max(meta.legacy_cursor_seq).max(0)
         } else {
             meta.cursor_seq
         };
@@ -1651,6 +1902,7 @@ async fn remote_monitor_loop(
                 "connecting": true,
                 "protocolVersion": 2,
                 "deviceId": device_id,
+                "feedId": &meta.feed_id,
                 "lastSeq": after,
                 "cursorSeq": meta.cursor_seq,
                 "latestSeq": meta.latest_seq
@@ -1705,9 +1957,11 @@ async fn remote_monitor_loop(
                                         .get("protocolVersion")
                                         .and_then(Value::as_u64)
                                         .unwrap_or(1);
-                                    replay_through =
-                                        event.get("latestSeq").and_then(Value::as_i64).unwrap_or(0);
+                                    let reported_latest =
+                                        event.get("latestSeq").and_then(Value::as_i64);
+                                    replay_through = reported_latest.unwrap_or(0);
                                     if protocol >= 2 {
+                                        let resumed_from_legacy = legacy_mode;
                                         legacy_mode = false;
                                         let current =
                                             match sync_client::get_sync_meta(&store, &server_url)
@@ -1726,11 +1980,23 @@ async fn remote_monitor_loop(
                                                     break;
                                                 }
                                             };
+                                        let remote_feed_id = event
+                                            .get("feedId")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .trim()
+                                            .to_owned();
                                         let reset = event
                                             .get("resetRequired")
                                             .and_then(Value::as_bool)
                                             .unwrap_or(false)
-                                            || !current.initialized;
+                                            || !current.initialized
+                                            || replay_through < current.latest_seq
+                                            || sync_client::sync_feed_changed(
+                                                &current.feed_id,
+                                                current.cursor_seq,
+                                                &remote_feed_id,
+                                            );
                                         if reset {
                                             if let Err(error) = bootstrap_remote(
                                                 &app,
@@ -1755,23 +2021,128 @@ async fn remote_monitor_loop(
                                             reconnect = true;
                                             break;
                                         }
+                                        let current_acked = match ack_remote(
+                                            &client,
+                                            &store,
+                                            &server_url,
+                                            &token,
+                                            &device_id,
+                                            current.cursor_seq,
+                                        )
+                                        .await
+                                        {
+                                            Ok(meta) => meta.last_ack_seq,
+                                            Err(error) => {
+                                                let _ = app.emit(
+                                                    "remote-status",
+                                                    json!({
+                                                        "connected": false,
+                                                        "connecting": false,
+                                                        "error": format!(
+                                                            "同步 ACK 持久化失败: {error}"
+                                                        )
+                                                    }),
+                                                );
+                                                break;
+                                            }
+                                        };
                                         emit_remote_connected(
                                             &app,
                                             &device_id,
                                             protocol,
                                             current.cursor_seq,
-                                            replay_through,
+                                            reported_latest
+                                                .unwrap_or(current.latest_seq)
+                                                .max(current.cursor_seq),
+                                            current_acked,
+                                            if remote_feed_id.is_empty() {
+                                                current.feed_id.as_str()
+                                            } else {
+                                                remote_feed_id.as_str()
+                                            },
                                         );
+                                        // The V1 connection used an event-journal cursor
+                                        // in the query string. Reconnect before accepting
+                                        // V2 sync batches so they start from the sync cursor.
+                                        if resumed_from_legacy && after != current.cursor_seq {
+                                            reconnect = true;
+                                            break;
+                                        }
                                     } else {
                                         legacy_mode = true;
-                                        legacy_seq = after;
+                                        let legacy_meta = match sync_client::get_sync_meta(
+                                            &store, &server_url,
+                                        )
+                                        .await
+                                        {
+                                            Ok(meta) => meta,
+                                            Err(error) => {
+                                                let _ = app.emit(
+                                                    "remote-status",
+                                                    json!({
+                                                        "connected": false,
+                                                        "connecting": false,
+                                                        "error": error
+                                                    }),
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        let initialized = legacy_meta.legacy_cursor_seq >= 0;
+                                        legacy_seq = legacy_meta.legacy_cursor_seq.max(0);
+                                        let journal_regressed = initialized
+                                            && reported_latest.is_some_and(|latest| latest < legacy_seq);
+                                        if journal_regressed {
+                                            if let Err(error) = sync_client::reset_legacy_event_cursor(
+                                                &store, &server_url,
+                                            )
+                                            .await
+                                            {
+                                                let _ = app.emit(
+                                                    "remote-status",
+                                                    json!({
+                                                        "connected": false,
+                                                        "connecting": false,
+                                                        "error": error
+                                                    }),
+                                                );
+                                                break;
+                                            }
+                                            legacy_seq = 0;
+                                        } else if !initialized {
+                                            if let Err(error) = sync_client::set_legacy_event_cursor(
+                                                &store, &server_url, 0,
+                                            )
+                                            .await
+                                            {
+                                                let _ = app.emit(
+                                                    "remote-status",
+                                                    json!({
+                                                        "connected": false,
+                                                        "connecting": false,
+                                                        "error": error
+                                                    }),
+                                                );
+                                                break;
+                                            }
+                                            legacy_seq = 0;
+                                        }
                                         emit_remote_connected(
                                             &app,
                                             &device_id,
                                             1,
-                                            after,
+                                            legacy_seq,
                                             replay_through,
+                                            legacy_meta.last_ack_seq,
+                                            "",
                                         );
+                                        // The first V1 connection may have used the V2
+                                        // sync cursor in its query string. Reconnect with
+                                        // the independent event-journal cursor.
+                                        if journal_regressed || !initialized || after != legacy_seq {
+                                            reconnect = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 Some("sync_batch") => {
@@ -1830,13 +2201,14 @@ async fn remote_monitor_loop(
                                         &token,
                                         &device_id,
                                         &batch,
-                                        current_cursor(&store, &server_url).await.unwrap_or(after),
                                     )
                                     .await
                                     {
                                         Ok(cursor) => cursor,
                                         Err(error) => {
-                                            if error.starts_with("SYNC_CACHE_INCONSISTENT:") {
+                                            if error.starts_with("SYNC_CACHE_INCONSISTENT:")
+                                                || error.starts_with("SYNC_FEED_CHANGED:")
+                                            {
                                                 if let Err(rebuild_error) = bootstrap_remote(
                                                     &app,
                                                     &client,
@@ -1874,28 +2246,34 @@ async fn remote_monitor_loop(
                                             break;
                                         }
                                     };
-                                    let _ = socket
-                                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                                            json!({"type": "ack", "seq": cursor})
-                                                .to_string()
-                                                .into(),
-                                        ))
-                                        .await;
-                                    let _ = app.emit(
-                                        "sync-applied",
-                                        json!({
-                                            "cursorSeq": cursor,
-                                            "latestSeq": batch.latest_seq,
-                                            "changeCount": batch.changes.len(),
-                                            "changes": batch.changes
-                                        }),
-                                    );
+                                    // Catch-up may have applied changes beyond this
+                                    // queued batch. Re-read local metadata so a late
+                                    // batch cannot publish a regressed latestSeq.
+                                    let (connected_latest, connected_acked, connected_feed_id) =
+                                        match sync_client::get_sync_meta(&store, &server_url).await {
+                                            Ok(meta) => (
+                                                meta.latest_seq.max(cursor),
+                                                meta.last_ack_seq,
+                                                if meta.feed_id.trim().is_empty() {
+                                                    batch.feed_id.clone()
+                                                } else {
+                                                    meta.feed_id
+                                                },
+                                            ),
+                                            Err(_) => (
+                                                batch.latest_seq.max(cursor),
+                                                cursor,
+                                                batch.feed_id.clone(),
+                                            ),
+                                        };
                                     emit_remote_connected(
                                         &app,
                                         &device_id,
                                         2,
                                         cursor,
-                                        batch.latest_seq,
+                                        connected_latest,
+                                        connected_acked,
+                                        &connected_feed_id,
                                     );
                                 }
                                 Some("reset_required") => {
@@ -1949,9 +2327,13 @@ async fn remote_monitor_loop(
                                 }
                                 Some("job_progress") => emit_job_progress(&app, &event),
                                 Some("ack") => {
-                                    if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
-                                        let _ = sync_client::set_sync_ack(&store, &server_url, seq)
+                                    if event.get("persisted").and_then(Value::as_bool) == Some(true) {
+                                        if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
+                                            let _ = sync_client::set_sync_ack(
+                                                &store, &server_url, seq,
+                                            )
                                             .await;
+                                        }
                                     }
                                 }
                                 Some("error") => {
@@ -1966,14 +2348,30 @@ async fn remote_monitor_loop(
                                     return;
                                 }
                                 _ => {
-                                    if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
-                                        if legacy_mode && seq <= legacy_seq {
-                                            continue;
+                                    if !prepare_forwarded_event(
+                                        legacy_mode,
+                                        &mut legacy_seq,
+                                        replay_through,
+                                        &mut event,
+                                    ) {
+                                        continue;
+                                    }
+                                    if legacy_mode {
+                                        if let Some(seq) =
+                                            event.get("seq").and_then(Value::as_i64)
+                                        {
+                                            if let Err(error) =
+                                                sync_client::advance_legacy_event_cursor(
+                                                    &store, &server_url, seq,
+                                                )
+                                                .await
+                                            {
+                                                let _ = app.emit(
+                                                    "monitor-error",
+                                                    format!("旧版服务器事件游标保存失败: {error}"),
+                                                );
+                                            }
                                         }
-                                        if legacy_mode {
-                                            legacy_seq = seq;
-                                        }
-                                        event["replayed"] = json!(seq <= replay_through);
                                     }
                                     let _ = app.emit("server-event", event);
                                 }
@@ -2022,15 +2420,19 @@ fn emit_remote_connected(
     protocol: u64,
     cursor: i64,
     latest: i64,
+    acked_seq: i64,
+    feed_id: &str,
 ) {
     let status = json!({
         "connected": true,
         "connecting": false,
         "protocolVersion": protocol,
         "deviceId": device_id,
+        "feedId": feed_id,
         "cursorSeq": cursor,
         "lastSeq": cursor,
         "latestSeq": latest,
+        "ackedSeq": acked_seq.min(cursor),
         "pending": latest.saturating_sub(cursor)
     });
     let _ = app.emit("remote-status", status.clone());
@@ -2046,25 +2448,60 @@ async fn apply_batch_with_catch_up(
     token: &str,
     device_id: &str,
     batch: &sync_client::SyncBatch,
-    current_cursor: i64,
 ) -> Result<i64, String> {
+    let meta = sync_client::get_sync_meta(store, server_url).await?;
+    sync_client::ensure_sync_feed_compatible(&meta.feed_id, meta.cursor_seq, &batch.feed_id)?;
+    if batch_is_fully_applied(batch, meta.cursor_seq) {
+        if batch.latest_seq <= meta.latest_seq {
+            return Ok(meta.cursor_seq);
+        }
+        return catch_up_changes(app, client, store, server_url, token, device_id).await;
+    }
     let needs_catch_up = batch
         .changes
         .iter()
-        .find(|change| change.seq > current_cursor)
-        .is_some_and(|change| change.seq != current_cursor + 1)
-        || (batch.changes.is_empty() && batch.to_seq > current_cursor);
+        .find(|change| change.seq > meta.cursor_seq)
+        .is_some_and(|change| change.seq != meta.cursor_seq + 1)
+        || (batch.changes.is_empty() && batch.to_seq > meta.cursor_seq);
     if needs_catch_up {
         catch_up_changes(app, client, store, server_url, token, device_id).await?;
+        let recovered_meta = sync_client::get_sync_meta(store, server_url).await?;
+        if batch_is_fully_applied(batch, recovered_meta.cursor_seq) {
+            // catch_up_changes already emitted and ACKed every applied page.
+            // This queued WebSocket batch is now stale, so do not re-emit,
+            // ACK it again, or treat its older latestSeq as a regression.
+            return Ok(recovered_meta.cursor_seq);
+        }
     }
+    let mut cursor_before_batch =
+        sync_client::get_sync_meta(store, server_url).await?.cursor_seq;
     let result = match sync_client::apply_batch(store, server_url, batch).await {
         Ok(result) => result,
         Err(error) if error.starts_with("SYNC_GAP") => {
             catch_up_changes(app, client, store, server_url, token, device_id).await?;
+            let recovered_meta = sync_client::get_sync_meta(store, server_url).await?;
+            if batch_is_fully_applied(batch, recovered_meta.cursor_seq) {
+                return Ok(recovered_meta.cursor_seq);
+            }
+            cursor_before_batch = recovered_meta.cursor_seq;
             sync_client::apply_batch(store, server_url, batch).await?
         }
         Err(error) => return Err(error),
     };
+    if result.applied > 0 {
+        let applied_changes = changes_after_cursor(&batch.changes, cursor_before_batch);
+        let _ = app.emit(
+            "sync-applied",
+            json!({
+                "feedId": &batch.feed_id,
+                "cursorSeq": result.cursor_seq,
+                "latestSeq": result.latest_seq,
+                "changeCount": result.applied,
+                "changes": applied_changes,
+                "recovered": false
+            }),
+        );
+    }
     ack_remote(
         client,
         store,
@@ -2089,7 +2526,14 @@ async fn catch_up_changes(
         let meta = sync_client::get_sync_meta(store, server_url).await?;
         let page =
             sync_client::fetch_changes(client, server_url, token, meta.cursor_seq, 200).await?;
-        if page.reset_required {
+        sync_client::ensure_sync_schema_version(page.schema_version)?;
+        if sync_client::ensure_sync_feed_compatible(
+            &meta.feed_id,
+            meta.cursor_seq,
+            &page.feed_id,
+        )
+        .is_err()
+        {
             return bootstrap_remote(
                 app,
                 client,
@@ -2101,20 +2545,99 @@ async fn catch_up_changes(
             )
             .await;
         }
+        if page.reset_required
+            || page.latest_seq < meta.cursor_seq
+            || page.latest_seq < meta.latest_seq
+        {
+            return bootstrap_remote(
+                app,
+                client,
+                store,
+                server_url,
+                token,
+                device_id,
+                meta.cursor_seq,
+            )
+            .await;
+        }
+        let expected_from = meta.cursor_seq.saturating_add(1);
         if page.changes.is_empty() {
             if page.has_more {
                 return Err("服务器返回空变更页但仍有更多数据".to_owned());
             }
+            if page.from_seq != expected_from
+                || page.to_seq != meta.cursor_seq
+                || empty_changes_page_requires_rebuild(
+                    meta.cursor_seq,
+                    meta.latest_seq,
+                    page.latest_seq,
+                )
+            {
+                return bootstrap_remote(
+                    app,
+                    client,
+                    store,
+                    server_url,
+                    token,
+                    device_id,
+                    meta.cursor_seq,
+                )
+                .await;
+            }
             ack_remote(client, store, server_url, token, device_id, meta.cursor_seq).await?;
             return Ok(meta.cursor_seq);
+        }
+        let expected_to = page
+            .changes
+            .last()
+            .map(|change| change.seq)
+            .unwrap_or(meta.cursor_seq);
+        let contiguous = page
+            .changes
+            .first()
+            .is_some_and(|change| change.seq == expected_from)
+            && page
+                .changes
+                .windows(2)
+                .all(|pair| pair[1].seq == pair[0].seq.saturating_add(1));
+        if page.from_seq != expected_from
+            || page.to_seq != expected_to
+            || page.latest_seq < expected_to
+            || !contiguous
+        {
+            return bootstrap_remote(
+                app,
+                client,
+                store,
+                server_url,
+                token,
+                device_id,
+                meta.cursor_seq,
+            )
+            .await;
         }
         let batch = sync_client::SyncBatch {
             from_seq: page.from_seq,
             to_seq: page.to_seq,
             latest_seq: page.latest_seq,
+            feed_id: page.feed_id,
             changes: page.changes,
         };
         let result = sync_client::apply_batch(store, server_url, &batch).await?;
+        if result.applied > 0 {
+            let applied_changes = changes_after_cursor(&batch.changes, meta.cursor_seq);
+            let _ = app.emit(
+                "sync-applied",
+                json!({
+                    "feedId": &batch.feed_id,
+                    "cursorSeq": result.cursor_seq,
+                    "latestSeq": result.latest_seq,
+                    "changeCount": result.applied,
+                    "changes": applied_changes,
+                    "recovered": true
+                }),
+            );
+        }
         ack_remote(
             client,
             store,
@@ -2124,15 +2647,6 @@ async fn catch_up_changes(
             result.cursor_seq,
         )
         .await?;
-        let _ = app.emit(
-            "sync-applied",
-            json!({
-                "cursorSeq": result.cursor_seq,
-                "latestSeq": result.latest_seq,
-                "changeCount": result.applied,
-                "recovered": true
-            }),
-        );
         if !page.has_more {
             return Ok(result.cursor_seq);
         }
@@ -2148,6 +2662,38 @@ async fn bootstrap_remote(
     device_id: &str,
     previous_cursor: i64,
 ) -> Result<i64, String> {
+    bootstrap_remote_checked(
+        app,
+        client,
+        store,
+        server_url,
+        token,
+        device_id,
+        previous_cursor,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bootstrap_remote_checked(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    store: &oshical_core::SqliteStore,
+    server_url: &str,
+    token: &str,
+    device_id: &str,
+    previous_cursor: i64,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<i64, String> {
+    let cancelled = || {
+        cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+    };
+    if cancelled() {
+        return Err("远端同步重建已取消".to_owned());
+    }
     let _ = app.emit(
         "remote-status",
         json!({
@@ -2158,8 +2704,26 @@ async fn bootstrap_remote(
         }),
     );
     let bootstrap = sync_client::fetch_bootstrap(client, server_url, token).await?;
+    if cancelled() {
+        return Err("远端同步重建已取消".to_owned());
+    }
     let result = sync_client::apply_bootstrap(store, server_url, &bootstrap).await?;
-    ack_remote(
+    if cancelled() {
+        return Err("远端同步重建已取消".to_owned());
+    }
+    let _ = app.emit(
+        "sync-bootstrap-applied",
+        json!({
+            "feedId": &bootstrap.feed_id,
+            "cursorSeq": result.cursor_seq,
+            "snapshotRevision": result.snapshot_revision,
+            "entityCount": result.applied
+        }),
+    );
+    if cancelled() {
+        return Err("远端同步重建已取消".to_owned());
+    }
+    let sync_meta = ack_remote(
         client,
         store,
         server_url,
@@ -2168,22 +2732,37 @@ async fn bootstrap_remote(
         result.cursor_seq,
     )
     .await?;
-    let _ = app.emit(
-        "sync-bootstrap-applied",
-        json!({
-            "cursorSeq": result.cursor_seq,
-            "snapshotRevision": result.snapshot_revision,
-            "entityCount": result.applied
-        }),
-    );
+    if cancelled() {
+        return Err("远端同步重建已取消".to_owned());
+    }
     emit_remote_connected(
         app,
         device_id,
         2,
         result.cursor_seq,
-        bootstrap.snapshot_revision.max(previous_cursor),
+        sync_meta.latest_seq.max(result.cursor_seq),
+        sync_meta.last_ack_seq,
+        &bootstrap.feed_id,
     );
     Ok(result.cursor_seq)
+}
+
+fn batch_is_fully_applied(batch: &sync_client::SyncBatch, cursor: i64) -> bool {
+    batch.to_seq <= cursor && batch.changes.iter().all(|change| change.seq <= cursor)
+}
+
+fn empty_changes_page_requires_rebuild(cursor: i64, local_latest: i64, page_latest: i64) -> bool {
+    page_latest < cursor || page_latest < local_latest || page_latest > cursor
+}
+
+fn changes_after_cursor(
+    changes: &[sync_client::SyncChange],
+    cursor: i64,
+) -> Vec<&sync_client::SyncChange> {
+    changes
+        .iter()
+        .filter(|change| change.seq > cursor)
+        .collect()
 }
 
 async fn ack_remote(
@@ -2193,10 +2772,26 @@ async fn ack_remote(
     token: &str,
     device_id: &str,
     seq: i64,
-) -> Result<(), String> {
-    sync_client::post_ack(client, server_url, token, device_id, seq).await?;
-    sync_client::set_sync_ack(store, server_url, seq).await?;
-    Ok(())
+) -> Result<sync_client::SyncMeta, String> {
+    let response = sync_client::post_ack(client, server_url, token, device_id, seq).await?;
+    let confirmed_device = response
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if confirmed_device != device_id.trim() {
+        return Err("服务器 ACK 确认的设备不匹配".to_owned());
+    }
+    let confirmed_seq = response
+        .get("lastAckSeq")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "服务器未确认 ACK 已持久化".to_owned())?;
+    if confirmed_seq < seq {
+        return Err(format!(
+            "服务器仅确认到 {confirmed_seq}，尚未持久化 {seq}"
+        ));
+    }
+    sync_client::set_sync_ack(store, server_url, seq).await
 }
 
 fn emit_job_progress(app: &AppHandle, event: &Value) {
@@ -2214,6 +2809,28 @@ fn emit_job_progress(app: &AppHandle, event: &Value) {
         });
         let _ = app.emit("refresh-progress", progress);
     }
+}
+
+fn prepare_forwarded_event(
+    legacy_mode: bool,
+    legacy_seq: &mut i64,
+    replay_through: i64,
+    event: &mut Value,
+) -> bool {
+    // V2 event-journal sequence numbers are independent from the sync cursor.
+    // Only legacy replay windows may mark an event as replayed.
+    if !legacy_mode {
+        return true;
+    }
+    let Some(seq) = event.get("seq").and_then(Value::as_i64) else {
+        return true;
+    };
+    if seq <= *legacy_seq {
+        return false;
+    }
+    *legacy_seq = seq;
+    event["replayed"] = json!(seq <= replay_through);
+    true
 }
 
 fn build_ws_url(server_url: &str, after: i64, protocol: u32) -> Result<String, String> {
@@ -2239,10 +2856,15 @@ async fn export_client_snapshot(
     state: State<'_, DesktopState>,
 ) -> Result<oshical_core::store::ServerSnapshot, String> {
     let store = state.service.store();
+    let bootstrap = store.sync_bootstrap().await.map_err(map_error)?;
     Ok(oshical_core::store::ServerSnapshot {
-        subscriptions: store.list_streamers().await.map_err(map_error)?,
-        schedules: store.list_all_schedules().await.map_err(map_error)?,
-        weekly_rules: store.list_weekly_rules(None).await.map_err(map_error)?,
+        schema_version: oshical_core::store::SERVER_SNAPSHOT_SCHEMA_VERSION,
+        subscriptions: bootstrap.subscriptions,
+        schedules: bootstrap.schedules,
+        weekly_rules: bootstrap.weekly_rules,
+        weekly_exceptions: bootstrap.weekly_exceptions,
+        schedule_sources: bootstrap.schedule_sources,
+        source_suppressions: bootstrap.source_suppressions,
         latest_event_seq: store.latest_event_seq().await.map_err(map_error)?,
         exported_at: Utc::now(),
     })
@@ -2251,9 +2873,12 @@ async fn export_client_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_endpoints, build_ws_url, cookie_header_from_webview, normalize_mirror_base,
-        validate_external_url,
+        app_update_endpoints, batch_is_fully_applied, build_ws_url, changes_after_cursor,
+        empty_changes_page_requires_rebuild, cookie_header_from_webview, normalize_mirror_base,
+        prepare_forwarded_event, validate_external_url, RemoteMonitorState,
     };
+    use crate::sync_client::SyncChange;
+    use serde_json::json;
     use tauri::webview::Cookie;
 
     #[test]
@@ -2269,6 +2894,17 @@ mod tests {
     }
 
     #[test]
+    fn stale_monitor_stop_cannot_stop_new_generation() {
+        let mut state = RemoteMonitorState::default();
+        let first = state.begin_generation();
+        let second = state.begin_generation();
+        assert!(!state.stop_if_current(first));
+        assert!(state.is_current(second));
+        assert!(state.stop_if_current(second));
+        assert!(!state.is_current(second));
+    }
+
+    #[test]
     fn app_update_endpoints_prefer_mirror_then_direct() {
         let endpoints = app_update_endpoints(Some("https://gh-proxy.com")).expect("endpoints");
         assert_eq!(endpoints.len(), 2);
@@ -2281,7 +2917,23 @@ mod tests {
             "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
         );
         assert_eq!(normalize_mirror_base(Some("")).unwrap(), None);
-        assert!(app_update_endpoints(Some("ftp://example.com")).is_err());
+        assert_eq!(
+            normalize_mirror_base(Some("https://gh-proxy.com")).unwrap(),
+            Some("https://gh-proxy.com/".to_owned())
+        );
+        assert!(normalize_mirror_base(Some("http://gh-proxy.com")).is_err());
+        assert!(normalize_mirror_base(Some("https://user@gh-proxy.com")).is_err());
+        assert!(normalize_mirror_base(Some("https://user:pass@gh-proxy.com")).is_err());
+        assert!(normalize_mirror_base(Some("https://gh-proxy.com?token=secret")).is_err());
+        assert!(normalize_mirror_base(Some("https://gh-proxy.com#fragment")).is_err());
+
+        let direct_only =
+            app_update_endpoints(Some("http://gh-proxy.com")).expect("direct fallback");
+        assert_eq!(direct_only.len(), 1);
+        assert_eq!(
+            direct_only[0].as_str(),
+            "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+        );
     }
 
     #[test]
@@ -2310,6 +2962,114 @@ mod tests {
                 .build()]),
             None
         );
+    }
+
+    #[test]
+    fn catch_up_can_identify_an_already_applied_batch() {
+        let batch = crate::sync_client::SyncBatch {
+            from_seq: 10,
+            to_seq: 12,
+            latest_seq: 20,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![
+                SyncChange {
+                    seq: 11,
+                    entity_type: "schedule".to_owned(),
+                    entity_id: "11".to_owned(),
+                    operation: "upsert".to_owned(),
+                    entity_revision: 1,
+                    payload: None,
+                    created_at: String::new(),
+                },
+                SyncChange {
+                    seq: 12,
+                    entity_type: "schedule".to_owned(),
+                    entity_id: "12".to_owned(),
+                    operation: "upsert".to_owned(),
+                    entity_revision: 1,
+                    payload: None,
+                    created_at: String::new(),
+                },
+            ],
+        };
+        assert!(batch_is_fully_applied(&batch, 12));
+        assert!(!batch_is_fully_applied(&batch, 11));
+    }
+
+    #[test]
+    fn empty_changes_page_rebuilds_for_gaps_or_regressions() {
+        assert!(!empty_changes_page_requires_rebuild(20, 20, 20));
+        assert!(empty_changes_page_requires_rebuild(20, 0, 19));
+        assert!(empty_changes_page_requires_rebuild(20, 30, 20));
+        assert!(empty_changes_page_requires_rebuild(20, 20, 30));
+        assert!(empty_changes_page_requires_rebuild(20, 30, 25));
+    }
+
+    #[test]
+    fn sync_applied_payload_excludes_changes_already_recovered() {
+        let changes = vec![
+            SyncChange {
+                seq: 10,
+                entity_type: "schedule".to_owned(),
+                entity_id: "10".to_owned(),
+                operation: "upsert".to_owned(),
+                entity_revision: 1,
+                payload: None,
+                created_at: String::new(),
+            },
+            SyncChange {
+                seq: 11,
+                entity_type: "schedule".to_owned(),
+                entity_id: "11".to_owned(),
+                operation: "upsert".to_owned(),
+                entity_revision: 1,
+                payload: None,
+                created_at: String::new(),
+            },
+        ];
+        let pending = changes_after_cursor(&changes, 10);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, 11);
+    }
+
+    #[test]
+    fn websocket_v2_live_status_is_not_marked_replayed() {
+        let mut event = json!({
+            "seq": 1,
+            "type": "live_status",
+            "payload": {"previousIsLive": false, "isLive": true}
+        });
+        let mut legacy_seq = 0;
+        assert!(prepare_forwarded_event(
+            false,
+            &mut legacy_seq,
+            51_688,
+            &mut event
+        ));
+        assert!(event.get("replayed").is_none());
+        assert_eq!(legacy_seq, 0);
+    }
+
+    #[test]
+    fn websocket_legacy_event_uses_event_journal_replay_window() {
+        let mut event = json!({"seq": 8, "type": "live_status"});
+        let mut legacy_seq = 7;
+        assert!(prepare_forwarded_event(
+            true,
+            &mut legacy_seq,
+            8,
+            &mut event
+        ));
+        assert_eq!(event["replayed"], true);
+        assert_eq!(legacy_seq, 8);
+
+        let mut duplicate = json!({"seq": 8, "type": "live_status"});
+        assert!(!prepare_forwarded_event(
+            true,
+            &mut legacy_seq,
+            8,
+            &mut duplicate
+        ));
     }
 
     #[test]

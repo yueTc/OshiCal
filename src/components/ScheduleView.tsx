@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { flushSync } from "react-dom";
 import { differenceInCalendarDays } from "date-fns";
 import {
   ChevronLeft,
@@ -9,8 +10,10 @@ import {
   Clock3,
   Grid3X3,
   GripHorizontal,
+  GripVertical,
   List,
   LoaderCircle,
+  Minus,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -58,9 +61,19 @@ function formatLiveTime(value: string): string {
   });
 }
 
-function liveQualityLabel(quality: string): string {
-  if (quality === "complete") return "数据完整";
-  if (quality === "partial") return "部分缺失";
+function liveCollectionFailed(session: LiveSession): boolean {
+  return session.reconnectCount > 0
+    && session.peakHighEnergy === 0
+    && session.danmakuCount === 0
+    && session.giftCount === 0
+    && session.superChatCount === 0
+    && session.guardCount === 0;
+}
+
+function liveQualityLabel(session: LiveSession): string {
+  if (liveCollectionFailed(session)) return "采集失败";
+  if (session.dataQuality === "complete") return "数据完整";
+  if (session.dataQuality === "partial") return "部分缺失";
   return "采集中";
 }
 type ViewMode = "timeline" | "grid";
@@ -70,13 +83,51 @@ const CALENDAR_BUFFER_AFTER = 20;
 const GRID_WINDOW_BEFORE = 14;
 const GRID_WINDOW_DAYS = 35;
 const GRID_GAP = 10;
+const GRID_DAY_COUNT_MAX = 7;
+const GRID_DAY_WIDTH_MIN = 120;
+const GRID_DAY_WIDTH_MAX = 360;
+const GRID_DAY_WIDTH_STEP = 20;
+const GRID_DAY_WIDTH_DEFAULT = 180;
+const GRID_DAY_WIDTH_KEY = "oshical.gridDayWidth";
 const GRID_DRAG_THRESHOLD = 42;
+const TIMELINE_COLUMNS_MIN = 1;
+const TIMELINE_COLUMNS_MAX = 4;
+const TIMELINE_COLUMNS_DEFAULT = 2;
+const TIMELINE_COLUMNS_KEY = "oshical.timelineColumns";
+const TIMELINE_CARD_MIN_WIDTH = 250;
+const TIMELINE_EVENT_GAP = 10;
+const TIMELINE_DATE_GAP = 8;
+const TIMELINE_GAP = 18;
+const TIMELINE_SWIPE_THRESHOLD = 32;
+const TIMELINE_SWIPE_DAY_STEP = 78;
 
-function visibleDayCountForWidth(width: number): number {
-  if (width >= 1040) return 7;
-  if (width >= 840) return 5;
-  if (width >= 500) return 3;
-  return 1;
+function clampGridDayWidth(width: number): number {
+  return Math.min(GRID_DAY_WIDTH_MAX, Math.max(GRID_DAY_WIDTH_MIN, width));
+}
+
+function readGridDayWidthPreference(): number {
+  const stored = Number.parseInt(readLocalPreference(GRID_DAY_WIDTH_KEY) ?? "", 10);
+  return Number.isFinite(stored) ? clampGridDayWidth(stored) : GRID_DAY_WIDTH_DEFAULT;
+}
+
+function clampTimelineColumns(columns: number): number {
+  return Math.min(TIMELINE_COLUMNS_MAX, Math.max(TIMELINE_COLUMNS_MIN, columns));
+}
+
+function readTimelineColumnsPreference(): number {
+  const stored = Number.parseInt(readLocalPreference(TIMELINE_COLUMNS_KEY) ?? "", 10);
+  return Number.isFinite(stored) ? clampTimelineColumns(stored) : TIMELINE_COLUMNS_DEFAULT;
+}
+
+function timelineDaysForDelta(deltaY: number): number {
+  if (Math.abs(deltaY) < TIMELINE_SWIPE_THRESHOLD) return 0;
+  const raw = Math.round(-deltaY / TIMELINE_SWIPE_DAY_STEP);
+  return raw === 0 ? (deltaY < 0 ? 1 : -1) : raw;
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== "undefined"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
 function startOfLocalDay(date: Date): number {
@@ -95,6 +146,9 @@ interface ScheduleActions {
 
 interface Draft {
   id: number | null;
+  sourceIdentity: string;
+  baselineUpdatedAt: string | null;
+  baselineRevision: number | null;
   streamerId: number | null;
   title: string;
   startAt: string;
@@ -120,10 +174,35 @@ const SOURCE_CLASS: Record<SourceKind, string> = {
   weekly: "source-weekly",
 };
 
+function createManualSourceIdentity(): string {
+  const random = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `manual:${random}`;
+}
+
+function readLocalPreference(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalPreference(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Preferences are optional; storage failures must not break the schedule view.
+  }
+}
+
 function emptyDraft(subscriptions: Streamer[]): Draft {
   const first = subscriptions[0];
   return {
     id: null,
+    sourceIdentity: createManualSourceIdentity(),
+    baselineUpdatedAt: null,
+    baselineRevision: null,
     streamerId: first?.id ?? null,
     title: "",
     startAt: inputDateTime(new Date(Date.now() + 60 * 60 * 1000).toISOString()),
@@ -148,15 +227,16 @@ export default function ScheduleView({
   onError: (message: string) => void;
 }) {
   const [anchor, setAnchor] = useState(() => new Date());
-  const [viewMode, setViewMode] = useState<ViewMode>(() => {
-    const stored = localStorage.getItem("oshical.viewMode");
-    return stored === "grid" ? "grid" : "timeline";
-  });
+  const [viewMode, setViewMode] = useState<ViewMode>(() =>
+    readLocalPreference("oshical.viewMode") === "grid" ? "grid" : "timeline",
+  );
+  const [viewEnterAnimation, setViewEnterAnimation] = useState(false);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [savingDraft, setSavingDraft] = useState(false);
   const [menu, setMenu] = useState<{ schedule: Schedule; x: number; y: number } | null>(null);
   const [liveModal, setLiveModal] = useState<{
     schedule: Schedule;
@@ -164,22 +244,62 @@ export default function ScheduleView({
     loading: boolean;
   } | null>(null);
   const longPress = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const longPressTriggered = useRef(false);
+  const suppressClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gridWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timelineWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pageRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const loadedWindowRef = useRef<{ from: number; to: number } | null>(null);
   const hasLoadedScheduleRef = useRef(false);
   const lastRevisionRef = useRef<number | null>(null);
   const loadRequestRef = useRef(0);
+  const savingDraftRef = useRef(false);
+  const draftRef = useRef<Draft | null>(draft);
+  const refreshRef = useRef(false);
+  const removingScheduleIdsRef = useRef<Set<number>>(new Set());
+  const liveRequestRef = useRef(0);
   const gridDragRef = useRef<{ startX: number; deltaX: number } | null>(null);
+  const timelineSwipeRef = useRef<{ startY: number; deltaY: number } | null>(null);
   const suppressCardClickRef = useRef(false);
   const gridWheelLockRef = useRef(false);
-  const [visibleDayCount, setVisibleDayCount] = useState(7);
+  const timelineWheelLockRef = useRef(false);
+  const [gridDayWidth, setGridDayWidth] = useState(readGridDayWidthPreference);
+  const [timelineColumns, setTimelineColumns] = useState(readTimelineColumnsPreference);
   const [calendarWidth, setCalendarWidth] = useState(0);
+  const visibleDayCount = useMemo(() => {
+    if (calendarWidth <= 0) return GRID_DAY_COUNT_MAX;
+    return Math.min(
+      GRID_DAY_COUNT_MAX,
+      Math.max(1, Math.floor((calendarWidth + GRID_GAP) / (gridDayWidth + GRID_GAP))),
+    );
+  }, [calendarWidth, gridDayWidth]);
+  const timelineColumnsMax = useMemo(() => {
+    if (calendarWidth <= 0) return TIMELINE_COLUMNS_MAX;
+    if (calendarWidth <= 620) return 1;
+    const dateColumnWidth = calendarWidth <= 960 ? 94 : 132;
+    const availableCardWidth = Math.max(0, calendarWidth - dateColumnWidth - TIMELINE_DATE_GAP);
+    return Math.max(
+      1,
+      Math.min(
+        TIMELINE_COLUMNS_MAX,
+        Math.floor((availableCardWidth + TIMELINE_EVENT_GAP) / (TIMELINE_CARD_MIN_WIDTH + TIMELINE_EVENT_GAP)),
+      ),
+    );
+  }, [calendarWidth]);
+  const effectiveTimelineColumns = Math.min(timelineColumns, timelineColumnsMax);
   const [gridWindowStart, setGridWindowStart] = useState(() => addDays(new Date(), -GRID_WINDOW_BEFORE));
   const [dragDayDelta, setDragDayDelta] = useState(0);
+  const [timelineSwipeDayDelta, setTimelineSwipeDayDelta] = useState(0);
+  const [timelineViewportHeight, setTimelineViewportHeight] = useState(0);
+  const [timelineOffsetY, setTimelineOffsetY] = useState(0);
   const pendingDragReleaseRef = useRef(false);
+  const pendingTimelineReleaseRef = useRef(false);
+  const releaseFrameRef = useRef<number | null>(null);
+  draftRef.current = draft;
 
   const timelineDays = useMemo(() => rollingDays(anchor), [anchor]);
   const gridWindowDays = useMemo(
@@ -199,23 +319,45 @@ export default function ScheduleView({
   );
   const stripDays = viewMode === "grid"
     ? gridWindowDays.slice(previewStartIndex, previewStartIndex + visibleDayCount)
-    : timelineDays;
-  const rangeDays = viewMode === "grid" ? stripDays : timelineDays;
+    : rollingDays(addDays(anchor, timelineSwipeDayDelta));
+  const rangeDays = stripDays;
   const displayDays = viewMode === "grid" ? visibleDays : timelineDays;
-  const gridDayWidth = calendarWidth > 0
-    ? Math.max(0, (calendarWidth - GRID_GAP * (visibleDayCount - 1)) / visibleDayCount)
-    : 160;
+  const visibleStartTime = startOfLocalDay(displayDays[0] ?? anchor);
+  const visibleEndTime = startOfLocalDay(addDays(displayDays[displayDays.length - 1] ?? anchor, 1));
   const gridOffset = -visibleStartIndex * (gridDayWidth + GRID_GAP);
+  const changeGridDayWidth = (delta: number) => {
+    setGridDayWidth((current) => clampGridDayWidth(current + delta));
+  };
+  const changeTimelineColumns = (delta: number) => {
+    setTimelineColumns((current) => clampTimelineColumns(
+      Math.min(current, timelineColumnsMax) + delta,
+    ));
+  };
+  const changeViewMode = (next: ViewMode) => {
+    if (next === viewMode) return;
+    setViewEnterAnimation(false);
+    if (prefersReducedMotion()) {
+      setViewMode(next);
+      return;
+    }
+    if (typeof document.startViewTransition === "function") {
+      document.startViewTransition(() => {
+        flushSync(() => setViewMode(next));
+      }).finished.catch(() => undefined);
+      return;
+    }
+    setViewEnterAnimation(true);
+    setViewMode(next);
+  };
   const liveScheduleIds = useMemo(
     () => matchLiveSchedules(schedules, liveStatuses),
     [schedules, liveStatuses],
   );
 
   const load = useCallback(async (force = false) => {
-    const anchorTime = startOfLocalDay(anchor);
     const loaded = loadedWindowRef.current;
     const revisionChanged = lastRevisionRef.current !== revision;
-    if (!force && !revisionChanged && loaded && anchorTime >= loaded.from && anchorTime < loaded.to) {
+    if (!force && !revisionChanged && loaded && visibleStartTime >= loaded.from && visibleEndTime <= loaded.to) {
       return;
     }
     const requestId = ++loadRequestRef.current;
@@ -261,15 +403,23 @@ export default function ScheduleView({
         setLoading(false);
       }
     }
-  }, [actions, anchor, onError, revision]);
+  }, [actions, anchor, onError, revision, visibleEndTime, visibleStartTime]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   useEffect(() => {
-    localStorage.setItem("oshical.viewMode", viewMode);
+    writeLocalPreference("oshical.viewMode", viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    writeLocalPreference(GRID_DAY_WIDTH_KEY, String(gridDayWidth));
+  }, [gridDayWidth]);
+
+  useEffect(() => {
+    writeLocalPreference(TIMELINE_COLUMNS_KEY, String(timelineColumns));
+  }, [timelineColumns]);
 
   useLayoutEffect(() => {
     const element = pageRef.current;
@@ -278,8 +428,6 @@ export default function ScheduleView({
       const width = element.clientWidth;
       if (width <= 0) return;
       setCalendarWidth(width);
-      const next = visibleDayCountForWidth(width);
-      setVisibleDayCount((current) => (current === next ? current : next));
     };
     update();
     if (typeof ResizeObserver === "undefined") {
@@ -290,6 +438,26 @@ export default function ScheduleView({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+
+  useLayoutEffect(() => {
+    if (viewMode !== "timeline" || loading) return;
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    const measure = () => {
+      const firstDay = timeline.firstElementChild;
+      const currentDay = timeline.querySelector<HTMLElement>(`[data-timeline-day="${localDateKey(anchor)}"]`);
+      const nextWindowDay = timeline.querySelector<HTMLElement>(`[data-timeline-day="${localDateKey(addDays(anchor, timelineDays.length))}"]`);
+      if (!(firstDay instanceof HTMLElement) || !currentDay || !nextWindowDay) return;
+      const nextOffset = nextWindowDay.offsetTop - currentDay.offsetTop - TIMELINE_GAP;
+      setTimelineOffsetY(currentDay.offsetTop - firstDay.offsetTop);
+      setTimelineViewportHeight(Math.max(0, nextOffset));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(timeline);
+    return () => observer.disconnect();
+  }, [anchor, calendarWidth, effectiveTimelineColumns, gridWindowStart, loading, schedules, viewMode]);
 
   useEffect(() => {
     const offset = differenceInCalendarDays(anchor, gridWindowStart);
@@ -304,22 +472,41 @@ export default function ScheduleView({
     pendingDragReleaseRef.current = false;
     const grid = gridRef.current;
     if (!grid) return;
-    requestAnimationFrame(() => {
+    if (releaseFrameRef.current !== null) cancelAnimationFrame(releaseFrameRef.current);
+    releaseFrameRef.current = requestAnimationFrame(() => {
+      releaseFrameRef.current = null;
       grid.classList.remove("is-dragging");
       grid.style.removeProperty("--drag-x");
     });
   }, [anchorIndex]);
 
+  useLayoutEffect(() => {
+    if (!pendingTimelineReleaseRef.current) return;
+    pendingTimelineReleaseRef.current = false;
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    if (releaseFrameRef.current !== null) cancelAnimationFrame(releaseFrameRef.current);
+    releaseFrameRef.current = requestAnimationFrame(() => {
+      releaseFrameRef.current = null;
+      timeline.classList.remove("is-dragging");
+      timeline.style.removeProperty("--timeline-drag-y");
+    });
+  }, [anchorIndex]);
+
   useEffect(() => {
-    if (!active || viewMode !== "grid") return;
+    if (!active) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
       const target = event.target;
       if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true'], .modal, .context-menu")) return;
-      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      if (viewMode === "grid" && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault();
         const daysToMove = event.shiftKey ? 7 : 1;
         setAnchor((value) => addDays(value, event.key === "ArrowLeft" ? -daysToMove : daysToMove));
+      } else if (viewMode === "timeline" && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+        event.preventDefault();
+        const daysToMove = event.shiftKey ? 7 : 1;
+        setAnchor((value) => addDays(value, event.key === "ArrowUp" ? -daysToMove : daysToMove));
       } else if (event.key === "Home" || event.key.toLowerCase() === "t") {
         event.preventDefault();
         setAnchor(new Date());
@@ -342,18 +529,72 @@ export default function ScheduleView({
       if (gridWheelLockRef.current) return;
       gridWheelLockRef.current = true;
       setAnchor((value) => addDays(value, delta > 0 ? 1 : -1));
-      window.setTimeout(() => { gridWheelLockRef.current = false; }, 180);
+      if (gridWheelTimerRef.current !== null) {
+        window.clearTimeout(gridWheelTimerRef.current);
+      }
+      gridWheelTimerRef.current = window.setTimeout(() => {
+        gridWheelTimerRef.current = null;
+        gridWheelLockRef.current = false;
+      }, 180);
     };
     element.addEventListener("wheel", onWheel, { passive: false });
     return () => element.removeEventListener("wheel", onWheel);
   }, [active, anchor, loading, schedules.length, viewMode]);
 
   useEffect(() => {
+    if (!active || viewMode !== "timeline" || loading) return;
+    const element = timelineRef.current;
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || !event.deltaY) return;
+      if (!(event.target instanceof Element) || !event.target.closest(".day-heading")) return;
+      event.preventDefault();
+      if (timelineWheelLockRef.current) return;
+      timelineWheelLockRef.current = true;
+      setAnchor((value) => addDays(value, event.deltaY > 0 ? 1 : -1));
+      if (timelineWheelTimerRef.current !== null) {
+        window.clearTimeout(timelineWheelTimerRef.current);
+      }
+      timelineWheelTimerRef.current = window.setTimeout(() => {
+        timelineWheelTimerRef.current = null;
+        timelineWheelLockRef.current = false;
+      }, 180);
+    };
+    element.addEventListener("wheel", onWheel, { passive: false });
+    return () => element.removeEventListener("wheel", onWheel);
+  }, [active, loading, viewMode]);
+
+  useEffect(() => {
     if (active) return;
+    liveRequestRef.current += 1;
+    if (longPress.current !== null) {
+      clearTimeout(longPress.current);
+      longPress.current = null;
+    }
+    longPressStartRef.current = null;
+    longPressTriggered.current = false;
     setMenu(null);
     setDraft(null);
     setLiveModal(null);
   }, [active]);
+
+  useEffect(() => () => {
+    if (longPress.current !== null) {
+      clearTimeout(longPress.current);
+    }
+    if (suppressClickTimerRef.current !== null) {
+      clearTimeout(suppressClickTimerRef.current);
+    }
+    if (gridWheelTimerRef.current !== null) {
+      clearTimeout(gridWheelTimerRef.current);
+    }
+    if (timelineWheelTimerRef.current !== null) {
+      clearTimeout(timelineWheelTimerRef.current);
+    }
+    if (releaseFrameRef.current !== null) {
+      cancelAnimationFrame(releaseFrameRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const close = () => setMenu(null);
@@ -404,6 +645,10 @@ export default function ScheduleView({
   );
 
   async function refresh() {
+    if (refreshRef.current) {
+      return;
+    }
+    refreshRef.current = true;
     setRefreshing(true);
     try {
       await actions.refresh();
@@ -411,17 +656,31 @@ export default function ScheduleView({
     } catch (refreshError) {
       onError(explainError(refreshError));
     } finally {
+      refreshRef.current = false;
       setRefreshing(false);
     }
+  }
+
+  function updateDraft(patch: Partial<Draft>) {
+    setDraft((current) => current ? { ...current, ...patch } : current);
   }
 
   function openCreate() {
     setDraft(emptyDraft(subscriptions));
   }
 
+  function closeDraft() {
+    if (!savingDraftRef.current) {
+      setDraft(null);
+    }
+  }
+
   function openEdit(schedule: Schedule) {
     setDraft({
       id: schedule.id,
+      sourceIdentity: schedule.sourceIdentity ?? "",
+      baselineUpdatedAt: schedule.updatedAt,
+      baselineRevision: schedule.revision ?? null,
       streamerId: schedule.streamerId,
       title: schedule.title,
       startAt: inputDateTime(schedule.startAt),
@@ -432,69 +691,118 @@ export default function ScheduleView({
   }
 
   async function saveDraft() {
-    if (!draft || !draft.streamerId || !draft.title.trim() || !draft.startAt) {
+    if (savingDraftRef.current) {
       return;
     }
-    const startAt = new Date(draft.startAt).toISOString();
-    const endAt = draft.endAt ? new Date(draft.endAt).toISOString() : null;
-    const editingSchedule = draft.id
-      ? schedules.find((schedule) => schedule.id === draft.id) ?? null
+    const submittedDraft = draftRef.current;
+    if (!submittedDraft || !submittedDraft.streamerId || !submittedDraft.title.trim() || !submittedDraft.startAt) {
+      return;
+    }
+    const startDate = new Date(submittedDraft.startAt);
+    const endDate = submittedDraft.endAt ? new Date(submittedDraft.endAt) : null;
+    if (!Number.isFinite(startDate.getTime()) || (endDate !== null && !Number.isFinite(endDate.getTime()))) {
+      onError("日程时间格式无效，请重新选择开始和结束时间。");
+      return;
+    }
+    if (endDate !== null && endDate.getTime() < startDate.getTime()) {
+      onError("结束时间不能早于开始时间。");
+      return;
+    }
+    const startAt = startDate.toISOString();
+    const endAt = endDate?.toISOString() ?? null;
+    const editingSchedule = submittedDraft.id !== null
+      ? schedules.find((schedule) => schedule.id === submittedDraft.id) ?? null
       : null;
+    if (submittedDraft.id !== null && !editingSchedule) {
+      setDraft(null);
+      onError("原日程已不存在，已重新加载日程列表。");
+      await load(true);
+      return;
+    }
+    if (
+      editingSchedule
+      && (
+        editingSchedule.updatedAt !== submittedDraft.baselineUpdatedAt
+        || (
+          submittedDraft.baselineRevision !== null
+          && editingSchedule.revision !== undefined
+          && editingSchedule.revision !== submittedDraft.baselineRevision
+        )
+      )
+    ) {
+      setDraft(null);
+      onError("原日程已在其他位置更新，已重新加载日程列表；请重新打开并确认最新内容。");
+      await load(true);
+      return;
+    }
+    savingDraftRef.current = true;
+    setSavingDraft(true);
     try {
-      if (draft.id && editingSchedule) {
+      if (editingSchedule) {
         await actions.update(editingSchedule, {
-          title: draft.title.trim(),
+          title: submittedDraft.title.trim(),
           startAt,
           endAt,
-          roomUrl: draft.roomUrl.trim() || null,
+          roomUrl: submittedDraft.roomUrl.trim() || null,
         });
       } else {
-        const streamer = subscriptions.find((value) => value.id === draft.streamerId);
+        const streamer = subscriptions.find((value) => value.id === submittedDraft.streamerId);
         await actions.create({
-          streamerId: draft.streamerId,
-          title: draft.title.trim(),
+          streamerId: submittedDraft.streamerId,
+          title: submittedDraft.title.trim(),
           startAt,
           endAt,
-          roomUrl: draft.roomUrl.trim() || streamer?.liveUrl || null,
+          roomUrl: submittedDraft.roomUrl.trim() || streamer?.liveUrl || null,
           sourceKind: "manual",
           sourcePostId: null,
           sourceImageUrl: null,
           sourceAuthorMid: null,
           sourceFingerprint: null,
-          sourceIdentity: `manual:${crypto.randomUUID()}`,
+          sourceIdentity: submittedDraft.sourceIdentity,
           confidence: 1,
         });
       }
-      setDraft(null);
-      await load(true);
     } catch (saveError) {
       onError(explainError(saveError));
+      return;
+    } finally {
+      savingDraftRef.current = false;
+      setSavingDraft(false);
     }
+    setDraft(null);
+    await load(true);
   }
 
   async function removeSchedule(schedule: Schedule) {
     setMenu(null);
+    if (removingScheduleIdsRef.current.has(schedule.id)) {
+      return;
+    }
     const message = schedule.sourceKind === "weekly"
       ? `跳过本次固定周表「${schedule.title}」？后续周次不会受影响。`
       : `删除「${schedule.title}」？`;
     if (!window.confirm(message)) {
       return;
     }
+    removingScheduleIdsRef.current.add(schedule.id);
     try {
       await actions.remove(schedule);
       await load(true);
     } catch (removeError) {
       onError(explainError(removeError));
+    } finally {
+      removingScheduleIdsRef.current.delete(schedule.id);
     }
   }
 
   async function openSchedule(schedule: Schedule) {
     if (suppressCardClickRef.current) {
       suppressCardClickRef.current = false;
-      return;
-    }
-    if (longPressTriggered.current) {
       longPressTriggered.current = false;
+      if (suppressClickTimerRef.current !== null) {
+        clearTimeout(suppressClickTimerRef.current);
+        suppressClickTimerRef.current = null;
+      }
       return;
     }
     if (!schedule.roomUrl) {
@@ -508,13 +816,25 @@ export default function ScheduleView({
     }
   }
 
+  function closeLiveData() {
+    liveRequestRef.current += 1;
+    setLiveModal(null);
+  }
+
   async function openLiveData(schedule: Schedule) {
+    const requestId = ++liveRequestRef.current;
     setMenu(null);
     setLiveModal({ schedule, session: null, loading: true });
     try {
       const session = await actions.liveSession(schedule.id);
+      if (liveRequestRef.current !== requestId) {
+        return;
+      }
       setLiveModal({ schedule, session, loading: false });
     } catch (liveError) {
+      if (liveRequestRef.current !== requestId) {
+        return;
+      }
       setLiveModal(null);
       onError(explainError(liveError));
     }
@@ -524,24 +844,112 @@ export default function ScheduleView({
   }
 
   function beginLongPress(schedule: Schedule, x: number, y: number) {
-    if (longPress.current) {
+    if (longPress.current !== null) {
       clearTimeout(longPress.current);
     }
+    if (suppressClickTimerRef.current !== null) {
+      clearTimeout(suppressClickTimerRef.current);
+      suppressClickTimerRef.current = null;
+    }
+    longPressTriggered.current = false;
+    longPressStartRef.current = { x, y };
     longPress.current = setTimeout(() => {
+      longPress.current = null;
       longPressTriggered.current = true;
+      suppressCardClickRef.current = true;
       showMenu(schedule, x, y);
     }, 550);
   }
 
   function endLongPress() {
-    if (longPress.current) {
+    if (longPress.current !== null) {
       clearTimeout(longPress.current);
       longPress.current = null;
     }
+    longPressStartRef.current = null;
+    if (!longPressTriggered.current) {
+      return;
+    }
+    if (suppressClickTimerRef.current !== null) {
+      clearTimeout(suppressClickTimerRef.current);
+    }
+    suppressClickTimerRef.current = setTimeout(() => {
+      suppressClickTimerRef.current = null;
+      suppressCardClickRef.current = false;
+      longPressTriggered.current = false;
+    }, 350);
+  }
+
+  function suppressCardClickBriefly() {
+    suppressCardClickRef.current = true;
+    if (suppressClickTimerRef.current !== null) {
+      clearTimeout(suppressClickTimerRef.current);
+    }
+    suppressClickTimerRef.current = setTimeout(() => {
+      suppressClickTimerRef.current = null;
+      suppressCardClickRef.current = false;
+    }, 120);
   }
 
   function shiftAnchor(delta: number) {
     setAnchor((value) => addDays(value, delta));
+  }
+
+  function beginTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0 || !(event.target instanceof Element)) return;
+    if (event.target.closest("button, a, input, textarea, select")) return;
+    if (event.pointerType === "touch" && !event.target.closest(".day-heading")) return;
+    setTimelineSwipeDayDelta(0);
+    timelineSwipeRef.current = { startY: event.clientY, deltaY: 0 };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture keeps a drag working outside the timeline; it is not required.
+    }
+  }
+
+  function moveTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    const swipe = timelineSwipeRef.current;
+    if (!swipe) return;
+    const deltaY = event.clientY - swipe.startY;
+    swipe.deltaY = deltaY;
+    if (Math.abs(deltaY) > 6) {
+      endLongPress();
+      timelineRef.current?.classList.add("is-dragging");
+      timelineRef.current?.style.setProperty("--timeline-drag-y", `${deltaY}px`);
+      setTimelineSwipeDayDelta(timelineDaysForDelta(deltaY));
+    }
+  }
+
+  function resetTimelineSwipeVisual() {
+    timelineRef.current?.classList.remove("is-dragging");
+    timelineRef.current?.style.removeProperty("--timeline-drag-y");
+    setTimelineSwipeDayDelta(0);
+  }
+
+  function finishTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    const swipe = timelineSwipeRef.current;
+    timelineSwipeRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (!swipe) return;
+    const daysMoved = timelineDaysForDelta(swipe.deltaY);
+    if (Math.abs(swipe.deltaY) > 6) {
+      suppressCardClickBriefly();
+    }
+    if (daysMoved !== 0) {
+      pendingTimelineReleaseRef.current = true;
+      shiftAnchor(daysMoved);
+      setTimelineSwipeDayDelta(0);
+    } else {
+      resetTimelineSwipeVisual();
+    }
+  }
+
+  function cancelTimelineSwipe() {
+    timelineSwipeRef.current = null;
+    resetTimelineSwipeVisual();
   }
 
   function gridDayStep(): number {
@@ -588,8 +996,7 @@ export default function ScheduleView({
     if (!drag) return;
     const daysMoved = dragDaysForDelta(drag.deltaX);
     if (Math.abs(drag.deltaX) > 6) {
-      suppressCardClickRef.current = true;
-      window.setTimeout(() => { suppressCardClickRef.current = false; }, 120);
+      suppressCardClickBriefly();
     }
     if (daysMoved !== 0) {
       pendingDragReleaseRef.current = true;
@@ -619,17 +1026,36 @@ export default function ScheduleView({
         className={`schedule-card ${isLiveSchedule ? "is-live" : ""}`}
         tabIndex={0}
         role="button"
-        onClick={() => void openSchedule(schedule)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            void openSchedule(schedule);
+        onClick={(event) => {
+          if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
+            return;
           }
+          void openSchedule(schedule);
+        }}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          void openSchedule(schedule);
         }}
         onContextMenu={(event) => {
           event.preventDefault();
           showMenu(schedule, event.clientX, event.clientY);
         }}
-        onPointerDown={(event) => beginLongPress(schedule, event.clientX, event.clientY)}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
+            return;
+          }
+          beginLongPress(schedule, event.clientX, event.clientY);
+        }}
+        onPointerMove={(event) => {
+          const start = longPressStartRef.current;
+          if (!start) return;
+          if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 8) {
+            endLongPress();
+          }
+        }}
         onPointerUp={endLongPress}
         onPointerLeave={endLongPress}
         onPointerCancel={endLongPress}
@@ -692,26 +1118,79 @@ export default function ScheduleView({
   const rangeText = rangeDays.length === 1
     ? `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日`
     : `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日 - ${rangeDays[rangeDays.length - 1].getMonth() + 1}月${rangeDays[rangeDays.length - 1].getDate()}日`;
+  const liveEventsUnavailable = liveModal?.session ? liveCollectionFailed(liveModal.session) : false;
 
   return (
     <section ref={pageRef} className="page schedule-page" aria-label="直播日程">
       <header className="page-header schedule-toolbar">
         <div>
           <h1 className="schedule-title">直播日程</h1>
-          <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右滑动切换` : "连续 7 天"}</p>
+          <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右滑动切换` : "连续 7 天 · 上下滑动切换"}</p>
         </div>
         <div className="toolbar-actions">
+          {viewMode === "timeline" ? (
+            <div className="calendar-width-control" role="group" aria-label="调整每行日程数量">
+              <span className="calendar-width-label timeline-columns-label">每行</span>
+              <button
+                type="button"
+                onClick={() => changeTimelineColumns(-1)}
+                disabled={effectiveTimelineColumns <= TIMELINE_COLUMNS_MIN}
+                title="减少每行日程"
+                aria-label="减少每行日程数量"
+              >
+                <Minus size={14} />
+              </button>
+              <strong className="calendar-control-value">{effectiveTimelineColumns}</strong>
+              <button
+                type="button"
+                onClick={() => changeTimelineColumns(1)}
+                disabled={effectiveTimelineColumns >= timelineColumnsMax}
+                title="增加每行日程"
+                aria-label="增加每行日程数量"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+          ) : (
+            <div className="calendar-width-control" role="group" aria-label="调整日历栏宽">
+              <span className="calendar-width-label">栏宽</span>
+              <button
+                type="button"
+                onClick={() => changeGridDayWidth(-GRID_DAY_WIDTH_STEP)}
+                disabled={gridDayWidth <= GRID_DAY_WIDTH_MIN}
+                title="缩窄栏宽"
+                aria-label="缩窄栏宽"
+              >
+                <Minus size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => changeGridDayWidth(GRID_DAY_WIDTH_STEP)}
+                disabled={gridDayWidth >= GRID_DAY_WIDTH_MAX}
+                title="加宽栏宽"
+                aria-label="加宽栏宽"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+          )}
           <div className="segmented" aria-label="视图模式">
             <button
+              type="button"
               className={viewMode === "timeline" ? "active" : ""}
-              onClick={() => setViewMode("timeline")}
+              onClick={() => changeViewMode("timeline")}
+              aria-label="切换到时间线"
+              aria-pressed={viewMode === "timeline"}
               title="时间线"
             >
               <List size={17} />
             </button>
             <button
+              type="button"
               className={viewMode === "grid" ? "active" : ""}
-              onClick={() => setViewMode("grid")}
+              onClick={() => changeViewMode("grid")}
+              aria-label="切换到日历网格"
+              aria-pressed={viewMode === "grid"}
               title="日历网格"
             >
               <Grid3X3 size={17} />
@@ -732,6 +1211,13 @@ export default function ScheduleView({
         </div>
       </header>
 
+      <div
+        key={viewMode}
+        className={`schedule-view-surface${viewEnterAnimation ? " is-entering" : ""}`}
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget) setViewEnterAnimation(false);
+        }}
+      >
       <div className="day-navigator">
         <button className="icon-button" onClick={() => shiftAnchor(-1)} aria-label="前移一天">
           <ChevronLeft size={19} />
@@ -768,22 +1254,56 @@ export default function ScheduleView({
             action={!subscriptions.length ? <span className="muted">前往“主播库”添加订阅</span> : null}
           />
         ) : (
-        <div className="timeline">
-          {timelineDays.map((day) => {
-            const values = grouped.get(localDateKey(day)) ?? [];
-            return (
-              <section className="day-section" key={localDateKey(day)}>
-                <div className="day-heading">
-                  <span>{day.getMonth() + 1}月{day.getDate()}日</span>
-                  <strong>{["周日", "周一", "周二", "周三", "周四", "周五", "周六"][day.getDay()]}</strong>
-                  <em>{values.length} 场</em>
-                </div>
-                <div className="day-events">
-                  {values.length ? values.map(renderCard) : <div className="day-empty">暂无安排</div>}
-                </div>
-              </section>
-            );
-          })}
+        <div className="timeline-shell">
+          <div className="timeline-viewport" style={{ height: `${timelineViewportHeight}px` }}>
+            <div
+              ref={timelineRef}
+              className="timeline"
+              data-timeline-columns={effectiveTimelineColumns}
+              style={{
+                "--timeline-columns": effectiveTimelineColumns,
+                "--timeline-gap": `${TIMELINE_GAP}px`,
+                "--timeline-offset-y": `${-timelineOffsetY}px`,
+              } as CSSProperties}
+              role="group"
+              aria-label={`时间线，当前显示 ${timelineDays.length} 天，上下拖动切换日期`}
+              title="按住上下拖动切换日期；在日期栏滚动滚轮也可切换"
+              onPointerDown={beginTimelineSwipe}
+              onPointerMove={moveTimelineSwipe}
+              onPointerUp={finishTimelineSwipe}
+              onPointerCancel={cancelTimelineSwipe}
+            >
+              {gridWindowDays.map((day, index) => {
+                const values = grouped.get(localDateKey(day)) ?? [];
+                const isVisible = index >= anchorIndex && index < anchorIndex + timelineDays.length;
+                return (
+                  <section
+                    className="day-section"
+                    key={localDateKey(day)}
+                    data-timeline-day={localDateKey(day)}
+                    aria-hidden={!isVisible}
+                    inert={!isVisible ? true : undefined}
+                  >
+                    <div className="day-heading" title="上下拖动切换日期">
+                      <span>{day.getMonth() + 1}月{day.getDate()}日</span>
+                      <strong>{["周日", "周一", "周二", "周三", "周四", "周五", "周六"][day.getDay()]}</strong>
+                      <em>{values.length} 场</em>
+                      <GripVertical className="day-heading-grip" size={14} aria-hidden="true" />
+                    </div>
+                    <div className="day-events">
+                      {values.length ? values.map(renderCard) : <div className="day-empty">暂无安排</div>}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+          </div>
+          <span className={`timeline-swipe-status ${timelineSwipeDayDelta !== 0 ? "is-active" : ""}`} aria-hidden="true">
+            <GripVertical size={14} />
+            <span>{timelineSwipeDayDelta === 0
+              ? "上下拖动切换日期"
+              : `${timelineSwipeDayDelta > 0 ? "向后" : "向前"} ${Math.abs(timelineSwipeDayDelta)} 天`}</span>
+          </span>
         </div>
         )
       ) : (
@@ -834,6 +1354,7 @@ export default function ScheduleView({
           </span>
         </div>
       )}
+      </div>
 
       {menu ? (
         <div
@@ -861,9 +1382,9 @@ export default function ScheduleView({
       {liveModal ? (
         <Modal
           title="直播数据"
-          onClose={() => setLiveModal(null)}
+          onClose={closeLiveData}
           wide
-          footer={<button className="button secondary" onClick={() => setLiveModal(null)}>关闭</button>}
+          footer={<button className="button secondary" onClick={closeLiveData}>关闭</button>}
         >
           {liveModal.loading ? (
             <div className="live-stats-loading"><LoaderCircle className="spin" size={24} />正在读取直播数据…</div>
@@ -878,26 +1399,32 @@ export default function ScheduleView({
                     {liveModal.session.endedAt ? ` - ${formatLiveTime(liveModal.session.endedAt)}` : " · 直播中"}
                   </span>
                 </div>
-                <em className={`live-data-quality ${liveModal.session.dataQuality}`}>
-                  {liveQualityLabel(liveModal.session.dataQuality)}
+                <em className={`live-data-quality ${liveEventsUnavailable ? "failed" : liveModal.session.dataQuality}`}>
+                  {liveQualityLabel(liveModal.session)}
                 </em>
               </div>
               <div className="live-stat-grid">
                 <div><span>时长</span><strong>{formatLiveDuration(liveModal.session.durationSeconds)}</strong></div>
-                <div><span>营收(估)</span><strong>{formatMoney(liveModal.session.revenueCents)}</strong></div>
-                <div><span>付费人数(估)</span><strong>{formatCount(liveModal.session.paidUserCount)}</strong></div>
-                <div><span>峰值人气</span><strong>{formatCount(liveModal.session.peakOnline)}</strong></div>
-                <div><span>互动人数(估)</span><strong>{formatCount(liveModal.session.interactiveUserCount)}</strong></div>
-                <div><span>弹幕</span><strong>{formatCount(liveModal.session.danmakuCount)}</strong></div>
+                <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(liveModal.session.revenueCents)}</strong></div>
+                <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.paidUserCount)}</strong></div>
+                <div><span>最高同时在线</span><strong>{liveModal.session.peakHighEnergy > 0 ? formatCount(liveModal.session.peakHighEnergy) : "—"}</strong></div>
+                <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.interactiveUserCount)}</strong></div>
+                <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.danmakuCount)}</strong></div>
               </div>
               <div className="live-revenue-breakdown">
-                <span>礼物 {formatMoney(liveModal.session.giftRevenueCents)}</span>
-                <span>SC {formatMoney(liveModal.session.superChatRevenueCents)}</span>
-                <span>舰长 {formatMoney(liveModal.session.guardRevenueCents)}</span>
+                <span>礼物 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.giftRevenueCents)}</span>
+                <span>SC {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.superChatRevenueCents)}</span>
+                <span>舰长 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.guardRevenueCents)}</span>
               </div>
-              <p className="form-hint">
-                营收与付费人数由公开直播事件估算，不含平台分成和活动特殊规则；粉丝侧无法获取官方“高能”指标，因此展示峰值人气。
-              </p>
+              {liveEventsUnavailable ? (
+                <p className="form-hint live-stats-error-note">
+                  本次未能建立 B 站弹幕采集连接（重试 {formatCount(liveModal.session.reconnectCount)} 次），事件类指标不可用；时长仍来自直播状态轮询。
+                </p>
+              ) : (
+                <p className="form-hint">
+                  最高同时在线来自公开“高能用户数”事件。营收与付费人数由公开直播事件估算，不含平台分成和活动特殊规则。
+                </p>
+              )}
             </div>
           ) : (
             <EmptyState
@@ -909,16 +1436,21 @@ export default function ScheduleView({
       ) : null}
       {draft ? (
         <Modal
-          title={draft.id ? "编辑日程" : "新增日程"}
-          onClose={() => setDraft(null)}
+          title={draft.id !== null ? "编辑日程" : "新增日程"}
+          onClose={closeDraft}
           footer={
             <>
-              <button className="button secondary" onClick={() => setDraft(null)}>取消</button>
-              <button className="button primary" onClick={() => void saveDraft()}>保存</button>
+              <button className="button secondary" onClick={closeDraft} disabled={savingDraft}>取消</button>
+              <button className="button primary" onClick={() => void saveDraft()} disabled={savingDraft}>保存</button>
             </>
           }
         >
-          <div className="form-grid">
+          <fieldset
+            className="form-grid"
+            disabled={savingDraft}
+            style={{ border: 0, margin: 0, minWidth: 0, padding: 0 }}
+            aria-busy={savingDraft}
+          >
             <label>
               <span>主播</span>
               <SubscriptionSelect
@@ -926,27 +1458,27 @@ export default function ScheduleView({
                 value={draft.streamerId}
                 onChange={(streamerId) => {
                   const streamer = subscriptions.find((value) => value.id === streamerId);
-                  setDraft({ ...draft, streamerId, roomUrl: streamer?.liveUrl ?? draft.roomUrl });
+                  updateDraft({ streamerId, roomUrl: streamer?.liveUrl ?? draft.roomUrl });
                 }}
               />
             </label>
             <label>
               <span>主题</span>
-              <input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="例如：周五杂谈" />
+              <input value={draft.title} onChange={(event) => updateDraft({ title: event.target.value })} placeholder="例如：周五杂谈" />
             </label>
             <label>
               <span>开始时间</span>
-              <input type="datetime-local" value={draft.startAt} onChange={(event) => setDraft({ ...draft, startAt: event.target.value })} />
+              <input type="datetime-local" value={draft.startAt} onChange={(event) => updateDraft({ startAt: event.target.value })} />
             </label>
             <label>
               <span>结束时间</span>
-              <input type="datetime-local" value={draft.endAt} onChange={(event) => setDraft({ ...draft, endAt: event.target.value })} />
+              <input type="datetime-local" value={draft.endAt} onChange={(event) => updateDraft({ endAt: event.target.value })} />
             </label>
             <label className="span-2">
               <span>直播间地址</span>
-              <input value={draft.roomUrl} onChange={(event) => setDraft({ ...draft, roomUrl: event.target.value })} placeholder="https://live.bilibili.com/..." />
+              <input value={draft.roomUrl} onChange={(event) => updateDraft({ roomUrl: event.target.value })} placeholder="https://live.bilibili.com/..." />
             </label>
-          </div>
+          </fieldset>
           <p className="form-hint"><Clock3 size={14} /> 手动修改后的自动日程会锁定，不再被抓取结果覆盖。</p>
         </Modal>
       ) : null}

@@ -1,17 +1,23 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bili_login::BiliQrManager;
+use crate::config::ALLOWED_WEB_ORIGINS;
 use crate::jobs::{
     job_progress_message, RefreshJob, RefreshJobAccepted, RefreshJobManager, RefreshJobProgress,
 };
-use crate::secrets::{load_persisted_llm_secret, save_persisted_llm_secret, SecretVault};
+use crate::secrets::{
+    bind_persisted_llm_secret_url, load_persisted_llm_secret, save_persisted_llm_secret,
+    SecretVault,
+};
 use crate::sync_api;
 use crate::update_manager::{ServerUpdateManager, ServerUpdateSettings, ServerUpdateView};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
-use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::http::uri::{Authority, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -19,16 +25,20 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::SinkExt;
 use oshical_core::{
-    load_settings, save_settings, AppError, AppService, AppSettings, LlmConfig, LlmDiscoveryConfig,
-    NewSchedule, NewWeeklyScheduleRule, ProxyTestInput, SqliteStore, SyncMutation, UpdateSchedule,
+    load_settings, AppError, AppService, AppSettings, LlmConfig, LlmDiscoveryConfig, NewSchedule,
+    NewWeeklyScheduleRule, ProxyTestInput, SqliteStore, SyncMutation, UpdateSchedule,
     UpdateSubscription, UpdateWeeklyScheduleRule,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
+
+static SERVER_SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +48,7 @@ pub struct AppState {
     pub hub: broadcast::Sender<Value>,
     pub jobs: RefreshJobManager,
     pub updates: ServerUpdateManager,
+    pub(crate) runtime_proxy_port: Arc<Mutex<Option<u16>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,10 +72,29 @@ impl From<AppError> for ApiError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Database(_) | AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::External { code, .. }
+                if matches!(
+                    code.as_str(),
+                    "MIGRATION_STALE_PREVIEW" | "MIGRATION_PREVIEW_CONTENTION"
+                ) =>
+            {
+                StatusCode::CONFLICT
+            }
             _ => StatusCode::BAD_GATEWAY,
         };
+        let code = match &value {
+            AppError::External { code, .. }
+                if matches!(
+                    code.as_str(),
+                    "MIGRATION_STALE_PREVIEW" | "MIGRATION_PREVIEW_CONTENTION"
+                ) =>
+            {
+                code.clone()
+            }
+            _ => value.code().to_owned(),
+        };
         Self {
-            code: value.code().to_owned(),
+            code,
             message: value.to_string(),
             status,
         }
@@ -78,6 +108,14 @@ impl From<serde_json::Error> for ApiError {
 }
 
 impl ApiError {
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            code: "FORBIDDEN".to_owned(),
+            message: message.into(),
+            status: StatusCode::FORBIDDEN,
+        }
+    }
+
     fn migration_id_conflict(message: impl Into<String>) -> Self {
         Self {
             code: "MIGRATION_ID_CONFLICT".to_owned(),
@@ -138,6 +176,11 @@ pub fn build_router(state: AppState) -> Router {
             delete(remove_linked_account),
         )
         .route("/api/subscriptions/{id}/refresh", post(refresh_streamer))
+        .route("/api/subscriptions/{id}/fans", get(fan_history))
+        .route(
+            "/api/subscriptions/{id}/fans/refresh",
+            post(refresh_streamer_fans),
+        )
         .route("/api/refresh", post(refresh_all))
         .route("/api/schedules", get(list_schedules).post(create_schedule))
         .route(
@@ -200,13 +243,9 @@ pub fn build_router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list([
-            HeaderValue::from_static("http://localhost:1420"),
-            HeaderValue::from_static("http://127.0.0.1:1420"),
-            HeaderValue::from_static("http://tauri.localhost"),
-            HeaderValue::from_static("https://tauri.localhost"),
-            HeaderValue::from_static("tauri://localhost"),
-        ]))
+        .allow_origin(AllowOrigin::list(
+            ALLOWED_WEB_ORIGINS.map(HeaderValue::from_static),
+        ))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -227,6 +266,10 @@ pub fn build_router(state: AppState) -> Router {
         .fallback_service(ServeDir::new(dist).not_found_service(ServeFile::new(index)))
         .layer(Extension(bili_qr_manager))
         .layer(Extension(migration_lock))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_cross_site_unsafe_http,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
@@ -244,7 +287,7 @@ async fn require_auth(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .unwrap_or_default();
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return ApiError::from(AppError::Unauthorized).into_response();
@@ -252,15 +295,57 @@ async fn require_auth(
     next.run(request).await
 }
 
+async fn reject_cross_site_unsafe_http(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if request.method() == Method::GET
+        || request.method() == Method::HEAD
+        || request.method() == Method::OPTIONS
+    {
+        return next.run(request).await;
+    }
+
+    // With a bearer token, a cross-site browser cannot add the required
+    // Authorization header without a successful CORS preflight. Tokenless
+    // loopback deployments rely on an explicit same-origin/allowed-origin gate.
+    if state.api_token.is_some() {
+        return next.run(request).await;
+    }
+
+    if !unsafe_http_origin_allowed(request.headers()) {
+        return ApiError::forbidden("拒绝跨站浏览器写入请求").into_response();
+    }
+    next.run(request).await
+}
+
+fn unsafe_http_origin_allowed(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::ORIGIN) {
+        return websocket_origin_allowed(headers);
+    }
+    !headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let mut parts = value.split_ascii_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() {
+        return None;
+    }
+    Some(token)
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
+    // Hash both sides first so unequal lengths still execute a fixed-size
+    // constant-time comparison and do not leak token length through timing.
+    let left = Sha256::digest(left);
+    let right = Sha256::digest(right);
+    bool::from(left.as_slice().ct_eq(right.as_slice()))
 }
 
 async fn health(State(state): State<AppState>) -> ApiResult {
@@ -496,6 +581,27 @@ async fn list_live_status(State(state): State<AppState>) -> ApiResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FanHistoryQuery {
+    days: Option<i64>,
+}
+
+async fn fan_history(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<FanHistoryQuery>,
+) -> ApiResult {
+    ok(state
+        .service
+        .get_fan_history(id, query.days.unwrap_or(30))
+        .await?)
+}
+
+async fn refresh_streamer_fans(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    ok(state.service.refresh_streamer_fans(id).await?)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LiveSessionQuery {
     streamer_id: Option<i64>,
     limit: Option<i64>,
@@ -615,6 +721,53 @@ async fn cancel_schedule(State(state): State<AppState>, Path(id): Path<i64>) -> 
     ok(state.service.store().cancel_schedule(id).await?)
 }
 
+fn llm_secret_url_binding_allows(
+    bound_base_url: Option<&str>,
+    pending_url_binding: bool,
+    target_base_url: &str,
+) -> bool {
+    bound_base_url == Some(target_base_url) || pending_url_binding
+}
+fn changed_setting_values(
+    current: &AppSettings,
+    next: &AppSettings,
+) -> oshical_core::AppResult<Vec<(&'static str, String)>> {
+    let mut values = Vec::new();
+    macro_rules! changed {
+        ($key:literal, $field:ident) => {
+            if current.$field != next.$field {
+                values.push(($key, serde_json::to_string(&next.$field)?));
+            }
+        };
+    }
+    changed!("data_mode", data_mode);
+    changed!("server_url", server_url);
+    changed!("live_poll_seconds", live_poll_seconds);
+    changed!("dynamic_poll_seconds", dynamic_poll_seconds);
+    changed!("auto_analyze_images", auto_analyze_images);
+    changed!("notifications_enabled", notifications_enabled);
+    changed!("live_stats_enabled", live_stats_enabled);
+    changed!("llm_base_url", llm_base_url);
+    changed!("llm_model", llm_model);
+    changed!("llm_prompt_version", llm_prompt_version);
+    changed!("proxy_port", proxy_port);
+    Ok(values)
+}
+
+pub(crate) async fn persist_changed_settings(
+    store: &SqliteStore,
+    current: &AppSettings,
+    next: &AppSettings,
+) -> oshical_core::AppResult<bool> {
+    next.validate()?;
+    let values = changed_setting_values(current, next)?;
+    if values.is_empty() {
+        return Ok(false);
+    }
+    store.set_settings(&values).await?;
+    Ok(true)
+}
+
 async fn get_settings(State(state): State<AppState>) -> ApiResult {
     ok(load_settings(state.service.store()).await?)
 }
@@ -623,8 +776,88 @@ async fn put_settings(
     State(state): State<AppState>,
     Json(settings): Json<AppSettings>,
 ) -> ApiResult {
-    save_settings(state.service.store(), &settings).await?;
-    state.service.update_proxy_port(settings.proxy_port).await?;
+    let _guard = SERVER_SETTINGS_WRITE_LOCK.lock().await;
+    let current = load_settings(state.service.store()).await?;
+    settings.validate()?;
+    let llm_url_changed = settings.llm_base_url.trim() != current.llm_base_url.trim();
+    let target_base_url = if !settings.llm_base_url.trim().is_empty() {
+        Some(oshical_core::llm::normalized_llm_base_url(
+            &settings.llm_base_url,
+        )?)
+    } else {
+        None
+    };
+    let mut bind_secret_to_url = false;
+    let mut validate_target = target_base_url.is_some() && llm_url_changed;
+    if let Some(target_base_url) = target_base_url.as_deref() {
+        if state.service.llm_api_key().await.is_some() {
+            let persisted =
+                load_persisted_llm_secret(state.service.store(), &state.secret_vault).await?;
+            if let Some(persisted) = persisted {
+                let bound_matches = persisted.bound_base_url.as_deref() == Some(target_base_url);
+                if llm_url_changed
+                    && !llm_secret_url_binding_allows(
+                        persisted.bound_base_url.as_deref(),
+                        persisted.pending_url_binding,
+                        target_base_url,
+                    )
+                {
+                    return Err(ApiError::from(AppError::validation(
+                        "当前 API Key 未绑定到目标模型地址，请先为新地址重新保存 API Key",
+                    )));
+                }
+                // Consume a fresh key-first permit even when the URL did not change.
+                // This prevents it from authorizing an unrelated URL later in its TTL.
+                bind_secret_to_url =
+                    persisted.pending_url_binding || (llm_url_changed && !bound_matches);
+                validate_target |= persisted.pending_url_binding;
+            } else if llm_url_changed {
+                return Err(ApiError::from(AppError::validation(
+                    "更改模型地址前必须先保存该地址对应的 API Key",
+                )));
+            }
+        }
+    }
+    if validate_target {
+        if let Some(target_base_url) = target_base_url.as_deref() {
+            oshical_core::llm::validate_llm_base_url_target(target_base_url, "日程模型地址")
+                .await?;
+        }
+    }
+    let runtime_proxy_matches = *state.runtime_proxy_port.lock().await == settings.proxy_port;
+    // Reconcile the runtime before the database write. The shadow value makes
+    // retries converge even if a prior commit outcome was uncertain.
+    if !runtime_proxy_matches {
+        state.service.update_proxy_port(settings.proxy_port).await?;
+        *state.runtime_proxy_port.lock().await = settings.proxy_port;
+    }
+    if let Err(error) = persist_changed_settings(state.service.store(), &current, &settings).await {
+        if !runtime_proxy_matches {
+            // Mark the rollback target before rebuilding. If the request is
+            // cancelled during compensation, a retry will reconcile again.
+            *state.runtime_proxy_port.lock().await = current.proxy_port;
+            if let Err(rollback_error) = state.service.update_proxy_port(current.proxy_port).await {
+                tracing::error!(
+                    %rollback_error,
+                    "设置写入失败后恢复运行时代理失败；相同请求重试会再次尝试应用目标代理"
+                );
+            }
+        }
+        return Err(ApiError::from(error));
+    }
+    // Bind after settings commit. If this write fails, the new settings and
+    // runtime stay live; the next identical request can consume the still-pending
+    // permit and finish the operation without a revision bump.
+    if bind_secret_to_url {
+        if let Some(target_base_url) = target_base_url.as_deref() {
+            bind_persisted_llm_secret_url(
+                state.service.store(),
+                &state.secret_vault,
+                target_base_url,
+            )
+            .await?;
+        }
+    }
     ok(settings)
 }
 
@@ -670,6 +903,8 @@ fn emit_server_update(state: &AppState, update: &ServerUpdateView) {
 #[serde(rename_all = "camelCase")]
 struct LlmSecretInput {
     api_key: String,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,6 +914,8 @@ struct LlmSecretResponse {
     revision: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound_base_url: Option<String>,
 }
 
 async fn get_llm_secret(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -688,14 +925,15 @@ async fn get_llm_secret(State(state): State<AppState>) -> Result<Response, ApiEr
         ok(LlmSecretResponse {
             configured: true,
             revision: persisted.revision,
-            api_key: Some(persisted.api_key),
+            api_key: None,
+            bound_base_url: persisted.bound_base_url,
         })?
     } else {
-        let api_key = state.service.llm_api_key().await;
         ok(LlmSecretResponse {
-            configured: api_key.is_some(),
+            configured: state.service.llm_api_key().await.is_some(),
             revision: 0,
-            api_key,
+            api_key: None,
+            bound_base_url: None,
         })?
     };
     Ok((
@@ -723,9 +961,30 @@ async fn put_llm_secret(
             "模型 API Key 不能包含控制字符",
         )));
     }
-    let persisted =
-        save_persisted_llm_secret(state.service.store(), &state.secret_vault, api_key).await?;
+    let bound_base_url = match input
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(base_url) => {
+            oshical_core::llm::validate_llm_base_url_target(base_url, "日程模型地址").await?;
+            Some(oshical_core::llm::normalized_llm_base_url(base_url)?)
+        }
+        None => None,
+    };
+    let _guard = SERVER_SETTINGS_WRITE_LOCK.lock().await;
+    let persisted = save_persisted_llm_secret(
+        state.service.store(),
+        &state.secret_vault,
+        api_key,
+        bound_base_url.as_deref(),
+    )
+    .await?;
     state.service.update_llm_api_key(api_key.to_owned()).await?;
+    // Re-emit the same revision when the value is unchanged. This makes a
+    // retry repair a previous failure after the secret row was persisted but
+    // its sync notification was not.
     state
         .service
         .store()
@@ -741,35 +1000,40 @@ async fn put_llm_secret(
         configured: true,
         revision: persisted.revision,
         api_key: None,
+        bound_base_url: persisted.bound_base_url,
     })
 }
 
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     after: Option<i64>,
+    limit: Option<i64>,
 }
 
 async fn events_after(
     State(state): State<AppState>,
     Query(query): Query<EventsQuery>,
 ) -> ApiResult {
+    let limit = query.limit.unwrap_or(500).clamp(1, 500);
     let events = state
         .service
         .store()
-        .events_after(query.after.unwrap_or(0).max(0), 500)
+        .events_after(query.after.unwrap_or(0).max(0), limit)
         .await?;
     ok(events)
 }
 
 async fn sync_snapshot(State(state): State<AppState>) -> ApiResult {
-    let subscriptions = state.service.list_subscriptions().await?;
-    let schedules = state.service.store().list_all_schedules().await?;
-    let weekly_rules = state.service.list_weekly_rules(None).await?;
+    let bootstrap = state.service.store().sync_bootstrap().await?;
     let latest_event_seq = state.service.store().latest_event_seq().await?;
     ok(json!({
-        "subscriptions": subscriptions,
-        "schedules": schedules,
-        "weeklyRules": weekly_rules,
+        "schemaVersion": oshical_core::store::SERVER_SNAPSHOT_SCHEMA_VERSION,
+        "subscriptions": bootstrap.subscriptions,
+        "schedules": bootstrap.schedules,
+        "weeklyRules": bootstrap.weekly_rules,
+        "weeklyExceptions": bootstrap.weekly_exceptions,
+        "scheduleSources": bootstrap.schedule_sources,
+        "sourceSuppressions": bootstrap.source_suppressions,
         "latestEventSeq": latest_event_seq,
         "exportedAt": Utc::now()
     }))
@@ -819,61 +1083,17 @@ async fn apply_mutation(state: &AppState, mutation: &SyncMutation) -> (String, O
                     .await?;
             }
             ("subscription", "update") => {
-                let payload = mutation.payload.as_object().ok_or_else(|| {
-                    AppError::validation("subscription update payload 必须是对象")
-                })?;
-                let id = payload
-                    .get("id")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| AppError::validation("缺少订阅 id"))?;
-                if let Some(base_revision) = mutation.base_revision {
-                    let current = state.service.store().get_streamer(id).await?;
-                    if current.revision != base_revision {
-                        return Err(AppError::External {
-                            code: "SYNC_CONFLICT".to_owned(),
-                            message: format!(
-                                "订阅已变化：期望 revision {base_revision}，当前 {}",
-                                current.revision
-                            ),
-                        });
-                    }
-                }
-                let update: UpdateSubscription = serde_json::from_value(
-                    payload
-                        .get("update")
-                        .cloned()
-                        .ok_or_else(|| AppError::validation("缺少 update"))?,
-                )?;
-                state.service.update_subscription(id, &update).await?;
-            }
-            ("link", "create") => {
-                let streamer_id = mutation
-                    .payload
-                    .get("streamerId")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| AppError::validation("缺少 streamerId"))?;
-                let mid = mutation
-                    .payload
-                    .get("mid")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AppError::validation("缺少官号 mid"))?;
-                state.service.add_linked_account(streamer_id, mid).await?;
-            }
-            ("link", "delete") => {
-                let streamer_id = mutation
-                    .payload
-                    .get("streamerId")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| AppError::validation("缺少 streamerId"))?;
-                let mid = mutation
-                    .payload
-                    .get("mid")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AppError::validation("缺少官号 mid"))?;
                 state
                     .service
                     .store()
-                    .remove_linked_account(streamer_id, mid)
+                    .apply_subscription_mutation(mutation)
+                    .await?;
+            }
+            ("link", _) => {
+                state
+                    .service
+                    .store()
+                    .apply_link_mutation(mutation)
                     .await?;
             }
             _ => {
@@ -917,20 +1137,86 @@ struct WsAuthFrame {
     protocol_version: Option<u32>,
 }
 
+fn websocket_origin_allowed(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = match (origins.next(), origins.next()) {
+        (None, None) => return true,
+        (Some(origin), None) => match origin.to_str() {
+            Ok(origin) => origin,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    ALLOWED_WEB_ORIGINS.contains(&origin)
+        || websocket_origin_matches_loopback_host(origin, headers)
+}
+
+fn websocket_origin_matches_loopback_host(origin: &str, headers: &HeaderMap) -> bool {
+    let Ok(origin) = origin.parse::<Uri>() else {
+        return false;
+    };
+    if !matches!(origin.scheme_str(), Some("http") | Some("https")) {
+        return false;
+    }
+    let Some(origin_authority) = origin.authority() else {
+        return false;
+    };
+    let Some(request_host) = headers.get(header::HOST).and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(request_authority) = request_host.parse::<Authority>() else {
+        return false;
+    };
+    if !origin_authority
+        .host()
+        .eq_ignore_ascii_case(request_authority.host())
+        || origin_authority.port_u16() != request_authority.port_u16()
+    {
+        return false;
+    }
+    loopback_host(request_authority.host())
+}
+
+fn loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
 async fn websocket(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let after = query.after.unwrap_or(0).max(0);
     let protocol = query.protocol.unwrap_or(1);
+    let origin_allowed = state.api_token.is_some() || websocket_origin_allowed(&headers);
     upgrade
-        .on_upgrade(move |socket| handle_websocket(socket, state, after, protocol))
+        .on_upgrade(move |socket| {
+            handle_websocket(socket, state, after, protocol, origin_allowed)
+        })
         .into_response()
 }
 
-async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_protocol: u32) {
+async fn handle_websocket(
+    socket: WebSocket,
+    state: AppState,
+    after: i64,
+    query_protocol: u32,
+    origin_allowed: bool,
+) {
     let mut socket = socket;
+    if state.api_token.is_none() && !origin_allowed {
+        reject_websocket(&mut socket, "REMOTE_UNAUTHORIZED").await;
+        return;
+    }
     let auth = tokio::time::timeout(Duration::from_secs(10), socket.recv()).await;
     let auth_frame = match auth {
         Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<WsAuthFrame>(&text)
@@ -947,7 +1233,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
             .token
             .as_deref()
             .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes())),
-        None => true,
+        None => origin_allowed,
     };
     if !authorized {
         reject_websocket(&mut socket, "REMOTE_UNAUTHORIZED").await;
@@ -970,23 +1256,49 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
         reject_websocket(&mut socket, "INVALID_DEVICE_ID").await;
         return;
     }
+    if let Some(device_id) = device_id.as_deref() {
+        // A successful authenticated socket counts as activity even when no new
+        // changes arrive and therefore no ACK is sent.
+        if let Err(error) = state.service.store().touch_device(device_id).await {
+            tracing::warn!(%error, device_id, "WebSocket 设备活跃时间更新失败");
+        }
+    }
 
     // Subscribe before replay so a change committed during catch-up is queued.
     let mut receiver = state.hub.subscribe();
     let mut sync_cursor = after;
     if protocol_v2 {
-        let latest = state.service.store().latest_sync_seq().await.unwrap_or(0);
-        let min_retained = state
-            .service
-            .store()
-            .min_retained_sync_seq()
-            .await
-            .unwrap_or(0);
-        let reset_required = sync_cursor < min_retained.saturating_sub(1);
+        let feed_id = match state.service.store().sync_feed_id().await {
+            Ok(feed_id) => feed_id,
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket 鉴权读取同步源标识失败");
+                reject_websocket(&mut socket, "STORE_UNAVAILABLE").await;
+                return;
+            }
+        };
+        let latest = match state.service.store().latest_sync_seq().await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket 鉴权读取同步游标失败");
+                reject_websocket(&mut socket, "STORE_UNAVAILABLE").await;
+                return;
+            }
+        };
+        let min_retained = match state.service.store().min_retained_sync_seq().await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket 鉴权读取最小保留游标失败");
+                reject_websocket(&mut socket, "STORE_UNAVAILABLE").await;
+                return;
+            }
+        };
+        let reset_required =
+            sync_cursor < min_retained.saturating_sub(1) || sync_cursor > latest;
         let auth_ok = json!({
             "type": "auth_ok",
             "protocolVersion": 2,
             "deviceId": device_id,
+            "feedId": &feed_id,
             "latestSeq": latest,
             "minRetainedSeq": min_retained,
             "resetRequired": reset_required,
@@ -999,7 +1311,13 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
             return;
         }
         if reset_required {
-            let reset = sync_api::reset_required_message(latest, min_retained, "cursor_expired");
+            sync_cursor = latest;
+            let reset = sync_api::reset_required_message(
+                latest,
+                min_retained,
+                &feed_id,
+                "cursor_expired",
+            );
             if socket
                 .send(Message::Text(reset.to_string().into()))
                 .await
@@ -1014,7 +1332,14 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
             return;
         }
     } else {
-        let latest = state.service.store().latest_event_seq().await.unwrap_or(0);
+        let latest = match state.service.store().latest_event_seq().await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket 鉴权读取事件游标失败");
+                reject_websocket(&mut socket, "STORE_UNAVAILABLE").await;
+                return;
+            }
+        };
         if socket
             .send(Message::Text(
                 json!({"type": "auth_ok", "latestSeq": latest})
@@ -1026,8 +1351,23 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
         {
             return;
         }
-        if let Ok(events) = state.service.store().events_after(sync_cursor, 500).await {
+        let mut replay_cursor = sync_cursor;
+        loop {
+            let events = match state.service.store().events_after(replay_cursor, 500).await {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(%error, "WebSocket V1 历史事件读取失败");
+                    reject_websocket(&mut socket, "STORE_UNAVAILABLE").await;
+                    return;
+                }
+            };
+            let page_len = events.len();
+            let mut advanced = false;
             for event in events {
+                if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
+                    replay_cursor = replay_cursor.max(seq);
+                    advanced = true;
+                }
                 if socket
                     .send(Message::Text(event.to_string().into()))
                     .await
@@ -1036,7 +1376,11 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
                     return;
                 }
             }
+            if page_len < 500 || !advanced {
+                break;
+            }
         }
+        sync_cursor = replay_cursor;
     }
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -1103,10 +1447,17 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
                                 break;
                             }
                         } else {
+                            let latest_seq = match state.service.store().latest_event_seq().await {
+                                Ok(seq) => seq,
+                                Err(error) => {
+                                    tracing::warn!(%error, "广播积压后读取事件游标失败");
+                                    break;
+                                }
+                            };
                             let resync = json!({
                                 "type": "resync_required",
                                 "skipped": skipped,
-                                "latestSeq": state.service.store().latest_event_seq().await.unwrap_or(0)
+                                "latestSeq": latest_seq
                             });
                             if socket.send(Message::Text(resync.to_string().into())).await.is_err() {
                                 break;
@@ -1122,6 +1473,11 @@ async fn handle_websocket(socket: WebSocket, state: AppState, after: i64, query_
                 }
             }
             _ = heartbeat.tick() => {
+                if let Some(device_id) = device_id.as_deref() {
+                    if let Err(error) = state.service.store().touch_device(device_id).await {
+                        tracing::warn!(%error, device_id, "WebSocket 心跳更新设备活跃时间失败");
+                    }
+                }
                 if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
@@ -1145,10 +1501,13 @@ fn forward_hub_message(protocol_v2: bool, value: &Value) -> bool {
         .unwrap_or_default();
     let sync_message = matches!(message_type, "sync_batch" | "reset_required");
     if protocol_v2 {
+        // Live status transitions are edge notifications, not state snapshots.
+        // V2 still receives state through sync batches, but needs this event to
+        // distinguish a real offline -> live transition from a startup snapshot.
         sync_message
             || matches!(
                 message_type,
-                "job_progress" | "refresh_progress" | "data_imported"
+                "live_status" | "job_progress" | "refresh_progress" | "data_imported"
             )
     } else {
         !sync_message
@@ -1169,6 +1528,7 @@ async fn send_sync_after(
             let reset = sync_api::reset_required_message(
                 page.latest_seq,
                 page.min_retained_seq,
+                &page.feed_id,
                 "cursor_expired",
             );
             socket
@@ -1184,8 +1544,9 @@ async fn send_sync_after(
         }
 
         let previous = *after;
-        let batches = sync_api::sync_batch_messages(&page.changes, page.latest_seq)
-            .map_err(|error| error.to_string())?;
+        let batches =
+            sync_api::sync_batch_messages(&page.changes, page.latest_seq, &page.feed_id)
+                .map_err(|error| error.to_string())?;
         for batch in batches {
             socket
                 .send(Message::Text(batch.to_string().into()))
@@ -1219,6 +1580,8 @@ struct MigrationApplyInput {
     migration_id: String,
     client_id: String,
     strategy: String,
+    #[serde(default)]
+    expected_server_digest: String,
     snapshot: oshical_core::store::ServerSnapshot,
 }
 
@@ -1235,7 +1598,45 @@ async fn migration_preview(
     State(state): State<AppState>,
     Json(snapshot): Json<oshical_core::store::ServerSnapshot>,
 ) -> ApiResult {
-    ok(state.service.store().preview_snapshot(&snapshot).await?)
+    let (preview, server_state_digest) =
+        migration_preview_with_consistent_digest(state.service.store(), &snapshot).await?;
+    let mut response = serde_json::to_value(orient_migration_preview_for_http(preview))?;
+    if let Some(object) = response.as_object_mut() {
+        object.insert("serverStateDigest".to_owned(), json!(server_state_digest));
+    }
+    ok(response)
+}
+
+async fn migration_preview_with_consistent_digest(
+    store: &SqliteStore,
+    snapshot: &oshical_core::store::ServerSnapshot,
+) -> Result<(oshical_core::store::ImportPreview, String), ApiError> {
+    for _ in 0..8 {
+        let before = store.migration_state_digest().await?;
+        let preview = store.preview_snapshot(snapshot).await?;
+        let after = store.migration_state_digest().await?;
+        if before == after {
+            return Ok((preview, after));
+        }
+    }
+    Err(AppError::External {
+        code: "MIGRATION_PREVIEW_CONTENTION".to_owned(),
+        message: "服务器数据持续变化，无法生成一致的迁移预览，请稍后重试".to_owned(),
+    }
+    .into())
+}
+
+fn orient_migration_preview_for_http(
+    mut preview: oshical_core::store::ImportPreview,
+) -> oshical_core::store::ImportPreview {
+    // Store previews describe "incoming snapshot vs local store". During HTTP
+    // migration the incoming snapshot is the client and the local store is the
+    // server, so expose that orientation to the UI without changing store semantics.
+    for conflict in &mut preview.conflicts {
+        std::mem::swap(&mut conflict.local_id, &mut conflict.remote_id);
+        std::mem::swap(&mut conflict.local, &mut conflict.remote);
+    }
+    preview
 }
 
 async fn migration_apply(
@@ -1249,71 +1650,65 @@ async fn migration_apply(
     if client_id.is_empty() || client_id.chars().count() > 128 {
         return Err(ApiError::from(AppError::validation("clientId 无效")));
     }
-    if !matches!(input.strategy.as_str(), "server" | "client" | "skip") {
-        return Err(ApiError::from(AppError::validation("迁移策略无效")));
+    let internal_strategy = migration_store_strategy(&input.strategy)?;
+    if input.expected_server_digest.trim().is_empty() {
+        return Err(ApiError::from(AppError::validation(
+            "expectedServerDigest 不能为空",
+        )));
     }
 
     let snapshot_digest = snapshot_digest(&input.snapshot)?;
     let receipt_key = migration_receipt_key(migration_id);
+    let event_payload = json!({
+        "clientId": client_id,
+        "migrationId": migration_id,
+        "strategy": &input.strategy,
+    });
     let _guard = migration_lock.0.lock().await;
-    if let Some(receipt) = load_migration_receipt(state.service.store(), &receipt_key).await? {
-        if receipt.strategy == input.strategy && receipt.snapshot_digest == snapshot_digest {
-            return ok(receipt.report);
-        }
-        return Err(ApiError::migration_id_conflict(
-            "migrationId 已用于不同的迁移内容或策略",
-        ));
-    }
-
-    let report = state
+    let outcome = state
         .service
         .store()
-        .import_snapshot(
+        .import_snapshot_migration(
             &input.snapshot,
-            &input.strategy,
+            internal_strategy,
             &format!("migration:{client_id}"),
-        )
-        .await?;
-    state
-        .service
-        .store()
-        .append_sync_change(
-            "sync_reset",
             migration_id,
-            "upsert",
-            1,
-            Some(json!({"id": migration_id, "reason": "data_imported"})),
-        )
-        .await?;
-    state
-        .service
-        .store()
-        .append_event(
+            &receipt_key,
+            &input.strategy,
+            &snapshot_digest,
+            Some(input.expected_server_digest.as_str()),
             "data_imported",
-            &json!({
-                "clientId": client_id,
-                "migrationId": migration_id,
-                "strategy": input.strategy,
-                "subscriptions": report.subscriptions,
-                "schedules": report.schedules,
-                "weeklyRules": report.weekly_rules,
-                "skipped": report.skipped,
-            }),
+            &event_payload,
         )
         .await?;
-    let report_value = serde_json::to_value(&report)?;
-    let receipt = MigrationReceipt {
-        strategy: input.strategy,
-        snapshot_digest,
-        report: report_value.clone(),
-        completed_at: Utc::now(),
-    };
-    state
-        .service
-        .store()
-        .set_client_sync_state(&receipt_key, &serde_json::to_string(&receipt)?)
-        .await?;
-    ok(report_value)
+
+    match outcome {
+        oshical_core::store::MigrationApplyOutcome::Existing(raw) => {
+            let receipt: MigrationReceipt = serde_json::from_str(&raw)?;
+            if receipt.strategy == input.strategy && receipt.snapshot_digest == snapshot_digest {
+                ok(receipt.report)
+            } else {
+                Err(ApiError::migration_id_conflict(
+                    "migrationId 已用于不同的迁移内容或策略",
+                ))
+            }
+        }
+        oshical_core::store::MigrationApplyOutcome::Applied(report) => {
+            ok(serde_json::to_value(&report)?)
+        }
+    }
+}
+
+fn migration_store_strategy(strategy: &str) -> Result<&'static str, ApiError> {
+    match strategy {
+        // HTTP migration snapshots are supplied by the client. "Keep server"
+        // therefore maps to the store strategy that preserves the local store.
+        "server" => Ok("client"),
+        // "Use client" means the supplied snapshot overwrites the server store.
+        "client" => Ok("server"),
+        "skip" => Ok("skip"),
+        _ => Err(ApiError::from(AppError::validation("迁移策略无效"))),
+    }
 }
 
 fn validate_migration_id(migration_id: &str) -> Result<(), ApiError> {
@@ -1334,16 +1729,6 @@ fn migration_receipt_key(migration_id: &str) -> String {
     // The public settings API only accepts fixed AppSettings keys. Reuse the existing
     // persistent key-value table so receipts survive restarts without changing core schema.
     format!("server:migration_receipt:v1:{migration_id}")
-}
-
-async fn load_migration_receipt(
-    store: &SqliteStore,
-    key: &str,
-) -> Result<Option<MigrationReceipt>, ApiError> {
-    let Some(raw) = store.get_client_sync_state(key).await? else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::from_str(&raw)?))
 }
 
 fn snapshot_digest(snapshot: &oshical_core::store::ServerSnapshot) -> Result<String, ApiError> {
@@ -1467,6 +1852,56 @@ mod protocol_tests {
     use super::*;
 
     #[test]
+    fn llm_secret_input_keeps_legacy_payload_compatible() {
+        let legacy: LlmSecretInput =
+            serde_json::from_value(json!({"apiKey": "sk-legacy"})).unwrap();
+        assert_eq!(legacy.api_key, "sk-legacy");
+        assert!(legacy.base_url.is_none());
+
+        let bound: LlmSecretInput = serde_json::from_value(json!({
+            "apiKey": "sk-bound",
+            "baseUrl": "https://api.example.com/v1"
+        }))
+        .unwrap();
+        assert_eq!(bound.base_url.as_deref(), Some("https://api.example.com/v1"));
+    }
+
+    #[test]
+    fn secret_url_binding_supports_legacy_key_first_and_exact_binding() {
+        assert!(llm_secret_url_binding_allows(
+            None,
+            true,
+            "https://api.example.com/v2"
+        ));
+        assert!(llm_secret_url_binding_allows(
+            Some("https://api.example.com/v2"),
+            false,
+            "https://api.example.com/v2"
+        ));
+        assert!(!llm_secret_url_binding_allows(
+            Some("https://api.example.com/v1"),
+            false,
+            "https://api.example.com/v2"
+        ));
+        assert!(!llm_secret_url_binding_allows(
+            None,
+            false,
+            "https://api.example.com/v2"
+        ));
+    }
+    #[test]
+    fn unchanged_settings_produce_no_revision_write() {
+        let current = AppSettings::default();
+        assert!(changed_setting_values(&current, &current)
+            .unwrap()
+            .is_empty());
+        let mut next = current.clone();
+        next.live_poll_seconds += 1;
+        let values = changed_setting_values(&current, &next).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, "live_poll_seconds");
+    }
+    #[test]
     fn sha256_matches_known_vectors() {
         assert_eq!(
             sha256_hex(b""),
@@ -1476,6 +1911,106 @@ mod protocol_tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn tokenless_http_writes_reject_cross_site_browser_requests() {
+        let mut headers = HeaderMap::new();
+        assert!(unsafe_http_origin_allowed(&headers));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!unsafe_http_origin_allowed(&headers));
+        headers.remove("sec-fetch-site");
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("127.0.0.1:8787"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8787"),
+        );
+        assert!(unsafe_http_origin_allowed(&headers));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(!unsafe_http_origin_allowed(&headers));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_comparison_handles_lengths() {
+        assert_eq!(bearer_token("Bearer secret"), Some("secret"));
+        assert_eq!(bearer_token("bearer secret"), Some("secret"));
+        assert_eq!(bearer_token("BEARER secret"), Some("secret"));
+        assert_eq!(bearer_token("Basic secret"), None);
+        assert_eq!(bearer_token("Bearer secret extra"), None);
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn websocket_origin_policy_allows_known_and_loopback_same_origin_only() {
+        let mut headers = HeaderMap::new();
+        assert!(websocket_origin_allowed(&headers));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://tauri.localhost"),
+        );
+        assert!(websocket_origin_allowed(&headers));
+
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8787"),
+        );
+        assert!(websocket_origin_allowed(&headers));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(!websocket_origin_allowed(&headers));
+    }
+
+    #[test]
+    fn migration_preview_reports_client_and_server_in_ui_order() {
+        let preview = oshical_core::store::ImportPreview {
+            subscriptions: 1,
+            schedules: 1,
+            weekly_rules: 0,
+            conflicts: vec![oshical_core::store::ImportConflict {
+                entity: "schedule".to_owned(),
+                label: "冲突".to_owned(),
+                local_id: 42,
+                remote_id: 7,
+                local: serde_json::json!({"source": "server"}),
+                remote: serde_json::json!({"source": "client"}),
+            }],
+        };
+        let preview = orient_migration_preview_for_http(preview);
+        let conflict = &preview.conflicts[0];
+        assert_eq!(conflict.local_id, 7);
+        assert_eq!(conflict.remote_id, 42);
+        assert_eq!(conflict.local["source"], "client");
+        assert_eq!(conflict.remote["source"], "server");
+    }
+
+    #[test]
+    fn stale_migration_preview_maps_to_conflict_and_specific_error_code() {
+        let error = ApiError::from(AppError::External {
+            code: "MIGRATION_STALE_PREVIEW".to_owned(),
+            message: "stale".to_owned(),
+        });
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "MIGRATION_STALE_PREVIEW");
+    }
+
+    #[test]
+    fn migration_http_strategy_is_mapped_to_store_direction() {
+        assert_eq!(migration_store_strategy("server").unwrap(), "client");
+        assert_eq!(migration_store_strategy("client").unwrap(), "server");
+        assert_eq!(migration_store_strategy("skip").unwrap(), "skip");
+        assert!(migration_store_strategy("unknown").is_err());
     }
 
     #[test]
@@ -1489,6 +2024,20 @@ mod protocol_tests {
             migration_receipt_key("device-a:1"),
             "server:migration_receipt:v1:device-a:1"
         );
+    }
+
+    #[test]
+    fn live_status_is_visible_to_both_websocket_protocols() {
+        let message = json!({
+            "seq": 7,
+            "type": "live_status",
+            "payload": {
+                "previousIsLive": false,
+                "isLive": true
+            }
+        });
+        assert!(forward_hub_message(false, &message));
+        assert!(forward_hub_message(true, &message));
     }
 
     #[test]

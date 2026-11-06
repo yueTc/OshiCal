@@ -50,21 +50,43 @@ if (!cargoUpdated) {
 }
 fs.writeFileSync(cargoPath, cargoLines.join("\n"), "utf8");
 
-const workspaceCrates = new Set(["oshical-core", "oshical-desktop", "oshical-server"]);
+function readPackageVersion(path) {
+  const source = fs.readFileSync(path, "utf8");
+  const header = /^\[package\]\s*$/m.exec(source);
+  if (!header) {
+    throw new Error("未找到 [package] 段: " + path);
+  }
+  const remainder = source.slice(header.index + header[0].length);
+  const nextSection = remainder.search(/^\[/m);
+  const packageSection = nextSection >= 0 ? remainder.slice(0, nextSection) : remainder;
+  const packageVersion = packageSection.match(/^version = "([^"]+)"$/m)?.[1];
+  if (!packageVersion) {
+    throw new Error("未找到 package.version: " + path);
+  }
+  return packageVersion;
+}
+
+const serverVersion = readPackageVersion("server/Cargo.toml");
+const lockVersions = new Map([
+  ["oshical-core", version],
+  ["oshical-desktop", version],
+  ["oshical-server", serverVersion],
+]);
 const lockPath = "Cargo.lock";
 const lock = fs.readFileSync(lockPath, "utf8");
 const blocks = lock.split(/(?=\[\[package\]\]\n)/);
 let lockUpdated = 0;
 for (let index = 0; index < blocks.length; index += 1) {
   const name = blocks[index].match(/^name = "([^"]+)"$/m)?.[1];
-  if (!name || !workspaceCrates.has(name)) {
+  const lockVersion = lockVersions.get(name);
+  if (!lockVersion) {
     continue;
   }
-  blocks[index] = blocks[index].replace(/^version = "[^"]+"$/m, 'version = "' + version + '"');
+  blocks[index] = blocks[index].replace(/^version = "[^"]+"$/m, 'version = "' + lockVersion + '"');
   lockUpdated += 1;
 }
-if (lockUpdated !== workspaceCrates.size) {
-  throw new Error("Cargo.lock 工作区包版本更新不完整: " + lockUpdated + "/" + workspaceCrates.size);
+if (lockUpdated !== lockVersions.size) {
+  throw new Error("Cargo.lock 工作区包版本更新不完整: " + lockUpdated + "/" + lockVersions.size);
 }
 fs.writeFileSync(lockPath, blocks.join(""), "utf8");
 

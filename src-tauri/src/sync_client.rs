@@ -1,4 +1,5 @@
 use std::hash::{BuildHasher, Hasher};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -24,13 +25,25 @@ CREATE TABLE IF NOT EXISTS device_identity (
 CREATE TABLE IF NOT EXISTS sync_meta (
     server_key TEXT PRIMARY KEY,
     device_id TEXT NOT NULL,
+    feed_id TEXT NOT NULL DEFAULT '',
     cursor_seq INTEGER NOT NULL DEFAULT 0,
     latest_seq INTEGER NOT NULL DEFAULT 0,
+    legacy_cursor_seq INTEGER NOT NULL DEFAULT -1,
     last_snapshot_revision INTEGER NOT NULL DEFAULT 0,
     last_ack_seq INTEGER NOT NULL DEFAULT 0,
     last_sync_at TEXT,
     status TEXT NOT NULL DEFAULT 'idle',
     initialized INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS sync_link_id_map (
+    server_key TEXT NOT NULL,
+    streamer_id INTEGER NOT NULL,
+    mid TEXT NOT NULL,
+    legacy_link_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (server_key, streamer_id, mid),
+    UNIQUE (server_key, legacy_link_id)
 );
 
 CREATE TABLE IF NOT EXISTS sync_entity_cache (
@@ -73,6 +86,8 @@ pub struct SyncBatch {
     #[serde(default)]
     pub latest_seq: i64,
     #[serde(default)]
+    pub feed_id: String,
+    #[serde(default)]
     pub changes: Vec<SyncChange>,
 }
 
@@ -81,6 +96,8 @@ pub struct SyncBatch {
 pub struct SyncChangesPage {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
+    pub feed_id: String,
     #[serde(default)]
     pub from_seq: i64,
     #[serde(default)]
@@ -98,7 +115,60 @@ pub struct SyncChangesPage {
 }
 
 const fn default_schema_version() -> u32 {
-    SYNC_SCHEMA_VERSION
+    // Missing schema versions must fail closed. Older protocol-v1 servers are
+    // handled through the legacy event path and never deserialize this shape.
+    0
+}
+
+const fn default_legacy_cursor_seq() -> i64 {
+    -1
+}
+
+pub(crate) fn ensure_sync_schema_version(schema_version: u32) -> Result<(), String> {
+    if schema_version != SYNC_SCHEMA_VERSION {
+        return Err(format!(
+            "SYNC_SCHEMA_INCOMPATIBLE: 服务端同步 schema 版本 {schema_version} 与客户端支持的 {SYNC_SCHEMA_VERSION} 不兼容，请升级客户端"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_feed_changed(
+    local_feed_id: &str,
+    local_cursor_seq: i64,
+    remote_feed_id: &str,
+) -> bool {
+    let remote_feed_id = remote_feed_id.trim();
+    let local_feed_id = local_feed_id.trim();
+    if remote_feed_id.is_empty() {
+        // A client that already persisted an epoch must not silently downgrade
+        // to an epoch-less server and mix two sequence spaces.
+        return !local_feed_id.is_empty() && local_cursor_seq > 0;
+    }
+    if local_feed_id.is_empty() {
+        local_cursor_seq > 0
+    } else {
+        local_feed_id != remote_feed_id
+    }
+}
+
+pub(crate) fn ensure_sync_feed_compatible(
+    local_feed_id: &str,
+    local_cursor_seq: i64,
+    remote_feed_id: &str,
+) -> Result<(), String> {
+    if sync_feed_changed(local_feed_id, local_cursor_seq, remote_feed_id) {
+        return Err(format!(
+            "SYNC_FEED_CHANGED: 服务器同步源已变化（本地 {}，服务器 {}），需要重建缓存",
+            if local_feed_id.trim().is_empty() {
+                "<legacy>"
+            } else {
+                local_feed_id.trim()
+            },
+            remote_feed_id.trim()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +176,8 @@ const fn default_schema_version() -> u32 {
 pub struct SyncBootstrap {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
+    pub feed_id: String,
     pub snapshot_revision: i64,
     #[serde(default)]
     pub min_retained_seq: i64,
@@ -135,8 +207,12 @@ pub struct SyncBootstrap {
 pub struct SyncMeta {
     pub server_key: String,
     pub device_id: String,
+    #[serde(default)]
+    pub feed_id: String,
     pub cursor_seq: i64,
     pub latest_seq: i64,
+    #[serde(default = "default_legacy_cursor_seq")]
+    pub legacy_cursor_seq: i64,
     pub last_snapshot_revision: i64,
     pub last_ack_seq: i64,
     pub last_sync_at: Option<String>,
@@ -213,6 +289,8 @@ struct EnvelopeError {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LinkPayload {
+    #[serde(default)]
+    id: Option<i64>,
     streamer_id: i64,
     mid: String,
     #[serde(default)]
@@ -220,16 +298,22 @@ struct LinkPayload {
     #[serde(default)]
     avatar_url: String,
     #[serde(default)]
+    revision: i64,
+    #[serde(default)]
     created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WeeklyExceptionPayload {
+    #[serde(default)]
+    id: Option<i64>,
     rule_id: i64,
     occurrence_date: String,
     exception_kind: String,
     schedule_id: Option<i64>,
+    #[serde(default)]
+    revision: i64,
     #[serde(default)]
     created_at: Option<String>,
 }
@@ -237,6 +321,8 @@ struct WeeklyExceptionPayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScheduleSourcePayload {
+    #[serde(default)]
+    id: Option<i64>,
     schedule_id: i64,
     source_kind: String,
     source_post_id: Option<String>,
@@ -246,6 +332,8 @@ struct ScheduleSourcePayload {
     #[serde(default = "default_confidence")]
     confidence: f64,
     #[serde(default)]
+    revision: i64,
+    #[serde(default)]
     created_at: Option<String>,
 }
 
@@ -254,6 +342,11 @@ const fn default_confidence() -> f64 {
 }
 
 pub async fn ensure_schema(store: &SqliteStore) -> Result<(), String> {
+    static SCHEMA_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _schema_guard = SCHEMA_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     sqlx::raw_sql(SYNC_SCHEMA)
         .execute(store.pool())
         .await
@@ -270,6 +363,20 @@ pub async fn ensure_schema(store: &SqliteStore) -> Result<(), String> {
         "sync_meta",
         "initialized",
         "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        store.pool(),
+        "sync_meta",
+        "feed_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    ensure_column(
+        store.pool(),
+        "sync_meta",
+        "legacy_cursor_seq",
+        "INTEGER NOT NULL DEFAULT -1",
     )
     .await?;
     Ok(())
@@ -385,11 +492,42 @@ pub async fn set_sync_ack(
     }
     let server_key = normalize_server_key(server_url)?;
     let device_id = device_id(store).await?;
+    let mut tx = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_error)?;
+    ensure_meta_row(&mut tx, &server_key, &device_id).await?;
     sqlx::query(
-        "INSERT INTO sync_meta(server_key, device_id, last_ack_seq) VALUES(?, ?, ?)
+        "UPDATE sync_meta
+         SET last_ack_seq = MAX(last_ack_seq, MIN(cursor_seq, ?))
+         WHERE server_key = ?",
+    )
+    .bind(seq)
+    .bind(&server_key)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    read_meta(store.pool(), &server_key).await
+}
+
+pub async fn set_legacy_event_cursor(
+    store: &SqliteStore,
+    server_url: &str,
+    seq: i64,
+) -> Result<SyncMeta, String> {
+    ensure_schema(store).await?;
+    if seq < 0 {
+        return Err("旧版服务器事件游标不能为负数".to_owned());
+    }
+    let server_key = normalize_server_key(server_url)?;
+    let device_id = device_id(store).await?;
+    sqlx::query(
+        "INSERT INTO sync_meta(server_key, device_id, legacy_cursor_seq) VALUES(?, ?, ?)
          ON CONFLICT(server_key) DO UPDATE SET
             device_id = excluded.device_id,
-            last_ack_seq = MAX(sync_meta.last_ack_seq, excluded.last_ack_seq)",
+            legacy_cursor_seq = MAX(sync_meta.legacy_cursor_seq, excluded.legacy_cursor_seq)",
     )
     .bind(&server_key)
     .bind(&device_id)
@@ -400,6 +538,48 @@ pub async fn set_sync_ack(
     read_meta(store.pool(), &server_key).await
 }
 
+pub(crate) async fn reset_legacy_event_cursor(
+    store: &SqliteStore,
+    server_url: &str,
+) -> Result<(), String> {
+    let server_key = normalize_server_key(server_url)?;
+    let result = sqlx::query(
+        "UPDATE sync_meta SET legacy_cursor_seq = 0 WHERE server_key = ?",
+    )
+    .bind(&server_key)
+    .execute(store.pool())
+    .await
+    .map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err("旧版服务器事件游标尚未初始化".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) async fn advance_legacy_event_cursor(
+    store: &SqliteStore,
+    server_url: &str,
+    seq: i64,
+) -> Result<(), String> {
+    if seq < 0 {
+        return Err("旧版服务器事件游标不能为负数".to_owned());
+    }
+    let server_key = normalize_server_key(server_url)?;
+    let result = sqlx::query(
+        "UPDATE sync_meta SET legacy_cursor_seq = MAX(legacy_cursor_seq, ?)
+         WHERE server_key = ?",
+    )
+    .bind(seq)
+    .bind(&server_key)
+    .execute(store.pool())
+    .await
+    .map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err("旧版服务器事件游标尚未初始化".to_owned());
+    }
+    Ok(())
+}
+
 pub async fn apply_batch(
     store: &SqliteStore,
     server_url: &str,
@@ -408,8 +588,34 @@ pub async fn apply_batch(
     ensure_schema(store).await?;
     let server_key = normalize_server_key(server_url)?;
     let device_id = device_id(store).await?;
+    if batch.from_seq < 0 || batch.to_seq < 0 || batch.latest_seq < 0 {
+        return Err("同步批次包含负序号".to_owned());
+    }
     if batch.changes.iter().any(|change| change.seq <= 0) {
         return Err("同步批次包含非法序号".to_owned());
+    }
+    if batch
+        .changes
+        .windows(2)
+        .any(|pair| pair[0].seq >= pair[1].seq)
+    {
+        return Err("同步批次序号未严格递增".to_owned());
+    }
+    if let Some(first) = batch.changes.first() {
+        if batch.from_seq != first.seq {
+            return Err(format!(
+                "SYNC_BATCH_INVALID: 批次声明 fromSeq={}，首变更序号={}",
+                batch.from_seq, first.seq
+            ));
+        }
+    }
+    if let Some(last) = batch.changes.last() {
+        if batch.to_seq != last.seq || batch.latest_seq < batch.to_seq {
+            return Err(format!(
+                "SYNC_BATCH_INVALID: 批次声明 toSeq={} latestSeq={}，最后变更序号={}",
+                batch.to_seq, batch.latest_seq, last.seq
+            ));
+        }
     }
 
     let mut tx = store
@@ -419,6 +625,26 @@ pub async fn apply_batch(
         .map_err(db_error)?;
     ensure_meta_row(&mut tx, &server_key, &device_id).await?;
     let meta = read_meta_tx(&mut tx, &server_key).await?;
+    if let Err(error) =
+        ensure_sync_feed_compatible(&meta.feed_id, meta.cursor_seq, &batch.feed_id)
+    {
+        if let Err(rollback_error) = tx.rollback().await {
+            return Err(format!("{error}；回滚事务失败: {rollback_error}"));
+        }
+        return Err(error);
+    }
+    if batch.latest_seq < meta.cursor_seq || batch.latest_seq < meta.latest_seq {
+        let error = format!(
+            "SYNC_CACHE_INCONSISTENT: 服务端最新序号 {} 低于本地已应用最新序号 {}（同步游标 {}），需要重建缓存",
+            batch.latest_seq,
+            meta.latest_seq.max(meta.cursor_seq),
+            meta.cursor_seq
+        );
+        if let Err(rollback_error) = tx.rollback().await {
+            return Err(format!("{error}；回滚事务失败: {rollback_error}"));
+        }
+        return Err(error);
+    }
     let mut cursor = meta.cursor_seq;
     let mut applied = 0_usize;
 
@@ -437,17 +663,30 @@ pub async fn apply_batch(
         cursor = change.seq;
         applied += 1;
     }
+    if batch.to_seq > cursor {
+        let error = format!(
+            "SYNC_GAP: 批次声明到 {}，但本地仅连续应用到 {}，需要补拉",
+            batch.to_seq, cursor
+        );
+        if let Err(rollback_error) = tx.rollback().await {
+            return Err(format!("{error}；回滚事务失败: {rollback_error}"));
+        }
+        return Err(error);
+    }
 
     let now = Utc::now().to_rfc3339();
-    let latest = batch.latest_seq.max(meta.latest_seq).max(cursor);
+    let latest = batch.latest_seq.max(cursor);
     sqlx::query(
         "UPDATE sync_meta SET cursor_seq = ?, latest_seq = ?, last_sync_at = ?,
+            feed_id = CASE WHEN ? <> '' THEN ? ELSE feed_id END,
             status = ?, initialized = CASE WHEN ? > 0 OR initialized = 1 THEN 1 ELSE 0 END
          WHERE server_key = ?",
     )
     .bind(cursor)
     .bind(latest)
     .bind(&now)
+    .bind(batch.feed_id.trim())
+    .bind(batch.feed_id.trim())
     .bind(if applied > 0 { "synced" } else { "idle" })
     .bind(cursor)
     .bind(&server_key)
@@ -468,6 +707,7 @@ pub async fn apply_bootstrap(
     server_url: &str,
     bootstrap: &SyncBootstrap,
 ) -> Result<ApplySyncBootstrapResult, String> {
+    ensure_sync_schema_version(bootstrap.schema_version)?;
     ensure_schema(store).await?;
     if bootstrap.snapshot_revision < 0 {
         return Err("快照 revision 不能为负数".to_owned());
@@ -498,6 +738,11 @@ pub async fn apply_bootstrap(
             .map_err(db_error)?;
     }
     sqlx::query("DELETE FROM sync_entity_cache WHERE server_key = ?")
+        .bind(&server_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    sqlx::query("DELETE FROM sync_link_id_map WHERE server_key = ?")
         .bind(&server_key)
         .execute(&mut *tx)
         .await
@@ -555,14 +800,17 @@ pub async fn apply_bootstrap(
 
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE sync_meta SET cursor_seq = ?, latest_seq = MAX(latest_seq, ?),
-            last_snapshot_revision = ?, last_sync_at = ?, status = 'synced', initialized = 1
+        "UPDATE sync_meta SET cursor_seq = ?, latest_seq = ?,
+            last_snapshot_revision = ?, last_sync_at = ?, feed_id = ?,
+            last_ack_seq = 0,
+            status = 'synced', initialized = 1
          WHERE server_key = ?",
     )
     .bind(bootstrap.snapshot_revision)
     .bind(bootstrap.snapshot_revision)
     .bind(bootstrap.snapshot_revision)
     .bind(&now)
+    .bind(bootstrap.feed_id.trim())
     .bind(&server_key)
     .execute(&mut *tx)
     .await
@@ -620,8 +868,8 @@ async fn apply_upsert(
 ) -> Result<(), String> {
     let entity_id = entity_id_from_payload(entity_type, payload)?;
     match entity_type {
-        "subscription" => apply_subscription(tx, payload).await?,
-        "link" | "linked_account" => apply_link(tx, payload).await?,
+        "subscription" => apply_subscription(tx, server_key, payload).await?,
+        "link" | "linked_account" => apply_link(tx, server_key, payload).await?,
         "schedule" => apply_schedule(tx, payload).await?,
         "weekly_rule" => apply_weekly_rule(tx, payload).await?,
         "weekly_exception" => apply_weekly_exception(tx, payload).await?,
@@ -655,6 +903,7 @@ async fn apply_delete(
     match entity_type {
         "subscription" => {
             let id = parse_entity_id(entity_id, "subscription")?;
+            clear_streamer_link_aliases(tx, server_key, id).await?;
             sqlx::query("DELETE FROM streamers WHERE id = ?")
                 .bind(id)
                 .execute(&mut **tx)
@@ -662,25 +911,140 @@ async fn apply_delete(
                 .map_err(db_error)?;
         }
         "link" | "linked_account" => {
-            if let Some(payload) = payload {
-                if let Ok(link) = serde_json::from_value::<LinkPayload>(payload.clone()) {
-                    sqlx::query("DELETE FROM linked_accounts WHERE streamer_id = ? AND mid = ?")
-                        .bind(link.streamer_id)
-                        .bind(&link.mid)
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(db_error)?;
+            // A tombstone may carry only the stable entity id. Treat a partial
+            // delete payload as advisory and resolve identity from entity_id or
+            // sync_link_id_map instead of rejecting an otherwise valid deletion.
+            let payload_link = payload.and_then(|payload| {
+                serde_json::from_value::<LinkPayload>(payload.clone()).ok()
+            });
+            let payload_target = payload_link
+                .as_ref()
+                .map(|link| (link.streamer_id, link.mid.trim().to_owned()))
+                .filter(|(_, mid)| !mid.is_empty());
+            let entity_target = entity_id
+                .split_once(':')
+                .filter(|(_, mid)| !mid.trim().is_empty())
+                .map(|(streamer_id, mid)| {
+                    let streamer_id = streamer_id
+                        .parse::<i64>()
+                        .map_err(|_| "link tombstone 的 streamerId 无效".to_owned())?;
+                    Ok::<_, String>((streamer_id, mid.trim().to_owned()))
+                })
+                .transpose()?;
+            if entity_target
+                .as_ref()
+                .zip(payload_target.as_ref())
+                .is_some_and(|(entity, payload)| entity != payload)
+            {
+                return Err(format!(
+                    "SYNC_CACHE_INCONSISTENT: link tombstone 身份冲突（entityId {entity_id}）"
+                ));
+            }
+            let numeric_entity_id = entity_id.parse::<i64>().ok();
+            let mut target = entity_target.or(payload_target);
+
+            if let Some(legacy_id) = numeric_entity_id {
+                // A legacy numeric entityId must agree with any identity carried
+                // by the delete payload. Otherwise a corrupt/forged tombstone
+                // could delete a different linked account than the one named by
+                // entityId.
+                if payload_link
+                    .as_ref()
+                    .and_then(|link| link.id)
+                    .is_some_and(|payload_id| payload_id != legacy_id)
+                {
+                    return Err(format!(
+                        "SYNC_CACHE_INCONSISTENT: link tombstone 身份冲突（entityId {entity_id}）"
+                    ));
                 }
-            } else if let Some((streamer_id, mid)) = entity_id.split_once(':') {
-                let streamer_id = streamer_id
-                    .parse::<i64>()
-                    .map_err(|_| "link tombstone 的 streamerId 无效".to_owned())?;
+                let resolved = resolve_legacy_link_target(tx, server_key, legacy_id).await?;
+                if let (Some(resolved), Some(claimed)) = (resolved.as_ref(), target.as_ref()) {
+                    if resolved != claimed {
+                        return Err(format!(
+                            "SYNC_CACHE_INCONSISTENT: link tombstone 身份冲突（entityId {entity_id}）"
+                        ));
+                    }
+                }
+                if resolved.is_some() {
+                    target = resolved;
+                }
+            }
+
+            if target.is_none() {
+                let Some(legacy_id) = numeric_entity_id else {
+                    return Err(format!("{entity_type} tombstone 的 entityId 无效: {entity_id}"));
+                };
+                return Err(format!(
+                    "SYNC_CACHE_INCONSISTENT: 无法解析旧版官号 tombstone {legacy_id}，需要重建缓存"
+                ));
+            }
+
+            let mut cache_ids = vec![entity_id.to_owned()];
+            if let Some(legacy_id) = numeric_entity_id {
+                cache_ids.push(legacy_id.to_string());
+            }
+            if let Some(link_id) = payload_link.as_ref().and_then(|link| link.id) {
+                cache_ids.push(link_id.to_string());
+            }
+
+            if let Some((streamer_id, mid)) = target.as_ref() {
+                let legacy_id = sqlx::query_scalar::<_, i64>(
+                    "SELECT legacy_link_id FROM sync_link_id_map
+                     WHERE server_key = ? AND streamer_id = ? AND mid = ?",
+                )
+                .bind(server_key)
+                .bind(*streamer_id)
+                .bind(mid)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(db_error)?;
+                if let Some(legacy_id) = legacy_id {
+                    cache_ids.push(legacy_id.to_string());
+                }
+                cache_ids.push(format!("{streamer_id}:{mid}"));
+
                 sqlx::query("DELETE FROM linked_accounts WHERE streamer_id = ? AND mid = ?")
-                    .bind(streamer_id)
+                    .bind(*streamer_id)
                     .bind(mid)
                     .execute(&mut **tx)
                     .await
                     .map_err(db_error)?;
+                sqlx::query(
+                    "DELETE FROM sync_link_id_map
+                     WHERE server_key = ? AND streamer_id = ? AND mid = ?",
+                )
+                .bind(server_key)
+                .bind(*streamer_id)
+                .bind(mid)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_error)?;
+            } else if let Some(legacy_id) = numeric_entity_id {
+                sqlx::query(
+                    "DELETE FROM sync_link_id_map WHERE server_key = ? AND legacy_link_id = ?",
+                )
+                .bind(server_key)
+                .bind(legacy_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_error)?;
+            }
+
+            cache_ids.sort();
+            cache_ids.dedup();
+            for cache_id in cache_ids {
+                for cache_type in ["link", "linked_account"] {
+                    sqlx::query(
+                        "DELETE FROM sync_entity_cache
+                         WHERE server_key = ? AND entity_type = ? AND entity_id = ?",
+                    )
+                    .bind(server_key)
+                    .bind(cache_type)
+                    .bind(cache_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(db_error)?;
+                }
             }
         }
         "schedule" => {
@@ -757,6 +1121,7 @@ async fn apply_delete(
 
 async fn apply_subscription(
     tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
     payload: &Value,
 ) -> Result<(), String> {
     let value = serde_json::from_value::<Streamer>(payload.clone())
@@ -765,16 +1130,17 @@ async fn apply_subscription(
     let created = value.created_at.to_rfc3339();
     sqlx::query(
         "INSERT INTO streamers(id, mid, name, avatar_url, room_id, live_url,
-            schedule_enabled, live_notify_enabled, live_stats_enabled, aliases_json,
+            schedule_enabled, live_notify_enabled, live_stats_enabled, fans, aliases_json,
             last_error, last_refresh_at, live_is_live, live_title, live_cover,
             live_started_at, live_checked_at, sort_order, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             mid = excluded.mid, name = excluded.name, avatar_url = excluded.avatar_url,
             room_id = excluded.room_id, live_url = excluded.live_url,
             schedule_enabled = excluded.schedule_enabled,
             live_notify_enabled = excluded.live_notify_enabled,
             live_stats_enabled = excluded.live_stats_enabled,
+            fans = excluded.fans,
             aliases_json = excluded.aliases_json, last_error = excluded.last_error,
             last_refresh_at = excluded.last_refresh_at, live_is_live = excluded.live_is_live,
             live_title = excluded.live_title, live_cover = excluded.live_cover,
@@ -791,6 +1157,7 @@ async fn apply_subscription(
     .bind(value.schedule_enabled)
     .bind(value.live_notify_enabled)
     .bind(value.live_stats_enabled)
+    .bind(value.fans.and_then(|v| i64::try_from(v).ok()))
     .bind(aliases)
     .bind(&value.last_error)
     .bind(value.last_refresh_at.map(|time| time.to_rfc3339()))
@@ -806,23 +1173,212 @@ async fn apply_subscription(
     .await
     .map_err(db_error)?;
 
+    clear_streamer_link_aliases(tx, server_key, value.id).await?;
     sqlx::query("DELETE FROM linked_accounts WHERE streamer_id = ?")
         .bind(value.id)
         .execute(&mut **tx)
         .await
         .map_err(db_error)?;
     for link in value.linked_accounts {
-        sqlx::query(
-            "INSERT INTO linked_accounts(streamer_id, mid, name, avatar_url, created_at)
-             VALUES(?, ?, ?, ?, ?)
-             ON CONFLICT(streamer_id, mid) DO UPDATE SET
-                name = excluded.name, avatar_url = excluded.avatar_url",
+        upsert_linked_account(
+            tx,
+            server_key,
+            value.id,
+            &link.mid,
+            &link.name,
+            &link.avatar_url,
+            Some(link.id).filter(|id| *id > 0),
+            link.revision,
+            link.created_at.to_rfc3339(),
         )
-        .bind(value.id)
-        .bind(&link.mid)
-        .bind(&link.name)
-        .bind(&link.avatar_url)
-        .bind(link.created_at.to_rfc3339())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn apply_link(
+    tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    let value = serde_json::from_value::<LinkPayload>(payload.clone())
+        .map_err(|error| format!("link payload 无效: {error}"))?;
+    let created = value
+        .created_at
+        .clone()
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    upsert_linked_account(
+        tx,
+        server_key,
+        value.streamer_id,
+        &value.mid,
+        &value.name,
+        &value.avatar_url,
+        value.id.filter(|id| *id > 0),
+        value.revision,
+        created,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_linked_account(
+    tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
+    streamer_id: i64,
+    mid: &str,
+    name: &str,
+    avatar_url: &str,
+    legacy_link_id: Option<i64>,
+    revision: i64,
+    created_at: String,
+) -> Result<(), String> {
+    let previous_legacy_id = sqlx::query_scalar::<_, i64>(
+        "SELECT legacy_link_id FROM sync_link_id_map
+         WHERE server_key = ? AND streamer_id = ? AND mid = ?",
+    )
+    .bind(server_key)
+    .bind(streamer_id)
+    .bind(mid)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)?;
+
+    if let Some(legacy_id) = legacy_link_id {
+        sqlx::query(
+            "DELETE FROM sync_link_id_map
+             WHERE server_key = ? AND legacy_link_id = ?
+               AND (streamer_id <> ? OR mid <> ?)",
+        )
+        .bind(server_key)
+        .bind(legacy_id)
+        .bind(streamer_id)
+        .bind(mid)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        sqlx::query(
+            "INSERT INTO sync_link_id_map(server_key, streamer_id, mid, legacy_link_id, updated_at)
+             VALUES(?, ?, ?, ?, ?)
+             ON CONFLICT(server_key, streamer_id, mid) DO UPDATE SET
+                legacy_link_id = excluded.legacy_link_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(server_key)
+        .bind(streamer_id)
+        .bind(mid)
+        .bind(legacy_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    }
+
+    // Keep the mirror's local AUTOINCREMENT ID independent from the server's
+    // legacy link ID. The compatibility map is the only source of truth for
+    // resolving old numeric tombstones.
+    sqlx::query(
+        "INSERT INTO linked_accounts(streamer_id, mid, name, avatar_url, created_at, revision)
+         VALUES(?, ?, ?, ?, ?, ?)
+         ON CONFLICT(streamer_id, mid) DO UPDATE SET
+            name = excluded.name,
+            avatar_url = excluded.avatar_url,
+            revision = MAX(linked_accounts.revision, excluded.revision)",
+    )
+    .bind(streamer_id)
+    .bind(mid)
+    .bind(name)
+    .bind(avatar_url)
+    .bind(created_at)
+    .bind(revision.max(1))
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+
+    let mut stale_ids = Vec::new();
+    if let Some(previous) = previous_legacy_id {
+        stale_ids.push(previous);
+    }
+    if let Some(current) = legacy_link_id {
+        stale_ids.push(current);
+    }
+    stale_ids.sort_unstable();
+    stale_ids.dedup();
+    for legacy_id in stale_ids {
+        // The stable `streamerId:mid` cache entry is written by apply_upsert;
+        // numeric aliases from older clients must not survive an upsert.
+        remove_cached_link_aliases(tx, server_key, &legacy_id.to_string()).await?;
+    }
+    Ok(())
+}
+
+async fn resolve_legacy_link_target(
+    tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
+    legacy_id: i64,
+) -> Result<Option<(i64, String)>, String> {
+    if let Some(target) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT streamer_id, mid FROM sync_link_id_map
+         WHERE server_key = ? AND legacy_link_id = ?",
+    )
+    .bind(server_key)
+    .bind(legacy_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)?
+    {
+        return Ok(Some(target));
+    }
+
+    // Compatibility for caches written before sync_link_id_map existed.
+    // The cache payload itself must still contain the exact server link ID.
+    let cached = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json
+         FROM sync_entity_cache
+         WHERE server_key = ?
+           AND entity_type IN ('link', 'linked_account')
+           AND operation = 'upsert'
+           AND payload_json IS NOT NULL",
+    )
+    .bind(server_key)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    let mut cached_target = None;
+    for payload_json in cached {
+        let Ok(link) = serde_json::from_str::<LinkPayload>(&payload_json) else {
+            continue;
+        };
+        if link.id != Some(legacy_id) {
+            continue;
+        }
+        let candidate = (link.streamer_id, link.mid);
+        if cached_target
+            .as_ref()
+            .is_some_and(|existing| existing != &candidate)
+        {
+            return Err(format!(
+                "SYNC_CACHE_INCONSISTENT: 旧版官号 ID {legacy_id} 对应多个缓存目标，需要重建缓存"
+            ));
+        }
+        cached_target = Some(candidate);
+    }
+    Ok(cached_target)
+}
+
+async fn remove_cached_link_aliases(
+    tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
+    entity_id: &str,
+) -> Result<(), String> {
+    for cache_type in ["link", "linked_account"] {
+        sqlx::query(
+            "DELETE FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type = ? AND entity_id = ?",
+        )
+        .bind(server_key)
+        .bind(cache_type)
+        .bind(entity_id)
         .execute(&mut **tx)
         .await
         .map_err(db_error)?;
@@ -830,27 +1386,44 @@ async fn apply_subscription(
     Ok(())
 }
 
-async fn apply_link(tx: &mut Transaction<'_, Sqlite>, payload: &Value) -> Result<(), String> {
-    let value = serde_json::from_value::<LinkPayload>(payload.clone())
-        .map_err(|error| format!("link payload 无效: {error}"))?;
-    let created = value
-        .created_at
-        .clone()
-        .unwrap_or_else(|| Utc::now().to_rfc3339());
-    sqlx::query(
-        "INSERT INTO linked_accounts(streamer_id, mid, name, avatar_url, created_at)
-         VALUES(?, ?, ?, ?, ?)
-         ON CONFLICT(streamer_id, mid) DO UPDATE SET
-            name = excluded.name, avatar_url = excluded.avatar_url",
+async fn clear_streamer_link_aliases(
+    tx: &mut Transaction<'_, Sqlite>,
+    server_key: &str,
+    streamer_id: i64,
+) -> Result<(), String> {
+    let aliases = sqlx::query_as::<_, (String, i64)>(
+        "SELECT mid, legacy_link_id FROM sync_link_id_map
+         WHERE server_key = ? AND streamer_id = ?",
     )
-    .bind(value.streamer_id)
-    .bind(&value.mid)
-    .bind(&value.name)
-    .bind(&value.avatar_url)
-    .bind(created)
-    .execute(&mut **tx)
+    .bind(server_key)
+    .bind(streamer_id)
+    .fetch_all(&mut **tx)
     .await
     .map_err(db_error)?;
+    for (mid, legacy_id) in &aliases {
+        remove_cached_link_aliases(tx, server_key, &format!("{streamer_id}:{mid}")).await?;
+        remove_cached_link_aliases(tx, server_key, &legacy_id.to_string()).await?;
+    }
+    sqlx::query("DELETE FROM sync_link_id_map WHERE server_key = ? AND streamer_id = ?")
+        .bind(server_key)
+        .bind(streamer_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+
+    let stable_prefix = format!("{streamer_id}:%");
+    for cache_type in ["link", "linked_account"] {
+        sqlx::query(
+            "DELETE FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type = ? AND entity_id LIKE ?",
+        )
+        .bind(server_key)
+        .bind(cache_type)
+        .bind(&stable_prefix)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -864,8 +1437,8 @@ async fn apply_schedule(tx: &mut Transaction<'_, Sqlite>, payload: &Value) -> Re
             room_url, room_owner_mid, room_owner_name, source_kind, source_post_id,
             source_image_url, source_author_mid, source_fingerprint, source_identity,
             source_published_at, weekly_rule_id, weekly_occurrence_date, confidence,
-            manual_locked, source_changed, cancelled, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            manual_locked, source_changed, cancelled, revision, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id, participants_json = excluded.participants_json,
             title = excluded.title, start_at = excluded.start_at, end_at = excluded.end_at,
@@ -881,7 +1454,7 @@ async fn apply_schedule(tx: &mut Transaction<'_, Sqlite>, payload: &Value) -> Re
             weekly_occurrence_date = excluded.weekly_occurrence_date,
             confidence = excluded.confidence, manual_locked = excluded.manual_locked,
             source_changed = excluded.source_changed, cancelled = excluded.cancelled,
-            updated_at = excluded.updated_at",
+            revision = excluded.revision, updated_at = excluded.updated_at",
     )
     .bind(value.id)
     .bind(value.streamer_id)
@@ -905,6 +1478,7 @@ async fn apply_schedule(tx: &mut Transaction<'_, Sqlite>, payload: &Value) -> Re
     .bind(value.manual_locked)
     .bind(value.source_changed)
     .bind(value.cancelled)
+    .bind(value.revision)
     .bind(value.created_at.to_rfc3339())
     .bind(value.updated_at.to_rfc3339())
     .execute(&mut **tx)
@@ -959,21 +1533,59 @@ async fn apply_weekly_exception(
 ) -> Result<(), String> {
     let value = serde_json::from_value::<WeeklyExceptionPayload>(payload.clone())
         .map_err(|error| format!("weekly_exception payload 无效: {error}"))?;
-    sqlx::query(
-        "INSERT INTO weekly_schedule_exceptions(rule_id, occurrence_date, exception_kind,
-            schedule_id, created_at)
-         VALUES(?, ?, ?, ?, ?)
-         ON CONFLICT(rule_id, occurrence_date) DO UPDATE SET
-            exception_kind = excluded.exception_kind, schedule_id = excluded.schedule_id",
-    )
-    .bind(value.rule_id)
-    .bind(&value.occurrence_date)
-    .bind(&value.exception_kind)
-    .bind(value.schedule_id)
-    .bind(value.created_at.unwrap_or_else(|| Utc::now().to_rfc3339()))
-    .execute(&mut **tx)
-    .await
-    .map_err(db_error)?;
+    let created_at = value.created_at.unwrap_or_else(|| Utc::now().to_rfc3339());
+    if let Some(id) = value.id {
+        sqlx::query(
+            "DELETE FROM weekly_schedule_exceptions
+             WHERE id <> ? AND rule_id = ? AND occurrence_date = ?",
+        )
+        .bind(id)
+        .bind(value.rule_id)
+        .bind(&value.occurrence_date)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        sqlx::query(
+            "INSERT INTO weekly_schedule_exceptions
+                (id, rule_id, occurrence_date, exception_kind, schedule_id, created_at, revision)
+             VALUES(?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                rule_id = excluded.rule_id,
+                occurrence_date = excluded.occurrence_date,
+                exception_kind = excluded.exception_kind,
+                schedule_id = excluded.schedule_id,
+                revision = excluded.revision",
+        )
+        .bind(id)
+        .bind(value.rule_id)
+        .bind(&value.occurrence_date)
+        .bind(&value.exception_kind)
+        .bind(value.schedule_id)
+        .bind(created_at)
+        .bind(value.revision.max(1))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    } else {
+        sqlx::query(
+            "INSERT INTO weekly_schedule_exceptions(rule_id, occurrence_date, exception_kind,
+                schedule_id, created_at, revision)
+             VALUES(?, ?, ?, ?, ?, ?)
+             ON CONFLICT(rule_id, occurrence_date) DO UPDATE SET
+                exception_kind = excluded.exception_kind,
+                schedule_id = excluded.schedule_id,
+                revision = excluded.revision",
+        )
+        .bind(value.rule_id)
+        .bind(&value.occurrence_date)
+        .bind(&value.exception_kind)
+        .bind(value.schedule_id)
+        .bind(created_at)
+        .bind(value.revision.max(1))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -983,27 +1595,71 @@ async fn apply_schedule_source(
 ) -> Result<(), String> {
     let value = serde_json::from_value::<ScheduleSourcePayload>(payload.clone())
         .map_err(|error| format!("schedule_source payload 无效: {error}"))?;
-    sqlx::query(
-        "INSERT INTO schedule_sources(schedule_id, source_kind, source_post_id,
-            source_image_url, source_fingerprint, source_identity, confidence, created_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
-            source_kind = excluded.source_kind, source_post_id = excluded.source_post_id,
-            source_image_url = excluded.source_image_url,
-            source_fingerprint = excluded.source_fingerprint,
-            confidence = excluded.confidence",
-    )
-    .bind(value.schedule_id)
-    .bind(&value.source_kind)
-    .bind(&value.source_post_id)
-    .bind(&value.source_image_url)
-    .bind(&value.source_fingerprint)
-    .bind(&value.source_identity)
-    .bind(value.confidence)
-    .bind(value.created_at.unwrap_or_else(|| Utc::now().to_rfc3339()))
-    .execute(&mut **tx)
-    .await
-    .map_err(db_error)?;
+    let created_at = value.created_at.unwrap_or_else(|| Utc::now().to_rfc3339());
+    if let Some(id) = value.id {
+        sqlx::query(
+            "DELETE FROM schedule_sources
+             WHERE id <> ? AND schedule_id = ? AND source_identity = ?",
+        )
+        .bind(id)
+        .bind(value.schedule_id)
+        .bind(&value.source_identity)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        sqlx::query(
+            "INSERT INTO schedule_sources
+                (id, schedule_id, source_kind, source_post_id, source_image_url,
+                 source_fingerprint, source_identity, confidence, created_at, revision)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                schedule_id = excluded.schedule_id,
+                source_kind = excluded.source_kind,
+                source_post_id = excluded.source_post_id,
+                source_image_url = excluded.source_image_url,
+                source_fingerprint = excluded.source_fingerprint,
+                source_identity = excluded.source_identity,
+                confidence = excluded.confidence,
+                revision = excluded.revision",
+        )
+        .bind(id)
+        .bind(value.schedule_id)
+        .bind(&value.source_kind)
+        .bind(&value.source_post_id)
+        .bind(&value.source_image_url)
+        .bind(&value.source_fingerprint)
+        .bind(&value.source_identity)
+        .bind(value.confidence)
+        .bind(created_at)
+        .bind(value.revision.max(1))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    } else {
+        sqlx::query(
+            "INSERT INTO schedule_sources(schedule_id, source_kind, source_post_id,
+                source_image_url, source_fingerprint, source_identity, confidence, created_at, revision)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
+                source_kind = excluded.source_kind, source_post_id = excluded.source_post_id,
+                source_image_url = excluded.source_image_url,
+                source_fingerprint = excluded.source_fingerprint,
+                confidence = excluded.confidence,
+                revision = excluded.revision",
+        )
+        .bind(value.schedule_id)
+        .bind(&value.source_kind)
+        .bind(&value.source_post_id)
+        .bind(&value.source_image_url)
+        .bind(&value.source_fingerprint)
+        .bind(&value.source_identity)
+        .bind(value.confidence)
+        .bind(created_at)
+        .bind(value.revision.max(1))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -1065,18 +1721,19 @@ async fn apply_live_session(
         .map_err(|error| format!("live_session payload 无效: {error}"))?;
     sqlx::query(
         "INSERT INTO live_sessions(id, streamer_id, streamer_name, room_id, title, cover_url,
-            started_at, ended_at, duration_seconds, peak_online, avg_online, online_samples,
-            online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
+            started_at, ended_at, duration_seconds, peak_online, peak_high_energy, avg_online,
+            online_samples, online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
             guard_revenue_cents, paid_user_count, interactive_user_count, danmaku_count,
             gift_count, super_chat_count, guard_count, reconnect_count, data_quality,
             collector_state, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id, streamer_name = excluded.streamer_name,
             room_id = excluded.room_id, title = excluded.title,
             cover_url = excluded.cover_url, started_at = excluded.started_at,
             ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds,
-            peak_online = excluded.peak_online, avg_online = excluded.avg_online,
+            peak_online = excluded.peak_online,
+            peak_high_energy = excluded.peak_high_energy, avg_online = excluded.avg_online,
             online_samples = excluded.online_samples, online_total = excluded.online_total,
             revenue_cents = excluded.revenue_cents,
             gift_revenue_cents = excluded.gift_revenue_cents,
@@ -1101,6 +1758,7 @@ async fn apply_live_session(
     .bind(value.ended_at.map(|time| time.to_rfc3339()))
     .bind(value.duration_seconds)
     .bind(value.peak_online as i64)
+    .bind(value.peak_high_energy as i64)
     .bind(value.avg_online as i64)
     .bind(value.online_samples)
     .bind(value.online_total)
@@ -1246,8 +1904,8 @@ async fn ensure_meta_row(
 
 async fn read_meta(pool: &SqlitePool, server_key: &str) -> Result<SyncMeta, String> {
     let row = sqlx::query(
-        "SELECT server_key, device_id, cursor_seq, latest_seq, last_snapshot_revision,
-            last_ack_seq, last_sync_at, status, initialized
+        "SELECT server_key, device_id, feed_id, cursor_seq, latest_seq, legacy_cursor_seq,
+            last_snapshot_revision, last_ack_seq, last_sync_at, status, initialized
          FROM sync_meta WHERE server_key = ?",
     )
     .bind(server_key)
@@ -1262,8 +1920,8 @@ async fn read_meta_tx(
     server_key: &str,
 ) -> Result<SyncMeta, String> {
     let row = sqlx::query(
-        "SELECT server_key, device_id, cursor_seq, latest_seq, last_snapshot_revision,
-            last_ack_seq, last_sync_at, status, initialized
+        "SELECT server_key, device_id, feed_id, cursor_seq, latest_seq, legacy_cursor_seq,
+            last_snapshot_revision, last_ack_seq, last_sync_at, status, initialized
          FROM sync_meta WHERE server_key = ?",
     )
     .bind(server_key)
@@ -1277,8 +1935,10 @@ fn meta_from_row(row: &sqlx::sqlite::SqliteRow) -> SyncMeta {
     SyncMeta {
         server_key: row.get("server_key"),
         device_id: row.get("device_id"),
+        feed_id: row.get("feed_id"),
         cursor_seq: row.get("cursor_seq"),
         latest_seq: row.get("latest_seq"),
+        legacy_cursor_seq: row.get("legacy_cursor_seq"),
         last_snapshot_revision: row.get("last_snapshot_revision"),
         last_ack_seq: row.get("last_ack_seq"),
         last_sync_at: row.get("last_sync_at"),
@@ -1640,6 +2300,103 @@ mod tests {
         store
     }
 
+    #[test]
+    fn legacy_sync_payloads_without_feed_id_remain_compatible() {
+        let batch: SyncBatch = serde_json::from_value(json!({
+            "fromSeq": 0,
+            "toSeq": 0,
+            "latestSeq": 0,
+            "changes": []
+        }))
+        .unwrap();
+        let page: SyncChangesPage = serde_json::from_value(json!({
+            "schemaVersion": SYNC_SCHEMA_VERSION,
+            "fromSeq": 0,
+            "toSeq": 0,
+            "latestSeq": 0,
+            "minRetainedSeq": 0,
+            "hasMore": false,
+            "resetRequired": false,
+            "changes": []
+        }))
+        .unwrap();
+        let bootstrap: SyncBootstrap = serde_json::from_value(json!({
+            "schemaVersion": SYNC_SCHEMA_VERSION,
+            "snapshotRevision": 0
+        }))
+        .unwrap();
+        assert!(batch.feed_id.is_empty());
+        assert!(page.feed_id.is_empty());
+        assert!(bootstrap.feed_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_event_cursor_is_independent_from_sync_cursor() {
+        let store = store().await;
+        let server = "https://legacy-cursor.example.com";
+        get_sync_meta(&store, server).await.unwrap();
+        sqlx::query(
+            "UPDATE sync_meta SET cursor_seq = 40, latest_seq = 60, initialized = 1
+             WHERE server_key = ?",
+        )
+        .bind(server)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let meta = set_legacy_event_cursor(&store, server, 5).await.unwrap();
+        assert_eq!(meta.cursor_seq, 40);
+        assert_eq!(meta.latest_seq, 60);
+        assert_eq!(meta.legacy_cursor_seq, 5);
+
+        let meta = set_legacy_event_cursor(&store, server, 3).await.unwrap();
+        assert_eq!(meta.cursor_seq, 40);
+        assert_eq!(meta.latest_seq, 60);
+        assert_eq!(meta.legacy_cursor_seq, 5);
+
+        reset_legacy_event_cursor(&store, server).await.unwrap();
+        let meta = get_sync_meta(&store, server).await.unwrap();
+        assert_eq!(meta.cursor_seq, 40);
+        assert_eq!(meta.latest_seq, 60);
+        assert_eq!(meta.legacy_cursor_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn older_batch_cannot_lower_latest_even_if_all_changes_were_applied() {
+        let store = store().await;
+        let server = "https://stale-batch.example.com";
+        get_sync_meta(&store, server).await.unwrap();
+        sqlx::query(
+            "UPDATE sync_meta SET cursor_seq = 20, latest_seq = 40, feed_id = 'feed-test',
+                initialized = 1 WHERE server_key = ?",
+        )
+        .bind(server)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let batch = SyncBatch {
+            from_seq: 19,
+            to_seq: 20,
+            latest_seq: 20,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 20,
+                entity_type: "schedule".to_owned(),
+                entity_id: "20".to_owned(),
+                operation: "delete".to_owned(),
+                entity_revision: 1,
+                payload: None,
+                created_at: String::new(),
+            }],
+        };
+        let error = apply_batch(&store, server, &batch).await.unwrap_err();
+        assert!(error.starts_with("SYNC_CACHE_INCONSISTENT:"), "{error}");
+        let meta = get_sync_meta(&store, server).await.unwrap();
+        assert_eq!(meta.cursor_seq, 20);
+        assert_eq!(meta.latest_seq, 40);
+    }
+
     #[tokio::test]
     async fn foreign_key_failure_requests_cache_rebuild() {
         let store = store().await;
@@ -1654,6 +2411,7 @@ mod tests {
             from_seq: 20,
             to_seq: 20,
             latest_seq: 20,
+            feed_id: String::new(),
             changes: vec![SyncChange {
                 seq: 20,
                 entity_type: "source_suppression".to_owned(),
@@ -1676,6 +2434,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_seq_regression_does_not_overwrite_previous_latest() {
+        let store = store().await;
+        let server = "https://sync-latest-regression.example.com";
+        get_sync_meta(&store, server).await.unwrap();
+        sqlx::query(
+            "UPDATE sync_meta SET cursor_seq = 10, latest_seq = 100, initialized = 1
+             WHERE server_key = ?",
+        )
+        .bind(server)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let batch = SyncBatch {
+            from_seq: 11,
+            to_seq: 20,
+            latest_seq: 20,
+            feed_id: String::new(),
+            changes: Vec::new(),
+        };
+        let error = apply_batch(&store, server, &batch).await.unwrap_err();
+        assert!(error.starts_with("SYNC_CACHE_INCONSISTENT:"), "{error}");
+        let meta = get_sync_meta(&store, server).await.unwrap();
+        assert_eq!(meta.cursor_seq, 10);
+        assert_eq!(meta.latest_seq, 100);
+    }
+
+    #[tokio::test]
+    async fn incompatible_bootstrap_schema_does_not_write_cache() {
+        let store = store().await;
+        let server = "https://sync-schema-mismatch.example.com";
+        let bootstrap = SyncBootstrap {
+            schema_version: SYNC_SCHEMA_VERSION + 1,
+            feed_id: "feed-test".to_owned(),
+            snapshot_revision: 12,
+            min_retained_seq: 0,
+            server_time: None,
+            subscriptions: Vec::new(),
+            schedules: Vec::new(),
+            weekly_rules: Vec::new(),
+            weekly_exceptions: Vec::new(),
+            schedule_sources: Vec::new(),
+            source_suppressions: Vec::new(),
+            server_settings: Value::Null,
+            live_statuses: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+        let error = apply_bootstrap(&store, server, &bootstrap).await.unwrap_err();
+        assert!(error.starts_with("SYNC_SCHEMA_INCOMPATIBLE:"), "{error}");
+        assert_eq!(get_sync_meta(&store, server).await.unwrap().cursor_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn feed_identity_change_requires_rebuild_before_applying_changes() {
+        let store = store().await;
+        let server = "https://sync-feed-change.example.com";
+        let bootstrap = SyncBootstrap {
+            schema_version: SYNC_SCHEMA_VERSION,
+            feed_id: "feed-a".to_owned(),
+            snapshot_revision: 5,
+            min_retained_seq: 0,
+            server_time: None,
+            subscriptions: Vec::new(),
+            schedules: Vec::new(),
+            weekly_rules: Vec::new(),
+            weekly_exceptions: Vec::new(),
+            schedule_sources: Vec::new(),
+            source_suppressions: Vec::new(),
+            server_settings: Value::Null,
+            live_statuses: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+        apply_bootstrap(&store, server, &bootstrap).await.unwrap();
+        let batch = SyncBatch {
+            from_seq: 6,
+            to_seq: 6,
+            latest_seq: 6,
+            feed_id: "feed-b".to_owned(),
+            changes: Vec::new(),
+        };
+
+        let error = apply_batch(&store, server, &batch).await.unwrap_err();
+        assert!(error.starts_with("SYNC_FEED_CHANGED:"), "{error}");
+        let meta = get_sync_meta(&store, server).await.unwrap();
+        assert_eq!(meta.cursor_seq, 5);
+        assert_eq!(meta.feed_id, "feed-a");
+    }
+
+    #[tokio::test]
     async fn device_id_is_stable() {
         let store = store().await;
         let first = device_id(&store).await.unwrap();
@@ -1694,6 +2540,7 @@ mod tests {
             from_seq: 1,
             to_seq: 2,
             latest_seq: 2,
+            feed_id: "feed-test".to_owned(),
             changes: vec![
                 SyncChange {
                     seq: 1,
@@ -1749,6 +2596,7 @@ mod tests {
             from_seq: 2,
             to_seq: 2,
             latest_seq: 2,
+            feed_id: "feed-test".to_owned(),
             changes: vec![SyncChange {
                 seq: 2,
                 entity_type: "schedule".to_owned(),
@@ -1765,11 +2613,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_numeric_link_tombstone_uses_server_identity_mapping() {
+        let store = store().await;
+        let server = "https://legacy-link-map.example.com";
+        let bootstrap = SyncBootstrap {
+            schema_version: SYNC_SCHEMA_VERSION,
+            feed_id: "feed-test".to_owned(),
+            snapshot_revision: 10,
+            min_retained_seq: 0,
+            server_time: None,
+            subscriptions: vec![json!({
+                "id": 1,
+                "mid": "100",
+                "name": "旧版官号映射测试",
+                "avatarUrl": "",
+                "roomId": "123",
+                "liveUrl": "https://live.bilibili.com/123",
+                "aliases": [],
+                "scheduleEnabled": true,
+                "liveNotifyEnabled": true,
+                "liveStatsEnabled": false,
+                "lastError": null,
+                "lastRefreshAt": null,
+                "isLive": false,
+                "liveTitle": null,
+                "liveCover": null,
+                "liveStartedAt": null,
+                "liveCheckedAt": null,
+                "linkedAccounts": [{
+                    "id": 7,
+                    "streamerId": 1,
+                    "mid": "200",
+                    "name": "应被删除的官号",
+                    "avatarUrl": "",
+                    "revision": 1,
+                    "createdAt": "2026-10-29T00:00:00Z"
+                }],
+                "createdAt": "2026-10-29T00:00:00Z"
+            })],
+            schedules: Vec::new(),
+            weekly_rules: Vec::new(),
+            weekly_exceptions: Vec::new(),
+            schedule_sources: Vec::new(),
+            source_suppressions: Vec::new(),
+            server_settings: Value::Null,
+            live_statuses: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+        apply_bootstrap(&store, server, &bootstrap).await.unwrap();
+
+        // Simulate an old mirror whose local AUTOINCREMENT row ID is unrelated
+        // to the server link ID and happens to point at another account.
+        sqlx::query("UPDATE linked_accounts SET id = 404 WHERE streamer_id = 1 AND mid = '200'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO linked_accounts(id, streamer_id, mid, name, avatar_url, created_at, revision)
+             VALUES(7, 1, '201', '不能误删的官号', '', '2026-10-29T00:00:00Z', 1)",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        for entity_type in ["link", "linked_account"] {
+            sqlx::query(
+                "INSERT INTO sync_entity_cache(server_key, entity_type, entity_id, entity_revision,
+                    operation, payload_json, updated_at)
+                 VALUES(?, ?, '7', 1, 'upsert', NULL, '2026-10-29T00:00:00Z')",
+            )
+            .bind(server)
+            .bind(entity_type)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        let delete = SyncBatch {
+            from_seq: 11,
+            to_seq: 11,
+            latest_seq: 11,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 11,
+                entity_type: "linked_account".to_owned(),
+                entity_id: "7".to_owned(),
+                operation: "delete".to_owned(),
+                entity_revision: 2,
+                payload: None,
+                created_at: String::new(),
+            }],
+        };
+        apply_batch(&store, server, &delete).await.unwrap();
+
+        let mapped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '200'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let local_numeric_collision: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '201'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(mapped, 0);
+        assert_eq!(local_numeric_collision, 1);
+        let aliases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type IN ('link', 'linked_account')
+               AND entity_id IN ('7', '1:200')",
+        )
+        .bind(server)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(aliases, 0);
+        let map_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_link_id_map
+             WHERE server_key = ? AND legacy_link_id = 7",
+        )
+        .bind(server)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(map_rows, 0);
+
+        // Once the mapping is gone, a numeric tombstone must not fall back to
+        // the local AUTOINCREMENT row ID and delete the unrelated account.
+        let unknown_numeric_delete = SyncBatch {
+            from_seq: 12,
+            to_seq: 12,
+            latest_seq: 12,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 12,
+                entity_type: "linked_account".to_owned(),
+                entity_id: "7".to_owned(),
+                operation: "delete".to_owned(),
+                entity_revision: 3,
+                payload: None,
+                created_at: String::new(),
+            }],
+        };
+        let error = apply_batch(&store, server, &unknown_numeric_delete)
+            .await
+            .unwrap_err();
+        assert!(error.contains("SYNC_CACHE_INCONSISTENT"), "{error}");
+        let still_present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '201'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(still_present, 1);
+    }
+
+    #[tokio::test]
     async fn bootstrap_applies_live_status_and_legacy_linked_account_changes() {
         let store = store().await;
         let server = "https://sync-entity.example.com";
         let bootstrap = SyncBootstrap {
             schema_version: SYNC_SCHEMA_VERSION,
+            feed_id: "feed-test".to_owned(),
             snapshot_revision: 10,
             min_retained_seq: 0,
             server_time: None,
@@ -1828,6 +2832,7 @@ mod tests {
             from_seq: 11,
             to_seq: 12,
             latest_seq: 12,
+            feed_id: "feed-test".to_owned(),
             changes: vec![
                 SyncChange {
                     seq: 11,
@@ -1865,7 +2870,109 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(links, 1);
-        assert_eq!(get_sync_meta(&store, server).await.unwrap().cursor_seq, 12);
+        let cached_entity_id: String = sqlx::query_scalar(
+            "SELECT entity_id FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type = 'linked_account' AND operation = 'upsert'",
+        )
+        .bind(server)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(cached_entity_id, "1:200");
+
+        let legacy_delete = SyncBatch {
+            from_seq: 13,
+            to_seq: 13,
+            latest_seq: 13,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 13,
+                entity_type: "linked_account".to_owned(),
+                entity_id: "7".to_owned(),
+                operation: "delete".to_owned(),
+                entity_revision: 1,
+                payload: None,
+                created_at: String::new(),
+            }],
+        };
+        apply_batch(&store, server, &legacy_delete).await.unwrap();
+        let links: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '200'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(links, 0);
+        let cached: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type IN ('link', 'linked_account')",
+        )
+        .bind(server)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(cached, 0);
+
+        let stable_upsert = SyncBatch {
+            from_seq: 14,
+            to_seq: 14,
+            latest_seq: 14,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 14,
+                entity_type: "linked_account".to_owned(),
+                entity_id: "1:200".to_owned(),
+                operation: "upsert".to_owned(),
+                entity_revision: 1,
+                payload: Some(json!({
+                    "id": 7,
+                    "streamerId": 1,
+                    "mid": "200",
+                    "name": "兼容官号",
+                    "avatarUrl": "",
+                    "revision": 1,
+                    "createdAt": "2026-10-29T00:00:00Z"
+                })),
+                created_at: String::new(),
+            }],
+        };
+        apply_batch(&store, server, &stable_upsert).await.unwrap();
+        let stable_delete = SyncBatch {
+            from_seq: 15,
+            to_seq: 15,
+            latest_seq: 15,
+            feed_id: "feed-test".to_owned(),
+            changes: vec![SyncChange {
+                seq: 15,
+                entity_type: "linked_account".to_owned(),
+                entity_id: "1:200".to_owned(),
+                operation: "delete".to_owned(),
+                entity_revision: 1,
+                payload: None,
+                created_at: String::new(),
+            }],
+        };
+        apply_batch(&store, server, &stable_delete).await.unwrap();
+        let links: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '200'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(links, 0);
+        let cached: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_entity_cache
+             WHERE server_key = ? AND entity_type IN ('link', 'linked_account')",
+        )
+        .bind(server)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(cached, 0);
+        assert_eq!(
+            get_sync_meta(&store, server).await.unwrap().cursor_seq,
+            15
+        );
     }
 
     #[tokio::test]
@@ -1875,6 +2982,7 @@ mod tests {
         let start_at = Utc::now() + chrono::Duration::hours(1);
         let bootstrap = SyncBootstrap {
             schema_version: SYNC_SCHEMA_VERSION,
+            feed_id: "feed-test".to_owned(),
             snapshot_revision: 10,
             min_retained_seq: 0,
             server_time: None,

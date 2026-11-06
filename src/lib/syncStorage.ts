@@ -22,6 +22,7 @@ const SERVER_SETTINGS_ENTITY_ID = "server_settings";
 export interface WebSyncCacheMeta {
   serverKey: string;
   schemaVersion: number;
+  feedId?: string;
   cursorSeq: number;
   latestSeq: number;
   minRetainedSeq: number;
@@ -38,6 +39,8 @@ export interface WebSyncEntityRecord {
   entityType: string;
   entityId: string;
   entityRevision: number;
+  operation?: "upsert" | "delete";
+  seq?: number;
   payload: unknown;
   updatedAt: string;
 }
@@ -54,6 +57,7 @@ export interface WebSyncCacheLoadResult {
 }
 
 export interface WebSyncCacheMetaInput {
+  feedId?: string;
   cursorSeq: number;
   latestSeq: number;
   minRetainedSeq: number;
@@ -62,7 +66,16 @@ export interface WebSyncCacheMetaInput {
   lastSyncAt: string | null;
 }
 
+export type WebSyncCacheWriteStatus = "persisted" | "unavailable" | "failed";
+
+export interface WebSyncCacheWriteResult {
+  status: WebSyncCacheWriteStatus;
+  error: Error | null;
+}
+
 let databasePromise: Promise<IDBDatabase | null> | null = null;
+const loadedCacheFeedIds = new Map<string, string>();
+const loadedCacheServerKeys = new Set<string>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -97,6 +110,14 @@ export function webSyncEntityCacheKey(serverKey: string, entityType: string, ent
   return `${serverKey}\u0000${entityType}\u0000${entityId}`;
 }
 
+export function loadedWebSyncFeedId(baseUrl: string): string {
+  return loadedCacheFeedIds.get(normalizeWebSyncServerKey(baseUrl)) ?? "";
+}
+
+export function webSyncCacheWasLoaded(baseUrl: string): boolean {
+  return loadedCacheServerKeys.has(normalizeWebSyncServerKey(baseUrl));
+}
+
 function payloadId(payload: unknown, fallbackKey = "id"): string | null {
   if (!isRecord(payload)) {
     return null;
@@ -115,6 +136,236 @@ function payloadRevision(payload: unknown): number {
   return isRecord(payload) ? nonNegativeInteger(payload.revision) : 0;
 }
 
+function idValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(Math.trunc(value));
+  }
+  return null;
+}
+
+function isLinkedAccountEntityType(entityType: string): boolean {
+  return entityType === "link" || entityType === "linked_account";
+}
+
+function linkedAccountIdentity(
+  streamerId: unknown,
+  mid: unknown,
+): { key: string; streamerId: string; mid: string } | null {
+  const normalizedStreamerId = idValue(streamerId);
+  const normalizedMid = idValue(mid);
+  if (!normalizedStreamerId || !normalizedMid) {
+    return null;
+  }
+  return {
+    key: `${normalizedStreamerId}\u0000${normalizedMid}`,
+    streamerId: normalizedStreamerId,
+    mid: normalizedMid,
+  };
+}
+
+function linkedAccountIdentityFromPayload(payload: unknown) {
+  if (!isRecord(payload)) {
+    return null;
+  }
+  return linkedAccountIdentity(
+    payload.streamerId ?? payload.streamer_id,
+    payload.mid,
+  );
+}
+
+function linkedAccountIdentityFromEntityId(entityId: string) {
+  const separator = entityId.indexOf(":");
+  if (separator <= 0 || separator === entityId.length - 1) {
+    return null;
+  }
+  return linkedAccountIdentity(entityId.slice(0, separator), entityId.slice(separator + 1));
+}
+
+function normalizedLinkedAccount(payload: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...(payload.id === undefined ? {} : { id: payload.id }),
+    ...(payload.revision === undefined ? {} : { revision: payload.revision }),
+    mid: idValue(payload.mid) ?? stringValue(payload.mid),
+    name: stringValue(payload.name),
+    avatarUrl: stringValue(payload.avatarUrl ?? payload.avatar_url),
+    createdAt: stringValue(payload.createdAt ?? payload.created_at),
+  };
+}
+
+interface EntityVersion {
+  revision: number;
+  updatedAt: string;
+  seq?: number;
+}
+
+interface LinkedAccountProjection {
+  upserts: Map<
+    string,
+    {
+      identity: { key: string; streamerId: string; mid: string };
+      payload: Record<string, unknown>;
+      version: EntityVersion;
+    }
+  >;
+  tombstones: Set<string>;
+  tombstoneVersions: Map<string, EntityVersion>;
+  legacyTombstoneIds: Set<string>;
+  legacyTombstoneVersions: Map<string, EntityVersion>;
+}
+
+function entityVersion(record: WebSyncEntityRecord): EntityVersion {
+  return {
+    revision: nonNegativeInteger(record.entityRevision),
+    updatedAt: record.updatedAt,
+    ...(record.seq === undefined ? {} : { seq: nonNegativeInteger(record.seq) }),
+  };
+}
+
+function versionIsNewer(candidate: EntityVersion, current?: EntityVersion): boolean {
+  if (!current) {
+    return true;
+  }
+  // The sync sequence is the authoritative order between an incremental delete
+  // and a later re-add, even when both rows reuse revision 1.
+  if (candidate.seq !== undefined || current.seq !== undefined) {
+    if (candidate.seq === undefined) {
+      return false;
+    }
+    if (current.seq === undefined) {
+      return true;
+    }
+    if (candidate.seq !== current.seq) {
+      return candidate.seq > current.seq;
+    }
+  }
+  if (candidate.revision !== current.revision) {
+    return candidate.revision > current.revision;
+  }
+  return candidate.updatedAt > current.updatedAt;
+}
+
+function linkedAccountProjection(cache: Pick<WebSyncCache, "entities">): LinkedAccountProjection {
+  const upserts = new Map<
+    string,
+    {
+      identity: { key: string; streamerId: string; mid: string };
+      payload: Record<string, unknown>;
+      version: EntityVersion;
+    }
+  >();
+  const tombstones = new Set<string>();
+  const tombstoneVersions = new Map<string, EntityVersion>();
+  const legacyTombstoneIds = new Set<string>();
+  const legacyTombstoneVersions = new Map<string, EntityVersion>();
+  for (const record of cache.entities) {
+    if (!isLinkedAccountEntityType(record.entityType)) {
+      continue;
+    }
+    const version = entityVersion(record);
+    if (record.operation === "delete") {
+      const identity =
+        linkedAccountIdentityFromPayload(record.payload) ??
+        linkedAccountIdentityFromEntityId(record.entityId);
+      if (identity) {
+        if (versionIsNewer(version, tombstoneVersions.get(identity.key))) {
+          tombstones.add(identity.key);
+          tombstoneVersions.set(identity.key, version);
+        }
+      } else if (versionIsNewer(version, legacyTombstoneVersions.get(record.entityId))) {
+        legacyTombstoneIds.add(record.entityId);
+        legacyTombstoneVersions.set(record.entityId, version);
+      }
+      continue;
+    }
+    if (!isRecord(record.payload)) {
+      continue;
+    }
+    const identity = linkedAccountIdentityFromPayload(record.payload);
+    if (identity && versionIsNewer(version, upserts.get(identity.key)?.version)) {
+      upserts.set(identity.key, { identity, payload: record.payload, version });
+    }
+  }
+  return {
+    upserts,
+    tombstones,
+    tombstoneVersions,
+    legacyTombstoneIds,
+    legacyTombstoneVersions,
+  };
+}
+
+function projectLinkedAccounts(
+  record: WebSyncEntityRecord,
+  projection: LinkedAccountProjection,
+): unknown {
+  const subscription = record.payload;
+  if (!isRecord(subscription)) {
+    return subscription;
+  }
+  const streamerId = payloadId(subscription);
+  if (!streamerId) {
+    return subscription;
+  }
+  const subscriptionVersion = entityVersion(record);
+  const links = new Map<string, Record<string, unknown>>();
+  const baseLinks = Array.isArray(subscription.linkedAccounts) ? subscription.linkedAccounts : [];
+  for (const link of baseLinks) {
+    if (!isRecord(link)) {
+      continue;
+    }
+    const mid = idValue(link.mid);
+    if (!mid) {
+      continue;
+    }
+    const baseVersion: EntityVersion = {
+      revision: Math.max(subscriptionVersion.revision, nonNegativeInteger(link.revision)),
+      updatedAt: subscriptionVersion.updatedAt,
+      ...(subscriptionVersion.seq === undefined ? {} : { seq: subscriptionVersion.seq }),
+    };
+    const stableTombstone = projection.tombstoneVersions.get(`${streamerId}\u0000${mid}`);
+    if (stableTombstone && !versionIsNewer(baseVersion, stableTombstone)) {
+      continue;
+    }
+    const legacyId = idValue(link.id);
+    const legacyTombstone = legacyId
+      ? projection.legacyTombstoneVersions.get(legacyId)
+      : undefined;
+    if (legacyTombstone && !versionIsNewer(baseVersion, legacyTombstone)) {
+      continue;
+    }
+    links.set(mid, link);
+  }
+  for (const { identity, payload, version } of projection.upserts.values()) {
+    if (identity.streamerId !== streamerId) {
+      continue;
+    }
+    const stableTombstone = projection.tombstoneVersions.get(identity.key);
+    if (stableTombstone && !versionIsNewer(version, stableTombstone)) {
+      continue;
+    }
+    const payloadIdValue = idValue(payload.id);
+    const legacyTombstone = payloadIdValue
+      ? projection.legacyTombstoneVersions.get(payloadIdValue)
+      : undefined;
+    if (legacyTombstone && !versionIsNewer(version, legacyTombstone)) {
+      continue;
+    }
+    links.set(identity.mid, {
+      ...(links.get(identity.mid) ?? {}),
+      ...normalizedLinkedAccount(payload),
+    });
+  }
+  return {
+    ...subscription,
+    linkedAccounts: Array.from(links.values()).sort((left, right) =>
+      stringValue(left.name).localeCompare(stringValue(right.name), "zh-CN"),
+    ),
+  };
+}
+
 function makeEntityRecord(
   serverKey: string,
   entityType: string,
@@ -122,6 +373,8 @@ function makeEntityRecord(
   payload: unknown,
   updatedAt: string,
   entityRevision = payloadRevision(payload),
+  operation: "upsert" | "delete" = "upsert",
+  seq?: number,
 ): WebSyncEntityRecord {
   return {
     cacheKey: webSyncEntityCacheKey(serverKey, entityType, entityId),
@@ -129,6 +382,8 @@ function makeEntityRecord(
     entityType,
     entityId,
     entityRevision,
+    operation,
+    ...(seq === undefined ? {} : { seq }),
     payload,
     updatedAt,
   };
@@ -193,7 +448,23 @@ export function applySyncChangesToEntities(
   for (const change of changes) {
     const key = webSyncEntityCacheKey(serverKey, change.entityType, change.entityId);
     if (change.operation === "delete") {
-      byCacheKey.delete(key);
+      if (isLinkedAccountEntityType(change.entityType)) {
+        byCacheKey.set(
+          key,
+          makeEntityRecord(
+            serverKey,
+            change.entityType,
+            change.entityId,
+            change.payload,
+            updatedAt,
+            change.entityRevision,
+            "delete",
+            change.seq,
+          ),
+        );
+      } else {
+        byCacheKey.delete(key);
+      }
       continue;
     }
     if (change.payload === null) {
@@ -208,6 +479,8 @@ export function applySyncChangesToEntities(
         change.payload,
         updatedAt,
         change.entityRevision,
+        "upsert",
+        change.seq,
       ),
     );
   }
@@ -216,7 +489,12 @@ export function applySyncChangesToEntities(
 
 function recordsForType(cache: Pick<WebSyncCache, "entities">, entityType: string): unknown[] {
   return cache.entities
-    .filter((record) => record.entityType === entityType && isRecord(record.payload))
+    .filter(
+      (record) =>
+        record.entityType === entityType &&
+        record.operation !== "delete" &&
+        isRecord(record.payload),
+    )
     .map((record) => record.payload);
 }
 
@@ -224,12 +502,21 @@ export function syncBootstrapFromCache(cache: Pick<WebSyncCache, "meta" | "entit
   const settingsRecord = cache.entities.find(
     (record) => record.entityType === "server_settings" && isRecord(record.payload),
   );
+  const linkProjection = linkedAccountProjection(cache);
   return {
     schemaVersion: cache.meta.schemaVersion,
+    feedId: stringValue(cache.meta.feedId).trim(),
     snapshotRevision: cache.meta.snapshotRevision,
     minRetainedSeq: cache.meta.minRetainedSeq,
     serverTime: cache.meta.updatedAt,
-    subscriptions: recordsForType(cache, "subscription") as Streamer[],
+    subscriptions: cache.entities
+      .filter(
+        (record) =>
+          record.entityType === "subscription" &&
+          record.operation !== "delete" &&
+          isRecord(record.payload),
+      )
+      .map((record) => projectLinkedAccounts(record, linkProjection) as Streamer),
     schedules: recordsForType(cache, "schedule") as Schedule[],
     weeklyRules: recordsForType(cache, "weekly_rule") as WeeklyScheduleRule[],
     weeklyExceptions: recordsForType(cache, "weekly_exception") as WeeklyScheduleException[],
@@ -294,6 +581,7 @@ function openWebSyncDatabase(): Promise<IDBDatabase | null> {
     try {
       request = factory.open(WEB_SYNC_DB_NAME, WEB_SYNC_DB_VERSION);
     } catch {
+      databasePromise = null;
       finish(null);
       return;
     }
@@ -309,11 +597,25 @@ function openWebSyncDatabase(): Promise<IDBDatabase | null> {
     };
     request.onsuccess = () => {
       const database = request.result;
-      database.onversionchange = () => database.close();
+      if (settled) {
+        database.close();
+        databasePromise = null;
+        return;
+      }
+      database.onversionchange = () => {
+        database.close();
+        databasePromise = null;
+      };
       finish(database);
     };
-    request.onerror = () => finish(null);
-    request.onblocked = () => finish(null);
+    request.onerror = () => {
+      databasePromise = null;
+      finish(null);
+    };
+    request.onblocked = () => {
+      databasePromise = null;
+      finish(null);
+    };
   });
   return databasePromise;
 }
@@ -323,35 +625,40 @@ export async function isWebSyncStorageAvailable(): Promise<boolean> {
 }
 
 function normalizedMeta(serverKey: string, input: WebSyncCacheMetaInput): WebSyncCacheMeta {
+  const cursorSeq = nonNegativeInteger(input.cursorSeq);
   return {
     serverKey,
     schemaVersion: WEB_SYNC_CACHE_SCHEMA_VERSION,
-    cursorSeq: nonNegativeInteger(input.cursorSeq),
-    latestSeq: Math.max(
-      nonNegativeInteger(input.latestSeq),
-      nonNegativeInteger(input.cursorSeq),
-    ),
+    feedId: stringValue(input.feedId).trim(),
+    cursorSeq,
+    latestSeq: nonNegativeInteger(input.latestSeq),
     minRetainedSeq: nonNegativeInteger(input.minRetainedSeq),
     snapshotRevision: nonNegativeInteger(input.snapshotRevision),
-    ackedSeq: nonNegativeInteger(input.ackedSeq),
+    ackedSeq: Math.min(cursorSeq, nonNegativeInteger(input.ackedSeq)),
     lastSyncAt: input.lastSyncAt,
     initialized: true,
     updatedAt: new Date().toISOString(),
   };
 }
 
+function errorValue(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 function metaFromRecord(serverKey: string, value: unknown): WebSyncCacheMeta | null {
   if (!isRecord(value)) {
     return null;
   }
+  const cursorSeq = nonNegativeInteger(value.cursorSeq);
   return {
     serverKey,
     schemaVersion: nonNegativeInteger(value.schemaVersion),
-    cursorSeq: nonNegativeInteger(value.cursorSeq),
+    feedId: stringValue(value.feedId).trim(),
+    cursorSeq,
     latestSeq: nonNegativeInteger(value.latestSeq),
     minRetainedSeq: nonNegativeInteger(value.minRetainedSeq),
     snapshotRevision: nonNegativeInteger(value.snapshotRevision),
-    ackedSeq: nonNegativeInteger(value.ackedSeq),
+    ackedSeq: Math.min(cursorSeq, nonNegativeInteger(value.ackedSeq)),
     lastSyncAt: typeof value.lastSyncAt === "string" ? value.lastSyncAt : null,
     initialized: value.initialized === true,
     updatedAt: stringValue(value.updatedAt, new Date(0).toISOString()),
@@ -367,12 +674,18 @@ function entityFromRecord(serverKey: string, value: unknown): WebSyncEntityRecor
   if (!entityType || !entityId || value.serverKey !== serverKey) {
     return null;
   }
+  const seq =
+    typeof value.seq === "number" && Number.isFinite(value.seq)
+      ? nonNegativeInteger(value.seq)
+      : undefined;
   return {
     cacheKey: webSyncEntityCacheKey(serverKey, entityType, entityId),
     serverKey,
     entityType,
     entityId,
     entityRevision: nonNegativeInteger(value.entityRevision),
+    operation: value.operation === "delete" ? "delete" : "upsert",
+    ...(seq === undefined ? {} : { seq }),
     payload: value.payload ?? null,
     updatedAt: stringValue(value.updatedAt, new Date(0).toISOString()),
   };
@@ -382,6 +695,10 @@ export async function loadWebSyncCache(baseUrl: string): Promise<WebSyncCacheLoa
   const serverKey = normalizeWebSyncServerKey(baseUrl);
   const database = await openWebSyncDatabase();
   if (!database || !serverKey) {
+    if (serverKey) {
+      loadedCacheFeedIds.delete(serverKey);
+      loadedCacheServerKeys.delete(serverKey);
+    }
     return { available: false, cache: null };
   }
   try {
@@ -398,6 +715,8 @@ export async function loadWebSyncCache(baseUrl: string): Promise<WebSyncCacheLoa
     await done;
     const meta = metaFromRecord(serverKey, metaValue);
     if (!meta) {
+      loadedCacheFeedIds.delete(serverKey);
+      loadedCacheServerKeys.delete(serverKey);
       return { available: true, cache: null };
     }
     const entities = (Array.isArray(entityValues) ? entityValues : [])
@@ -405,25 +724,56 @@ export async function loadWebSyncCache(baseUrl: string): Promise<WebSyncCacheLoa
       .filter((record): record is WebSyncEntityRecord => Boolean(record));
     const cache: WebSyncCache = { meta, entities, snapshot: {} as SyncBootstrap };
     cache.snapshot = syncBootstrapFromCache(cache);
+    if (isWebSyncCacheUsable(cache)) {
+      loadedCacheFeedIds.set(serverKey, stringValue(meta.feedId).trim());
+      loadedCacheServerKeys.add(serverKey);
+    } else {
+      loadedCacheFeedIds.delete(serverKey);
+      loadedCacheServerKeys.delete(serverKey);
+    }
     return { available: true, cache };
   } catch {
+    loadedCacheFeedIds.delete(serverKey);
+    loadedCacheServerKeys.delete(serverKey);
     return { available: true, cache: null };
   }
 }
 
-export async function replaceWebSyncCache(
+export async function replaceWebSyncCacheWithResult(
   baseUrl: string,
   snapshot: SyncBootstrap,
   input: WebSyncCacheMetaInput,
-): Promise<boolean> {
+): Promise<WebSyncCacheWriteResult> {
+  if (snapshot.schemaVersion !== WEB_SYNC_CACHE_SCHEMA_VERSION) {
+    return {
+      status: "failed",
+      error: new Error(
+        `同步快照 schema 不兼容（服务器 ${snapshot.schemaVersion}，缓存 ${WEB_SYNC_CACHE_SCHEMA_VERSION}）`,
+      ),
+    };
+  }
+  const snapshotFeedId = stringValue(snapshot.feedId).trim();
+  const inputFeedId = stringValue(input.feedId).trim();
+  if (
+    input.cursorSeq !== snapshot.snapshotRevision ||
+    input.snapshotRevision !== snapshot.snapshotRevision ||
+    (input.feedId !== undefined && inputFeedId !== snapshotFeedId)
+  ) {
+    return {
+      status: "failed",
+      error: new Error("同步快照与缓存元数据身份不一致"),
+    };
+  }
   const serverKey = normalizeWebSyncServerKey(baseUrl);
   const database = await openWebSyncDatabase();
   if (!database || !serverKey) {
-    return false;
+    return { status: "unavailable", error: null };
   }
   let transaction: IDBTransaction | null = null;
+  let transactionStarted = false;
   try {
     transaction = database.transaction([META_STORE, ENTITY_STORE], "readwrite");
+    transactionStarted = true;
     const done = transactionDone(transaction);
     void done.catch(() => undefined);
     const entityStore = transaction.objectStore(ENTITY_STORE);
@@ -448,33 +798,48 @@ export async function replaceWebSyncCache(
       }
     };
     await done;
-    return true;
-  } catch {
+    loadedCacheFeedIds.set(serverKey, stringValue(input.feedId).trim());
+    loadedCacheServerKeys.add(serverKey);
+    return { status: "persisted", error: null };
+  } catch (error) {
     try {
       transaction?.abort();
     } catch {
       // The transaction may already have aborted or completed.
     }
-    return false;
+    if (transactionStarted || database) {
+      databasePromise = null;
+    }
+    return {
+      status: transactionStarted || database ? "failed" : "unavailable",
+      error: errorValue(error),
+    };
   }
 }
 
-export async function persistWebSyncBatch(
+export async function replaceWebSyncCache(
+  baseUrl: string,
+  snapshot: SyncBootstrap,
+  input: WebSyncCacheMetaInput,
+): Promise<boolean> {
+  return (await replaceWebSyncCacheWithResult(baseUrl, snapshot, input)).status === "persisted";
+}
+
+export async function persistWebSyncBatchWithResult(
   baseUrl: string,
   changes: SyncChange[],
   input: WebSyncCacheMetaInput,
-): Promise<boolean> {
+): Promise<WebSyncCacheWriteResult> {
   const serverKey = normalizeWebSyncServerKey(baseUrl);
   const database = await openWebSyncDatabase();
   if (!database || !serverKey) {
-    return false;
-  }
-  if (!changes.length) {
-    return true;
+    return { status: "unavailable", error: null };
   }
   let transaction: IDBTransaction | null = null;
+  let transactionStarted = false;
   try {
     transaction = database.transaction([META_STORE, ENTITY_STORE], "readwrite");
+    transactionStarted = true;
     const done = transactionDone(transaction);
     void done.catch(() => undefined);
     const entityStore = transaction.objectStore(ENTITY_STORE);
@@ -482,7 +847,22 @@ export async function persistWebSyncBatch(
     for (const change of changes) {
       const key = webSyncEntityCacheKey(serverKey, change.entityType, change.entityId);
       if (change.operation === "delete") {
-        entityStore.delete(key);
+        if (isLinkedAccountEntityType(change.entityType)) {
+          entityStore.put(
+            makeEntityRecord(
+              serverKey,
+              change.entityType,
+              change.entityId,
+              change.payload,
+              updatedAt,
+              change.entityRevision,
+              "delete",
+              change.seq,
+            ),
+          );
+        } else {
+          entityStore.delete(key);
+        }
         continue;
       }
       if (change.payload === null) {
@@ -496,18 +876,36 @@ export async function persistWebSyncBatch(
           change.payload,
           updatedAt,
           change.entityRevision,
+          "upsert",
+          change.seq,
         ),
       );
     }
     transaction.objectStore(META_STORE).put(normalizedMeta(serverKey, input));
     await done;
-    return true;
-  } catch {
+    loadedCacheFeedIds.set(serverKey, stringValue(input.feedId).trim());
+    loadedCacheServerKeys.add(serverKey);
+    return { status: "persisted", error: null };
+  } catch (error) {
     try {
       transaction?.abort();
     } catch {
       // The transaction may already have aborted or completed.
     }
-    return false;
+    if (transactionStarted || database) {
+      databasePromise = null;
+    }
+    return {
+      status: transactionStarted || database ? "failed" : "unavailable",
+      error: errorValue(error),
+    };
   }
+}
+
+export async function persistWebSyncBatch(
+  baseUrl: string,
+  changes: SyncChange[],
+  input: WebSyncCacheMetaInput,
+): Promise<boolean> {
+  return (await persistWebSyncBatchWithResult(baseUrl, changes, input)).status === "persisted";
 }

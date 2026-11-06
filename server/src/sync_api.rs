@@ -39,7 +39,10 @@ pub(crate) async fn changes(
     State(state): State<AppState>,
     Query(query): Query<ChangesQuery>,
 ) -> ApiResult {
-    let after = query.after.unwrap_or(0).max(0);
+    let after = query.after.unwrap_or(0);
+    if after < 0 {
+        return Err(AppError::validation("同步游标不能为负数").into());
+    }
     let limit = query
         .limit
         .unwrap_or(DEFAULT_CHANGES_LIMIT)
@@ -84,8 +87,8 @@ pub(crate) async fn register_device(
     Json(input): Json<DeviceRegisterInput>,
 ) -> ApiResult {
     validate_device_id(&input.device_id)?;
-    validate_text("设备名称", &input.name, 128)?;
-    validate_text("设备平台", &input.platform, 64)?;
+    validate_text("设备名称", &input.name, 80)?;
+    validate_text("设备平台", &input.platform, 32)?;
     validate_text("应用版本", &input.app_version, 64)?;
     ok(state
         .service
@@ -148,6 +151,7 @@ pub(crate) async fn publish_sync_feed(state: &AppState, after: &mut i64) -> Resu
             let _ = state.hub.send(reset_required_message(
                 page.latest_seq,
                 page.min_retained_seq,
+                &page.feed_id,
                 "cursor_expired",
             ));
             *after = page.latest_seq;
@@ -159,7 +163,7 @@ pub(crate) async fn publish_sync_feed(state: &AppState, after: &mut i64) -> Resu
         }
 
         let previous = *after;
-        for message in sync_batch_messages(&page.changes, page.latest_seq)? {
+        for message in sync_batch_messages(&page.changes, page.latest_seq, &page.feed_id)? {
             let _ = state.hub.send(message);
         }
         *after = page
@@ -176,6 +180,7 @@ pub(crate) async fn publish_sync_feed(state: &AppState, after: &mut i64) -> Resu
 pub(crate) fn sync_batch_messages(
     changes: &[SyncChange],
     latest_seq: i64,
+    feed_id: &str,
 ) -> Result<Vec<Value>, AppError> {
     if changes.is_empty() {
         return Ok(Vec::new());
@@ -192,7 +197,7 @@ pub(crate) fn sync_batch_messages(
         let would_exceed_bytes =
             !batch.is_empty() && batch_bytes.saturating_add(value_bytes) > BATCH_MAX_BYTES;
         if would_exceed_count || would_exceed_bytes {
-            messages.push(sync_batch_message(&batch, latest_seq));
+            messages.push(sync_batch_message(&batch, latest_seq, feed_id));
             batch.clear();
             batch_bytes = 0;
         }
@@ -201,12 +206,12 @@ pub(crate) fn sync_batch_messages(
     }
 
     if !batch.is_empty() {
-        messages.push(sync_batch_message(&batch, latest_seq));
+        messages.push(sync_batch_message(&batch, latest_seq, feed_id));
     }
     Ok(messages)
 }
 
-fn sync_batch_message(changes: &[Value], latest_seq: i64) -> Value {
+fn sync_batch_message(changes: &[Value], latest_seq: i64, feed_id: &str) -> Value {
     let from_seq = changes
         .first()
         .and_then(|change| change.get("seq"))
@@ -222,6 +227,7 @@ fn sync_batch_message(changes: &[Value], latest_seq: i64) -> Value {
         "fromSeq": from_seq,
         "toSeq": to_seq,
         "latestSeq": latest_seq,
+        "feedId": feed_id,
         "changes": changes,
     })
 }
@@ -229,11 +235,13 @@ fn sync_batch_message(changes: &[Value], latest_seq: i64) -> Value {
 pub(crate) fn reset_required_message(
     latest_seq: i64,
     min_retained_seq: i64,
+    feed_id: &str,
     reason: &str,
 ) -> Value {
     json!({
         "type": "reset_required",
         "reason": reason,
+        "feedId": feed_id,
         "latestSeq": latest_seq,
         "minRetainedSeq": min_retained_seq,
     })

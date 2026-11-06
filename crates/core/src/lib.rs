@@ -20,6 +20,6 @@ pub use network::{
     client_builder as proxy_client_builder, proxy_url, test_google as test_proxy_google,
     validate_proxy_port, ProxyTestInput, ProxyTestReport, PROXY_HOST,
 };
-pub use service::AppService;
+pub use service::{AppService, FAN_POLL_INTERVAL_SECONDS};
 pub use settings::{load_settings, save_settings, AppSettings, DataMode, RuntimeSecrets};
 pub use store::{SqliteStore, SyncPrunePolicy, SYNC_SCHEMA_VERSION};

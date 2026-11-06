@@ -63,9 +63,12 @@ export interface AccountSearchResult {
 }
 
 export interface LinkedAccount {
+  id?: number;
+  streamerId?: number;
   mid: string;
   name: string;
   avatarUrl: string;
+  revision?: number;
   createdAt: string;
 }
 
@@ -80,6 +83,7 @@ export interface Streamer {
   scheduleEnabled: boolean;
   liveNotifyEnabled: boolean;
   liveStatsEnabled: boolean;
+  fans: number | null;
   lastError: string | null;
   lastRefreshAt: string | null;
   isLive: boolean;
@@ -89,6 +93,7 @@ export interface Streamer {
   liveCheckedAt: string | null;
   linkedAccounts: LinkedAccount[];
   sortOrder: number;
+  revision?: number;
   createdAt: string;
 }
 
@@ -138,6 +143,7 @@ export interface WeeklyScheduleRule {
   effectiveFrom: string;
   effectiveUntil: string | null;
   enabled: boolean;
+  revision?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -181,6 +187,7 @@ export interface LiveSession {
   endedAt: string | null;
   durationSeconds: number;
   peakOnline: number;
+  peakHighEnergy: number;
   avgOnline: number;
   onlineSamples: number;
   onlineTotal: number;
@@ -200,6 +207,18 @@ export interface LiveSession {
   createdAt: string;
   updatedAt: string;
 }
+export interface FanSnapshot {
+  capturedAt: string;
+  fans: number;
+}
+
+export interface FanHistory {
+  streamerId: number;
+  currentFans: number | null;
+  checkedAt: string | null;
+  snapshots: FanSnapshot[];
+}
+
 export interface LiveStatus {
   streamerId: number;
   mid: string;
@@ -213,6 +232,7 @@ export interface LiveStatus {
   startedAt: string | null;
   checkedAt: string;
   liveNotifyEnabled: boolean;
+  revision?: number;
 }
 
 export interface FertilityStatus {
@@ -270,6 +290,7 @@ export interface LlmSecret {
   configured: boolean;
   revision: number;
   apiKey?: string | null;
+  boundBaseUrl?: string | null;
 }
 
 export interface LlmTestInput {
@@ -315,6 +336,7 @@ export interface SyncMutation {
   appliedAt: string | null;
   deviceId?: string | null;
   baseRevision?: number | null;
+  resultJson?: unknown;
 }
 
 export interface LiveEventPayload {
@@ -330,6 +352,7 @@ export interface LiveEventPayload {
   startedAt?: string | null;
   checkedAt: string;
   liveNotifyEnabled: boolean;
+  revision?: number;
 }
 
 export interface ServerEvent {
@@ -341,9 +364,13 @@ export interface ServerEvent {
 }
 
 export interface ServerSnapshot {
+  schemaVersion: number;
   subscriptions: Streamer[];
   schedules: Schedule[];
   weeklyRules?: WeeklyScheduleRule[];
+  weeklyExceptions?: WeeklyScheduleException[];
+  scheduleSources?: ScheduleSource[];
+  sourceSuppressions?: SourceSuppression[];
   latestEventSeq: number;
   exportedAt: string;
 }
@@ -386,9 +413,14 @@ export interface ImportPreview {
   subscriptions: number;
   schedules: number;
   weeklyRules: number;
+  serverStateDigest?: string;
   conflicts: { entity: string; label: string; localId: number; remoteId: number;
     local: unknown; remote: unknown }[];
 }
+export interface MigrationPreview extends ImportPreview {
+  serverStateDigest: string;
+}
+
 export interface ImportReport {
   subscriptions: number;
   schedules: number;
@@ -419,11 +451,13 @@ export interface SyncBatch {
   fromSeq: number;
   toSeq: number;
   latestSeq: number;
+  feedId?: string;
   changes: SyncChange[];
 }
 
 export interface SyncChangesPage {
   schemaVersion: number;
+  feedId?: string;
   fromSeq: number;
   toSeq: number;
   latestSeq: number;
@@ -439,6 +473,7 @@ export interface WeeklyScheduleException {
   occurrenceDate: string;
   exceptionKind: string;
   scheduleId: number | null;
+  revision?: number;
   createdAt: string;
 }
 
@@ -451,6 +486,7 @@ export interface ScheduleSource {
   sourceFingerprint: string | null;
   sourceIdentity: string;
   confidence: number;
+  revision?: number;
   createdAt: string;
 }
 
@@ -459,6 +495,7 @@ export interface SourceSuppression {
   streamerId: number;
   sourcePostId: string;
   sourceFingerprint: string;
+  revision?: number;
   createdAt: string;
 }
 
@@ -471,10 +508,12 @@ export interface ServerSettings {
   llmModel?: string;
   llmPromptVersion?: string;
   proxyPort?: number | null;
+  revision?: number;
 }
 
 export interface SyncBootstrap {
   schemaVersion: number;
+  feedId?: string;
   snapshotRevision: number;
   minRetainedSeq: number;
   serverTime: string;
@@ -492,9 +531,11 @@ export interface SyncBootstrap {
 export interface SyncMeta {
   serverKey: string;
   deviceId: string;
+  feedId?: string;
   cursorSeq: number;
   latestSeq: number;
   lastSnapshotRevision: number;
+  legacyCursorSeq?: number;
   lastAckSeq: number;
   lastSyncAt: string | null;
   status: string;
@@ -554,6 +595,7 @@ export interface RefreshJob {
 export interface RefreshJobAccepted {
   jobId: string;
   status: string;
+  deduplicated?: boolean;
 }
 
 export interface SyncAckResult {

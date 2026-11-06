@@ -7,45 +7,102 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-publish
   cancel-in-progress: false
 
 jobs:
   windows:
     name: Build Windows release
     runs-on: windows-latest
-    env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - name: Verify tag matches app version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify release commit is on the default branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          status="$(gh api "repos/$REPOSITORY/compare/$DEFAULT_BRANCH...$RELEASE_SHA" --jq .status)"
+          case "$status" in
+            identical|behind) ;;
+            *)
+              echo "发布提交不在默认分支历史中：status=$status" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Enforce release ref policy
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $expected = "refs/heads/$($env:DEFAULT_BRANCH)"
+            if ($env:RELEASE_REF -ne $expected) {
+              throw "手动发布仅允许从默认分支运行：期望 $expected，实际 $env:RELEASE_REF"
+            }
+          }
+
+      - name: Validate app version and tag
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "标签 ${{ github.ref_name }} 与 tauri.conf.json 版本 v$version 不一致"
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+            throw "tauri.conf.json 版本不是有效 SemVer: $version"
+          }
+          if ($env:RELEASE_REF.StartsWith("refs/tags/") -and "v$version" -ne $env:RELEASE_REF_NAME) {
+            throw "标签 $env:RELEASE_REF_NAME 与 tauri.conf.json 版本 v$version 不一致"
+          }
+
+      - name: Reject an existing release tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          gh release view $tag --repo $env:REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "发布 $tag 已存在；拒绝覆盖已发布资产"
+          }
+          $tagCommit = gh api "repos/$($env:REPOSITORY)/commits/$tag" --jq .sha 2> $null
+          if ($LASTEXITCODE -eq 0 -and $tagCommit -ne $env:RELEASE_SHA) {
+            throw "标签 $tag 已指向其它提交，拒绝发布"
           }
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           cache: npm
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: "./src-tauri -> target"
 
@@ -62,9 +119,11 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
       - name: Build and publish release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: "OshiCal v__VERSION__"
@@ -85,10 +144,11 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $tag = "v$version"
-          $repo = "${{ github.repository }}"
+          $repo = $env:REPOSITORY
           $dir = Join-Path $env:RUNNER_TEMP "oshical-updater"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           gh release download $tag --repo $repo --pattern latest.json --dir $dir --clobber
@@ -98,9 +158,27 @@ jobs:
           if (-not $installer) { throw "未找到 Windows 安装包资产" }
           $manifestPath = Join-Path $dir "latest.json"
           $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+          if ($manifest.version -ne $version) {
+            throw "latest.json 版本 $($manifest.version) 与 tauri.conf.json 版本 $version 不一致"
+          }
+          if (-not $manifest.platforms -or $manifest.platforms.PSObject.Properties.Count -eq 0) {
+            throw "latest.json 缺少平台更新条目"
+          }
+          $platformNames = @($manifest.platforms.PSObject.Properties.Name)
+          if (-not ($platformNames -contains "windows-x86_64-nsis") -and -not ($platformNames -contains "windows-x86_64")) {
+            throw "latest.json 缺少 Windows 更新平台"
+          }
           foreach ($key in @("windows-x86_64", "windows-x86_64-nsis")) {
             if ($manifest.platforms.PSObject.Properties.Name -contains $key) {
               $manifest.platforms.$key.url = $installer.url
+            }
+          }
+          foreach ($platform in $manifest.platforms.PSObject.Properties) {
+            if ([string]::IsNullOrWhiteSpace($platform.Value.url)) {
+              throw "更新清单平台 $($platform.Name) 缺少下载 URL"
+            }
+            if ([string]::IsNullOrWhiteSpace($platform.Value.signature)) {
+              throw "更新清单平台 $($platform.Name) 缺少 Tauri 签名"
             }
           }
           $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM

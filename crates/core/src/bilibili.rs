@@ -8,7 +8,7 @@ use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, REFERER, SET_COOKIE};
 use reqwest::Client;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::form_urlencoded::Serializer;
 
 use crate::error::{AppError, AppResult};
@@ -28,6 +28,8 @@ const LOGIN_COOKIE_NAMES: [&str; 5] = [
     "DedeUserID__ckMd5",
     "sid",
 ];
+const MAX_JSON_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AVATAR_RESPONSE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QrLoginStatus {
@@ -79,6 +81,9 @@ pub struct BilibiliClient {
     user_cookie: RwLock<Option<String>>,
     session: RwLock<Option<SessionCookies>>,
     wbi: RwLock<Option<WbiKeys>>,
+    session_init: Mutex<()>,
+    wbi_init: Mutex<()>,
+    websocket_proxy: Option<String>,
 }
 
 impl BilibiliClient {
@@ -87,6 +92,7 @@ impl BilibiliClient {
     }
 
     pub fn new_with_proxy(user_cookie: Option<String>, proxy_port: Option<u16>) -> AppResult<Self> {
+        let websocket_proxy = crate::network::websocket_proxy_url(proxy_port);
         let http = crate::network::client_builder(proxy_port)?
             .timeout(Duration::from_secs(25))
             .connect_timeout(Duration::from_secs(10))
@@ -100,18 +106,39 @@ impl BilibiliClient {
             user_cookie: RwLock::new(user_cookie),
             session: RwLock::new(None),
             wbi: RwLock::new(None),
+            session_init: Mutex::new(()),
+            wbi_init: Mutex::new(()),
+            websocket_proxy,
         })
     }
 
+    pub fn websocket_proxy(&self) -> Option<&str> {
+        self.websocket_proxy.as_deref()
+    }
+
     pub async fn set_cookie(&self, user_cookie: Option<String>) {
+        let _wbi_guard = self.wbi_init.lock().await;
+        let _session_guard = self.session_init.lock().await;
         let value = user_cookie
             .map(|cookie| cookie.replace(['\r', '\n'], "").trim().to_owned())
             .filter(|cookie| !cookie.is_empty());
         *self.user_cookie.write().await = value;
         *self.session.write().await = None;
+        *self.wbi.write().await = None;
+    }
+
+    async fn invalidate_session(&self) {
+        let _wbi_guard = self.wbi_init.lock().await;
+        let _session_guard = self.session_init.lock().await;
+        *self.session.write().await = None;
+        *self.wbi.write().await = None;
     }
 
     async fn ensure_session(&self) -> AppResult<SessionCookies> {
+        if let Some(session) = self.session.read().await.clone() {
+            return Ok(session);
+        }
+        let _init_guard = self.session_init.lock().await;
         if let Some(session) = self.session.read().await.clone() {
             return Ok(session);
         }
@@ -146,6 +173,12 @@ impl BilibiliClient {
     }
 
     async fn ensure_wbi(&self) -> AppResult<String> {
+        if let Some(keys) = self.wbi.read().await.as_ref() {
+            if keys.fetched_at.elapsed() < Duration::from_secs(30 * 60) {
+                return Ok(keys.mixin_key.clone());
+            }
+        }
+        let _init_guard = self.wbi_init.lock().await;
         if let Some(keys) = self.wbi.read().await.as_ref() {
             if keys.fetched_at.elapsed() < Duration::from_secs(30 * 60) {
                 return Ok(keys.mixin_key.clone());
@@ -205,7 +238,9 @@ impl BilibiliClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("B 站接口请求失败")
-                .to_owned();
+                .chars()
+                .take(512)
+                .collect::<String>();
             return Err(AppError::External {
                 code: code.to_string(),
                 message,
@@ -216,10 +251,13 @@ impl BilibiliClient {
 
     async fn response_json_unchecked(&self, response: reqwest::Response) -> AppResult<Value> {
         let status = response.status();
-        let text = response.text().await?;
         if !status.is_success() {
             return Err(AppError::External {
-                code: status.as_str().to_owned(),
+                code: if status.as_u16() == 412 {
+                    "-412".to_owned()
+                } else {
+                    status.as_str().to_owned()
+                },
                 message: if status.as_u16() == 412 {
                     "B 站风控拒绝了请求，可在设置中配置 SESSDATA Cookie 后重试".to_owned()
                 } else {
@@ -227,7 +265,8 @@ impl BilibiliClient {
                 },
             });
         }
-        serde_json::from_str(&text).map_err(|_| AppError::External {
+        let body = read_response_bytes_limited(response, MAX_JSON_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&body).map_err(|_| AppError::External {
             code: "BILI_NON_JSON".to_owned(),
             message: "B 站返回了非 JSON 内容，可能触发风控".to_owned(),
         })
@@ -249,50 +288,107 @@ impl BilibiliClient {
         params: BTreeMap<String, String>,
         referer: &str,
     ) -> AppResult<Value> {
-        let mixin = self.ensure_wbi().await?;
-        let cookie = self.cookie_header().await?;
-        let mut signed = params;
-        signed.insert("wts".to_owned(), Utc::now().timestamp().to_string());
-        let query = signed_query(&signed, &mixin);
-        let url = format!("{base_url}{path}?{query}");
-        let response = send_with_retry(|| {
-            self.http
-                .get(&url)
-                .header(ACCEPT, "application/json, text/plain, */*")
-                .header(REFERER, referer)
-                .header(COOKIE, cookie.clone())
+        for attempt in 0..2 {
+            let mixin = self.ensure_wbi().await?;
+            let cookie = self.cookie_header().await?;
+            let mut signed = params.clone();
+            signed.insert("wts".to_owned(), Utc::now().timestamp().to_string());
+            let query = signed_query(&signed, &mixin);
+            let url = format!("{base_url}{path}?{query}");
+            let response = send_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .header(ACCEPT, "application/json, text/plain, */*")
+                    .header(REFERER, referer)
+                    .header(COOKIE, cookie.clone())
+            })
+            .await?;
+            match self.response_json(response).await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt == 0 && should_refresh_bili_session(&error) => {
+                    self.invalidate_session().await;
+                    tracing::debug!(%error, path, "B 站签名请求失败，刷新匿名会话后重试");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::External {
+            code: "BILI_RETRY".to_owned(),
+            message: "B 站签名请求重试后仍未成功".to_owned(),
         })
-        .await?;
-        self.response_json(response).await
     }
 
     pub async fn fetch_live_danmu_info(&self, room_id: &str) -> AppResult<Value> {
         if room_id.trim().is_empty() || !room_id.chars().all(|ch| ch.is_ascii_digit()) {
             return Err(AppError::validation("直播间号必须是数字"));
         }
+        let referer = format!("https://live.bilibili.com/{room_id}");
+        let legacy_params = BTreeMap::from([
+            ("room_id".to_owned(), room_id.to_owned()),
+            ("platform".to_owned(), "pc".to_owned()),
+            ("player".to_owned(), "web".to_owned()),
+        ]);
+        let legacy_query = {
+            let mut serializer = Serializer::new(String::new());
+            for (key, value) in legacy_params {
+                serializer.append_pair(&key, &value);
+            }
+            serializer.finish()
+        };
+        let legacy_url =
+            format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{legacy_query}");
+        match self.get_public(&legacy_url, &referer).await {
+            Ok(value) if danmu_info_has_token(&value) => {
+                return Ok(normalize_danmu_info(value));
+            }
+            Ok(_) => tracing::warn!(%room_id, "旧版弹幕接口未返回 token，尝试 WBI 接口"),
+            Err(error) => tracing::warn!(%room_id, %error, "旧版弹幕接口失败，尝试 WBI 接口"),
+        }
+
         let mut params = BTreeMap::new();
         params.insert("id".to_owned(), room_id.to_owned());
         params.insert("type".to_owned(), "0".to_owned());
-        self.get_signed_host(
-            "https://api.live.bilibili.com",
-            "/xlive/web-room/v1/index/getDanmuInfo",
-            params,
-            &format!("https://live.bilibili.com/{room_id}"),
-        )
-        .await
+        let value = self
+            .get_signed_host(
+                "https://api.live.bilibili.com",
+                "/xlive/web-room/v1/index/getDanmuInfo",
+                params,
+                &referer,
+            )
+            .await?;
+        if !danmu_info_has_token(&value) {
+            return Err(AppError::External {
+                code: "BILI_DANMU".to_owned(),
+                message: "弹幕服务器缺少 token".to_owned(),
+            });
+        }
+        Ok(normalize_danmu_info(value))
     }
 
     async fn get_public(&self, url: &str, referer: &str) -> AppResult<Value> {
-        let cookie = self.cookie_header().await?;
-        let response = send_with_retry(|| {
-            self.http
-                .get(url)
-                .header(ACCEPT, "application/json, text/plain, */*")
-                .header(REFERER, referer)
-                .header(COOKIE, cookie.clone())
+        for attempt in 0..2 {
+            let cookie = self.cookie_header().await?;
+            let response = send_with_retry(|| {
+                self.http
+                    .get(url)
+                    .header(ACCEPT, "application/json, text/plain, */*")
+                    .header(REFERER, referer)
+                    .header(COOKIE, cookie.clone())
+            })
+            .await?;
+            match self.response_json(response).await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt == 0 && should_refresh_bili_session(&error) => {
+                    self.invalidate_session().await;
+                    tracing::debug!(%error, url, "B 站公开请求失败，刷新匿名会话后重试");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::External {
+            code: "BILI_RETRY".to_owned(),
+            message: "B 站公开请求重试后仍未成功".to_owned(),
         })
-        .await?;
-        self.response_json(response).await
     }
     pub async fn search_accounts(&self, keyword: &str) -> AppResult<Vec<AccountSearchResult>> {
         let keyword = keyword.trim();
@@ -481,7 +577,11 @@ impl BilibiliClient {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let fans = card.get("fans").and_then(Value::as_u64).unwrap_or(0);
+        let fans = card
+            .get("fans")
+            .and_then(value_to_string)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
         let room_id = self.resolve_room_id(mid).await.ok().flatten();
         Ok(AccountSearchResult {
             mid: mid.to_owned(),
@@ -492,6 +592,13 @@ impl BilibiliClient {
             fans,
             is_live: false,
         })
+    }
+
+    pub async fn fetch_fan_count(&self, mid: &str) -> AppResult<u64> {
+        validate_mid(mid)?;
+        let url = format!("https://api.bilibili.com/x/web-interface/card?mid={mid}");
+        let value = self.get_public(&url, "https://space.bilibili.com/").await?;
+        parse_fan_count(&value)
     }
 
     pub async fn fetch_avatar_data_url(&self, avatar_url: &str) -> AppResult<String> {
@@ -528,11 +635,11 @@ impl BilibiliClient {
                 message: "B 站头像响应不是图片".to_owned(),
             });
         }
-        let bytes = response.bytes().await?;
-        if bytes.is_empty() || bytes.len() > 512 * 1024 {
+        let bytes = read_response_bytes_limited(response, MAX_AVATAR_RESPONSE_BYTES).await?;
+        if bytes.is_empty() {
             return Err(AppError::External {
                 code: "BILI_AVATAR_SIZE".to_owned(),
-                message: "B 站头像为空或超过 512 KiB".to_owned(),
+                message: "B 站头像为空".to_owned(),
             });
         }
         Ok(format!(
@@ -740,6 +847,32 @@ where
     })
 }
 
+async fn read_response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> AppResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(AppError::External {
+            code: "BILI_RESPONSE_SIZE".to_owned(),
+            message: format!("B 站响应超过 {} KiB 限制", limit / 1024),
+        });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(AppError::External {
+                code: "BILI_RESPONSE_SIZE".to_owned(),
+                message: format!("B 站响应超过 {} KiB 限制", limit / 1024),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn extract_login_cookies(
     callback_url: Option<&str>,
     set_cookie_headers: &[String],
@@ -895,12 +1028,49 @@ fn sanitize_wbi_value(value: &str) -> String {
         .collect()
 }
 
+fn danmu_info_has_token(value: &Value) -> bool {
+    value
+        .pointer("/data/token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+}
+
+fn normalize_danmu_info(mut value: Value) -> Value {
+    let hosts = value.pointer("/data/host_server_list").cloned();
+    if let Some(hosts) = hosts {
+        if let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) {
+            data.entry("host_list".to_owned()).or_insert(hosts);
+        }
+    }
+    value
+}
+
+fn should_refresh_bili_session(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::External { code, .. } if matches!(code.as_str(), "-352" | "-412" | "-101")
+    )
+}
+
 fn value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn parse_fan_count(value: &Value) -> AppResult<u64> {
+    value
+        .get("data")
+        .and_then(|data| data.get("card"))
+        .and_then(|card| card.get("fans"))
+        .and_then(value_to_string)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| AppError::External {
+            code: "BILI_FANS".to_owned(),
+            message: "账号卡片缺少粉丝数".to_owned(),
+        })
 }
 
 fn validate_mid(mid: &str) -> AppResult<()> {
@@ -1160,6 +1330,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_fan_count_from_account_card() {
+        let value = serde_json::json!({"data": {"card": {"fans": 123456}}});
+        assert_eq!(parse_fan_count(&value).expect("fans"), 123456);
+        let string_value = serde_json::json!({"data": {"card": {"fans": "123456"}}});
+        assert_eq!(parse_fan_count(&string_value).expect("fans"), 123456);
+        assert!(parse_fan_count(&serde_json::json!({"data": {"card": {}}})).is_err());
+    }
+
+    #[test]
     fn search_normalizes_uid_mentions_and_space_urls() {
         for value in [
             "672328094",
@@ -1175,6 +1354,39 @@ mod tests {
             );
         }
         assert!(extract_search_mid("嘉然").is_none());
+    }
+
+    #[test]
+    fn legacy_danmu_info_adds_host_list_alias() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "token": "token",
+                "host_server_list": [{"host": "example", "wss_port": 443}]
+            }
+        });
+        assert!(danmu_info_has_token(&value));
+        let normalized = normalize_danmu_info(value);
+        assert_eq!(
+            normalized.pointer("/data/host_list/0/host"),
+            Some(&Value::String("example".to_owned()))
+        );
+    }
+
+    #[test]
+    fn refreshable_bili_session_errors_are_limited() {
+        for code in ["-352", "-412", "-101"] {
+            let error = AppError::External {
+                code: code.to_owned(),
+                message: "blocked".to_owned(),
+            };
+            assert!(should_refresh_bili_session(&error));
+        }
+        let ordinary = AppError::External {
+            code: "-400".to_owned(),
+            message: "bad request".to_owned(),
+        };
+        assert!(!should_refresh_bili_session(&ordinary));
     }
 
     #[test]

@@ -266,6 +266,69 @@ async fn subscription_and_manual_schedule_round_trip_over_http() {
 }
 
 #[tokio::test]
+async fn fan_history_route_returns_current_count_and_recent_snapshots() {
+    let state = state().await;
+    let streamer = state
+        .service
+        .add_subscription(AddSubscription {
+            mid: "99101".to_owned(),
+            name: Some("粉丝历史主播".to_owned()),
+            avatar_url: None,
+            room_id: Some("12345".to_owned()),
+            aliases: None,
+            schedule_enabled: true,
+            live_notify_enabled: true,
+            live_stats_enabled: false,
+        })
+        .await
+        .expect("streamer");
+    let now = Utc::now();
+    state
+        .service
+        .store()
+        .record_fan_snapshot(streamer.id, 900, now - Duration::days(40))
+        .await
+        .expect("old snapshot");
+    state
+        .service
+        .store()
+        .record_fan_snapshot(streamer.id, 1_000, now)
+        .await
+        .expect("recent snapshot");
+    let app = build_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/subscriptions/{}/fans?days=30", streamer.id))
+                .header(header::AUTHORIZATION, auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("fan history");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["streamerId"], streamer.id);
+    assert_eq!(value["data"]["currentFans"], 1_000);
+    assert_eq!(value["data"]["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(value["data"]["snapshots"][0]["fans"], 1_000);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/subscriptions/{}/fans?days=0", streamer.id))
+                .header(header::AUTHORIZATION, auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("invalid range");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn weekly_rule_round_trip_generates_weekly_schedule() {
     let state = state().await;
     let streamer = state
