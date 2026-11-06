@@ -447,6 +447,18 @@ async fn collect_once(
         Ok(value) => value,
         Err(error) => return CollectResult::Disconnected(error.to_string()),
     };
+    let cookie_revision = info.cookie_revision;
+    let mut auth = serde_json::json!({
+        "uid": info.uid,
+        "roomid": session.room_id.parse::<u64>().unwrap_or_default(),
+        "protover": 2,
+        "platform": "web",
+        "type": 2,
+    });
+    if let Some(buvid) = info.buvid {
+        auth["buvid"] = Value::String(buvid);
+    }
+    let info = info.response;
     let token = match info.pointer("/data/token").and_then(Value::as_str) {
         Some(value) => value,
         None => return CollectResult::Disconnected("弹幕服务器缺少 token".to_owned()),
@@ -484,14 +496,10 @@ async fn collect_once(
         let (mut writer, mut reader) = socket.split();
         stats.connection_established = false;
         let mut last_received = Instant::now();
-        let auth = serde_json::json!({
-            "uid": 0,
-            "roomid": session.room_id.parse::<u64>().unwrap_or_default(),
-            "protover": 2,
-            "platform": "web",
-            "type": 2,
-            "key": token,
-        });
+        if bili.cookie_revision() != cookie_revision {
+            return CollectResult::Disconnected("B 站登录状态变化，重新认证直播连接".to_owned());
+        }
+        auth["key"] = Value::String(token.to_owned());
         let auth_result = tokio::select! {
             value = &mut *stop_rx => {
                 return match value {
@@ -560,6 +568,9 @@ async fn collect_once(
                     }
                 }
                 _ = checkpoint.tick() => {
+                    if bili.cookie_revision() != cookie_revision {
+                        return CollectResult::Disconnected("B 站登录状态变化，重新认证直播连接".to_owned());
+                    }
                     if last_received.elapsed() >= LIVE_SOCKET_IDLE_TIMEOUT {
                         { last_error = Some("弹幕服务器长时间无响应".to_owned()); continue 'endpoints; }
                     }
@@ -979,7 +990,7 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
         "SEND_GIFT" => {
             add_gift(
                 stats,
-                data.get("uid").and_then(value_to_string),
+                event_sender_uid(data),
                 data.get("giftId").and_then(Value::as_i64).unwrap_or(0),
                 data.get("giftName")
                     .and_then(Value::as_str)
@@ -1023,7 +1034,7 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
             }
         }
         "SUPER_CHAT_MESSAGE" => {
-            let uid = data.get("uid").and_then(value_to_string);
+            let uid = event_sender_uid(data);
             let event_id = data
                 .get("id")
                 .and_then(value_to_string)
@@ -1065,11 +1076,13 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
                     stats.super_chat_revenue_cents.saturating_add(cents);
                 if let Some(uid) = uid.as_deref() {
                     add_paid_user(stats, uid);
+                } else {
+                    stats.data_degraded = true;
                 }
             }
         }
         "GUARD_BUY" => {
-            let uid = data.get("uid").and_then(value_to_string);
+            let uid = event_sender_uid(data);
             let key = format!(
                 "guard:{}:{}:{}:{}",
                 uid.as_deref().unwrap_or("anonymous"),
@@ -1104,6 +1117,8 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
                 stats.guard_revenue_cents = stats.guard_revenue_cents.saturating_add(cents);
                 if let Some(uid) = uid.as_deref() {
                     add_paid_user(stats, uid);
+                } else {
+                    stats.data_degraded = true;
                 }
             }
         }
@@ -1172,8 +1187,24 @@ fn add_gift(
         stats.gift_revenue_cents = stats.gift_revenue_cents.saturating_add(cents);
         if let Some(uid) = uid.as_deref() {
             add_paid_user(stats, uid);
+        } else {
+            stats.data_degraded = true;
         }
     }
+}
+
+fn event_sender_uid(data: &Value) -> Option<String> {
+    // The top-level UID may be redacted while the sender profile still has it.
+    // Never use receiver_uinfo: that identifies the gift recipient.
+    [
+        data.get("uid"),
+        data.pointer("/sender_uinfo/uid"),
+        data.pointer("/uinfo/uid"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(value_to_string)
+    .find_map(|uid| normalize_uid(Some(&uid)))
 }
 
 fn normalize_uid(uid: Option<&str>) -> Option<String> {
@@ -1627,6 +1658,68 @@ mod tests {
         assert_eq!(stats.revenue_cents, 200);
         assert!(stats.interactive_users.is_empty());
         assert!(stats.paid_users.is_empty());
+    }
+
+    #[test]
+    fn nested_sender_uid_deduplicates_gifts_super_chats_and_guards() {
+        let mut stats = CollectorStats::default();
+        for tid in ["gift-1", "gift-2"] {
+            parse_live_message(
+                &mut stats,
+                &serde_json::json!({
+                    "cmd": "SEND_GIFT",
+                    "data": {
+                        "uid": 0, "sender_uinfo": {"uid": 42},
+                        "receiver_uinfo": {"uid": 99},
+                        "giftId": 1, "num": 1, "price": 1000,
+                        "coin_type": "gold", "tid": tid
+                    }
+                }),
+            );
+        }
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SUPER_CHAT_MESSAGE",
+                "data": {"id": 11, "uid": 0, "uinfo": {"uid": "42"}, "price": 30}
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "GUARD_BUY",
+                "data": {"uid": "42", "guard_level": 3, "price": 1000, "start_time": 1}
+            }),
+        );
+        assert_eq!(stats.paid_user_count, 1);
+        assert_eq!(stats.interactive_user_count, 1);
+        assert_eq!(stats.revenue_cents, 3300);
+        assert!(!stats.data_degraded);
+    }
+
+    #[test]
+    fn recipient_uid_never_counts_as_a_payer() {
+        let mut stats = CollectorStats {
+            has_connected_once: true,
+            ..CollectorStats::default()
+        };
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "uid": 0, "sender_uinfo": {"uid": 0}, "receiver_uinfo": {"uid": 99},
+                    "giftId": 1, "num": 1, "price": 1000,
+                    "coin_type": "gold", "tid": "redacted-sender"
+                }
+            }),
+        );
+        assert_eq!(stats.revenue_cents, 100);
+        assert_eq!(stats.paid_user_count, 0);
+        assert_eq!(
+            stats.snapshot("complete", "finished").data_quality,
+            "partial"
+        );
     }
 
     #[test]

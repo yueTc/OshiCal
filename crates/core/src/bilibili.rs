@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -76,9 +77,17 @@ struct WbiKeys {
     fetched_at: Instant,
 }
 
+pub struct LiveDanmuInfo {
+    pub response: Value,
+    pub uid: u64,
+    pub buvid: Option<String>,
+    pub cookie_revision: u64,
+}
+
 pub struct BilibiliClient {
     http: Client,
     user_cookie: RwLock<Option<String>>,
+    cookie_revision: AtomicU64,
     session: RwLock<Option<SessionCookies>>,
     wbi: RwLock<Option<WbiKeys>>,
     session_init: Mutex<()>,
@@ -104,6 +113,7 @@ impl BilibiliClient {
         Ok(Self {
             http,
             user_cookie: RwLock::new(user_cookie),
+            cookie_revision: AtomicU64::new(0),
             session: RwLock::new(None),
             wbi: RwLock::new(None),
             session_init: Mutex::new(()),
@@ -134,7 +144,14 @@ impl BilibiliClient {
         let value = user_cookie
             .map(|cookie| cookie.replace(['\r', '\n'], "").trim().to_owned())
             .filter(|cookie| !cookie.is_empty());
-        *self.user_cookie.write().await = value;
+        {
+            let mut cookie = self.user_cookie.write().await;
+            if *cookie == value {
+                return;
+            }
+            *cookie = value;
+            self.cookie_revision.fetch_add(1, Ordering::Release);
+        }
         *self.session.write().await = None;
         *self.wbi.write().await = None;
     }
@@ -330,10 +347,60 @@ impl BilibiliClient {
         })
     }
 
-    pub async fn fetch_live_danmu_info(&self, room_id: &str) -> AppResult<Value> {
+    pub fn cookie_revision(&self) -> u64 {
+        self.cookie_revision.load(Ordering::Acquire)
+    }
+
+    async fn live_client_snapshot(&self) -> (Self, u64) {
+        // Keep token acquisition and socket authentication on the same cookie,
+        // even if login/logout occurs while an HTTP request is in flight.
+        let cookie = self.user_cookie.read().await;
+        let revision = self.cookie_revision();
+        let client = Self {
+            http: self.http.clone(),
+            user_cookie: RwLock::new(cookie.clone()),
+            cookie_revision: AtomicU64::new(revision),
+            session: RwLock::new(self.session.read().await.clone()),
+            wbi: RwLock::new(self.wbi.read().await.clone()),
+            session_init: Mutex::new(()),
+            wbi_init: Mutex::new(()),
+            websocket_proxy: self.websocket_proxy.clone(),
+        };
+        (client, revision)
+    }
+
+    pub async fn fetch_live_danmu_info(&self, room_id: &str) -> AppResult<LiveDanmuInfo> {
         if room_id.trim().is_empty() || !room_id.chars().all(|ch| ch.is_ascii_digit()) {
             return Err(AppError::validation("直播间号必须是数字"));
         }
+        let (client, cookie_revision) = self.live_client_snapshot().await;
+        let logged_in = client.user_cookie.read().await.is_some();
+        let uid = if logged_in {
+            let nav = client
+                .get_public(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    "https://www.bilibili.com/",
+                )
+                .await?;
+            live_login_uid(&nav)?
+        } else {
+            0
+        };
+        let response = client.fetch_live_danmu_response(room_id, logged_in).await?;
+        let buvid = if logged_in {
+            Some(client.ensure_session().await?.buvid3)
+        } else {
+            None
+        };
+        Ok(LiveDanmuInfo {
+            response,
+            uid,
+            buvid,
+            cookie_revision,
+        })
+    }
+
+    async fn fetch_live_danmu_response(&self, room_id: &str, logged_in: bool) -> AppResult<Value> {
         let referer = format!("https://live.bilibili.com/{room_id}");
         let legacy_params = BTreeMap::from([
             ("room_id".to_owned(), room_id.to_owned()),
@@ -349,6 +416,28 @@ impl BilibiliClient {
         };
         let legacy_url =
             format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{legacy_query}");
+        if logged_in {
+            // A logged-in token must be paired with the account UID, never uid=0.
+            let params = BTreeMap::from([
+                ("id".to_owned(), room_id.to_owned()),
+                ("type".to_owned(), "0".to_owned()),
+            ]);
+            let value = self
+                .get_signed_host(
+                    "https://api.live.bilibili.com",
+                    "/xlive/web-room/v1/index/getDanmuInfo",
+                    params,
+                    &referer,
+                )
+                .await?;
+            if !danmu_info_has_token(&value) {
+                return Err(AppError::External {
+                    code: "BILI_DANMU".to_owned(),
+                    message: "登录弹幕接口缺少 token".to_owned(),
+                });
+            }
+            return Ok(normalize_danmu_info(value));
+        }
         match self.get_public_anonymous(&legacy_url, &referer).await {
             Ok(value) if danmu_info_has_token(&value) => {
                 return Ok(normalize_danmu_info(value));
@@ -1040,6 +1129,23 @@ fn sanitize_wbi_value(value: &str) -> String {
         .collect()
 }
 
+fn live_login_uid(value: &Value) -> AppResult<u64> {
+    let uid = value.pointer("/data/mid").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.parse::<u64>().ok())
+    });
+    if value.pointer("/data/isLogin").and_then(Value::as_bool) == Some(true) {
+        if let Some(uid) = uid.filter(|uid| *uid > 0) {
+            return Ok(uid);
+        }
+    }
+    Err(AppError::External {
+        code: "BILI_LIVE_LOGIN".to_owned(),
+        message: "直播采集的 B 站登录状态已失效，请重新登录".to_owned(),
+    })
+}
+
 fn danmu_info_has_token(value: &Value) -> bool {
     value
         .pointer("/data/token")
@@ -1366,6 +1472,51 @@ mod tests {
             );
         }
         assert!(extract_search_mid("嘉然").is_none());
+    }
+
+    #[test]
+    fn live_login_requires_a_valid_logged_in_account() {
+        for mid in [serde_json::json!(42), serde_json::json!("42")] {
+            assert_eq!(
+                live_login_uid(&serde_json::json!({
+                    "data": {"isLogin": true, "mid": mid}
+                }))
+                .expect("logged in UID"),
+                42
+            );
+        }
+        for data in [
+            serde_json::json!({"isLogin": false, "mid": 42}),
+            serde_json::json!({"isLogin": true, "mid": 0}),
+            serde_json::json!({"isLogin": true, "mid": -1}),
+            serde_json::json!({"isLogin": true, "mid": 1.5}),
+            serde_json::json!({"isLogin": true}),
+        ] {
+            assert!(live_login_uid(&serde_json::json!({"data": data})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_credentials_snapshot_survives_login_changes() {
+        let client = BilibiliClient::new(None).expect("client");
+        let (anonymous, anonymous_revision) = client.live_client_snapshot().await;
+        client
+            .set_cookie(Some("SESSDATA=test; DedeUserID=42".to_owned()))
+            .await;
+        assert_ne!(client.cookie_revision(), anonymous_revision);
+        assert!(anonymous.user_cookie.read().await.is_none());
+
+        let (logged_in, login_revision) = client.live_client_snapshot().await;
+        client
+            .set_cookie(Some(" SESSDATA=test; DedeUserID=42 ".to_owned()))
+            .await;
+        assert_eq!(client.cookie_revision(), login_revision);
+        client.set_cookie(None).await;
+        assert_ne!(client.cookie_revision(), login_revision);
+        assert_eq!(
+            logged_in.user_cookie.read().await.as_deref(),
+            Some("SESSDATA=test; DedeUserID=42")
+        );
     }
 
     #[test]
