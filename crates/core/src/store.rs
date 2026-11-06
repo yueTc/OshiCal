@@ -1,6 +1,7 @@
 mod import;
 pub use import::{
-    ImportConflict, ImportPreview, ImportReport, ServerSnapshot, SERVER_SNAPSHOT_SCHEMA_VERSION,
+    ImportConflict, ImportPreview, ImportReport, MigrationApplyOutcome, ServerSnapshot,
+    SERVER_SNAPSHOT_SCHEMA_VERSION,
 };
 mod sync;
 mod sync_feed;

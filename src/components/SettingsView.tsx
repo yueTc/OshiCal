@@ -360,6 +360,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         return merged;
       }
       const next = { ...current };
+      const mergeUntouched = <K extends keyof typeof next>(key: K) => {
+        mergeUntouched(key);
+      };
       for (const key of [
         "livePollSeconds",
         "dynamicPollSeconds",

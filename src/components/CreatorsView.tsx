@@ -771,7 +771,8 @@ export default function CreatorsView({
     setWeeklyDrafts((current) => {
       const draft = current[index];
       if (draft && draft.id !== null) {
-        setWeeklyRemovedIds((ids) => ids.includes(draft.id) ? ids : [...ids, draft.id]);
+        const removedId = draft.id;
+        setWeeklyRemovedIds((ids) => ids.includes(removedId) ? ids : [...ids, removedId]);
       }
       return current.filter((_, draftIndex) => draftIndex !== index);
     });

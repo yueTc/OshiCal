@@ -435,7 +435,7 @@ impl SqliteStore {
             .any(|pair| pair[1].seq != pair[0].seq.saturating_add(1));
         let starts_after_cursor = changes
             .first()
-            .map_or(true, |change| change.seq == after.saturating_add(1));
+            .is_none_or(|change| change.seq == after.saturating_add(1));
         let empty_before_latest = changes.is_empty() && after < latest_seq;
         if has_gap || !starts_after_cursor || empty_before_latest {
             tx.commit().await?;

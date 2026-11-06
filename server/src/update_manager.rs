@@ -670,7 +670,7 @@ fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
                 || ip.is_documentation()
                 || ip.is_unspecified()
                 || ip.is_multicast()
-                || ip.is_reserved()
+                || octets[0] >= 240
         }
         std::net::IpAddr::V6(ip) => {
             let segments = ip.segments();

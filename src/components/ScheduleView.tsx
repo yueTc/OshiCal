@@ -247,8 +247,8 @@ export default function ScheduleView({
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const longPressTriggered = useRef(false);
   const suppressClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const gridWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const timelineWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gridWheelTimerRef = useRef<number | null>(null);
+  const timelineWheelTimerRef = useRef<number | null>(null);
   const pageRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);

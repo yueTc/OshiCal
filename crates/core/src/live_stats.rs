@@ -1257,8 +1257,8 @@ struct GiftV2 {
 enum ProtoValue {
     Varint(u64),
     Bytes(Vec<u8>),
-    Fixed32(Vec<u8>),
-    Fixed64(Vec<u8>),
+    Fixed32,
+    Fixed64,
 }
 
 fn take_protobuf_bytes(bytes: &[u8], offset: &mut usize, len: usize) -> AppResult<Vec<u8>> {
@@ -1290,7 +1290,10 @@ fn decode_protobuf(bytes: &[u8]) -> AppResult<HashMap<u32, Vec<ProtoValue>>> {
                 decode_varint(bytes, &mut offset)
                     .ok_or_else(|| AppError::validation("非法 protobuf varint"))?,
             ),
-            1 => ProtoValue::Fixed64(take_protobuf_bytes(bytes, &mut offset, 8)?),
+            1 => {
+                let _ = take_protobuf_bytes(bytes, &mut offset, 8)?;
+                ProtoValue::Fixed64
+            }
             2 => {
                 let len = decode_varint(bytes, &mut offset)
                     .ok_or_else(|| AppError::validation("非法 protobuf 长度"))?;
@@ -1298,7 +1301,10 @@ fn decode_protobuf(bytes: &[u8]) -> AppResult<HashMap<u32, Vec<ProtoValue>>> {
                     .map_err(|_| AppError::validation("protobuf 长度不支持"))?;
                 ProtoValue::Bytes(take_protobuf_bytes(bytes, &mut offset, len)?)
             }
-            5 => ProtoValue::Fixed32(take_protobuf_bytes(bytes, &mut offset, 4)?),
+            5 => {
+                let _ = take_protobuf_bytes(bytes, &mut offset, 4)?;
+                ProtoValue::Fixed32
+            }
             _ => return Err(AppError::validation("不支持的 protobuf wire type")),
         };
         fields.entry(field).or_default().push(value);
@@ -1334,7 +1340,7 @@ fn field_varint(fields: &HashMap<u32, Vec<ProtoValue>>, id: u32) -> AppResult<Op
                     result = Some(*value);
                 }
             }
-            ProtoValue::Bytes(_) | ProtoValue::Fixed32(_) | ProtoValue::Fixed64(_) => {
+            ProtoValue::Bytes(_) | ProtoValue::Fixed32 | ProtoValue::Fixed64 => {
                 return Err(AppError::validation(format!(
                     "protobuf 字段 {id} 的 wire type 错误"
                 )));
@@ -1678,7 +1684,7 @@ mod tests {
 
     #[test]
     fn protobuf_strictly_rejects_invalid_wire_types_utf8_and_lengths() {
-        let wrong_varint = HashMap::from([(1u32, vec![ProtoValue::Fixed32(vec![0; 4])])]);
+        let wrong_varint = HashMap::from([(1u32, vec![ProtoValue::Fixed32])]);
         assert!(field_varint(&wrong_varint, 1).is_err());
 
         let wrong_string = HashMap::from([(2u32, vec![ProtoValue::Varint(1)])]);

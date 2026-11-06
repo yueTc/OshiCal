@@ -1078,6 +1078,24 @@ export default function App() {
     const keepCleanup = (cleanup: () => void) => {
       if (disposed) { cleanup(); } else { cleanups.push(cleanup); }
     };
+    const scheduleCacheRefresh = () => {
+      if (legacyRefreshTimer.current) {
+        clearTimeout(legacyRefreshTimer.current);
+      }
+      legacyRefreshTimer.current = setTimeout(() => {
+        legacyRefreshTimer.current = null;
+        if (disposed) {
+          return;
+        }
+        setScheduleRevision((value) => value + 1);
+        void refreshActiveData().catch((error) => {
+          if (!disposed) {
+            setConnectionError(explainError(error));
+          }
+        });
+      }, 120);
+    };
+
     async function install() {
       try {
         const granted = await ensureNotificationPermission();
@@ -1211,23 +1229,6 @@ export default function App() {
     let deliberateReconnect = false;
     let engine: SyncProtocolEngine | null = null;
 
-    const scheduleCacheRefresh = () => {
-      if (legacyRefreshTimer.current) {
-        clearTimeout(legacyRefreshTimer.current);
-      }
-      legacyRefreshTimer.current = setTimeout(() => {
-        legacyRefreshTimer.current = null;
-        if (disposed) {
-          return;
-        }
-        setScheduleRevision((value) => value + 1);
-        void refreshActiveData().catch((error) => {
-          if (!disposed) {
-            setConnectionError(explainError(error));
-          }
-        });
-      }, 120);
-    };
 
     function connectSocket() {
       if (disposed || isTauri || !engine) {
