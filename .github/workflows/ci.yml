@@ -54,7 +54,18 @@ jobs:
 
       - name: Rust tests
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --locked --no-fail-fast
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --no-fail-fast 2>&1 | Tee-Object -Variable testOutput
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $failures = $testOutput | Select-String -Pattern 'FAILED|panicked at|assertion' -Context 0,4
+            foreach ($failure in $failures) {
+              $message = $failure.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Host "::error title=Rust test failure::$message"
+            }
+          }
+          exit $testExit
 
       - name: Frontend production build
         if: ${{ !cancelled() }}
