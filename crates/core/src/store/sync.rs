@@ -312,13 +312,13 @@ mod tests {
         );
         assert_eq!(reopened.latest_event_seq().await.unwrap(), 1);
         reopened.pool.close().await;
-        // SQLx closes its SQLite worker asynchronously on Windows.
-        for attempt in 0..100 {
-            match std::fs::remove_file(&path) {
-                Ok(()) => break,
-                Err(error) if attempt == 99 => panic!("temporary database cleanup: {error}"),
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        // SQLx may release its SQLite worker after the pool has closed on Windows.
+        // Temporary-file cleanup is best effort and must not make a persistence test flaky.
+        for _ in 0..100 {
+            if std::fs::remove_file(&path).is_ok() {
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
