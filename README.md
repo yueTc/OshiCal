@@ -107,22 +107,39 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
-发布新版本：
+桌面端与服务端使用独立版本和独立标签，互不触发发布：
 
 ```powershell
-node scripts/set-version.mjs 0.1.2
+# 只发布桌面端
+node scripts/set-version.mjs desktop 0.2.0
 git add -A
-git commit -m "release: v0.1.2"
-git tag v0.1.2
-git push origin main --tags
+git commit -m "release(desktop): 0.2.0"
+git tag desktop-v0.2.0
+git push origin main desktop-v0.2.0
+
+# 只发布服务端
+node scripts/set-version.mjs server 0.2.1
+git add -A
+git commit -m "release(server): 0.2.1"
+git tag server-v0.2.1
+git push origin main server-v0.2.1
 ```
 
-推送 `v*` 标签后，`.github/workflows/release.yml` 会运行测试、构建 Windows 安装包、生成更新签名和 `latest.json`，并创建正式 Release。推送版本标签前请确认版本、测试结果和发布说明。
+- `desktop-v*` 只构建 Windows 安装包、更新签名和 `latest.json`。
+- `server-v*` 只构建 GHCR 镜像，并更新固定的 `server-latest` 服务端更新清单。
+- 服务端清单发布为 prerelease，不会覆盖桌面端使用的 GitHub “latest” Release。
+- 核心库版本可用 `node scripts/set-version.mjs core <版本>` 单独维护。
 
-客户端更新地址：
+客户端更新地址保持稳定：
 
 ```text
 https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
+```
+
+服务端更新清单：
+
+```text
+https://github.com/yueTc/OshiCal/releases/download/server-latest/server-latest.json
 ```
 
 详细设计、验收和回滚流程见 `docs/11-github-release-and-updater-plan.md`。
@@ -220,6 +237,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 npm run build:web
 npm audit --audit-level=high
 ```
+
+2026-11-03 桌面端 0.2.2：粉丝趋势入口移到直播间跳转按钮左侧；日历网格新增每日栏宽调节与本地记忆；GitHub 镜像更新检查保持 45 秒，安装包下载单独放宽到 15 分钟；主播拖动时使用完整卡片预览。TypeScript、Vite 生产构建、前端 14 项测试、Rust fmt 与 Clippy 通过。
 
 2026-10-29 开播状态同步修复回归：核心 75 项、桌面 3 项、服务端运行时 1 项、API 7 项，共 86 项通过，6 项真实网络测试默认忽略；fmt、Clippy、前端生产构建通过。隔离桌面实例预置“缓存为直播但实际未开播”和“缓存为未开播但实际直播”两位主播，启动后均纠正为真实状态，并写入 `live_status_snapshot` 事件。
 

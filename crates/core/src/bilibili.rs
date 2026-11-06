@@ -5,7 +5,7 @@ use base64::Engine;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use md5::{Digest, Md5};
 use regex::Regex;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, REFERER, SET_COOKIE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, SET_COOKIE};
 use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
@@ -114,6 +114,18 @@ impl BilibiliClient {
 
     pub fn websocket_proxy(&self) -> Option<&str> {
         self.websocket_proxy.as_deref()
+    }
+
+    async fn get_public_anonymous(&self, url: &str, referer: &str) -> AppResult<Value> {
+        let response = send_with_retry(|| {
+            self.http
+                .get(url)
+                .header(ACCEPT, "application/json, text/plain, */*")
+                .header(REFERER, referer)
+                .header(ORIGIN, "https://live.bilibili.com")
+        })
+        .await?;
+        self.response_json(response).await
     }
 
     pub async fn set_cookie(&self, user_cookie: Option<String>) {
@@ -337,7 +349,7 @@ impl BilibiliClient {
         };
         let legacy_url =
             format!("https://api.live.bilibili.com/room/v1/Danmu/getConf?{legacy_query}");
-        match self.get_public(&legacy_url, &referer).await {
+        match self.get_public_anonymous(&legacy_url, &referer).await {
             Ok(value) if danmu_info_has_token(&value) => {
                 return Ok(normalize_danmu_info(value));
             }

@@ -543,13 +543,11 @@ pub(crate) async fn reset_legacy_event_cursor(
     server_url: &str,
 ) -> Result<(), String> {
     let server_key = normalize_server_key(server_url)?;
-    let result = sqlx::query(
-        "UPDATE sync_meta SET legacy_cursor_seq = 0 WHERE server_key = ?",
-    )
-    .bind(&server_key)
-    .execute(store.pool())
-    .await
-    .map_err(db_error)?;
+    let result = sqlx::query("UPDATE sync_meta SET legacy_cursor_seq = 0 WHERE server_key = ?")
+        .bind(&server_key)
+        .execute(store.pool())
+        .await
+        .map_err(db_error)?;
     if result.rows_affected() == 0 {
         return Err("旧版服务器事件游标尚未初始化".to_owned());
     }
@@ -625,8 +623,7 @@ pub async fn apply_batch(
         .map_err(db_error)?;
     ensure_meta_row(&mut tx, &server_key, &device_id).await?;
     let meta = read_meta_tx(&mut tx, &server_key).await?;
-    if let Err(error) =
-        ensure_sync_feed_compatible(&meta.feed_id, meta.cursor_seq, &batch.feed_id)
+    if let Err(error) = ensure_sync_feed_compatible(&meta.feed_id, meta.cursor_seq, &batch.feed_id)
     {
         if let Err(rollback_error) = tx.rollback().await {
             return Err(format!("{error}；回滚事务失败: {rollback_error}"));
@@ -914,9 +911,8 @@ async fn apply_delete(
             // A tombstone may carry only the stable entity id. Treat a partial
             // delete payload as advisory and resolve identity from entity_id or
             // sync_link_id_map instead of rejecting an otherwise valid deletion.
-            let payload_link = payload.and_then(|payload| {
-                serde_json::from_value::<LinkPayload>(payload.clone()).ok()
-            });
+            let payload_link = payload
+                .and_then(|payload| serde_json::from_value::<LinkPayload>(payload.clone()).ok());
             let payload_target = payload_link
                 .as_ref()
                 .map(|link| (link.streamer_id, link.mid.trim().to_owned()))
@@ -972,7 +968,9 @@ async fn apply_delete(
 
             if target.is_none() {
                 let Some(legacy_id) = numeric_entity_id else {
-                    return Err(format!("{entity_type} tombstone 的 entityId 无效: {entity_id}"));
+                    return Err(format!(
+                        "{entity_type} tombstone 的 entityId 无效: {entity_id}"
+                    ));
                 };
                 return Err(format!(
                     "SYNC_CACHE_INCONSISTENT: 无法解析旧版官号 tombstone {legacy_id}，需要重建缓存"
@@ -2480,7 +2478,9 @@ mod tests {
             live_statuses: Vec::new(),
             live_sessions: Vec::new(),
         };
-        let error = apply_bootstrap(&store, server, &bootstrap).await.unwrap_err();
+        let error = apply_bootstrap(&store, server, &bootstrap)
+            .await
+            .unwrap_err();
         assert!(error.starts_with("SYNC_SCHEMA_INCOMPATIBLE:"), "{error}");
         assert_eq!(get_sync_meta(&store, server).await.unwrap().cursor_seq, 0);
     }
@@ -2705,16 +2705,18 @@ mod tests {
         };
         apply_batch(&store, server, &delete).await.unwrap();
 
-        let mapped: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '200'")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        let local_numeric_collision: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '201'")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
+        let mapped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '200'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let local_numeric_collision: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM linked_accounts WHERE streamer_id = 1 AND mid = '201'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
         assert_eq!(mapped, 0);
         assert_eq!(local_numeric_collision, 1);
         let aliases: i64 = sqlx::query_scalar(
@@ -2788,6 +2790,7 @@ mod tests {
                 "scheduleEnabled": true,
                 "liveNotifyEnabled": true,
                 "liveStatsEnabled": false,
+                "fans": 123456,
                 "lastError": null,
                 "lastRefreshAt": null,
                 "isLive": false,
@@ -2827,6 +2830,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(is_live, 1);
+        let fans: Option<i64> = sqlx::query_scalar("SELECT fans FROM streamers WHERE id = 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(fans, Some(123456));
 
         let batch = SyncBatch {
             from_seq: 11,
@@ -2969,10 +2977,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached, 0);
-        assert_eq!(
-            get_sync_meta(&store, server).await.unwrap().cursor_seq,
-            15
-        );
+        assert_eq!(get_sync_meta(&store, server).await.unwrap().cursor_seq, 15);
     }
 
     #[tokio::test]

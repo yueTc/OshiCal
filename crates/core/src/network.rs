@@ -111,7 +111,11 @@ fn parse_proxy_url(value: &str) -> Option<url::Url> {
 fn no_proxy_bypasses_host(host: &str, port: u16) -> bool {
     ["NO_PROXY", "no_proxy"]
         .into_iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .is_some_and(|value| no_proxy_matches(&value, host, port))
 }
 
@@ -269,11 +273,7 @@ mod tests {
             "api.test",
             8443
         ));
-        assert!(!no_proxy_matches(
-            "api.test:8443",
-            "api.test",
-            443
-        ));
+        assert!(!no_proxy_matches("api.test:8443", "api.test", 443));
         assert!(!no_proxy_matches(
             "bilibili.com.evil.test",
             "broadcastlv.chat.bilibili.com",

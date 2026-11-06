@@ -42,8 +42,7 @@ impl ServerConfig {
                 .ok_or_else(|| "服务器绑定非回环地址时必须设置 OSHICAL_API_TOKEN".to_owned())?;
             if token.len() < 32 || token.chars().any(char::is_control) {
                 return Err(
-                    "非回环部署的 OSHICAL_API_TOKEN 必须至少 32 字节且不能包含控制字符"
-                        .to_owned(),
+                    "非回环部署的 OSHICAL_API_TOKEN 必须至少 32 字节且不能包含控制字符".to_owned(),
                 );
             }
         }

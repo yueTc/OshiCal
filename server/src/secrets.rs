@@ -149,6 +149,7 @@ pub struct PersistedLlmSecret {
     pub changed: bool,
     pub bound_base_url: Option<String>,
     pub pending_url_binding: bool,
+    pub requires_url_binding: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +197,7 @@ fn persisted_llm_secret(
         changed,
         bound_base_url: stored.bound_base_url.clone(),
         pending_url_binding: pending_url_binding_is_fresh(stored),
+        requires_url_binding: stored.pending_url_binding,
     })
 }
 
@@ -361,14 +363,10 @@ mod tests {
         assert_eq!(pending.bound_base_url, None);
         assert!(pending.pending_url_binding);
 
-        let bound = save_persisted_llm_secret(
-            &store,
-            &vault,
-            "sk-one",
-            Some("https://api.example.com/v1"),
-        )
-        .await
-        .unwrap();
+        let bound =
+            save_persisted_llm_secret(&store, &vault, "sk-one", Some("https://api.example.com/v1"))
+                .await
+                .unwrap();
         assert_eq!(bound.revision, 1);
         assert_eq!(
             bound.bound_base_url.as_deref(),
@@ -376,13 +374,9 @@ mod tests {
         );
         assert!(!bound.pending_url_binding);
 
-        let rebound = bind_persisted_llm_secret_url(
-            &store,
-            &vault,
-            "https://api.example.com/v2",
-        )
-        .await
-        .unwrap();
+        let rebound = bind_persisted_llm_secret_url(&store, &vault, "https://api.example.com/v2")
+            .await
+            .unwrap();
         assert_eq!(rebound.revision, 1);
         assert_eq!(
             rebound.bound_base_url.as_deref(),

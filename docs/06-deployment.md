@@ -210,11 +210,21 @@ https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
 
 发布流程：
 
-1. 使用 `node scripts/set-version.mjs <版本号>` 同步 npm、Cargo 与 Tauri 版本。
-2. 提交改动并推送 `v<版本号>` 标签。
+1. 使用 `node scripts/set-version.mjs desktop <版本号>` 更新桌面端版本。
+2. 提交改动并推送 `desktop-v<版本号>` 标签。
 3. GitHub Actions 构建 NSIS 安装包，生成 `.sig` 与 `latest.json`。
-4. 检查 Release 资产与更新清单。
+4. 检查正式 Release 资产与更新清单。
 5. 安装旧版本，确认客户端能检测、下载、校验、安装并重启到新版本。
+
+服务端使用独立版本与标签：
+
+```powershell
+node scripts/set-version.mjs server <服务端版本号>
+git tag server-v<服务端版本号>
+git push origin server-v<服务端版本号>
+```
+
+`server-v*` 只更新 GHCR 镜像和固定标签 `server-latest` 下的服务端更新清单，不会触发桌面端发布。
 
 签名 Secrets：
 

@@ -1626,23 +1626,19 @@ impl SqliteStore {
         merge_input: Option<&NewSchedule>,
     ) -> AppResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let canonical = sqlx::query(
-            "SELECT manual_locked, revision FROM schedules WHERE id = ?",
-        )
-        .bind(canonical_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("日程 {canonical_id}")))?;
+        let canonical = sqlx::query("SELECT manual_locked, revision FROM schedules WHERE id = ?")
+            .bind(canonical_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("日程 {canonical_id}")))?;
         let canonical_locked: i64 = canonical.try_get("manual_locked")?;
         let current_canonical_revision: i64 = canonical.try_get("revision")?;
 
-        let duplicate = sqlx::query(
-            "SELECT manual_locked, revision FROM schedules WHERE id = ?",
-        )
-        .bind(duplicate_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("日程 {duplicate_id}")))?;
+        let duplicate = sqlx::query("SELECT manual_locked, revision FROM schedules WHERE id = ?")
+            .bind(duplicate_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("日程 {duplicate_id}")))?;
         let duplicate_locked: i64 = duplicate.try_get("manual_locked")?;
         let current_duplicate_revision: i64 = duplicate.try_get("revision")?;
 
@@ -1677,7 +1673,11 @@ impl SqliteStore {
             .bind(&merge_input.source_image_url)
             .bind(&merge_input.source_author_mid)
             .bind(&merge_input.source_fingerprint)
-            .bind(merge_input.source_published_at.map(|value| value.to_rfc3339()))
+            .bind(
+                merge_input
+                    .source_published_at
+                    .map(|value| value.to_rfc3339()),
+            )
             .bind(Utc::now().to_rfc3339())
             .bind(canonical_id)
             .bind(canonical_revision)
@@ -1810,10 +1810,11 @@ impl SqliteStore {
         conn: &mut sqlx::SqliteConnection,
         rule_id: i64,
     ) -> AppResult<bool> {
-        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM weekly_schedule_rules WHERE id = ?")
-            .bind(rule_id)
-            .fetch_optional(&mut *conn)
-            .await?;
+        let id: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM weekly_schedule_rules WHERE id = ?")
+                .bind(rule_id)
+                .fetch_optional(&mut *conn)
+                .await?;
         Ok(id.is_some())
     }
 
@@ -2052,12 +2053,11 @@ impl SqliteStore {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let existing = sqlx::query(
-            "SELECT id, streamer_id FROM weekly_schedule_rules WHERE rule_key = ?",
-        )
-        .bind(&rule_key)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let existing =
+            sqlx::query("SELECT id, streamer_id FROM weekly_schedule_rules WHERE rule_key = ?")
+                .bind(&rule_key)
+                .fetch_optional(&mut *tx)
+                .await?;
         if let Some(row) = existing {
             let id: i64 = row.try_get("id")?;
             let existing_streamer_id: i64 = row.try_get("streamer_id")?;
@@ -2115,7 +2115,10 @@ impl SqliteStore {
         .ok_or_else(|| AppError::not_found(format!("固定周表 {id}")))?;
         let current = map_weekly_rule(current_row)?;
         let current_revision = current.revision;
-        let title = update.title.clone().unwrap_or_else(|| current.title.clone());
+        let title = update
+            .title
+            .clone()
+            .unwrap_or_else(|| current.title.clone());
         let weekdays_mask = update.weekdays_mask.unwrap_or(current.weekdays_mask);
         let start_time = update
             .start_time
@@ -2734,10 +2737,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn record_refresh_result_preserving_error(
-        &self,
-        streamer_id: i64,
-    ) -> AppResult<()> {
+    pub async fn record_refresh_result_preserving_error(&self, streamer_id: i64) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM streamers WHERE id = ?")
@@ -2749,6 +2749,8 @@ impl SqliteStore {
         }
         sqlx::query(
             "UPDATE streamers SET last_refresh_at = ?, updated_at = ?,
+                    last_error = CASE WHEN last_error LIKE '动态文字分析失败:%'
+                        OR last_error LIKE '图片日程分析失败:%' THEN last_error ELSE NULL END,
                     revision = revision + 1 WHERE id = ?",
         )
         .bind(&now)
@@ -3873,10 +3875,7 @@ mod tests {
         assert!(!partially_updated.schedule_enabled);
         assert!(!partially_updated.live_notify_enabled);
         assert!(partially_updated.live_stats_enabled);
-        assert!(partially_updated
-            .aliases
-            .iter()
-            .any(|value| value == "B酱"));
+        assert!(partially_updated.aliases.iter().any(|value| value == "B酱"));
     }
 
     #[tokio::test]
@@ -4083,7 +4082,10 @@ mod tests {
             .add_subscription(&add_input("204", "同步元数据主播"))
             .await
             .expect("streamer");
-        let before = store.sync_changes_after(0, 1000).await.expect("initial feed");
+        let before = store
+            .sync_changes_after(0, 1000)
+            .await
+            .expect("initial feed");
         store
             .record_streamer_error(streamer.id, "network failed")
             .await
@@ -4124,7 +4126,9 @@ mod tests {
             .expect("refresh feed");
         let change = refreshed.changes.last().expect("refresh change");
         assert!(change.payload.as_ref().is_some_and(|value| {
-            value.get("lastRefreshAt").is_some_and(|value| !value.is_null())
+            value
+                .get("lastRefreshAt")
+                .is_some_and(|value| !value.is_null())
         }));
     }
 
@@ -4227,10 +4231,7 @@ mod tests {
             .await
             .expect("streamer");
         let (schedule, _) = store
-            .upsert_schedule(&new_schedule(
-                streamer.id,
-                Utc::now() + Duration::days(1),
-            ))
+            .upsert_schedule(&new_schedule(streamer.id, Utc::now() + Duration::days(1)))
             .await
             .expect("schedule");
         {
@@ -4357,13 +4358,12 @@ mod tests {
             .expect("reopen");
         assert_eq!(reopened.id, session.id);
         assert!(reopened.ended_at.is_none());
-        let stored_duration: i64 = sqlx::query_scalar(
-            "SELECT duration_seconds FROM live_sessions WHERE id = ?",
-        )
-        .bind(session.id)
-        .fetch_one(&store.pool)
-        .await
-        .expect("stored duration");
+        let stored_duration: i64 =
+            sqlx::query_scalar("SELECT duration_seconds FROM live_sessions WHERE id = ?")
+                .bind(session.id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("stored duration");
         assert_eq!(stored_duration, 0);
         assert_eq!(reopened.danmaku_count, 0);
         assert_eq!(reopened.revenue_cents, 0);

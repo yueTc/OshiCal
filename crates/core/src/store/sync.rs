@@ -7,11 +7,13 @@ impl SqliteStore {
         if device_id.is_empty() {
             return Err(AppError::validation("deviceId 不能为空"));
         }
-        let updated = sqlx::query("UPDATE devices SET last_seen_at = ? WHERE device_id = ? AND revoked_at IS NULL")
-            .bind(Utc::now().to_rfc3339())
-            .bind(device_id)
-            .execute(&self.pool)
-            .await?;
+        let updated = sqlx::query(
+            "UPDATE devices SET last_seen_at = ? WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
         if updated.rows_affected() == 0 {
             return Err(AppError::not_found(format!("设备 {device_id}")));
         }
@@ -138,12 +140,11 @@ impl SqliteStore {
                         current.try_get::<Option<i64>, _>("weekly_rule_id")?,
                         current.try_get::<Option<String>, _>("weekly_occurrence_date")?,
                     ) {
-                        let rule_exists: Option<i64> = sqlx::query_scalar(
-                            "SELECT id FROM weekly_schedule_rules WHERE id = ?",
-                        )
-                        .bind(rule_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                        let rule_exists: Option<i64> =
+                            sqlx::query_scalar("SELECT id FROM weekly_schedule_rules WHERE id = ?")
+                                .bind(rule_id)
+                                .fetch_optional(&mut *tx)
+                                .await?;
                         if rule_exists.is_some() {
                             self.save_weekly_exception_on(
                                 &mut tx,
@@ -337,7 +338,7 @@ impl SqliteStore {
         let name: String = current.get("name");
         let mut aliases =
             serde_json::from_str::<Vec<String>>(&current.get::<String, _>("aliases_json"))
-            .map_err(|_| AppError::validation("主播别名数据损坏"))?;
+                .map_err(|_| AppError::validation("主播别名数据损坏"))?;
         if let Some(value) = update.aliases {
             aliases = normalize_aliases(value, &name);
         }
@@ -400,18 +401,11 @@ impl SqliteStore {
         if updated.rows_affected() == 0 {
             return Err(AppError::External {
                 code: "SYNC_CONFLICT".to_owned(),
-                message: format!(
-                    "订阅已变化：期望 revision {current_revision}，请重新同步后再试"
-                ),
+                message: format!("订阅已变化：期望 revision {current_revision}，请重新同步后再试"),
             });
         }
-        self.emit_streamer_change(
-            &mut tx,
-            id,
-            "upsert",
-            sync_actor_for_mutation(mutation),
-        )
-        .await?;
+        self.emit_streamer_change(&mut tx, id, "upsert", sync_actor_for_mutation(mutation))
+            .await?;
         let result = json!({
             "streamerId": id,
             "revision": current_revision + 1,
@@ -542,15 +536,15 @@ impl SqliteStore {
                 })
             }
             "delete" => {
-                let row = existing
-                    .ok_or_else(|| AppError::not_found(format!("官号 {mid}")))?;
+                let row = existing.ok_or_else(|| AppError::not_found(format!("官号 {mid}")))?;
                 self.emit_linked_account_change(&mut tx, row.id, "delete", actor)
                     .await?;
-                let deleted = sqlx::query("DELETE FROM linked_accounts WHERE id = ? AND revision = ?")
-                    .bind(row.id)
-                    .bind(row.revision)
-                    .execute(&mut *tx)
-                    .await?;
+                let deleted =
+                    sqlx::query("DELETE FROM linked_accounts WHERE id = ? AND revision = ?")
+                        .bind(row.id)
+                        .bind(row.revision)
+                        .execute(&mut *tx)
+                        .await?;
                 if deleted.rows_affected() != 1 {
                     return Err(AppError::External {
                         code: "SYNC_CONFLICT".to_owned(),
@@ -954,13 +948,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(changes, 1);
-        let actor: (String, Option<String>) = sqlx::query_as(
-            "SELECT actor_type, actor_id FROM sync_changes WHERE mutation_id = ?",
-        )
-        .bind(&request.mutation_id)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
+        let actor: (String, Option<String>) =
+            sqlx::query_as("SELECT actor_type, actor_id FROM sync_changes WHERE mutation_id = ?")
+                .bind(&request.mutation_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
         assert_eq!(actor.0, "device");
         assert_eq!(actor.1.as_deref(), Some("device-subscription-replay"));
     }
@@ -1026,14 +1019,13 @@ mod tests {
         assert_eq!(first_delete, replay_delete);
         let loaded = store.get_streamer(streamer.id).await.unwrap();
         assert!(loaded.linked_accounts.is_empty());
-        let changes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sync_changes WHERE mutation_id IN (?, ?)",
-        )
-        .bind(&create.mutation_id)
-        .bind(&delete.mutation_id)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
+        let changes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_changes WHERE mutation_id IN (?, ?)")
+                .bind(&create.mutation_id)
+                .bind(&delete.mutation_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
         assert_eq!(changes, 2);
     }
 }

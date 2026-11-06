@@ -122,9 +122,7 @@ impl ServerUpdateManager {
                 let allowed_host = host == "github.com"
                     || host == "www.github.com"
                     || host.ends_with(".githubusercontent.com");
-                if attempt.previous().len() < 5
-                    && attempt.url().scheme() == "https"
-                    && allowed_host
+                if attempt.previous().len() < 5 && attempt.url().scheme() == "https" && allowed_host
                 {
                     attempt.follow()
                 } else {
@@ -247,7 +245,9 @@ impl ServerUpdateManager {
         let settings = self.settings().await?;
         let latest = self.check_release(&settings.github_mirror_url).await?;
         if !is_newer_version(&latest.version, env!("CARGO_PKG_VERSION")) {
-            return Err(AppError::validation("服务器已经是最新版本，拒绝重复安装或降级"));
+            return Err(AppError::validation(
+                "服务器已经是最新版本，拒绝重复安装或降级",
+            ));
         }
         self.write_request(
             &latest.version,
@@ -501,11 +501,10 @@ impl ServerUpdateManager {
         if !is_newer_version(target_version, env!("CARGO_PKG_VERSION")) {
             return Err(AppError::validation("目标版本必须严格高于当前服务器版本"));
         }
-        let image_digest = image_digest
-            .ok_or_else(|| AppError::validation("更新请求缺少不可变镜像摘要"))?;
+        let image_digest =
+            image_digest.ok_or_else(|| AppError::validation("更新请求缺少不可变镜像摘要"))?;
         validate_image_digest(image_digest)?;
-        let signature = signature
-            .ok_or_else(|| AppError::validation("更新请求缺少发布者签名"))?;
+        let signature = signature.ok_or_else(|| AppError::validation("更新请求缺少发布者签名"))?;
         validate_update_signature(signature)?;
         let target_digest_line = format!("target_digest={image_digest}\n");
         let signature_line = format!("signature={signature}\n");

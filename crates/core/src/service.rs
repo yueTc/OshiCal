@@ -11,8 +11,8 @@ use crate::error::{AppError, AppResult};
 use crate::fertility::{parse_fertility_payload, FertilityClient};
 use crate::live_stats::LiveStatsManager;
 use crate::llm::{
-    analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient, LlmConfig,
-    LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
+    analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient,
+    LlmConfig, LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
 };
 use crate::models::{
     AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
@@ -20,7 +20,7 @@ use crate::models::{
     Streamer, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
-use crate::schedule::{parse_reserve_schedule, ParsedSchedule};
+use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::SqliteStore;
 
@@ -38,6 +38,7 @@ pub struct AppService {
     llm: Arc<StdRwLock<Arc<dyn ContentAnalyzer>>>,
     fertility: Arc<StdRwLock<Arc<FertilityClient>>>,
     secrets: Arc<RwLock<RuntimeSecrets>>,
+    llm_key_binding: Arc<RwLock<Option<(String, String)>>>,
     live_stats: LiveStatsManager,
     refresh_lock: Arc<Mutex<()>>,
     live_check_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
@@ -66,6 +67,7 @@ impl AppService {
                 proxy_port,
             )?))),
             secrets: Arc::new(RwLock::new(secrets)),
+            llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -84,6 +86,7 @@ impl AppService {
             llm: Arc::new(StdRwLock::new(analyzer)),
             fertility: Arc::new(StdRwLock::new(Arc::new(FertilityClient::new()?))),
             secrets: Arc::new(RwLock::new(secrets)),
+            llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -212,8 +215,34 @@ impl AppService {
     }
 
     pub async fn update_llm_api_key(&self, api_key: String) -> AppResult<()> {
+        *self.llm_key_binding.write().await = None;
         self.secrets.write().await.llm_api_key = Some(api_key);
         Ok(())
+    }
+
+    pub async fn update_bound_llm_api_key(
+        &self,
+        api_key: String,
+        base_url: Option<String>,
+    ) -> AppResult<()> {
+        // Install the scope first: a concurrent reader can only withhold a key,
+        // never send a new key to the previous endpoint during a two-step save.
+        *self.llm_key_binding.write().await = Some((api_key.clone(), base_url.unwrap_or_default()));
+        self.secrets.write().await.llm_api_key = Some(api_key);
+        Ok(())
+    }
+
+    async fn llm_key_for_base_url(&self, base_url: &str) -> Option<String> {
+        let key = self.secrets.read().await.llm_api_key.clone()?;
+        if let Some((bound_key, bound_url)) = self.llm_key_binding.read().await.as_ref() {
+            if bound_key != &key
+                || bound_url.is_empty()
+                || !llm_base_urls_match(base_url, bound_url).unwrap_or(false)
+            {
+                return None;
+            }
+        }
+        Some(key)
     }
 
     pub async fn test_llm(&self, mut config: LlmConfig) -> AppResult<LlmTestReport> {
@@ -223,11 +252,8 @@ impl AppService {
                 && llm_base_urls_match(&config.base_url, &settings.llm_base_url)?
             {
                 config.api_key = self
-                    .secrets
-                    .read()
+                    .llm_key_for_base_url(&config.base_url)
                     .await
-                    .llm_api_key
-                    .clone()
                     .unwrap_or_default();
             }
         }
@@ -241,11 +267,8 @@ impl AppService {
                 && llm_base_urls_match(&config.base_url, &settings.llm_base_url)?
             {
                 config.api_key = self
-                    .secrets
-                    .read()
+                    .llm_key_for_base_url(&config.base_url)
                     .await
-                    .llm_api_key
-                    .clone()
                     .unwrap_or_default();
             }
         }
@@ -807,10 +830,7 @@ impl AppService {
                 // Disabling statistics must stop an existing collector even when
                 // the live-status request below fails or no room can be resolved.
                 let disabled_at = Utc::now();
-                let open_session = self
-                    .store
-                    .latest_open_live_session(streamer.id)
-                    .await?;
+                let open_session = self.store.latest_open_live_session(streamer.id).await?;
                 self.live_stats.stop(streamer.id, disabled_at).await;
                 if let Some(session) = open_session {
                     self.store
@@ -881,10 +901,7 @@ impl AppService {
                     }
                 }
             } else if stats_enabled {
-                let open_session = self
-                    .store
-                    .latest_open_live_session(streamer.id)
-                    .await?;
+                let open_session = self.store.latest_open_live_session(streamer.id).await?;
                 self.live_stats.stop(streamer.id, snapshot.checked_at).await;
                 if let Some(session) = open_session {
                     self.store
@@ -1011,10 +1028,13 @@ impl AppService {
     }
 
     async fn current_llm_config(&self, settings: &AppSettings) -> Option<LlmConfig> {
-        let secrets = self.secrets.read().await.clone();
+        let api_key = self.llm_key_for_base_url(&settings.llm_base_url).await;
+        if api_key.is_none() && self.llm_key_binding.read().await.is_some() {
+            return None;
+        }
         (settings.auto_analyze_images && !settings.llm_model.trim().is_empty()).then(|| LlmConfig {
             base_url: settings.llm_base_url.clone(),
-            api_key: secrets.llm_api_key.clone().unwrap_or_default(),
+            api_key: api_key.unwrap_or_default(),
             model: settings.llm_model.clone(),
             prompt_version: settings.llm_prompt_version.clone(),
         })
@@ -1079,6 +1099,33 @@ impl AppService {
                     report.llm_calls += stats.llm_calls;
                     report.llm_cache_hits += stats.llm_cache_hits;
                     for target in targets {
+                        let state_key = format!("analysis-errors:v1:{}", target.id);
+                        let previous = self.store.get_client_sync_state(&state_key).await?;
+                        let mut unresolved: std::collections::BTreeMap<String, String> = previous
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()?
+                            .unwrap_or_default();
+                        for (identity, outcome) in &stats.analysis_outcomes {
+                            if let Some(message) = outcome {
+                                unresolved.insert(identity.clone(), message.clone());
+                            } else {
+                                unresolved.remove(identity);
+                            }
+                        }
+                        if !stats.analysis_outcomes.is_empty() {
+                            self.store
+                                .set_client_sync_state(
+                                    &state_key,
+                                    &serde_json::to_string(&unresolved)?,
+                                )
+                                .await?;
+                        }
+                        if let Some(error) = unresolved.values().next() {
+                            streamer_errors
+                                .entry(target.id)
+                                .or_insert_with(|| error.clone());
+                        }
                         attempted_streamer_ids.insert(target.id);
                         if let Some(error) = stats.analysis_errors.get(&target.id) {
                             streamer_errors
@@ -1318,6 +1365,9 @@ impl AppService {
                     self.remove_stale_non_live_reserve_schedule(post).await?;
             }
 
+            self.apply_deterministic_reservation_time_change(source_mid, targets, post)
+                .await?;
+
             let has_combined_images = post.reserve.is_none()
                 && llm_config.is_some()
                 && settings.auto_analyze_images
@@ -1369,11 +1419,12 @@ impl AppService {
                             Err(error) => {
                                 tracing::warn!(%error, post_id = %post.id, "text analysis failed");
                                 let message = format!("动态文字分析失败: {error}");
+                                stats
+                                    .analysis_outcomes
+                                    .insert(format!("text:{}", post.id), Some(message.clone()));
                                 for target in targets {
-                                    let _ = self
-                                        .store
-                                        .record_streamer_error(target.id, &message)
-                                        .await;
+                                    let _ =
+                                        self.store.record_streamer_error(target.id, &message).await;
                                     stats
                                         .analysis_errors
                                         .entry(target.id)
@@ -1384,6 +1435,9 @@ impl AppService {
                         },
                     };
                     if analysis_succeeded {
+                        stats
+                            .analysis_outcomes
+                            .insert(format!("text:{}", post.id), None);
                         stats
                             .analyzed_streamer_ids
                             .extend(targets.iter().map(|target| target.id));
@@ -1537,6 +1591,10 @@ impl AppService {
                                     Err(error) => {
                                         tracing::warn!(%error, post_id = %post.id, "image analysis failed");
                                         let message = format!("图片日程分析失败: {error}");
+                                        stats.analysis_outcomes.insert(
+                                            format!("image:{}:{image_url}", post.id),
+                                            Some(message.clone()),
+                                        );
                                         for target in targets {
                                             let _ = self
                                                 .store
@@ -1556,6 +1614,9 @@ impl AppService {
                         stats
                             .analyzed_streamer_ids
                             .extend(targets.iter().map(|target| target.id));
+                        stats
+                            .analysis_outcomes
+                            .insert(format!("image:{}:{image_url}", post.id), None);
                         let digest = analysis.source_digest.clone();
                         let events = analysis.events.clone();
                         analysis_cache.insert(image_cache_key, analysis);
@@ -1631,8 +1692,8 @@ impl AppService {
                     continue;
                 }
                 let duplicate_input = schedule_to_new_input(duplicate);
-                let merged = (!base.manual_locked)
-                    .then(|| merge_group_schedule(&base, &duplicate_input));
+                let merged =
+                    (!base.manual_locked).then(|| merge_group_schedule(&base, &duplicate_input));
                 if self
                     .store
                     .merge_and_delete_schedule_duplicate(
@@ -1917,6 +1978,52 @@ impl AppService {
         Ok((candidates.len() == 1).then(|| candidates[0].clone()))
     }
 
+    async fn apply_deterministic_reservation_time_change(
+        &self,
+        source_mid: &str,
+        targets: &[Streamer],
+        post: &DynamicPost,
+    ) -> AppResult<()> {
+        if post.reserve.is_some() || !text_looks_like_schedule_time_change(&post.text) {
+            return Ok(());
+        }
+        let Some(target) = choose_text_target(source_mid, targets, &post.text) else {
+            return Ok(());
+        };
+        // Relative dates such as “tomorrow” refer to the post publication date, not
+        // the later refresh time. Matching still requires a unique existing reservation.
+        let Some(schedule) =
+            parse_text_schedule(&post.text, post.published_at, post.published_at, "直播")
+        else {
+            return Ok(());
+        };
+        let Some(existing) = self
+            .find_reservation_time_change_candidate(&target, schedule.start_at, post)
+            .await
+        else {
+            return Ok(());
+        };
+        let fingerprint = source_fingerprint(post, &schedule.title, "text");
+        let digest = text_digest(post.text.trim());
+        let identity = format!("text:{}:{digest}:0", post.id);
+        let participants = [target.name.clone()];
+        self.upsert_candidate(
+            &target,
+            &schedule,
+            "text",
+            post,
+            "editor",
+            &identity,
+            &fingerprint,
+            target.live_url.as_deref().or(existing.room_url.as_deref()),
+            Some(post.author_mid.as_str()),
+            Some(post.author_name.as_str()),
+            &participants,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn cancel_schedule_from_event(
         &self,
         target: &Streamer,
@@ -2125,7 +2232,9 @@ impl AppService {
                 .find_reservation_time_change_candidate(target, schedule.start_at, post)
                 .await?
             {
-                self.store.attach_schedule_source(existing.id, &input).await?;
+                self.store
+                    .attach_schedule_source(existing.id, &input)
+                    .await?;
                 let mut merged = merge_input_for_existing(&existing, &input);
                 merged.source_published_at = Some(post.published_at);
                 merged.confidence = existing.confidence.max(input.confidence);
@@ -2143,7 +2252,9 @@ impl AppService {
                     || input.source_kind == "reserve")
                     && !cancellation_titles_match(&existing.title, &input.title);
                 if !incompatible_reservation {
-                    self.store.attach_schedule_source(existing.id, &input).await?;
+                    self.store
+                        .attach_schedule_source(existing.id, &input)
+                        .await?;
                     if existing.weekly_rule_id.is_some()
                         && normalize_alias(&existing.title) != normalize_alias(&schedule.title)
                     {
@@ -2216,6 +2327,7 @@ struct ProcessStats {
     llm_calls: usize,
     llm_cache_hits: usize,
     analysis_errors: HashMap<i64, String>,
+    analysis_outcomes: HashMap<String, Option<String>>,
     analyzed_streamer_ids: HashSet<i64>,
 }
 
@@ -3245,46 +3357,42 @@ mod tests {
         text_post.published_at = now + Duration::hours(1);
         text_post.text = "书梦之旅".to_owned();
         let participants = vec!["心宜不是心仪".to_owned(), "思诺snow".to_owned()];
-        assert!(
-            service
-                .upsert_candidate(
-                    &xinyi,
-                    &schedule,
-                    "image",
-                    &image_post,
-                    "https://i0.hdslb.com/group.jpg",
-                    "image:group-image",
-                    "image-fingerprint",
-                    Some("https://live.bilibili.com/555555"),
-                    Some("402"),
-                    Some("思诺snow"),
-                    &participants,
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &xinyi,
+                &schedule,
+                "image",
+                &image_post,
+                "https://i0.hdslb.com/group.jpg",
+                "image:group-image",
+                "image-fingerprint",
+                Some("https://live.bilibili.com/555555"),
+                Some("402"),
+                Some("思诺snow"),
+                &participants,
+            )
+            .await
+            .expect("upsert candidate"));
         let short = ParsedSchedule {
             title: "书梦之旅".to_owned(),
             ..schedule
         };
-        assert!(
-            !service
-                .upsert_candidate(
-                    &sinuo,
-                    &short,
-                    "text",
-                    &text_post,
-                    "editor",
-                    "text:group-text",
-                    "text-fingerprint",
-                    Some("https://live.bilibili.com/444444"),
-                    Some("401"),
-                    Some("心宜不是心仪"),
-                    &participants,
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(!service
+            .upsert_candidate(
+                &sinuo,
+                &short,
+                "text",
+                &text_post,
+                "editor",
+                "text:group-text",
+                "text-fingerprint",
+                Some("https://live.bilibili.com/444444"),
+                Some("401"),
+                Some("心宜不是心仪"),
+                &participants,
+            )
+            .await
+            .expect("upsert candidate"));
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].title, "心宜思诺周年纪念直播·《执笔入梦》");
@@ -3357,24 +3465,22 @@ mod tests {
             confidence: 0.96,
         };
         let participants = vec!["心宜不是心仪".to_owned(), "思诺snow".to_owned()];
-        assert!(
-            service
-                .upsert_candidate(
-                    &xinyi,
-                    &text_schedule,
-                    "text",
-                    &text_post,
-                    "editor",
-                    "text:xinyi-sinuo-anniversary-text:0",
-                    "text-fingerprint",
-                    Some("https://live.bilibili.com/555555"),
-                    Some("402"),
-                    Some("思诺snow"),
-                    &participants,
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &xinyi,
+                &text_schedule,
+                "text",
+                &text_post,
+                "editor",
+                "text:xinyi-sinuo-anniversary-text:0",
+                "text-fingerprint",
+                Some("https://live.bilibili.com/555555"),
+                Some("402"),
+                Some("思诺snow"),
+                &participants,
+            )
+            .await
+            .expect("upsert candidate"));
 
         let mut cache = HashMap::new();
         let stats = service
@@ -3698,42 +3804,38 @@ mod tests {
         even_older_post.id = "even-older-post".to_owned();
         even_older_post.published_at = now - Duration::hours(1);
 
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &schedule,
-                    "text",
-                    &old_post,
-                    "editor",
-                    "text:old-post",
-                    "old-fingerprint",
-                    Some("https://live.bilibili.com/111111"),
-                    Some("100"),
-                    Some("甲"),
-                    &["甲".to_owned(), "乙".to_owned()],
-                )
-                .await
-                .expect("upsert candidate")
-        );
-        assert!(
-            !service
-                .upsert_candidate(
-                    &streamer,
-                    &schedule,
-                    "text",
-                    &new_post,
-                    "editor",
-                    "text:new-post",
-                    "new-fingerprint",
-                    Some("https://live.bilibili.com/222222"),
-                    Some("200"),
-                    Some("乙"),
-                    &["甲".to_owned(), "乙".to_owned(), "外部嘉宾".to_owned()],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &schedule,
+                "text",
+                &old_post,
+                "editor",
+                "text:old-post",
+                "old-fingerprint",
+                Some("https://live.bilibili.com/111111"),
+                Some("100"),
+                Some("甲"),
+                &["甲".to_owned(), "乙".to_owned()],
+            )
+            .await
+            .expect("upsert candidate"));
+        assert!(!service
+            .upsert_candidate(
+                &streamer,
+                &schedule,
+                "text",
+                &new_post,
+                "editor",
+                "text:new-post",
+                "new-fingerprint",
+                Some("https://live.bilibili.com/222222"),
+                Some("200"),
+                Some("乙"),
+                &["甲".to_owned(), "乙".to_owned(), "外部嘉宾".to_owned()],
+            )
+            .await
+            .expect("upsert candidate"));
         let schedules = store
             .list_all_schedules()
             .await
@@ -3750,24 +3852,22 @@ mod tests {
             Some(new_post.published_at)
         );
 
-        assert!(
-            !service
-                .upsert_candidate(
-                    &streamer,
-                    &schedule,
-                    "text",
-                    &even_older_post,
-                    "editor",
-                    "text:even-older-post",
-                    "even-older-fingerprint",
-                    Some("https://live.bilibili.com/333333"),
-                    Some("100"),
-                    Some("甲"),
-                    &["甲".to_owned()],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(!service
+            .upsert_candidate(
+                &streamer,
+                &schedule,
+                "text",
+                &even_older_post,
+                "editor",
+                "text:even-older-post",
+                "even-older-fingerprint",
+                Some("https://live.bilibili.com/333333"),
+                Some("100"),
+                Some("甲"),
+                &["甲".to_owned()],
+            )
+            .await
+            .expect("upsert candidate"));
         let schedules = store
             .list_all_schedules()
             .await
@@ -3823,24 +3923,22 @@ mod tests {
             end_at: None,
             confidence: 1.0,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &reserve_schedule,
-                    "reserve",
-                    &reserve_post,
-                    "",
-                    "reserve:reserve-post",
-                    "reserve-fingerprint",
-                    Some("https://live.bilibili.com/5850386"),
-                    Some("100"),
-                    Some("乃琳Queen"),
-                    &["乃琳Queen".to_owned()],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &reserve_schedule,
+                "reserve",
+                &reserve_post,
+                "",
+                "reserve:reserve-post",
+                "reserve-fingerprint",
+                Some("https://live.bilibili.com/5850386"),
+                Some("100"),
+                Some("乃琳Queen"),
+                &["乃琳Queen".to_owned()],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let new_post = DynamicPost {
             id: "new-post".to_owned(),
@@ -3875,24 +3973,22 @@ mod tests {
             end_at: None,
             confidence: 0.7,
         };
-        assert!(
-            !service
-                .upsert_candidate(
-                    &streamer,
-                    &changed,
-                    "text",
-                    &new_post,
-                    "editor",
-                    "text:new-post",
-                    "new-fingerprint",
-                    Some("https://live.bilibili.com/5850386"),
-                    Some("100"),
-                    Some("乃琳Queen"),
-                    &["乃琳".to_owned()],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(!service
+            .upsert_candidate(
+                &streamer,
+                &changed,
+                "text",
+                &new_post,
+                "editor",
+                "text:new-post",
+                "new-fingerprint",
+                Some("https://live.bilibili.com/5850386"),
+                Some("100"),
+                Some("乃琳Queen"),
+                &["乃琳".to_owned()],
+            )
+            .await
+            .expect("upsert candidate"));
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].title, "【突击】影之刃零DAY5！");
@@ -4181,56 +4277,80 @@ mod tests {
     #[tokio::test]
     async fn group_dedupe_prefers_and_preserves_manual_schedule() {
         let store = SqliteStore::in_memory().await.expect("db");
-        let first = store.add_subscription(&subscription("301", "团播甲")).await.expect("first");
-        let second = store.add_subscription(&subscription("302", "团播乙")).await.expect("second");
+        let first = store
+            .add_subscription(&subscription("301", "团播甲"))
+            .await
+            .expect("first");
+        let second = store
+            .add_subscription(&subscription("302", "团播乙"))
+            .await
+            .expect("second");
         let service = AppService::new(store.clone(), RuntimeSecrets::default()).expect("service");
         let start = Utc::now() + Duration::days(1);
         let participants = vec!["团播甲".to_owned(), "团播乙".to_owned()];
-        let (manual, _) = store.upsert_schedule(&NewSchedule {
-            streamer_id: first.id,
-            participants: participants.clone(),
-            title: "手工锁定团播".to_owned(),
-            start_at: start,
-            end_at: Some(start + Duration::hours(2)),
-            room_url: Some("https://live.bilibili.com/12345".to_owned()),
-            room_owner_mid: Some(first.mid.clone()),
-            room_owner_name: Some(first.name.clone()),
-            source_kind: "manual".to_owned(),
-            source_post_id: None,
-            source_image_url: None,
-            source_author_mid: None,
-            source_fingerprint: None,
-            source_identity: None,
-            source_published_at: None,
-            confidence: 1.0,
-        }).await.expect("manual schedule");
-        store.update_schedule(manual.id, &UpdateSchedule {
-            title: Some("手工锁定团播".to_owned()),
-            start_at: None,
-            end_at: None,
-            room_url: None,
-        }).await.expect("lock manual schedule");
-        let (automatic, _) = store.upsert_schedule(&NewSchedule {
-            streamer_id: second.id,
-            participants,
-            title: "自动识别团播".to_owned(),
-            start_at: start + Duration::minutes(5),
-            end_at: Some(start + Duration::hours(2)),
-            room_url: Some("https://live.bilibili.com/12345".to_owned()),
-            room_owner_mid: Some(first.mid.clone()),
-            room_owner_name: Some(first.name.clone()),
-            source_kind: "text".to_owned(),
-            source_post_id: Some("group-dedupe-post".to_owned()),
-            source_image_url: None,
-            source_author_mid: Some(first.mid.clone()),
-            source_fingerprint: Some("group-dedupe-fingerprint".to_owned()),
-            source_identity: Some("text:group-dedupe-post".to_owned()),
-            source_published_at: Some(Utc::now()),
-            confidence: 0.95,
-        }).await.expect("automatic schedule");
+        let (manual, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: first.id,
+                participants: participants.clone(),
+                title: "手工锁定团播".to_owned(),
+                start_at: start,
+                end_at: Some(start + Duration::hours(2)),
+                room_url: Some("https://live.bilibili.com/12345".to_owned()),
+                room_owner_mid: Some(first.mid.clone()),
+                room_owner_name: Some(first.name.clone()),
+                source_kind: "manual".to_owned(),
+                source_post_id: None,
+                source_image_url: None,
+                source_author_mid: None,
+                source_fingerprint: None,
+                source_identity: None,
+                source_published_at: None,
+                confidence: 1.0,
+            })
+            .await
+            .expect("manual schedule");
+        store
+            .update_schedule(
+                manual.id,
+                &UpdateSchedule {
+                    title: Some("手工锁定团播".to_owned()),
+                    start_at: None,
+                    end_at: None,
+                    room_url: None,
+                },
+            )
+            .await
+            .expect("lock manual schedule");
+        let (automatic, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: second.id,
+                participants,
+                title: "自动识别团播".to_owned(),
+                start_at: start + Duration::minutes(5),
+                end_at: Some(start + Duration::hours(2)),
+                room_url: Some("https://live.bilibili.com/12345".to_owned()),
+                room_owner_mid: Some(first.mid.clone()),
+                room_owner_name: Some(first.name.clone()),
+                source_kind: "text".to_owned(),
+                source_post_id: Some("group-dedupe-post".to_owned()),
+                source_image_url: None,
+                source_author_mid: Some(first.mid.clone()),
+                source_fingerprint: Some("group-dedupe-fingerprint".to_owned()),
+                source_identity: Some("text:group-dedupe-post".to_owned()),
+                source_published_at: Some(Utc::now()),
+                confidence: 0.95,
+            })
+            .await
+            .expect("automatic schedule");
 
         assert_eq!(service.dedupe_group_schedules().await.expect("dedupe"), 1);
-        assert!(store.get_schedule(manual.id).await.expect("manual remains").manual_locked);
+        assert!(
+            store
+                .get_schedule(manual.id)
+                .await
+                .expect("manual remains")
+                .manual_locked
+        );
         assert!(store.get_schedule(automatic.id).await.is_err());
     }
 
@@ -4574,42 +4694,38 @@ mod tests {
             end_at: None,
             confidence: 0.9,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    target,
-                    &schedule_a,
-                    "text",
-                    &post_a,
-                    "",
-                    "text:post-a",
-                    "fp-a",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
-        assert!(
-            !service
-                .upsert_candidate(
-                    target,
-                    &schedule_b,
-                    "text",
-                    &post_b,
-                    "",
-                    "text:post-b",
-                    "fp-b",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                target,
+                &schedule_a,
+                "text",
+                &post_a,
+                "",
+                "text:post-a",
+                "fp-a",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
+        assert!(!service
+            .upsert_candidate(
+                target,
+                &schedule_b,
+                "text",
+                &post_b,
+                "",
+                "text:post-b",
+                "fp-b",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
         let schedules = store
             .list_schedules(now, now + Duration::days(3), false)
             .await
@@ -4675,24 +4791,22 @@ mod tests {
             end_at: None,
             confidence: 0.9,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &previous,
-                    "text",
-                    &previous_post,
-                    "",
-                    "text:previous-theme",
-                    "previous-theme-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &previous,
+                "text",
+                &previous_post,
+                "",
+                "text:previous-theme",
+                "previous-theme-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let current_post = DynamicPost {
             id: "missing-theme".to_owned(),
@@ -4705,24 +4819,22 @@ mod tests {
             end_at: None,
             confidence: 0.9,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &current,
-                    "text",
-                    &current_post,
-                    "",
-                    "text:missing-theme",
-                    "missing-theme-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &current,
+                "text",
+                &current_post,
+                "",
+                "text:missing-theme",
+                "missing-theme-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let schedules = store.list_all_schedules().await.expect("schedules");
         let reused = schedules
@@ -4780,24 +4892,22 @@ mod tests {
             end_at: None,
             confidence: 0.9,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &schedule,
-                    "text",
-                    &post,
-                    "",
-                    "text:live-session-theme",
-                    "live-session-theme-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &schedule,
+                "text",
+                &post,
+                "",
+                "text:live-session-theme",
+                "live-session-theme-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
@@ -4843,24 +4953,22 @@ mod tests {
             end_at: None,
             confidence: 1.0,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &stale_schedule,
-                    "reserve",
-                    &post,
-                    "editor",
-                    "reserve:video-reserve-post",
-                    "stale-video-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &stale_schedule,
+                "reserve",
+                &post,
+                "editor",
+                "reserve:video-reserve-post",
+                "stale-video-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let mut cache = HashMap::new();
         let stats = service
@@ -4975,24 +5083,22 @@ mod tests {
             end_at: None,
             confidence: 0.95,
         };
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &stale_text,
-                    "text",
-                    &stale_post,
-                    "editor",
-                    "text:reserved-text-post:0",
-                    "old-text-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &stale_text,
+                "text",
+                &stale_post,
+                "editor",
+                "text:reserved-text-post:0",
+                "old-text-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let config = LlmConfig {
             base_url: "https://fixture.invalid/v1".to_owned(),
@@ -5070,24 +5176,22 @@ mod tests {
             now,
         )
         .expect("reservation schedule");
-        assert!(
-            service
-                .upsert_candidate(
-                    &streamer,
-                    &reservation,
-                    "reserve",
-                    &post,
-                    "editor",
-                    "reserve:reserve-post",
-                    "reserve-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(service
+            .upsert_candidate(
+                &streamer,
+                &reservation,
+                "reserve",
+                &post,
+                "editor",
+                "reserve:reserve-post",
+                "reserve-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let llm_schedule = ParsedSchedule {
             title: "电台".to_owned(),
@@ -5095,24 +5199,22 @@ mod tests {
             end_at: None,
             confidence: 0.95,
         };
-        assert!(
-            !service
-                .upsert_candidate(
-                    &streamer,
-                    &llm_schedule,
-                    "text",
-                    &post,
-                    "editor",
-                    "text:reserve-post:0",
-                    "text-fingerprint",
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .await
-                .expect("upsert candidate")
-        );
+        assert!(!service
+            .upsert_candidate(
+                &streamer,
+                &llm_schedule,
+                "text",
+                &post,
+                "editor",
+                "text:reserve-post:0",
+                "text-fingerprint",
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("upsert candidate"));
 
         let schedules = store
             .list_schedules(now, now + Duration::days(2), false)

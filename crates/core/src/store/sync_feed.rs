@@ -1823,10 +1823,7 @@ mod tests {
             .await
             .expect("delete link");
 
-        let page = store
-            .sync_changes_after(0, 100)
-            .await
-            .expect("changes");
+        let page = store.sync_changes_after(0, 100).await.expect("changes");
         let changes: Vec<_> = page
             .changes
             .iter()

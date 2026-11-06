@@ -30,9 +30,9 @@ use oshical_core::{
     UpdateSubscription, UpdateWeeklyScheduleRule,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -48,7 +48,6 @@ pub struct AppState {
     pub hub: broadcast::Sender<Value>,
     pub jobs: RefreshJobManager,
     pub updates: ServerUpdateManager,
-    pub(crate) runtime_proxy_port: Arc<Mutex<Option<u16>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -824,24 +823,12 @@ async fn put_settings(
                 .await?;
         }
     }
-    let runtime_proxy_matches = *state.runtime_proxy_port.lock().await == settings.proxy_port;
-    // Reconcile the runtime before the database write. The shadow value makes
-    // retries converge even if a prior commit outcome was uncertain.
-    if !runtime_proxy_matches {
-        state.service.update_proxy_port(settings.proxy_port).await?;
-        *state.runtime_proxy_port.lock().await = settings.proxy_port;
-    }
+    // Rebuild on every request, including no-op retries. A previous request
+    // may have been cancelled after swapping clients but before committing SQL.
+    state.service.update_proxy_port(settings.proxy_port).await?;
     if let Err(error) = persist_changed_settings(state.service.store(), &current, &settings).await {
-        if !runtime_proxy_matches {
-            // Mark the rollback target before rebuilding. If the request is
-            // cancelled during compensation, a retry will reconcile again.
-            *state.runtime_proxy_port.lock().await = current.proxy_port;
-            if let Err(rollback_error) = state.service.update_proxy_port(current.proxy_port).await {
-                tracing::error!(
-                    %rollback_error,
-                    "设置写入失败后恢复运行时代理失败；相同请求重试会再次尝试应用目标代理"
-                );
-            }
+        if let Err(rollback_error) = state.service.update_proxy_port(current.proxy_port).await {
+            tracing::error!(%rollback_error, "恢复运行时代理失败；重试设置请求会重新应用配置");
         }
         return Err(ApiError::from(error));
     }
@@ -850,12 +837,16 @@ async fn put_settings(
     // permit and finish the operation without a revision bump.
     if bind_secret_to_url {
         if let Some(target_base_url) = target_base_url.as_deref() {
-            bind_persisted_llm_secret_url(
+            let bound = bind_persisted_llm_secret_url(
                 state.service.store(),
                 &state.secret_vault,
                 target_base_url,
             )
             .await?;
+            state
+                .service
+                .update_bound_llm_api_key(bound.api_key, bound.bound_base_url)
+                .await?;
         }
     }
     ok(settings)
@@ -981,7 +972,10 @@ async fn put_llm_secret(
         bound_base_url.as_deref(),
     )
     .await?;
-    state.service.update_llm_api_key(api_key.to_owned()).await?;
+    state
+        .service
+        .update_bound_llm_api_key(api_key.to_owned(), persisted.bound_base_url.clone())
+        .await?;
     // Re-emit the same revision when the value is unchanged. This makes a
     // retry repair a previous failure after the secret row was persisted but
     // its sync notification was not.
@@ -1090,11 +1084,7 @@ async fn apply_mutation(state: &AppState, mutation: &SyncMutation) -> (String, O
                     .await?;
             }
             ("link", _) => {
-                state
-                    .service
-                    .store()
-                    .apply_link_mutation(mutation)
-                    .await?;
+                state.service.store().apply_link_mutation(mutation).await?;
             }
             _ => {
                 return Err(AppError::validation(format!(
@@ -1147,8 +1137,7 @@ fn websocket_origin_allowed(headers: &HeaderMap) -> bool {
         },
         _ => return false,
     };
-    ALLOWED_WEB_ORIGINS.contains(&origin)
-        || websocket_origin_matches_loopback_host(origin, headers)
+    ALLOWED_WEB_ORIGINS.contains(&origin) || websocket_origin_matches_loopback_host(origin, headers)
 }
 
 fn websocket_origin_matches_loopback_host(origin: &str, headers: &HeaderMap) -> bool {
@@ -1161,7 +1150,9 @@ fn websocket_origin_matches_loopback_host(origin: &str, headers: &HeaderMap) -> 
     let Some(origin_authority) = origin.authority() else {
         return false;
     };
-    let Some(request_host) = headers.get(header::HOST).and_then(|value| value.to_str().ok())
+    let Some(request_host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
     else {
         return false;
     };
@@ -1186,7 +1177,8 @@ fn loopback_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
-    host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 async fn websocket(
@@ -1199,9 +1191,7 @@ async fn websocket(
     let protocol = query.protocol.unwrap_or(1);
     let origin_allowed = state.api_token.is_some() || websocket_origin_allowed(&headers);
     upgrade
-        .on_upgrade(move |socket| {
-            handle_websocket(socket, state, after, protocol, origin_allowed)
-        })
+        .on_upgrade(move |socket| handle_websocket(socket, state, after, protocol, origin_allowed))
         .into_response()
 }
 
@@ -1292,8 +1282,7 @@ async fn handle_websocket(
                 return;
             }
         };
-        let reset_required =
-            sync_cursor < min_retained.saturating_sub(1) || sync_cursor > latest;
+        let reset_required = sync_cursor < min_retained.saturating_sub(1) || sync_cursor > latest;
         let auth_ok = json!({
             "type": "auth_ok",
             "protocolVersion": 2,
@@ -1312,12 +1301,8 @@ async fn handle_websocket(
         }
         if reset_required {
             sync_cursor = latest;
-            let reset = sync_api::reset_required_message(
-                latest,
-                min_retained,
-                &feed_id,
-                "cursor_expired",
-            );
+            let reset =
+                sync_api::reset_required_message(latest, min_retained, &feed_id, "cursor_expired");
             if socket
                 .send(Message::Text(reset.to_string().into()))
                 .await
@@ -1544,9 +1529,8 @@ async fn send_sync_after(
         }
 
         let previous = *after;
-        let batches =
-            sync_api::sync_batch_messages(&page.changes, page.latest_seq, &page.feed_id)
-                .map_err(|error| error.to_string())?;
+        let batches = sync_api::sync_batch_messages(&page.changes, page.latest_seq, &page.feed_id)
+            .map_err(|error| error.to_string())?;
         for batch in batches {
             socket
                 .send(Message::Text(batch.to_string().into()))
@@ -1863,7 +1847,10 @@ mod protocol_tests {
             "baseUrl": "https://api.example.com/v1"
         }))
         .unwrap();
-        assert_eq!(bound.base_url.as_deref(), Some("https://api.example.com/v1"));
+        assert_eq!(
+            bound.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
     }
 
     #[test]
@@ -1920,10 +1907,7 @@ mod protocol_tests {
         headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
         assert!(!unsafe_http_origin_allowed(&headers));
         headers.remove("sec-fetch-site");
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_static("127.0.0.1:8787"),
-        );
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
         headers.insert(
             header::ORIGIN,
             HeaderValue::from_static("http://127.0.0.1:8787"),

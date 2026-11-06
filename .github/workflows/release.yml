@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "desktop-v*"
   workflow_dispatch:
 
 permissions:
@@ -67,7 +67,7 @@ jobs:
           if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
             throw "tauri.conf.json 版本不是有效 SemVer: $version"
           }
-          if ($env:RELEASE_REF.StartsWith("refs/tags/") -and "v$version" -ne $env:RELEASE_REF_NAME) {
+          if ($env:RELEASE_REF.StartsWith("refs/tags/") -and "desktop-v$version" -ne $env:RELEASE_REF_NAME) {
             throw "标签 $env:RELEASE_REF_NAME 与 tauri.conf.json 版本 v$version 不一致"
           }
 
@@ -79,7 +79,7 @@ jobs:
           RELEASE_SHA: ${{ github.sha }}
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $tag = "v$version"
+          $tag = "desktop-v$version"
           gh release view $tag --repo $env:REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             throw "发布 $tag 已存在；拒绝覆盖已发布资产"
@@ -125,8 +125,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__
-          releaseName: "OshiCal v__VERSION__"
+          tagName: desktop-v__VERSION__
+          releaseName: "OshiCal Desktop v__VERSION__"
           releaseBody: |
             Windows 安装包与自动更新清单由 GitHub Actions 自动生成。
 
@@ -147,7 +147,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $tag = "v$version"
+          $tag = "desktop-v$version"
           $repo = $env:REPOSITORY
           $dir = Join-Path $env:RUNNER_TEMP "oshical-updater"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null

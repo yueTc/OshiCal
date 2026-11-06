@@ -717,9 +717,10 @@ async fn migration_receipt_survives_store_reopen() {
         let store = SqliteStore::connect_path(database_path.clone())
             .await
             .expect("first db");
-        payload["expectedServerDigest"] = json!(
-            store.migration_state_digest().await.expect("initial digest")
-        );
+        payload["expectedServerDigest"] = json!(store
+            .migration_state_digest()
+            .await
+            .expect("initial digest"));
         let app = build_router(state_with_store(store));
         let (status, applied) = call_json(
             &app,

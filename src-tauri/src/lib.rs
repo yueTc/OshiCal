@@ -52,11 +52,7 @@ impl RemoteMonitorState {
         self.generation
     }
 
-    fn set_rebuild_cancel(
-        &mut self,
-        generation: u64,
-        cancel: Arc<AtomicBool>,
-    ) -> bool {
+    fn set_rebuild_cancel(&mut self, generation: u64, cancel: Arc<AtomicBool>) -> bool {
         if !self.is_current(generation) {
             cancel.store(true, AtomicOrdering::Release);
             return false;
@@ -2070,33 +2066,35 @@ async fn remote_monitor_loop(
                                         }
                                     } else {
                                         legacy_mode = true;
-                                        let legacy_meta = match sync_client::get_sync_meta(
-                                            &store, &server_url,
-                                        )
-                                        .await
-                                        {
-                                            Ok(meta) => meta,
-                                            Err(error) => {
-                                                let _ = app.emit(
-                                                    "remote-status",
-                                                    json!({
-                                                        "connected": false,
-                                                        "connecting": false,
-                                                        "error": error
-                                                    }),
-                                                );
-                                                break;
-                                            }
-                                        };
+                                        let legacy_meta =
+                                            match sync_client::get_sync_meta(&store, &server_url)
+                                                .await
+                                            {
+                                                Ok(meta) => meta,
+                                                Err(error) => {
+                                                    let _ = app.emit(
+                                                        "remote-status",
+                                                        json!({
+                                                            "connected": false,
+                                                            "connecting": false,
+                                                            "error": error
+                                                        }),
+                                                    );
+                                                    break;
+                                                }
+                                            };
                                         let initialized = legacy_meta.legacy_cursor_seq >= 0;
                                         legacy_seq = legacy_meta.legacy_cursor_seq.max(0);
                                         let journal_regressed = initialized
-                                            && reported_latest.is_some_and(|latest| latest < legacy_seq);
+                                            && reported_latest
+                                                .is_some_and(|latest| latest < legacy_seq);
                                         if journal_regressed {
-                                            if let Err(error) = sync_client::reset_legacy_event_cursor(
-                                                &store, &server_url,
-                                            )
-                                            .await
+                                            if let Err(error) =
+                                                sync_client::reset_legacy_event_cursor(
+                                                    &store,
+                                                    &server_url,
+                                                )
+                                                .await
                                             {
                                                 let _ = app.emit(
                                                     "remote-status",
@@ -2110,10 +2108,13 @@ async fn remote_monitor_loop(
                                             }
                                             legacy_seq = 0;
                                         } else if !initialized {
-                                            if let Err(error) = sync_client::set_legacy_event_cursor(
-                                                &store, &server_url, 0,
-                                            )
-                                            .await
+                                            if let Err(error) =
+                                                sync_client::set_legacy_event_cursor(
+                                                    &store,
+                                                    &server_url,
+                                                    0,
+                                                )
+                                                .await
                                             {
                                                 let _ = app.emit(
                                                     "remote-status",
@@ -2139,7 +2140,8 @@ async fn remote_monitor_loop(
                                         // The first V1 connection may have used the V2
                                         // sync cursor in its query string. Reconnect with
                                         // the independent event-journal cursor.
-                                        if journal_regressed || !initialized || after != legacy_seq {
+                                        if journal_regressed || !initialized || after != legacy_seq
+                                        {
                                             reconnect = true;
                                             break;
                                         }
@@ -2250,7 +2252,8 @@ async fn remote_monitor_loop(
                                     // queued batch. Re-read local metadata so a late
                                     // batch cannot publish a regressed latestSeq.
                                     let (connected_latest, connected_acked, connected_feed_id) =
-                                        match sync_client::get_sync_meta(&store, &server_url).await {
+                                        match sync_client::get_sync_meta(&store, &server_url).await
+                                        {
                                             Ok(meta) => (
                                                 meta.latest_seq.max(cursor),
                                                 meta.last_ack_seq,
@@ -2327,12 +2330,13 @@ async fn remote_monitor_loop(
                                 }
                                 Some("job_progress") => emit_job_progress(&app, &event),
                                 Some("ack") => {
-                                    if event.get("persisted").and_then(Value::as_bool) == Some(true) {
-                                        if let Some(seq) = event.get("seq").and_then(Value::as_i64) {
-                                            let _ = sync_client::set_sync_ack(
-                                                &store, &server_url, seq,
-                                            )
-                                            .await;
+                                    if event.get("persisted").and_then(Value::as_bool) == Some(true)
+                                    {
+                                        if let Some(seq) = event.get("seq").and_then(Value::as_i64)
+                                        {
+                                            let _ =
+                                                sync_client::set_sync_ack(&store, &server_url, seq)
+                                                    .await;
                                         }
                                     }
                                 }
@@ -2357,12 +2361,13 @@ async fn remote_monitor_loop(
                                         continue;
                                     }
                                     if legacy_mode {
-                                        if let Some(seq) =
-                                            event.get("seq").and_then(Value::as_i64)
+                                        if let Some(seq) = event.get("seq").and_then(Value::as_i64)
                                         {
                                             if let Err(error) =
                                                 sync_client::advance_legacy_event_cursor(
-                                                    &store, &server_url, seq,
+                                                    &store,
+                                                    &server_url,
+                                                    seq,
                                                 )
                                                 .await
                                             {
@@ -2473,8 +2478,9 @@ async fn apply_batch_with_catch_up(
             return Ok(recovered_meta.cursor_seq);
         }
     }
-    let mut cursor_before_batch =
-        sync_client::get_sync_meta(store, server_url).await?.cursor_seq;
+    let mut cursor_before_batch = sync_client::get_sync_meta(store, server_url)
+        .await?
+        .cursor_seq;
     let result = match sync_client::apply_batch(store, server_url, batch).await {
         Ok(result) => result,
         Err(error) if error.starts_with("SYNC_GAP") => {
@@ -2527,12 +2533,8 @@ async fn catch_up_changes(
         let page =
             sync_client::fetch_changes(client, server_url, token, meta.cursor_seq, 200).await?;
         sync_client::ensure_sync_schema_version(page.schema_version)?;
-        if sync_client::ensure_sync_feed_compatible(
-            &meta.feed_id,
-            meta.cursor_seq,
-            &page.feed_id,
-        )
-        .is_err()
+        if sync_client::ensure_sync_feed_compatible(&meta.feed_id, meta.cursor_seq, &page.feed_id)
+            .is_err()
         {
             return bootstrap_remote(
                 app,
@@ -2787,9 +2789,7 @@ async fn ack_remote(
         .and_then(Value::as_i64)
         .ok_or_else(|| "服务器未确认 ACK 已持久化".to_owned())?;
     if confirmed_seq < seq {
-        return Err(format!(
-            "服务器仅确认到 {confirmed_seq}，尚未持久化 {seq}"
-        ));
+        return Err(format!("服务器仅确认到 {confirmed_seq}，尚未持久化 {seq}"));
     }
     sync_client::set_sync_ack(store, server_url, seq).await
 }
@@ -2874,7 +2874,7 @@ async fn export_client_snapshot(
 mod tests {
     use super::{
         app_update_endpoints, batch_is_fully_applied, build_ws_url, changes_after_cursor,
-        empty_changes_page_requires_rebuild, cookie_header_from_webview, normalize_mirror_base,
+        cookie_header_from_webview, empty_changes_page_requires_rebuild, normalize_mirror_base,
         prepare_forwarded_event, validate_external_url, RemoteMonitorState,
     };
     use crate::sync_client::SyncChange;

@@ -70,7 +70,9 @@ fn validate_llm_base_url(base_url: &str, label: &str) -> AppResult<url::Url> {
     }
     let url = url::Url::parse(base_url.trim())?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(AppError::validation(format!("{label}必须使用 http 或 https")));
+        return Err(AppError::validation(format!(
+            "{label}必须使用 http 或 https"
+        )));
     }
     if url.host_str().is_none() {
         return Err(AppError::validation(format!("{label}缺少主机名")));
@@ -155,10 +157,7 @@ fn ipv6_is_non_public(ip: Ipv6Addr) -> bool {
             || segments[1] == 0x0002
             || (segments[1] & 0xfff0) == 0x0010
             || (segments[1] & 0xfff0) == 0x0020)
-        || (segments[0] == 0x0100
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0)
+        || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
 }
 
 fn ip_is_non_public(ip: IpAddr) -> bool {
@@ -363,7 +362,11 @@ fn proxy_host_from_value(value: &str) -> Option<String> {
 fn llm_trusted_proxy_hosts(proxy_port: Option<u16>) -> Vec<String> {
     let mut hosts = Vec::new();
     if proxy_port.is_some() {
-        hosts.extend(["127.0.0.1".to_owned(), "::1".to_owned(), "localhost".to_owned()]);
+        hosts.extend([
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+            "localhost".to_owned(),
+        ]);
     }
     for key in [
         "HTTPS_PROXY",
@@ -858,11 +861,10 @@ impl LlmClient {
         let image_digest = sha256_hex(bytes);
         let upload_content_type = "image/jpeg";
         let source_bytes = bytes.to_vec();
-        let upload_bytes = tokio::task::spawn_blocking(move || {
-            prepare_image_for_llm(&source_bytes)
-        })
-        .await
-        .map_err(|error| AppError::validation(format!("图片处理任务失败: {error}")))??;
+        let upload_bytes =
+            tokio::task::spawn_blocking(move || prepare_image_for_llm(&source_bytes))
+                .await
+                .map_err(|error| AppError::validation(format!("图片处理任务失败: {error}")))??;
         let context_text = context_text.trim();
         if context_text.chars().count() > 30_000 {
             return Err(AppError::validation("动态文字超过 30000 字限制"));
@@ -990,9 +992,9 @@ fn prepare_image_for_llm_with_limit(bytes: &[u8], byte_limit: usize) -> AppResul
         .with_guessed_format()
         .map_err(|_| AppError::validation("图片格式无法识别"))?;
     reader.limits(limits);
-    let mut image = reader
-        .decode()
-        .map_err(|error| AppError::validation(format!("图片数据无法解析或超出尺寸限制: {error}")))?;
+    let mut image = reader.decode().map_err(|error| {
+        AppError::validation(format!("图片数据无法解析或超出尺寸限制: {error}"))
+    })?;
     if image.width().max(image.height()) > IMAGE_MAX_SIDE {
         image = image.resize(IMAGE_MAX_SIDE, IMAGE_MAX_SIDE, FilterType::Lanczos3);
     }
@@ -2042,13 +2044,10 @@ mod regression_tests {
 
         let local_addresses = [SocketAddr::from(([127, 0, 0, 1], 11434))];
         let local_http = url::Url::parse("http://127.0.0.1:11434/v1").unwrap();
-        assert!(validate_resolved_addresses(
-            "127.0.0.1",
-            &local_addresses,
-            &[],
-            "日程模型地址"
-        )
-        .is_err());
+        assert!(
+            validate_resolved_addresses("127.0.0.1", &local_addresses, &[], "日程模型地址")
+                .is_err()
+        );
         let local_allowlist = ["127.0.0.1".to_owned()];
         assert!(validate_resolved_addresses(
             "127.0.0.1",
@@ -2106,11 +2105,10 @@ mod regression_tests {
             "https://api.example.com/v1/models"
         )
         .expect("matching urls"));
-        assert!(!llm_base_urls_match(
-            "https://api.example.com/v1",
-            "https://api.example.com/v2"
-        )
-        .expect("different urls"));
+        assert!(
+            !llm_base_urls_match("https://api.example.com/v1", "https://api.example.com/v2")
+                .expect("different urls")
+        );
     }
 
     #[test]

@@ -44,11 +44,16 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         .map_err(|error| format!("保存服务端设置失败: {error}"))?;
     let secret_vault = SecretVault::from_env(config.api_token.as_deref(), &config.database_path);
     let mut runtime_secrets = config.secrets;
+    let mut persisted_llm_binding = None;
     if let Some(persisted) = load_persisted_llm_secret(&store, &secret_vault)
         .await
         .map_err(|error| format!("读取服务端模型密钥失败: {error}"))?
     {
-        runtime_secrets.llm_api_key = Some(persisted.api_key);
+        let base_url = persisted
+            .bound_base_url
+            .or_else(|| (!persisted.requires_url_binding).then(|| settings.llm_base_url.clone()));
+        runtime_secrets.llm_api_key = Some(persisted.api_key.clone());
+        persisted_llm_binding = Some((persisted.api_key, base_url));
     }
     if let Some(persisted) = load_persisted_bili_secret(&store, &secret_vault)
         .await
@@ -58,10 +63,15 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     }
     let service = AppService::new_with_proxy(store, runtime_secrets, settings.proxy_port)
         .map_err(|error| format!("初始化服务失败: {error}"))?;
+    if let Some((api_key, base_url)) = persisted_llm_binding {
+        service
+            .update_bound_llm_api_key(api_key, base_url)
+            .await
+            .map_err(|error| format!("恢复模型密钥绑定失败: {error}"))?;
+    }
     let (hub, _) = broadcast::channel(256);
     let updates = ServerUpdateManager::new(config.update_dir.clone())
         .map_err(|error| format!("初始化服务器更新管理器失败: {error}"))?;
-    let runtime_proxy_port = Arc::new(tokio::sync::Mutex::new(settings.proxy_port));
     let state = AppState {
         service: Arc::new(service),
         api_token: config.api_token.map(Arc::new),
@@ -69,7 +79,6 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         hub,
         jobs: RefreshJobManager::new(),
         updates,
-        runtime_proxy_port,
     };
     spawn_background_tasks(state.clone());
     let router = build_router(state);

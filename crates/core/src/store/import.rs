@@ -571,8 +571,8 @@ impl SqliteStore {
             else {
                 continue;
             };
-            let Some(local_source) = local_sources
-                .get(&(local_schedule_id, remote_source.source_identity.clone()))
+            let Some(local_source) =
+                local_sources.get(&(local_schedule_id, remote_source.source_identity.clone()))
             else {
                 continue;
             };
@@ -672,12 +672,11 @@ impl SqliteStore {
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(existing) = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM client_sync_state WHERE key = ?",
-        )
-        .bind(receipt_key)
-        .fetch_optional(&mut **tx)
-        .await?
+        if let Some(existing) =
+            sqlx::query_scalar::<_, String>("SELECT value FROM client_sync_state WHERE key = ?")
+                .bind(receipt_key)
+                .fetch_optional(&mut **tx)
+                .await?
         {
             tx.commit().await?;
             return Ok(MigrationApplyOutcome::Existing(existing));
@@ -739,14 +738,12 @@ impl SqliteStore {
             "report": report.clone(),
             "completedAt": now,
         });
-        sqlx::query(
-            "INSERT INTO client_sync_state (key, value, updated_at) VALUES (?, ?, ?)",
-        )
-        .bind(receipt_key)
-        .bind(serde_json::to_string(&receipt)?)
-        .bind(&now_text)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query("INSERT INTO client_sync_state (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind(receipt_key)
+            .bind(serde_json::to_string(&receipt)?)
+            .bind(&now_text)
+            .execute(&mut **tx)
+            .await?;
 
         tx.commit().await?;
         Ok(MigrationApplyOutcome::Applied(report))
@@ -794,7 +791,6 @@ impl SqliteStore {
     }
 }
 
-
 fn digest_part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
@@ -831,14 +827,12 @@ async fn hash_migration_table(
 async fn migration_state_digest_on(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> AppResult<String> {
-    let latest_sync: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM sync_changes")
-            .fetch_one(&mut **tx)
-            .await?;
-    let latest_event: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM event_journal")
-            .fetch_one(&mut **tx)
-            .await?;
+    let latest_sync: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM sync_changes")
+        .fetch_one(&mut **tx)
+        .await?;
+    let latest_event: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM event_journal")
+        .fetch_one(&mut **tx)
+        .await?;
     let feed_id: String = sqlx::query_scalar(
         "SELECT COALESCE(
             (SELECT feed_id FROM sync_feed_identity WHERE singleton = 1),
@@ -1012,11 +1006,7 @@ async fn migration_state_digest_on(
             &["singleton", "feed_id", "created_at"],
             "singleton",
         ),
-        (
-            "sync_feed_meta",
-            &["key", "value", "updated_at"],
-            "key",
-        ),
+        ("sync_feed_meta", &["key", "value", "updated_at"], "key"),
     ];
     for (table, columns, order_by) in tables {
         hash_migration_table(tx, &mut hasher, table, columns, order_by).await?;
@@ -1059,49 +1049,24 @@ async fn import_snapshot_on(
         weekly_rules: 0,
         skipped: 0,
     };
-        for remote in &snapshot.subscriptions {
-            let existing: Option<(i64, String)> =
-                sqlx::query_as("SELECT id, updated_at FROM streamers WHERE mid=?")
-                    .bind(&remote.mid)
-                    .fetch_optional(&mut **tx)
-                    .await?;
-            let aliases =
-                serde_json::to_string(&normalize_aliases(remote.aliases.clone(), &remote.name))?;
-            let id = if let Some((id, local_updated_at)) = existing {
-                if strategy == "server" {
-                    let local_updated_at = parse_ts(&local_updated_at)?;
-                    let updated_at = local_updated_at.max(Utc::now()).to_rfc3339();
-                    sqlx::query(
-                        "UPDATE streamers SET name=?, avatar_url=?, room_id=?, live_url=?,
+    for remote in &snapshot.subscriptions {
+        let existing: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, updated_at FROM streamers WHERE mid=?")
+                .bind(&remote.mid)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let aliases =
+            serde_json::to_string(&normalize_aliases(remote.aliases.clone(), &remote.name))?;
+        let id = if let Some((id, local_updated_at)) = existing {
+            if strategy == "server" {
+                let local_updated_at = parse_ts(&local_updated_at)?;
+                let updated_at = local_updated_at.max(Utc::now()).to_rfc3339();
+                sqlx::query(
+                    "UPDATE streamers SET name=?, avatar_url=?, room_id=?, live_url=?,
                             schedule_enabled=?, live_notify_enabled=?, live_stats_enabled=?, fans=?,
                             aliases_json=?, updated_at=?, revision=MAX(revision + 1, ?)
                          WHERE id=?",
-                    )
-                    .bind(&remote.name)
-                    .bind(&remote.avatar_url)
-                    .bind(&remote.room_id)
-                    .bind(&remote.live_url)
-                    .bind(remote.schedule_enabled)
-                    .bind(remote.live_notify_enabled)
-                    .bind(remote.live_stats_enabled)
-                    .bind(remote.fans.and_then(|value| i64::try_from(value).ok()))
-                    .bind(aliases)
-                    .bind(updated_at)
-                    .bind(remote.revision.max(1))
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-                id
-            } else {
-                sqlx::query(
-                    "INSERT INTO streamers
-                        (mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                         live_notify_enabled, live_stats_enabled, fans, aliases_json,
-                         created_at, updated_at, revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(&remote.mid)
                 .bind(&remote.name)
                 .bind(&remote.avatar_url)
                 .bind(&remote.room_id)
@@ -1111,126 +1076,112 @@ async fn import_snapshot_on(
                 .bind(remote.live_stats_enabled)
                 .bind(remote.fans.and_then(|value| i64::try_from(value).ok()))
                 .bind(aliases)
-                .bind(remote.created_at.to_rfc3339())
-                .bind(&now)
+                .bind(updated_at)
                 .bind(remote.revision.max(1))
+                .bind(id)
                 .execute(&mut **tx)
-                .await?
-                .last_insert_rowid()
-            };
-            ids.insert(remote.id, id);
-            report.subscriptions += 1;
-            save_mapping(tx, server_key, "subscription", remote.id, id, None).await?;
-            for link in &remote.linked_accounts {
-                let existing: Option<(i64, i64)> = sqlx::query_as(
-                    "SELECT id, revision FROM linked_accounts WHERE streamer_id=? AND mid=?",
+                .await?;
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO streamers
+                        (mid, name, avatar_url, room_id, live_url, schedule_enabled,
+                         live_notify_enabled, live_stats_enabled, fans, aliases_json,
+                         created_at, updated_at, revision)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&remote.mid)
+            .bind(&remote.name)
+            .bind(&remote.avatar_url)
+            .bind(&remote.room_id)
+            .bind(&remote.live_url)
+            .bind(remote.schedule_enabled)
+            .bind(remote.live_notify_enabled)
+            .bind(remote.live_stats_enabled)
+            .bind(remote.fans.and_then(|value| i64::try_from(value).ok()))
+            .bind(aliases)
+            .bind(remote.created_at.to_rfc3339())
+            .bind(&now)
+            .bind(remote.revision.max(1))
+            .execute(&mut **tx)
+            .await?
+            .last_insert_rowid()
+        };
+        ids.insert(remote.id, id);
+        report.subscriptions += 1;
+        save_mapping(tx, server_key, "subscription", remote.id, id, None).await?;
+        for link in &remote.linked_accounts {
+            let existing: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT id, revision FROM linked_accounts WHERE streamer_id=? AND mid=?",
+            )
+            .bind(id)
+            .bind(&link.mid)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if let Some((link_id, local_revision)) = existing {
+                if strategy != "server" {
+                    continue;
+                }
+                sqlx::query(
+                    "UPDATE linked_accounts
+                         SET name=?, avatar_url=?, revision=?
+                         WHERE id=?",
+                )
+                .bind(&link.name)
+                .bind(&link.avatar_url)
+                .bind(advanced_revision(local_revision, link.revision))
+                .bind(link_id)
+                .execute(&mut **tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO linked_accounts
+                            (streamer_id, mid, name, avatar_url, created_at, revision)
+                         VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(id)
                 .bind(&link.mid)
-                .fetch_optional(&mut **tx)
+                .bind(&link.name)
+                .bind(&link.avatar_url)
+                .bind(link.created_at.to_rfc3339())
+                .bind(link.revision.max(1))
+                .execute(&mut **tx)
                 .await?;
-                if let Some((link_id, local_revision)) = existing {
-                    if strategy != "server" {
-                        continue;
-                    }
-                    sqlx::query(
-                        "UPDATE linked_accounts
-                         SET name=?, avatar_url=?, revision=?
-                         WHERE id=?",
-                    )
-                    .bind(&link.name)
-                    .bind(&link.avatar_url)
-                    .bind(advanced_revision(local_revision, link.revision))
-                    .bind(link_id)
-                    .execute(&mut **tx)
-                    .await?;
-                } else {
-                    sqlx::query(
-                        "INSERT INTO linked_accounts
-                            (streamer_id, mid, name, avatar_url, created_at, revision)
-                         VALUES (?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(id)
-                    .bind(&link.mid)
-                    .bind(&link.name)
-                    .bind(&link.avatar_url)
-                    .bind(link.created_at.to_rfc3339())
-                    .bind(link.revision.max(1))
-                    .execute(&mut **tx)
-                    .await?;
-                }
             }
         }
-        for remote in &snapshot.schedules {
-            let owner = ids[&remote.streamer_id];
-            let existing: Option<(i64, i64, String)> = sqlx::query_as(
-                "SELECT id, revision, updated_at FROM schedules
+    }
+    for remote in &snapshot.schedules {
+        let owner = ids[&remote.streamer_id];
+        let existing: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT id, revision, updated_at FROM schedules
                  WHERE streamer_id=?
                    AND ((source_identity IS NOT NULL AND source_identity=?)
                         OR (start_at=? AND title=?))
                  LIMIT 1",
-            )
-            .bind(owner)
-            .bind(&remote.source_identity)
-            .bind(remote.start_at.to_rfc3339())
-            .bind(&remote.title)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let inserted = existing.is_none();
-            let participants_json = serde_json::to_string(&remote.participants)?;
-            let id = if let Some((id, local_revision, local_updated_at)) = existing {
-                if strategy == "server" {
-                    let local_updated_at = parse_ts(&local_updated_at)?;
-                    let updated_at =
-                        non_regressing_timestamp(local_updated_at, remote.updated_at).to_rfc3339();
-                    sqlx::query(
-                        "UPDATE schedules SET participants_json=?, title=?, start_at=?, end_at=?,
+        )
+        .bind(owner)
+        .bind(&remote.source_identity)
+        .bind(remote.start_at.to_rfc3339())
+        .bind(&remote.title)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let inserted = existing.is_none();
+        let participants_json = serde_json::to_string(&remote.participants)?;
+        let id = if let Some((id, local_revision, local_updated_at)) = existing {
+            if strategy == "server" {
+                let local_updated_at = parse_ts(&local_updated_at)?;
+                let updated_at =
+                    non_regressing_timestamp(local_updated_at, remote.updated_at).to_rfc3339();
+                sqlx::query(
+                    "UPDATE schedules SET participants_json=?, title=?, start_at=?, end_at=?,
                             room_url=?, room_owner_mid=?, room_owner_name=?, source_kind=?,
                             source_post_id=?, source_image_url=?, source_author_mid=?,
                             source_fingerprint=?, source_identity=?, source_published_at=?,
                             confidence=?, manual_locked=?, source_changed=?, cancelled=?,
                             weekly_rule_id=NULL, weekly_occurrence_date=NULL,
                             revision=?, updated_at=? WHERE id=?",
-                    )
-                    .bind(&participants_json)
-                    .bind(&remote.title)
-                    .bind(remote.start_at.to_rfc3339())
-                    .bind(remote.end_at.map(|date| date.to_rfc3339()))
-                    .bind(&remote.room_url)
-                    .bind(&remote.room_owner_mid)
-                    .bind(&remote.room_owner_name)
-                    .bind(&remote.source_kind)
-                    .bind(&remote.source_post_id)
-                    .bind(&remote.source_image_url)
-                    .bind(&remote.source_author_mid)
-                    .bind(&remote.source_fingerprint)
-                    .bind(&remote.source_identity)
-                    .bind(remote.source_published_at.map(|date| date.to_rfc3339()))
-                    .bind(remote.confidence)
-                    .bind(remote.manual_locked)
-                    .bind(remote.source_changed)
-                    .bind(remote.cancelled)
-                    .bind(advanced_revision(local_revision, remote.revision))
-                    .bind(updated_at)
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await?;
-                    report.schedules += 1;
-                } else {
-                    report.skipped += 1;
-                }
-                id
-            } else {
-                sqlx::query(
-                    "INSERT INTO schedules
-                        (streamer_id, participants_json, title, start_at, end_at, room_url,
-                         room_owner_mid, room_owner_name, source_kind, source_post_id,
-                         source_image_url, source_author_mid, source_fingerprint, source_identity,
-                         source_published_at, confidence, manual_locked, source_changed, cancelled,
-                         created_at, updated_at, revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(owner)
                 .bind(&participants_json)
                 .bind(&remote.title)
                 .bind(remote.start_at.to_rfc3339())
@@ -1249,74 +1200,87 @@ async fn import_snapshot_on(
                 .bind(remote.manual_locked)
                 .bind(remote.source_changed)
                 .bind(remote.cancelled)
-                .bind(remote.created_at.to_rfc3339())
-                .bind(remote.updated_at.to_rfc3339())
-                .bind(remote.revision.max(1))
+                .bind(advanced_revision(local_revision, remote.revision))
+                .bind(updated_at)
+                .bind(id)
                 .execute(&mut **tx)
-                .await?
-                .last_insert_rowid()
-            };
-            if inserted {
+                .await?;
                 report.schedules += 1;
+            } else {
+                report.skipped += 1;
             }
-            if inserted || strategy == "server" {
-                applied_schedules.insert(remote.id);
-            }
-            save_mapping(
-                tx,
-                server_key,
-                "schedule",
-                remote.id,
-                id,
-                Some(remote.updated_at),
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO schedules
+                        (streamer_id, participants_json, title, start_at, end_at, room_url,
+                         room_owner_mid, room_owner_name, source_kind, source_post_id,
+                         source_image_url, source_author_mid, source_fingerprint, source_identity,
+                         source_published_at, confidence, manual_locked, source_changed, cancelled,
+                         created_at, updated_at, revision)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .await?;
-            schedule_ids.insert(remote.id, id);
+            .bind(owner)
+            .bind(&participants_json)
+            .bind(&remote.title)
+            .bind(remote.start_at.to_rfc3339())
+            .bind(remote.end_at.map(|date| date.to_rfc3339()))
+            .bind(&remote.room_url)
+            .bind(&remote.room_owner_mid)
+            .bind(&remote.room_owner_name)
+            .bind(&remote.source_kind)
+            .bind(&remote.source_post_id)
+            .bind(&remote.source_image_url)
+            .bind(&remote.source_author_mid)
+            .bind(&remote.source_fingerprint)
+            .bind(&remote.source_identity)
+            .bind(remote.source_published_at.map(|date| date.to_rfc3339()))
+            .bind(remote.confidence)
+            .bind(remote.manual_locked)
+            .bind(remote.source_changed)
+            .bind(remote.cancelled)
+            .bind(remote.created_at.to_rfc3339())
+            .bind(remote.updated_at.to_rfc3339())
+            .bind(remote.revision.max(1))
+            .execute(&mut **tx)
+            .await?
+            .last_insert_rowid()
+        };
+        if inserted {
+            report.schedules += 1;
         }
-        for remote in &snapshot.weekly_rules {
-            let owner = ids[&remote.streamer_id];
-            let existing: Option<(i64, i64, String)> = sqlx::query_as(
-                "SELECT id, revision, updated_at FROM weekly_schedule_rules WHERE rule_key = ?",
-            )
-            .bind(&remote.rule_key)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let id = if let Some((id, local_revision, local_updated_at)) = existing {
-                if strategy == "server" {
-                    let local_updated_at = parse_ts(&local_updated_at)?;
-                    let updated_at =
-                        non_regressing_timestamp(local_updated_at, remote.updated_at).to_rfc3339();
-                    sqlx::query(
-                        "UPDATE weekly_schedule_rules SET streamer_id=?, title=?, weekdays_mask=?,
+        if inserted || strategy == "server" {
+            applied_schedules.insert(remote.id);
+        }
+        save_mapping(
+            tx,
+            server_key,
+            "schedule",
+            remote.id,
+            id,
+            Some(remote.updated_at),
+        )
+        .await?;
+        schedule_ids.insert(remote.id, id);
+    }
+    for remote in &snapshot.weekly_rules {
+        let owner = ids[&remote.streamer_id];
+        let existing: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT id, revision, updated_at FROM weekly_schedule_rules WHERE rule_key = ?",
+        )
+        .bind(&remote.rule_key)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let id = if let Some((id, local_revision, local_updated_at)) = existing {
+            if strategy == "server" {
+                let local_updated_at = parse_ts(&local_updated_at)?;
+                let updated_at =
+                    non_regressing_timestamp(local_updated_at, remote.updated_at).to_rfc3339();
+                sqlx::query(
+                    "UPDATE weekly_schedule_rules SET streamer_id=?, title=?, weekdays_mask=?,
                             start_time=?, end_time=?, timezone=?, room_url=?, effective_from=?,
                             effective_until=?, enabled=?, updated_at=?, revision=? WHERE id=?",
-                    )
-                    .bind(owner)
-                    .bind(&remote.title)
-                    .bind(remote.weekdays_mask)
-                    .bind(&remote.start_time)
-                    .bind(&remote.end_time)
-                    .bind(&remote.timezone)
-                    .bind(&remote.room_url)
-                    .bind(&remote.effective_from)
-                    .bind(&remote.effective_until)
-                    .bind(remote.enabled)
-                    .bind(updated_at)
-                    .bind(advanced_revision(local_revision, remote.revision))
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-                id
-            } else {
-                sqlx::query(
-                    "INSERT INTO weekly_schedule_rules
-                     (rule_key, streamer_id, title, weekdays_mask, start_time, end_time, timezone,
-                      room_url, effective_from, effective_until, enabled, created_at, updated_at,
-                      revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(&remote.rule_key)
                 .bind(owner)
                 .bind(&remote.title)
                 .bind(remote.weekdays_mask)
@@ -1327,194 +1291,203 @@ async fn import_snapshot_on(
                 .bind(&remote.effective_from)
                 .bind(&remote.effective_until)
                 .bind(remote.enabled)
-                .bind(remote.created_at.to_rfc3339())
-                .bind(remote.updated_at.to_rfc3339())
-                .bind(remote.revision.max(1))
+                .bind(updated_at)
+                .bind(advanced_revision(local_revision, remote.revision))
+                .bind(id)
                 .execute(&mut **tx)
-                .await?
-                .last_insert_rowid()
-            };
-            report.weekly_rules += 1;
-            rule_ids.insert(remote.id, id);
-            save_mapping(
-                tx,
-                server_key,
-                "weekly_rule",
-                remote.id,
-                id,
-                Some(remote.updated_at),
-            )
-            .await?;
-        }
-        for remote in &snapshot.schedules {
-            let (Some(remote_rule_id), Some(occurrence_date)) = (
-                remote.weekly_rule_id,
-                remote.weekly_occurrence_date.as_deref(),
-            ) else {
-                continue;
-            };
-            if !applied_schedules.contains(&remote.id) {
-                continue;
+                .await?;
             }
-            let local_rule_id = mapped_local_id(&rule_ids, remote_rule_id)?;
-            let local_schedule_id = mapped_local_id(&schedule_ids, remote.id)?;
-            let local_updated_at: String =
-                sqlx::query_scalar("SELECT updated_at FROM schedules WHERE id = ?")
-                    .bind(local_schedule_id)
-                    .fetch_one(&mut **tx)
-                    .await?;
-            let updated_at =
-                non_regressing_timestamp(parse_ts(&local_updated_at)?, remote.updated_at)
-                    .to_rfc3339();
+            id
+        } else {
             sqlx::query(
-                "UPDATE schedules SET weekly_rule_id = ?, weekly_occurrence_date = ?,
-                    revision=MAX(revision + 1, ?), updated_at=? WHERE id = ?",
+                "INSERT INTO weekly_schedule_rules
+                     (rule_key, streamer_id, title, weekdays_mask, start_time, end_time, timezone,
+                      room_url, effective_from, effective_until, enabled, created_at, updated_at,
+                      revision)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(local_rule_id)
-            .bind(occurrence_date)
+            .bind(&remote.rule_key)
+            .bind(owner)
+            .bind(&remote.title)
+            .bind(remote.weekdays_mask)
+            .bind(&remote.start_time)
+            .bind(&remote.end_time)
+            .bind(&remote.timezone)
+            .bind(&remote.room_url)
+            .bind(&remote.effective_from)
+            .bind(&remote.effective_until)
+            .bind(remote.enabled)
+            .bind(remote.created_at.to_rfc3339())
+            .bind(remote.updated_at.to_rfc3339())
             .bind(remote.revision.max(1))
-            .bind(updated_at)
-            .bind(local_schedule_id)
             .execute(&mut **tx)
-            .await?;
+            .await?
+            .last_insert_rowid()
+        };
+        report.weekly_rules += 1;
+        rule_ids.insert(remote.id, id);
+        save_mapping(
+            tx,
+            server_key,
+            "weekly_rule",
+            remote.id,
+            id,
+            Some(remote.updated_at),
+        )
+        .await?;
+    }
+    for remote in &snapshot.schedules {
+        let (Some(remote_rule_id), Some(occurrence_date)) = (
+            remote.weekly_rule_id,
+            remote.weekly_occurrence_date.as_deref(),
+        ) else {
+            continue;
+        };
+        if !applied_schedules.contains(&remote.id) {
+            continue;
         }
+        let local_rule_id = mapped_local_id(&rule_ids, remote_rule_id)?;
+        let local_schedule_id = mapped_local_id(&schedule_ids, remote.id)?;
+        let local_updated_at: String =
+            sqlx::query_scalar("SELECT updated_at FROM schedules WHERE id = ?")
+                .bind(local_schedule_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        let updated_at =
+            non_regressing_timestamp(parse_ts(&local_updated_at)?, remote.updated_at).to_rfc3339();
+        sqlx::query(
+            "UPDATE schedules SET weekly_rule_id = ?, weekly_occurrence_date = ?,
+                    revision=MAX(revision + 1, ?), updated_at=? WHERE id = ?",
+        )
+        .bind(local_rule_id)
+        .bind(occurrence_date)
+        .bind(remote.revision.max(1))
+        .bind(updated_at)
+        .bind(local_schedule_id)
+        .execute(&mut **tx)
+        .await?;
+    }
 
-        for remote in &snapshot.schedule_sources {
-            let local_schedule_id = mapped_local_id(&schedule_ids, remote.schedule_id)?;
-            let existing: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT id, revision FROM schedule_sources
+    for remote in &snapshot.schedule_sources {
+        let local_schedule_id = mapped_local_id(&schedule_ids, remote.schedule_id)?;
+        let existing: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, revision FROM schedule_sources
                  WHERE schedule_id = ? AND source_identity = ?",
-            )
-            .bind(local_schedule_id)
-            .bind(&remote.source_identity)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let id = if let Some((id, local_revision)) = existing {
-                if strategy == "server" {
-                    sqlx::query(
-                        "UPDATE schedule_sources SET source_kind = ?, source_post_id = ?,
+        )
+        .bind(local_schedule_id)
+        .bind(&remote.source_identity)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let id = if let Some((id, local_revision)) = existing {
+            if strategy == "server" {
+                sqlx::query(
+                    "UPDATE schedule_sources SET source_kind = ?, source_post_id = ?,
                             source_image_url = ?, source_fingerprint = ?, confidence = ?,
                             revision = ?
                          WHERE id = ?",
-                    )
-                    .bind(&remote.source_kind)
-                    .bind(&remote.source_post_id)
-                    .bind(&remote.source_image_url)
-                    .bind(&remote.source_fingerprint)
-                    .bind(remote.confidence)
-                    .bind(advanced_revision(local_revision, remote.revision))
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-                id
-            } else {
-                sqlx::query(
-                    "INSERT INTO schedule_sources
-                        (schedule_id, source_kind, source_post_id, source_image_url,
-                         source_fingerprint, source_identity, confidence, created_at, revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(local_schedule_id)
                 .bind(&remote.source_kind)
                 .bind(&remote.source_post_id)
                 .bind(&remote.source_image_url)
                 .bind(&remote.source_fingerprint)
-                .bind(&remote.source_identity)
                 .bind(remote.confidence)
-                .bind(remote.created_at.to_rfc3339())
-                .bind(remote.revision.max(1))
+                .bind(advanced_revision(local_revision, remote.revision))
+                .bind(id)
                 .execute(&mut **tx)
-                .await?
-                .last_insert_rowid()
-            };
-            save_mapping(
-                tx,
-                server_key,
-                "schedule_source",
-                remote.id,
-                id,
-                None,
+                .await?;
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO schedule_sources
+                        (schedule_id, source_kind, source_post_id, source_image_url,
+                         source_fingerprint, source_identity, confidence, created_at, revision)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .await?;
-        }
-
-        for remote in &snapshot.source_suppressions {
-            let local_streamer_id = mapped_local_id(&ids, remote.streamer_id)?;
-            let existing: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT id, revision FROM source_suppressions
-                 WHERE streamer_id = ? AND source_post_id = ? AND source_fingerprint = ?",
-            )
-            .bind(local_streamer_id)
+            .bind(local_schedule_id)
+            .bind(&remote.source_kind)
             .bind(&remote.source_post_id)
+            .bind(&remote.source_image_url)
             .bind(&remote.source_fingerprint)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let id = if let Some((id, local_revision)) = existing {
-                if strategy == "server" {
-                    sqlx::query("UPDATE source_suppressions SET revision = ? WHERE id = ?")
-                        .bind(advanced_revision(local_revision, remote.revision))
-                        .bind(id)
-                        .execute(&mut **tx)
-                        .await?;
-                }
-                id
-            } else {
-                sqlx::query(
-                    "INSERT INTO source_suppressions
-                        (streamer_id, source_post_id, source_fingerprint, created_at, revision)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(local_streamer_id)
-                .bind(&remote.source_post_id)
-                .bind(&remote.source_fingerprint)
-                .bind(remote.created_at.to_rfc3339())
-                .bind(remote.revision.max(1))
-                .execute(&mut **tx)
-                .await?
-                .last_insert_rowid()
-            };
-            save_mapping(
-                tx,
-                server_key,
-                "source_suppression",
-                remote.id,
-                id,
-                None,
-            )
-            .await?;
-        }
+            .bind(&remote.source_identity)
+            .bind(remote.confidence)
+            .bind(remote.created_at.to_rfc3339())
+            .bind(remote.revision.max(1))
+            .execute(&mut **tx)
+            .await?
+            .last_insert_rowid()
+        };
+        save_mapping(tx, server_key, "schedule_source", remote.id, id, None).await?;
+    }
 
-        for remote in &snapshot.weekly_exceptions {
-            let local_rule_id = mapped_local_id(&rule_ids, remote.rule_id)?;
-            let local_schedule_id = remote
-                .schedule_id
-                .map(|schedule_id| mapped_local_id(&schedule_ids, schedule_id))
-                .transpose()?;
-            let existing: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT id, revision FROM weekly_schedule_exceptions
-                 WHERE rule_id = ? AND occurrence_date = ?",
-            )
-            .bind(local_rule_id)
-            .bind(&remote.occurrence_date)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let id = if let Some((id, local_revision)) = existing {
-                if strategy == "server" {
-                    sqlx::query(
-                        "UPDATE weekly_schedule_exceptions
-                         SET exception_kind = ?, schedule_id = ?, revision = ? WHERE id = ?",
-                    )
-                    .bind(&remote.exception_kind)
-                    .bind(local_schedule_id)
+    for remote in &snapshot.source_suppressions {
+        let local_streamer_id = mapped_local_id(&ids, remote.streamer_id)?;
+        let existing: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, revision FROM source_suppressions
+                 WHERE streamer_id = ? AND source_post_id = ? AND source_fingerprint = ?",
+        )
+        .bind(local_streamer_id)
+        .bind(&remote.source_post_id)
+        .bind(&remote.source_fingerprint)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let id = if let Some((id, local_revision)) = existing {
+            if strategy == "server" {
+                sqlx::query("UPDATE source_suppressions SET revision = ? WHERE id = ?")
                     .bind(advanced_revision(local_revision, remote.revision))
                     .bind(id)
                     .execute(&mut **tx)
                     .await?;
-                }
-                id
-            } else {
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO source_suppressions
+                        (streamer_id, source_post_id, source_fingerprint, created_at, revision)
+                     VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(local_streamer_id)
+            .bind(&remote.source_post_id)
+            .bind(&remote.source_fingerprint)
+            .bind(remote.created_at.to_rfc3339())
+            .bind(remote.revision.max(1))
+            .execute(&mut **tx)
+            .await?
+            .last_insert_rowid()
+        };
+        save_mapping(tx, server_key, "source_suppression", remote.id, id, None).await?;
+    }
+
+    for remote in &snapshot.weekly_exceptions {
+        let local_rule_id = mapped_local_id(&rule_ids, remote.rule_id)?;
+        let local_schedule_id = remote
+            .schedule_id
+            .map(|schedule_id| mapped_local_id(&schedule_ids, schedule_id))
+            .transpose()?;
+        let existing: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, revision FROM weekly_schedule_exceptions
+                 WHERE rule_id = ? AND occurrence_date = ?",
+        )
+        .bind(local_rule_id)
+        .bind(&remote.occurrence_date)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let id = if let Some((id, local_revision)) = existing {
+            if strategy == "server" {
                 sqlx::query(
+                    "UPDATE weekly_schedule_exceptions
+                         SET exception_kind = ?, schedule_id = ?, revision = ? WHERE id = ?",
+                )
+                .bind(&remote.exception_kind)
+                .bind(local_schedule_id)
+                .bind(advanced_revision(local_revision, remote.revision))
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            id
+        } else {
+            sqlx::query(
                     "INSERT INTO weekly_schedule_exceptions
                         (rule_id, occurrence_date, exception_kind, schedule_id, created_at, revision)
                      VALUES (?, ?, ?, ?, ?, ?)",
@@ -1528,17 +1501,9 @@ async fn import_snapshot_on(
                 .execute(&mut **tx)
                 .await?
                 .last_insert_rowid()
-            };
-            save_mapping(
-                tx,
-                server_key,
-                "weekly_exception",
-                remote.id,
-                id,
-                None,
-            )
-            .await?;
-        }
+        };
+        save_mapping(tx, server_key, "weekly_exception", remote.id, id, None).await?;
+    }
 
     Ok(report)
 }
@@ -2063,12 +2028,11 @@ mod tests {
                 .fetch_one(local.pool())
                 .await
                 .unwrap();
-        let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM event_journal WHERE type='data_imported'",
-        )
-        .fetch_one(local.pool())
-        .await
-        .unwrap();
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_journal WHERE type='data_imported'")
+                .fetch_one(local.pool())
+                .await
+                .unwrap();
         let receipts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM client_sync_state
              WHERE key='server:migration_receipt:v1:migration-1'",
@@ -2140,5 +2104,4 @@ mod tests {
             .unwrap();
         assert_eq!((receipts, imported), (0, 0));
     }
-
 }

@@ -16,8 +16,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
@@ -48,7 +46,6 @@ const MAX_DEDUP_EVENTS: usize = 50_000;
 const USER_TRACKING_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const EVENT_DEDUP_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PROTOBUF_FIELD_NUMBER: u64 = (1 << 29) - 1;
-const LIVE_WS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 #[derive(Clone, Default)]
 pub struct LiveStatsManager {
@@ -211,7 +208,10 @@ impl CollectorStats {
             // A resumed active session has lost the in-memory UID/dedup sets.
             // Preserve its counters, but never claim exact unique-user totals.
             data_degraded: session.data_quality == "partial" || session.collector_state == "active",
-            has_connected_once: matches!(session.collector_state.as_str(), "active" | "reconnecting"),
+            has_connected_once: matches!(
+                session.collector_state.as_str(),
+                "active" | "reconnecting"
+            ),
             ..Self::default()
         }
     }
@@ -338,16 +338,7 @@ async fn run_collector(
         if !token.is_current() {
             return;
         }
-        match collect_once(
-            &store,
-            &bili,
-            &session,
-            &mut stats,
-            &mut stop_rx,
-            &token,
-        )
-        .await
-        {
+        match collect_once(&store, &bili, &session, &mut stats, &mut stop_rx, &token).await {
             CollectResult::Stopped(ended_at) => {
                 let quality = if stats.reconnect_count == 0 {
                     "complete"
@@ -465,7 +456,8 @@ async fn collect_once(
         None => return CollectResult::Disconnected("弹幕服务器列表为空".to_owned()),
     };
 
-    for url in websocket_endpoints(hosts) {
+    let mut last_error = None;
+    'endpoints: for url in websocket_endpoints(hosts) {
         let connection = tokio::select! {
             value = &mut *stop_rx => {
                 return match value {
@@ -516,8 +508,14 @@ async fn collect_once(
         };
         match auth_result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return CollectResult::Disconnected(error.to_string()),
-            Err(_) => return CollectResult::Disconnected("发送弹幕认证消息超时".to_owned()),
+            Ok(Err(error)) => {
+                last_error = Some(error.to_string());
+                continue 'endpoints;
+            }
+            Err(_) => {
+                last_error = Some("发送弹幕认证消息超时".to_owned());
+                continue 'endpoints;
+            }
         }
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
@@ -537,7 +535,7 @@ async fn collect_once(
                     };
                 }
                 _ = &mut auth_timeout, if !stats.connection_established => {
-                    return CollectResult::Disconnected("弹幕服务器认证超时".to_owned());
+                    { last_error = Some("弹幕服务器认证超时".to_owned()); continue 'endpoints; }
                 }
                 _ = heartbeat.tick() => {
                     if !collector_token.is_current() {
@@ -557,13 +555,13 @@ async fn collect_once(
                     };
                     match send_result {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => return CollectResult::Disconnected(error.to_string()),
-                        Err(_) => return CollectResult::Disconnected("发送弹幕心跳超时".to_owned()),
+                        Ok(Err(error)) => { last_error = Some(error.to_string()); continue 'endpoints; },
+                        Err(_) => { last_error = Some("发送弹幕心跳超时".to_owned()); continue 'endpoints; },
                     }
                 }
                 _ = checkpoint.tick() => {
                     if last_received.elapsed() >= LIVE_SOCKET_IDLE_TIMEOUT {
-                        return CollectResult::Disconnected("弹幕服务器长时间无响应".to_owned());
+                        { last_error = Some("弹幕服务器长时间无响应".to_owned()); continue 'endpoints; }
                     }
                     if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
                         last_checkpoint = Instant::now();
@@ -613,15 +611,15 @@ async fn collect_once(
                             };
                             match pong_result {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => return CollectResult::Disconnected(error.to_string()),
-                                Err(_) => return CollectResult::Disconnected("发送弹幕 Pong 超时".to_owned()),
+                                Ok(Err(error)) => { last_error = Some(error.to_string()); continue 'endpoints; },
+                                Err(_) => { last_error = Some("发送弹幕 Pong 超时".to_owned()); continue 'endpoints; },
                             }
                         }
                         Some(Ok(Message::Close(_))) | None => {
-                            return CollectResult::Disconnected("直播弹幕连接关闭".to_owned());
+                            { last_error = Some("直播弹幕连接关闭".to_owned()); continue 'endpoints; }
                         }
                         Some(Err(error)) => {
-                            return CollectResult::Disconnected(error.to_string());
+                            { last_error = Some(error.to_string()); continue 'endpoints; };
                         }
                         _ => {}
                     }
@@ -629,23 +627,16 @@ async fn collect_once(
             }
         }
     }
-    CollectResult::Disconnected("所有弹幕服务器均连接失败".to_owned())
+    CollectResult::Disconnected(last_error.unwrap_or_else(|| "所有弹幕服务器均连接失败".to_owned()))
 }
 
 async fn connect_live_socket(
     url: &str,
     proxy: Option<&str>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    let mut request = url
+    let request = url
         .into_client_request()
         .map_err(|error| format!("创建弹幕 WebSocket 请求失败: {error}"))?;
-    request.headers_mut().insert(
-        ORIGIN,
-        HeaderValue::from_static("https://live.bilibili.com"),
-    );
-    request
-        .headers_mut()
-        .insert(USER_AGENT, HeaderValue::from_static(LIVE_WS_USER_AGENT));
 
     let Some(proxy) = proxy else {
         return connect_async_with_config(request, Some(live_socket_config()), false)
@@ -667,7 +658,9 @@ async fn connect_live_socket(
         || proxy_url.query().is_some()
         || proxy_url.fragment().is_some()
     {
-        return Err(format!("弹幕代理地址必须是无路径、查询和片段的 HTTP 地址: {proxy_display}"));
+        return Err(format!(
+            "弹幕代理地址必须是无路径、查询和片段的 HTTP 地址: {proxy_display}"
+        ));
     }
     let proxy_host = proxy_url
         .host_str()
@@ -678,9 +671,11 @@ async fn connect_live_socket(
     if target_url.scheme() != "wss" {
         return Err("弹幕服务器必须使用 WSS".to_owned());
     }
-    let target_host = normalized_websocket_host(target_url
-        .host_str()
-        .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?)
+    let target_host = normalized_websocket_host(
+        target_url
+            .host_str()
+            .ok_or_else(|| "弹幕服务器地址缺少主机名".to_owned())?,
+    )
     .ok_or_else(|| "弹幕服务器主机名不受信任".to_owned())?;
     let target_port = target_url.port_or_known_default().unwrap_or(443);
 
@@ -858,7 +853,8 @@ fn parse_live_packets_inner(
             return Err("直播数据包尾部不足 16 字节".to_owned());
         }
         let packet_len =
-            u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("packet header")) as usize;
+            u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("packet header"))
+                as usize;
         if packet_len < 16 {
             return Err("直播数据包长度小于头部长度".to_owned());
         }
@@ -868,16 +864,24 @@ fn parse_live_packets_inner(
         if packet_end > bytes.len() {
             return Err("直播数据包长度越界".to_owned());
         }
-        let header_len =
-            u16::from_be_bytes(bytes[offset + 4..offset + 6].try_into().expect("packet header"))
-                as usize;
+        let header_len = u16::from_be_bytes(
+            bytes[offset + 4..offset + 6]
+                .try_into()
+                .expect("packet header"),
+        ) as usize;
         if header_len < 16 || header_len > packet_len {
             return Err("直播数据包头部长度非法".to_owned());
         }
-        let version =
-            u16::from_be_bytes(bytes[offset + 6..offset + 8].try_into().expect("packet header"));
-        let operation =
-            u32::from_be_bytes(bytes[offset + 8..offset + 12].try_into().expect("packet header"));
+        let version = u16::from_be_bytes(
+            bytes[offset + 6..offset + 8]
+                .try_into()
+                .expect("packet header"),
+        );
+        let operation = u32::from_be_bytes(
+            bytes[offset + 8..offset + 12]
+                .try_into()
+                .expect("packet header"),
+        );
         let body = &bytes[offset + header_len..packet_end];
         if operation == 8 {
             let value = serde_json::from_slice::<Value>(body)
@@ -1030,8 +1034,12 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
                     "sc:{}:{}:{}:{}",
                     uid.as_deref().unwrap_or("anonymous"),
                     data.get("price").and_then(Value::as_f64).unwrap_or(0.0),
-                    data.get("time").and_then(value_to_string).unwrap_or_default(),
-                    data.get("message").and_then(Value::as_str).unwrap_or_default()
+                    data.get("time")
+                        .and_then(value_to_string)
+                        .unwrap_or_default(),
+                    data.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
                 ),
             };
             if !mark_unique_event(stats, key) {
@@ -1314,10 +1322,7 @@ fn decode_varint(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     None
 }
 
-fn field_varint(
-    fields: &HashMap<u32, Vec<ProtoValue>>,
-    id: u32,
-) -> AppResult<Option<u64>> {
+fn field_varint(fields: &HashMap<u32, Vec<ProtoValue>>, id: u32) -> AppResult<Option<u64>> {
     let Some(values) = fields.get(&id) else {
         return Ok(None);
     };
@@ -1339,10 +1344,7 @@ fn field_varint(
     Ok(result)
 }
 
-fn field_string(
-    fields: &HashMap<u32, Vec<ProtoValue>>,
-    id: u32,
-) -> AppResult<Option<String>> {
+fn field_string(fields: &HashMap<u32, Vec<ProtoValue>>, id: u32) -> AppResult<Option<String>> {
     let Some(values) = fields.get(&id) else {
         return Ok(None);
     };
@@ -1370,11 +1372,15 @@ fn required_protobuf_i64(
     let value = field_varint(fields, id)?
         .ok_or_else(|| AppError::validation(format!("SEND_GIFT_V2 缺少{label}")))?;
     if value > i64::MAX as u64 {
-        return Err(AppError::validation(format!("SEND_GIFT_V2 {label}超出范围")));
+        return Err(AppError::validation(format!(
+            "SEND_GIFT_V2 {label}超出范围"
+        )));
     }
     let value = value as i64;
     if value == 0 {
-        return Err(AppError::validation(format!("SEND_GIFT_V2 {label}必须大于 0")));
+        return Err(AppError::validation(format!(
+            "SEND_GIFT_V2 {label}必须大于 0"
+        )));
     }
     Ok(value)
 }
@@ -1388,7 +1394,9 @@ fn optional_protobuf_i64(
         return Ok(0);
     };
     if value > i64::MAX as u64 {
-        return Err(AppError::validation(format!("SEND_GIFT_V2 {label}超出范围")));
+        return Err(AppError::validation(format!(
+            "SEND_GIFT_V2 {label}超出范围"
+        )));
     }
     Ok(value as i64)
 }
@@ -1743,9 +1751,7 @@ mod tests {
 
     #[test]
     fn malformed_live_packet_marks_data_quality_partial() {
-        let packet = [
-            0, 0, 0, 20, 0, 16, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1,
-        ];
+        let packet = [0, 0, 0, 20, 0, 16, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1];
         let mut stats = CollectorStats::default();
         parse_live_packets(&mut stats, &packet, 0);
         let snapshot = stats.snapshot("complete", "finished");
