@@ -682,25 +682,31 @@ fn add_gift(
     tid: &str,
     timestamp: i64,
 ) {
-    let Some(uid) = uid.and_then(|value| normalized_uid_value(&value)) else {
-        return;
-    };
-    stats.interactive_users.insert(uid.clone());
+    // Anonymous danmaku connections receive `uid = 0`; revenue must still be
+    // counted even though we cannot attribute the gift to a unique user.
+    let uid = uid.and_then(|value| normalized_uid_value(&value));
+    if let Some(uid) = uid.as_ref() {
+        stats.interactive_users.insert(uid.clone());
+    }
+
     let coins = if total_coin > 0 {
         total_coin
     } else {
         price * num
     };
     let cents = if coin_type == "silver" { 0 } else { coins / 10 };
+    let user_key = uid.as_deref().unwrap_or("anonymous");
     let key = if tid.is_empty() {
-        format!("gift:{uid}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
+        format!("gift:{user_key}:{gift_id}:{num}:{timestamp}:{price}:{gift_name}")
     } else {
         format!("gift:{tid}")
     };
     if cents > 0 && stats.dedup.insert(key) {
         stats.revenue_cents += cents;
         stats.gift_revenue_cents += cents;
-        stats.paid_users.insert(uid);
+        if let Some(uid) = uid {
+            stats.paid_users.insert(uid);
+        }
     }
 }
 
@@ -1031,6 +1037,50 @@ mod tests {
 
         assert_eq!(stats.danmaku_count, 1);
         assert!(stats.interactive_users.contains("name:viewer"));
+    }
+
+    #[test]
+    fn anonymous_gifts_still_contribute_revenue() {
+        let mut stats = CollectorStats::default();
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "uid": 0,
+                    "giftId": 1,
+                    "giftName": "anonymous gift",
+                    "num": 1,
+                    "price": 1000,
+                    "total_coin": 1000,
+                    "coin_type": "gold",
+                    "tid": "anonymous-gift-1",
+                    "timestamp": 1
+                }
+            }),
+        );
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "SEND_GIFT",
+                "data": {
+                    "giftId": 2,
+                    "giftName": "missing uid gift",
+                    "num": 1,
+                    "price": 1000,
+                    "total_coin": 1000,
+                    "coin_type": "gold",
+                    "tid": "anonymous-gift-2",
+                    "timestamp": 2
+                }
+            }),
+        );
+
+        assert_eq!(stats.gift_count, 2);
+        assert_eq!(stats.gift_revenue_cents, 200);
+        assert_eq!(stats.revenue_cents, 200);
+        assert!(stats.interactive_users.is_empty());
+        assert!(stats.paid_users.is_empty());
     }
 
     #[test]
