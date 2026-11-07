@@ -116,27 +116,25 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      # 幂等：gen/android 已存在就跳过。首次运行（或工作区清空后）在 CI 生成工程壳，
-      # 日志里明确提示需要把工程壳提交回仓库。
-      - name: 初始化 Android 工程壳（首次）
+      # 工程壳已入库（src-tauri/gen/android）。这一步只做兜底：目录被清空时重新生成。
+      - name: 检查 Android 工程壳
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d src-tauri/gen/android ]; then
-            echo "src-tauri/gen/android 已存在，跳过 npx tauri android init"
+          if [ -d src-tauri/gen/android/app ]; then
+            echo "src-tauri/gen/android 已入库，跳过 npx tauri android init"
           else
-            echo "src-tauri/gen/android 不存在：在 CI 中生成 Tauri Android 工程壳"
+            echo "src-tauri/gen/android 缺失：重新生成 Tauri Android 工程壳"
             # `--ci` 在部分 CLI 版本上是全局参数、部分版本只给 init；参数不被接受时退回不带该参数。
-            # GitHub Actions 本身会设置 CI=true，CLI 也会读取该环境变量跳过交互提示。
             npx tauri android init --ci || npx tauri android init
-            echo "::notice title=Android 工程壳是新生成的::请把 src-tauri/gen/android 提交回仓库，让后续构建可复现（.gitignore 只忽略 gen/schemas）"
+            echo "::notice title=Android 工程壳被重新生成::请把 src-tauri/gen/android 的改动提交回仓库"
           fi
 
-      # 签名材料只在这里展开成文件，不打印任何密钥内容。缺失时跳过，后面构建未签名包。
-      # 注意：key.properties 只有在 gen/android 的 app/build.gradle.kts 里被读取时才生效；
-      # 当前工程壳是 Tauri 模板生成的，未内置这段读取逻辑，因此这一步骤只负责“把材料放到
-      # 约定位置”，是否签名由工程壳决定（见 docs/22-android-client.md 第 4 节的签名说明）。
-      - name: 准备签名材料（可选）
+      # 签名材料只在这里展开成文件，不打印任何密钥内容。
+      # 工程壳（src-tauri/gen/android/app/build.gradle.kts）会读取 rootProject 下的 key.properties：
+      #   - 仓库配置了 ANDROID_KEY_BASE64：用正式发布密钥签名；
+      #   - 没配置：用本次流水线临时生成的密钥签名，APK 能直接安装，但换一次运行签名就变。
+      - name: 准备签名材料
         shell: bash
         env:
           ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
@@ -145,29 +143,36 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${ANDROID_KEY_BASE64:-}" ]; then
-            echo "::notice title=未签名构建::仓库未配置 ANDROID_KEY_BASE64，本次只产出未签名 APK（侧载安装需手动允许未知来源）"
-            exit 0
-          fi
           mkdir -p src-tauri/gen/android
-          printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > src-tauri/gen/android/oshical-release.keystore
-          {
-            printf 'storeFile=oshical-release.keystore\n'
-            printf 'storePassword=%s\n' "${ANDROID_KEYSTORE_PASSWORD:-}"
-            printf 'keyAlias=%s\n' "${ANDROID_KEY_ALIAS:-}"
-            printf 'keyPassword=%s\n' "${ANDROID_KEY_PASSWORD:-}"
-          } > src-tauri/gen/android/key.properties
-          echo "已写出 keystore 与 key.properties（内容不打印）；工程壳读取该文件后才会对 APK 签名。"
+          if [ -n "${ANDROID_KEY_BASE64:-}" ]; then
+            printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > src-tauri/gen/android/oshical-release.keystore
+            {
+              printf 'storeFile=oshical-release.keystore\n'
+              printf 'storePassword=%s\n' "${ANDROID_KEYSTORE_PASSWORD:-}"
+              printf 'keyAlias=%s\n' "${ANDROID_KEY_ALIAS:-}"
+              printf 'keyPassword=%s\n' "${ANDROID_KEY_PASSWORD:-}"
+            } > src-tauri/gen/android/key.properties
+            echo "使用仓库 Secrets 中的发布签名密钥（内容不打印）"
+          else
+            echo "::notice title=临时签名::仓库未配置 ANDROID_KEY_BASE64，使用本次运行生成的临时密钥签名"
+            keytool -genkeypair \
+              -keystore src-tauri/gen/android/ci-signing.keystore \
+              -storetype JKS -alias ci -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass ci-signing -keypass ci-signing \
+              -dname "CN=OshiCal CI, OU=CI, O=OshiCal, C=CN" > /dev/null 2>&1
+            {
+              printf 'storeFile=ci-signing.keystore\n'
+              printf 'storePassword=ci-signing\n'
+              printf 'keyAlias=ci\n'
+              printf 'keyPassword=ci-signing\n'
+            } > src-tauri/gen/android/key.properties
+          fi
+          echo "key.properties 已就绪（内容不打印），签名由 app/build.gradle.kts 的 signingConfigs 应用。"
 
       - name: 构建 APK
         shell: bash
-        env:
-          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          if [ -z "${ANDROID_KEY_BASE64:-}" ]; then
-            echo "未配置签名 Secrets：产出未签名 APK 并继续，不中断流水线。"
-          fi
           npx tauri android build --apk
 
       # 仓库现有 server-binary.yml 也用 @v4；补到 SHA 后替换本行。
@@ -176,22 +181,6 @@ jobs:
         with:
           name: oshical-android-apk
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
-          retention-days: 14
-
-      # 工程壳快照：用于把 src-tauri/gen/android 固化回仓库（首次初始化后一次性提交）。
-      # 必须排除签名材料（keystore / key.properties）与构建产物（build / .gradle）。
-      - name: 上传 Android 工程壳
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4 # TODO: 无已核对 SHA，暂用主版本号
-        with:
-          name: oshical-android-project
-          path: |
-            src-tauri/gen/android/**
-            !src-tauri/gen/android/**/build/**
-            !src-tauri/gen/android/**/.gradle/**
-            !src-tauri/gen/android/**/*.keystore
-            !src-tauri/gen/android/key.properties
           if-no-files-found: warn
           retention-days: 14
 

@@ -1,0 +1,22 @@
+# 构建产物与本地环境
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.iml
+.idea/
+local.properties
+
+# 由 Tauri CLI 在构建时生成的版本信息与嵌入配置
+app/tauri.properties
+app/src/main/assets/tauri.conf.json
+
+# 原生库由 rust 插件在构建时从 cargo 产物复制
+app/src/main/jniLibs/
+
+# 签名材料绝不入库
+key.properties
+*.keystore
+*.jks
