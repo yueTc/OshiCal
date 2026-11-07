@@ -39,8 +39,8 @@ docker compose up -d --no-deps oshical
 镜像地址：
 
 ```text
-ghcr.io/yuetec/oshical-server:<版本号>
-ghcr.io/yuetec/oshical-server:latest
+ghcr.io/yuetc/oshical-server:<版本号>
+ghcr.io/yuetc/oshical-server:latest
 ```
 
 检查：
@@ -70,7 +70,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 可配置变量：
 
 ```dotenv
-OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:latest
+OSHICAL_IMAGE=ghcr.io/yuetc/oshical-server:latest
 OSHICAL_HEALTH_URL=http://127.0.0.1:8787/api/health
 OSHICAL_BACKUP_DIR=backups
 ```
@@ -97,21 +97,87 @@ echo "$CR_PAT" | sudo docker login ghcr.io -u <GitHub用户名> --password-stdin
 
 应用容器只写入受控更新请求，不挂载 Docker Socket。实际更新由宿主机 systemd 代理执行。
 
-在服务器仓库目录安装代理：
+在服务器仓库目录安装代理（推荐）：
 
 ```bash
-sudo install -m 755 scripts/oshical-updater-agent.sh /opt/oshical/scripts/oshical-updater-agent.sh
+cd /opt/oshical
+
+# 1) HMAC 密钥：内容必须与仓库 Secret OSHICAL_SERVER_UPDATE_HMAC_KEY 完全一致
+#    （64 位小写十六进制字符），root 所有、0400 或 0600、单硬链接。
+sudo install -d -m 0755 /etc/oshical
+printf '%s\n' "<64位小写十六进制密钥>" | sudo tee /etc/oshical/updater-hmac.key >/dev/null
+sudo chown root:root /etc/oshical/updater-hmac.key
+sudo chmod 0400 /etc/oshical/updater-hmac.key
+
+# 2) 安装代理脚本、systemd unit、部署路径 drop-in，并启动 timer
+sudo bash scripts/install-oshical-updater.sh
+
+# 3) 只读自检：密钥、timer、最近一次服务结果和心跳
+sudo bash scripts/install-oshical-updater.sh --check
+```
+
+安装脚本会自动处理以下情况：
+
+- 仓库就在 `/opt/oshical` 时，不会用 `install` 把文件覆盖到自身。
+- 自动创建 `/etc/systemd/system/oshical-updater.service.d/oshical-deploy.conf`，设置实际部署目录和更新目录。
+- 在启动代理后等待 90 秒内的新鲜心跳。
+- 密钥缺失、权限错误或格式错误时直接给出可执行的修复命令。
+
+如果部署目录不是 `/opt/oshical`：
+
+```bash
+sudo env OSHICAL_DEPLOY_DIR=/srv/oshical \
+  bash /srv/oshical/scripts/install-oshical-updater.sh
+```
+
+如果需要自定义密钥或健康检查地址，可同时传入：
+
+```bash
+sudo env \
+  OSHICAL_DEPLOY_DIR=/srv/oshical \
+  OSHICAL_UPDATE_HMAC_KEY_FILE=/etc/oshical/updater-hmac.key \
+  OSHICAL_HEALTH_URL=http://127.0.0.1:8787/api/health \
+  bash /srv/oshical/scripts/install-oshical-updater.sh
+```
+
+手动安装时，如果仓库本身就在 `/opt/oshical`，不要执行 `install scripts/foo /opt/oshical/scripts/foo`，因为源文件和目标文件相同；此时只需确保权限：
+
+```bash
+sudo install -d -m 0755 /opt/oshical/scripts
+sudo chmod 755 /opt/oshical/scripts/oshical-updater-agent.sh /opt/oshical/scripts/update-server.sh
 sudo install -m 644 deploy/systemd/oshical-updater.service /etc/systemd/system/oshical-updater.service
 sudo install -m 644 deploy/systemd/oshical-updater.timer /etc/systemd/system/oshical-updater.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now oshical-updater.timer
+sudo systemctl start oshical-updater.service
 ```
 
-如果部署目录不是 `/opt/oshical`，先修改 systemd 单元中的 `WorkingDirectory` 和 `OSHICAL_UPDATE_DIR`。
+GitHub Secret 无法读回。如果旧 HMAC 密钥已经丢失，不要把新生成的密钥当作现有发布版本的签名密钥；现有 0.3.3 清单仍会用旧密钥验签。此时应重新发布带新签名的服务器版本，或先按手动 Docker 流程更新当前版本。
 
 代理每 15 秒检查一次请求。手动更新会立即执行；自动更新只在设置的时间段内执行。更新时间统一按 `Asia/Shanghai` 解释，开始时间晚于结束时间表示跨午夜。
 
 更新代理会调用 `scripts/update-server.sh`，执行镜像比较、数据备份、容器重启、健康检查和失败回滚。
+
+### 客户端显示「更新代理未在线」
+
+服务端只负责写 `data/system/update-request.env`，真正干活的是宿主机代理。代理每次运行都会刷新 `data/system/updater-heartbeat.json`；服务端读到心跳超过 90 秒未更新（或文件不存在）就判定离线，客户端卡片显示「更新代理未在线」，同时禁用「立即更新服务器」。
+
+按顺序排查：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `systemctl status oshical-updater.timer` 报 Unit not found | 未安装 | 运行 `cd /opt/oshical && sudo bash scripts/install-oshical-updater.sh` |
+| timer 是 active，但 `updater-heartbeat.json` 不存在 | 代理脚本没跑起来、工作目录错误，或旧 unit 仍在等待缺失的 `LoadCredential` | 运行 `cd /opt/oshical && sudo bash scripts/install-oshical-updater.sh --check`，再查看 journal |
+| 心跳存在、客户端仍显示未在线 | 容器看不到同一目录 | `docker compose exec oshical ls -l /app/data/system`，确认 `OSHICAL_UPDATE_DIR` 与卷挂载一致 |
+| 代理在线，但点更新后状态变 `failed / validation` | HMAC 密钥缺失、权限不对或与发布签名不匹配 | 检查 `/etc/oshical/updater-hmac.key`（64 位小写十六进制、root、0400/0600），并与仓库 Secret 对比 |
+
+日志：
+
+```bash
+sudo journalctl -u oshical-updater.service -n 200 --no-pager
+cat data/system/updater.log
+cat data/system/server-update-status.json
+```
 
 默认 GHCR 镜像可能为私有。服务器需先登录：
 
@@ -119,16 +185,10 @@ sudo systemctl enable --now oshical-updater.timer
 echo "$CR_PAT" | sudo docker login ghcr.io -u yueTc --password-stdin
 ```
 
-日志：
-
-```bash
-sudo journalctl -u oshical-updater.service -n 200 --no-pager
-cat data/system/updater.log
-```
-
 服务端更新设置中可单独填写“服务端 GitHub 镜像加速”，例如 `https://gh-proxy.com/`。它只影响服务器读取 GitHub 更新清单；不会影响桌面客户端的镜像设置。
 
 客户端镜像加速在桌面端设置的“客户端 GitHub 镜像加速”卡片中单独保存，仅作用于当前设备。
+
 ## 2. 便携服务端
 
 从 GitHub Release `server-v<版本>` 直接下载编译好的压缩包，解压即可运行，不需要 Docker、Rust 或 Node.js：

@@ -281,9 +281,18 @@ if [[ -z "$signing_key_file" ]]; then
 fi
 
 fields_file="$(mktemp "${TMPDIR:-/tmp}/oshical-update-fields.XXXXXX")"
-trap 'rm -f -- "$fields_file"' EXIT
+reason_file="$(mktemp "${TMPDIR:-/tmp}/oshical-update-reason.XXXXXX")"
+heartbeat_pid=""
+stop_heartbeat_loop() {
+  if [[ -n "$heartbeat_pid" ]]; then
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    heartbeat_pid=""
+  fi
+}
+trap 'stop_heartbeat_loop; rm -f -- "$fields_file" "$reason_file"' EXIT
 
-if ! python3 - "$request_file" "$signing_key_file" "$image_repository" >"$fields_file" <<'PY'
+if ! python3 - "$request_file" "$signing_key_file" "$image_repository" >"$fields_file" 2>"$reason_file" <<'PY'
 import hashlib
 import hmac
 import os
@@ -345,7 +354,7 @@ def read_key(path):
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError("HMAC key must be a single regular file")
         if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-            raise ValueError("HMAC key must be owned by updater user with mode 0600 or stricter")
+            raise ValueError("HMAC key must be owned by updater user with mode 0400 or 0600")
         raw = bytearray()
         while True:
             chunk = os.read(fd, 4096)
@@ -431,13 +440,23 @@ if values["force"] not in {"true", "false"}:
 if not HHMM.fullmatch(values["window_start"]) or not HHMM.fullmatch(values["window_end"]):
     raise ValueError("invalid update window")
 
-key_raw = read_key(key_path)
+def fail(code, detail):
+    print(f"REASON:{code}:{detail}", file=sys.stderr, flush=True)
+    raise SystemExit(3)
+
+
+try:
+    key_raw = read_key(key_path)
+except OSError as error:
+    fail("key_unreadable", error.strerror or error.__class__.__name__)
+except ValueError as error:
+    fail("key_invalid", str(error))
 try:
     key_text = key_raw.decode("ascii").strip()
-except UnicodeDecodeError as error:
-    raise ValueError("HMAC key is not ASCII") from error
+except UnicodeDecodeError:
+    fail("key_invalid", "key is not ASCII")
 if not SIGNATURE.fullmatch(key_text):
-    raise ValueError("HMAC key must be exactly 64 lowercase hexadecimal characters")
+    fail("key_invalid", "key must be exactly 64 lowercase hex characters")
 key = bytes.fromhex(key_text)
 payload = (
     f"server\n{image_repository}\n"
@@ -445,7 +464,7 @@ payload = (
 ).encode("ascii")
 expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
 if not hmac.compare_digest(expected, values["signature"]):
-    raise ValueError("update signature verification failed")
+    fail("signature_mismatch", "signature does not match this host key")
 
 for field in (
     "request_id",
@@ -458,8 +477,25 @@ for field in (
     sys.stdout.buffer.write(values[field].encode("utf-8") + b"\0")
 PY
 then
-  echo "更新请求未通过结构或签名校验。" >&2
-  write_status "failed" "validation" "更新请求未通过安全校验" "invalid or unsigned update request"
+  reason="$(grep -o 'REASON:[a-z_]*' "$reason_file" | head -n 1 || true)"
+  detail="$(grep -o 'REASON:[^:]*:.*' "$reason_file" | head -n 1 || true)"
+  detail="${detail#*:*:}"
+  case "$reason" in
+    REASON:key_unreadable*)
+      message="更新代理的 HMAC 密钥缺失或不可读：$signing_key_file"
+      ;;
+    REASON:key_invalid*)
+      message="更新代理的 HMAC 密钥无效：需 64 位小写十六进制、root 所有、权限 0400/0600"
+      ;;
+    REASON:signature_mismatch*)
+      message="宿主机 HMAC 密钥与发布清单签名不匹配，更新被拒绝"
+      ;;
+    *)
+      message="更新请求未通过结构或签名校验"
+      ;;
+  esac
+  echo "$message" >&2
+  write_status "failed" "validation" "$message" "${detail:-$reason}"
   safe_remove_file "$request_file" || true
   exit 1
 fi
@@ -708,6 +744,16 @@ fi
 server_image="$image_repository@$target_digest"
 pull_message="正在拉取固定摘要服务器镜像 $target_digest"
 write_status "running" "pulling" "$pull_message" "" "$target_version"
+
+# A pull, backup, restart, and health check can exceed the 90-second online
+# window. Keep refreshing the heartbeat while the long-running update works.
+(
+  while true; do
+    sleep 30
+    write_heartbeat || exit 0
+  done
+) &
+heartbeat_pid=$!
 
 if OSHICAL_IMAGE="$server_image" \
   OSHICAL_TARGET_VERSION="$target_version" \

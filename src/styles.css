@@ -2120,6 +2120,30 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .server-update-card { background: rgba(248, 250, 255, .9); }
 .settings-card header .update-agent-online { color: #126b49; background: rgba(22, 164, 107, .09); }
 .settings-card header .update-agent-offline { color: var(--danger); background: var(--danger-soft); }
+
+.server-update-agent-missing {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  color: var(--muted);
+  background: rgba(255, 246, 232, .72);
+  border: 1px solid rgba(222, 145, 45, .28);
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.server-update-agent-missing strong { color: #8a5a12; font-size: 13px; }
+.server-update-agent-missing p { margin: 0; }
+.server-update-agent-missing ol { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
+.server-update-agent-missing code {
+  padding: 1px 5px;
+  color: var(--text);
+  background: rgba(0, 0, 0, .05);
+  border-radius: 5px;
+  font-size: 11px;
+  word-break: break-all;
+}
 .server-update-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-bottom: 14px; }
 .server-update-metrics > div { display: grid; gap: 3px; padding: 12px; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 12px; }
 .server-update-metrics span { color: var(--muted); font-size: 10px; }

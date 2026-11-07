@@ -12,8 +12,19 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=OSHICAL_UPDATE_DIR=/opt/oshical/data/system
 EnvironmentFile=-/etc/oshical/updater.env
 # Root-only 64-hex HMAC-SHA256 key shared with the server image release workflow.
-# The updater fails closed when this credential is absent.
-LoadCredential=update-hmac-key:/etc/oshical/updater-hmac.key
+#
+# 这里刻意不用 LoadCredential：凭据缺失时 systemd 会让整个 unit 启动失败，
+# 代理一次都不跑，心跳文件永远不会出现，客户端只能看到「更新代理未在线」，
+# 完全没有可排查信息。改为让脚本自己读取同一份文件（root 所有、权限
+# 0400/0600、单硬链接校验，见 scripts/oshical-updater-agent.sh 的 read_key），
+# 这样代理会照常写心跳，并把「密钥缺失/无效/签名不匹配」写成可见的失败状态。
+# 需要换路径时设置 OSHICAL_UPDATE_HMAC_KEY_FILE。
+#
+# 密钥内容需与仓库 Secret OSHICAL_SERVER_UPDATE_HMAC_KEY 一致：
+#   install -d -m 0755 /etc/oshical
+#   printf '%s\n' "$KEY" > /etc/oshical/updater-hmac.key
+#   chown root:root /etc/oshical/updater-hmac.key
+#   chmod 0400 /etc/oshical/updater-hmac.key
 ExecStart=/bin/bash /opt/oshical/scripts/oshical-updater-agent.sh
 TimeoutStartSec=2h
 Nice=10

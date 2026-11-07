@@ -1410,9 +1410,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </div>
             ) : null}
             {!serverUpdate?.agentOnline ? (
-              <p className="form-hint">
-                宿主机尚未安装或启动更新代理。安装 <code>oshical-updater.timer</code> 后才能执行服务器更新。
-              </p>
+              <div className="server-update-agent-missing" role="status">
+                <strong>宿主机更新代理没有在线，服务器更新无法执行</strong>
+                <p>
+                  服务端只负责写更新请求，真正拉镜像、备份、重启容器的是宿主机上的
+                  <code>oshical-updater.timer</code>。它每 15 秒跑一次并写心跳，
+                  服务端读到的心跳超过 90 秒没有更新就会显示「更新代理未在线」。
+                </p>
+                <p>按顺序排查（在服务器 shell 里执行）：</p>
+                <ol>
+                  <li><code>cd /opt/oshical &amp;&amp; sudo bash scripts/install-oshical-updater.sh</code> —— 安装或修复代理、密钥检查和部署路径。</li>
+                  <li><code>sudo bash scripts/install-oshical-updater.sh --check</code> —— 检查密钥、timer、最近一次服务结果和心跳。</li>
+                  <li><code>sudo journalctl -u oshical-updater.service -n 80 --no-pager</code> —— 查看具体启动错误。</li>
+                  <li><code>docker compose exec oshical ls -l /app/data/system</code> —— 确认容器与宿主机指向同一个 <code>data/</code> 卷。</li>
+                </ol>
+                <p>
+                  代理起来后卡片会自动变成「更新代理在线」，不需要重连。安装步骤见
+                  <code>docs/06-deployment.md</code> 的「客户端服务器更新」一节。
+                </p>
+              </div>
             ) : null}
           </section>
         ) : null}

@@ -461,7 +461,7 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 
 ## 15. 服务端镜像更新
 
-- GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetec/oshical-server:<版本号>` 和 `latest` 镜像。
+- GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetc/oshical-server:<版本号>` 和 `latest` 镜像。
 - `scripts/update-server.sh` 负责镜像比较、数据备份、更新、健康检查和失败回滚。
 - 默认不挂载 Docker Socket；自动更新由宿主机 cron 调度更新脚本。
 

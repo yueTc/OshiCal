@@ -187,8 +187,8 @@ docker compose up -d --build
 仅在需要发布服务器时推送 `server-v*` 标签；`.github/workflows/server-image.yml` 会构建并发布：
 
 ```text
-ghcr.io/yuetec/oshical-server:<版本号>
-ghcr.io/yuetec/oshical-server:latest
+ghcr.io/yuetc/oshical-server:<版本号>
+ghcr.io/yuetc/oshical-server:latest
 ```
 
 服务器更新清单：
@@ -215,7 +215,7 @@ docker compose up -d --no-deps oshical
 生产环境建议在 `.env` 中固定版本：
 
 ```dotenv
-OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:0.1.2
+OSHICAL_IMAGE=ghcr.io/yuetc/oshical-server:0.3.3
 ```
 
 也可以每小时执行一次更新检查，只有镜像变化时才会重启：
@@ -232,7 +232,14 @@ OSHICAL_IMAGE=ghcr.io/yuetec/oshical-server:0.1.2
 - 开启自动更新时间段。
 - 查看更新代理在线状态、阶段和失败原因。
 
-服务端更新由宿主机 `oshical-updater` systemd 代理执行，应用容器不挂载 Docker Socket。安装步骤见 `docs/06-deployment.md`。
+服务端更新由宿主机 `oshical-updater` systemd 代理执行，应用容器不挂载 Docker Socket。在服务器仓库根目录安装并自检：
+
+```bash
+sudo bash scripts/install-oshical-updater.sh
+sudo bash scripts/install-oshical-updater.sh --check
+```
+
+详细步骤见 `docs/06-deployment.md`。
 
 客户端与服务端镜像分开配置：
 
