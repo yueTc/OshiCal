@@ -1,0 +1,39 @@
+name: Verify Update Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-update-key
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Compare Secret with published manifest signature
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download published manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/updater"
+          gh release download server-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern latest-server.json \
+            --dir "$RUNNER_TEMP/updater"
+
+      - name: Verify OSHICAL_SERVER_UPDATE_HMAC_KEY
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.OSHICAL_SERVER_UPDATE_HMAC_KEY }}
+        run: python3 scripts/verify-update-key.py "$RUNNER_TEMP/updater/latest-server.json"
