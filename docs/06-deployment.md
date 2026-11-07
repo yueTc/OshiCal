@@ -131,13 +131,35 @@ cat data/system/updater.log
 客户端镜像加速在桌面端设置的“客户端 GitHub 镜像加速”卡片中单独保存，仅作用于当前设备。
 ## 2. 便携服务端
 
+从 GitHub Release `server-v<版本>` 直接下载编译好的压缩包，解压即可运行，不需要 Docker、Rust 或 Node.js：
+
+| 平台 | 产物 | 内含 |
+| --- | --- | --- |
+| Linux x86_64 | `oshical-server-<版本>-linux-x86_64.tar.gz` | `oshical-server`、`dist/`、`.env.example`、`START-HERE.md`、`DEPLOYMENT.md` |
+| Windows x86_64 | `oshical-server-<版本>-windows-x86_64.zip` | `oshical-server.exe`、`dist/`、`.env.example`、`START-HERE.md`、`DEPLOYMENT.md` |
+
+每个包同时发布 `.sha256` 校验文件。编译由 `.github/workflows/server-binary.yml` 在标签 `server-v*` 上完成。
+
 ```powershell
-cd release/server
+# Windows
+Expand-Archive oshical-server-0.3.3-windows-x86_64.zip -DestinationPath server
+cd server
 $env:OSHICAL_BIND = "0.0.0.0:8787"
 $env:OSHICAL_API_TOKEN = "至少32位随机令牌"
 $env:OSHICAL_WEB_DIR = "$PWD\dist"
 $env:OSHICAL_DB_PATH = "$PWD\data\oshical.db"
 .\oshical-server.exe
+```
+
+```bash
+# Linux
+tar -xzf oshical-server-0.3.3-linux-x86_64.tar.gz -C /opt/oshical
+cd /opt/oshical
+export OSHICAL_BIND=0.0.0.0:8787
+export OSHICAL_API_TOKEN='至少32位随机令牌'
+export OSHICAL_WEB_DIR="$PWD/dist"
+export OSHICAL_DB_PATH="$PWD/data/oshical.db"
+./oshical-server
 ```
 
 ## 3. HTTPS 反向代理

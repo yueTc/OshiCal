@@ -60,6 +60,16 @@ B 站虚拟主播日程与开播通知工具。支持 Windows 桌面端、本地
 - 服务端静态界面：`release/server/dist/`
 - Docker：`Dockerfile`、`compose.yaml`
 
+服务端发布的 GitHub Release（`server-v*`）现在同时提供三种形态：
+
+| 形态 | 产物 | 说明 |
+| --- | --- | --- |
+| 容器镜像 | `ghcr.io/yuetc/oshical-server:<版本>`、`:latest` | 由 `server-image.yml` 构建，附带签名清单 `latest-server.json` |
+| Linux 压缩包 | `oshical-server-<版本>-linux-x86_64.tar.gz` | 由 `server-binary.yml` 编译，内含可执行文件 + `dist/` + `.env.example` + 部署说明 |
+| Windows 压缩包 | `oshical-server-<版本>-windows-x86_64.zip` | 同上，Windows 版可执行文件 |
+
+压缩包下载后即可直接运行，无需 Docker；每个压缩包同时附带 `.sha256` 校验文件。
+
 Windows 便携程序无需 Node.js，直接双击运行。首次运行会在应用数据目录创建 SQLite 数据库。
 
 ## 本地开发
@@ -294,3 +304,4 @@ cargo test -p oshical-core real_bilibili_smoke -- --ignored --nocapture
 - `docs/12-release-0.3.0.md`
 - `docs/13-release-server-0.3.1.md`
 - `docs/14-release-0.3.2.md`（寻血猎犬：LAPLACE 生理期数据）
+- `docs/15-release-server-0.3.3.md`（服务端编译产物发布）

@@ -1,0 +1,231 @@
+name: Server Binary
+
+# 服务端编译产物发布：在 server-v* 标签上额外产出可直接下载的运行包。
+# Server Image 工作流只产出 GHCR 镜像与签名清单；本工作流补上
+# Linux tar.gz 与 Windows zip（内含 oshical-server 可执行文件 + dist 前端资源）。
+on:
+  push:
+    tags:
+      - "server-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-binary-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Read server version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(python -c "import tomllib; print(tomllib.load(open('server/Cargo.toml','rb'))['package']['version'])")"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "server/Cargo.toml 中的版本不是有效 SemVer: $version" >&2
+            exit 1
+          fi
+          tag="server-v$version"
+          if [[ "$RELEASE_REF" == refs/tags/* && "$RELEASE_REF_NAME" != "$tag" ]]; then
+            echo "标签 $RELEASE_REF_NAME 与 server/Cargo.toml 版本 $tag 不一致" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            artifact: oshical-server-linux
+          - os: windows-latest
+            label: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            artifact: oshical-server-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> target"
+          key: server-binary-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build web assets
+        run: npm run build:web
+
+      - name: Build server binary
+        run: cargo build --release -p oshical-server --locked --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          stage="stage"
+          rm -rf "$stage"
+          mkdir -p "$stage/dist"
+          cp "target/${{ matrix.target }}/release/oshical-server" "$stage/oshical-server"
+          chmod 755 "$stage/oshical-server"
+          cp -r dist/. "$stage/dist/"
+          cp .env.example "$stage/.env.example"
+          cp docs/06-deployment.md "$stage/DEPLOYMENT.md"
+          {
+            printf '# OshiCal Server %s (linux-x86_64)\n\n' "$VERSION"
+            printf '1. `cp .env.example .env`，至少填写 OSHICAL_API_TOKEN（非回环绑定需 32 位以上）。\n'
+            printf '2. `export OSHICAL_WEB_DIR="$PWD/dist"`，按需设置 `OSHICAL_DB_PATH`。\n'
+            printf '3. 运行 `./oshical-server`，浏览器打开 http://127.0.0.1:8787 并输入 Bearer Token。\n\n'
+            printf '详细说明见 DEPLOYMENT.md。也可以只用 Docker 镜像：`ghcr.io/yuetc/oshical-server:%s`\n' "$VERSION"
+          } > "$stage/START-HERE.md"
+          tar -C "$stage" -czf "oshical-server-${VERSION}-linux-x86_64.tar.gz" .
+          ls -l "oshical-server-${VERSION}-linux-x86_64.tar.gz"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $PWD 'stage'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Path (Join-Path $stage 'dist') -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/oshical-server.exe" (Join-Path $stage 'oshical-server.exe')
+          Copy-Item 'dist/*' (Join-Path $stage 'dist') -Recurse -Force
+          Copy-Item '.env.example' (Join-Path $stage '.env.example')
+          Copy-Item 'docs/06-deployment.md' (Join-Path $stage 'DEPLOYMENT.md')
+          $readme = @(
+            "# OshiCal Server $env:VERSION (windows-x86_64)",
+            "",
+            "1. 复制 .env.example 为 .env，至少填写 OSHICAL_API_TOKEN（非回环绑定需 32 位以上）。",
+            '2. 设置 $env:OSHICAL_WEB_DIR = "<解压目录>\dist"，按需设置 $env:OSHICAL_DB_PATH = "<解压目录>\data\oshical.db"。',
+            "3. 运行 .\oshical-server.exe，浏览器打开 http://127.0.0.1:8787 并输入 Bearer Token。",
+            "",
+            "详细说明见 DEPLOYMENT.md。也可以只用 Docker 镜像：ghcr.io/yuetc/oshical-server:$env:VERSION"
+          )
+          Set-Content -Path (Join-Path $stage 'START-HERE.md') -Value $readme -Encoding utf8
+          $zip = "oshical-server-$env:VERSION-windows-x86_64.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            oshical-server-${{ needs.meta.outputs.version }}-*.tar.gz
+            oshical-server-${{ needs.meta.outputs.version }}-*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attach binaries to release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        working-directory: packages
+        run: |
+          set -euo pipefail
+          ls -l
+          shopt -s nullglob
+          for asset in oshical-server-*.tar.gz oshical-server-*.zip; do
+            sha256sum "$asset" > "$asset.sha256"
+            cat "$asset.sha256"
+          done
+
+      # Server Image 工作流负责创建 release 并写入签名清单，且它对已存在的
+      # release 会直接报错退出。这里先等它把 release 建出来，避免抢先创建把它
+      # 顶掉；超过等待窗口仍未出现时才兜底创建。
+      - name: Wait for the server release to exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+              echo "release $TAG 已存在（第 $attempt 次检查），开始追加编译产物"
+              exit 0
+            fi
+            echo "等待 Server Image 创建 release $TAG …（$attempt/60）"
+            sleep 30
+          done
+          echo "等待超时，兜底创建 release $TAG"
+          # --latest=false：服务端发布不能抢走桌面端的 "latest" 通道。
+          gh release create "$TAG" --repo "$REPOSITORY" \
+            --target "$GITHUB_SHA" --latest=false \
+            --title "OshiCal Server v$VERSION" \
+            --notes "服务端 $VERSION。编译产物：linux-x86_64.tar.gz、windows-x86_64.zip；镜像清单见 server-latest。"
+
+      - name: Upload binaries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" packages/oshical-server-*.tar.gz packages/oshical-server-*.zip \
+            packages/oshical-server-*.sha256 \
+            --repo "$REPOSITORY" --clobber
+          echo "已上传编译产物到 $TAG"
+          gh release view "$TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name'
