@@ -13,6 +13,7 @@ import {
   List,
   LoaderCircle,
   Minus,
+  MonitorPlay,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -915,6 +916,34 @@ export default function ScheduleView({
     }
   }
 
+  // @decision LIVE-ROOM-1 进入直播间统一按 日程直播间地址 → 主播直播间地址 → 主播房间号 解析，
+  // 点击卡片和右键菜单共用同一个目标，避免两条入口落到不同房间。
+  function resolveRoomUrl(schedule: Schedule): string | null {
+    if (schedule.roomUrl) {
+      return schedule.roomUrl;
+    }
+    const streamer = subscriptions.find((value) => value.id === schedule.streamerId);
+    if (streamer?.liveUrl) {
+      return streamer.liveUrl;
+    }
+    const roomId = streamer?.roomId ?? schedule.roomOwnerMid;
+    return roomId ? `https://live.bilibili.com/${roomId}` : null;
+  }
+
+  async function enterLiveRoom(schedule: Schedule) {
+    setMenu(null);
+    const roomUrl = resolveRoomUrl(schedule);
+    if (!roomUrl) {
+      onError(`「${schedule.title}」还没有直播间地址，可在右键菜单里选择“编辑”补充。`);
+      return;
+    }
+    try {
+      await openExternalUrl(roomUrl);
+    } catch (openError) {
+      onError(explainError(openError));
+    }
+  }
+
   async function openSchedule(schedule: Schedule) {
     if (suppressCardClickRef.current) {
       suppressCardClickRef.current = false;
@@ -925,12 +954,13 @@ export default function ScheduleView({
       }
       return;
     }
-    if (!schedule.roomUrl) {
+    const roomUrl = resolveRoomUrl(schedule);
+    if (!roomUrl) {
       onError("该日程没有配置直播间地址");
       return;
     }
     try {
-      await openExternalUrl(schedule.roomUrl);
+      await openExternalUrl(roomUrl);
     } catch (openError) {
       onError(explainError(openError));
     }
@@ -1502,6 +1532,13 @@ export default function ScheduleView({
           style={{ left: menu.x, top: menu.y }}
           onClick={(event) => event.stopPropagation()}
         >
+          <button
+            className={`live-room-entry${liveScheduleIds.has(menu.schedule.id) ? " is-live" : ""}`}
+            title={resolveRoomUrl(menu.schedule) ?? "该日程还没有直播间地址"}
+            onClick={() => void enterLiveRoom(menu.schedule)}
+          >
+            <MonitorPlay size={15} />进入直播间
+          </button>
           <button onClick={() => void openLiveData(menu.schedule)}><BarChart3 size={15} />查看直播数据</button>
           <button onClick={() => openEdit(menu.schedule)}><Pencil size={15} />编辑</button>
           <button onClick={() => void removeSchedule(menu.schedule)} className="danger">

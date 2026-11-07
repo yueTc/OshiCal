@@ -604,6 +604,9 @@ pub struct LlmTestReport {
 
 #[async_trait]
 pub trait ContentAnalyzer: Send + Sync {
+    /// `Ok(None)` means the image was deliberately skipped (for example an
+    /// animated GIF that no model input supports). A skip is not a failure and
+    /// must not surface as an error for the streamer.
     async fn analyze_image_url(
         &self,
         config: &LlmConfig,
@@ -611,7 +614,7 @@ pub trait ContentAnalyzer: Send + Sync {
         context_text: &str,
         published_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> AppResult<LlmAnalysis>;
+    ) -> AppResult<Option<LlmAnalysis>>;
 
     async fn analyze_text(
         &self,
@@ -664,11 +667,13 @@ impl LlmClient {
         context_text: &str,
         published_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> AppResult<LlmAnalysis> {
+    ) -> AppResult<Option<LlmAnalysis>> {
         config.validate()?;
         let image_url = normalize_image_url(image_url)
             .ok_or_else(|| AppError::validation("图片地址不是允许的 hdslb.com URL"))?;
-        let (content_type, bytes) = self.download_image(&image_url).await?;
+        let Some((content_type, bytes)) = self.download_image(&image_url).await? else {
+            return Ok(None);
+        };
         self.analyze_image_bytes(
             config,
             &content_type,
@@ -678,6 +683,7 @@ impl LlmClient {
             now,
         )
         .await
+        .map(Some)
     }
 
     pub async fn analyze_text(
@@ -709,6 +715,8 @@ impl LlmClient {
              action 只能是 schedule 或 cancel：新增或改期后的新日程用 schedule；明确取消、停播、延期、改期、无法直播或原日程作废用 cancel。cancel 必须给出 performer 和能定位旧日程的 title；能确定原日程开始时间时同时给出 start_at，不能确定时 start_at 用 null。title 不得是“直播”等泛称；如果原文没有提供主题，title 填空字符串，不要编造“未提供主题”“未知主题”等占位词，系统会复用历史信息。若同时给出新时间，再额外输出一条 schedule。本条动态附带的直播预约属于新日程，不要把该预约本身输出成 cancel。\n\
              当前日期：{}。动态发布时间：{}。未标明日期的周表按当前自然周 {} 至 {} 解释；只有时间没有日期时，按发布时间和未来最近日期解释。\n\
              一条动态可能包含多个主播、多条日程，必须分别输出。performer 填日程对应主播的可见名称，aliases 可填括号、昵称或同义称呼。participants 是本次直播的全部可见参与者姓名数组，也包含未订阅或陌生人；尽量使用动态中出现的完整 B 站昵称，单人直播可只填一人。\n\
+             正文常把时间写在事项前面（“6:00来看IG VS geng四强战”“今晚20:00来杂谈”“*明晚8点 歌回”），行首的 *、·、-、👉、① 等列表符号或项目符号不影响识别；每个带时间的事项都要单独输出，不要因为已经有别的条目就只挑一条。陪看、转播、解说比赛（“来看XX四强战”）同样是直播日程。同一行里既有日期又有时间时按该日期；只有时间时按发布时间和未来最近日期解释。\n\
+             本条动态若自带直播预约卡片，卡片那一场按预约处理：正文里与预约时间相同的重复条目可以不输出，但正文里另写的其它时间点必须照样输出，不要因为存在预约就整段跳过。\n\
              多人团播必须只输出一条事件，在 participants 中列出全部人员，不要把同一场团播按参与者拆成多条。只有同一时间存在多个独立直播间或明确不同场次时才拆分。A-SOUL 视为乃琳、嘉然、贝拉三人团体。团播直播间可能属于未订阅人员，room_url 必须优先使用原文明确给出的直播间链接或房间号，room_owner 填原文能确认的直播间所属主播；不能确认时填 null，不要猜测成 performer 的直播间。\n\
              title 只填直播主题，不要重复主播名。只有星期几、既没有明确日期也没有本周/下周等周范围时不要猜测；只有日期没有具体时间的事件不要输出；过去日期不要输出；无法确认主播的事件不要输出；end_at 可为 null；confidence 为 0 到 1 的数字。\n\
              start_at 和 end_at 使用带时区的 RFC3339，例如 2026-10-30T20:00:00+08:00。room_url 只允许 https://live.bilibili.com/ 的链接。",
@@ -942,7 +950,7 @@ impl LlmClient {
         analysis.source_digest = source_digest;
         Ok(analysis)
     }
-    async fn download_image(&self, image_url: &str) -> AppResult<(String, Vec<u8>)> {
+    async fn download_image(&self, image_url: &str) -> AppResult<Option<(String, Vec<u8>)>> {
         let response = self
             .http
             .get(image_url)
@@ -967,16 +975,29 @@ impl LlmClient {
             .split(';')
             .next()
             .unwrap_or("image/jpeg")
+            .trim()
             .to_owned();
+        let bytes = read_bounded_body(response, IMAGE_DOWNLOAD_LIMIT_BYTES).await?;
+        if is_skippable_image(&content_type, &bytes) {
+            tracing::debug!(image_url, content_type, "skip animated image");
+            return Ok(None);
+        }
         if !matches!(
             content_type.as_str(),
             "image/jpeg" | "image/png" | "image/webp"
         ) {
             return Err(AppError::validation("图片格式只支持 JPEG、PNG 或 WebP"));
         }
-        let bytes = read_bounded_body(response, IMAGE_DOWNLOAD_LIMIT_BYTES).await?;
-        Ok((content_type, bytes))
+        Ok(Some((content_type, bytes)))
     }
+}
+
+/// 动图（GIF）不进入日程提取：跳过即可，既不算失败，也不占模型调用。
+/// 用 Content-Type 加文件头双保险，避免 CDN 把 GIF 标成 image/png 时误判。
+fn is_skippable_image(content_type: &str, bytes: &[u8]) -> bool {
+    content_type.eq_ignore_ascii_case("image/gif")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
 }
 
 fn prepare_image_for_llm(bytes: &[u8]) -> AppResult<Vec<u8>> {
@@ -1280,7 +1301,7 @@ impl ContentAnalyzer for LlmClient {
         context_text: &str,
         published_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> AppResult<LlmAnalysis> {
+    ) -> AppResult<Option<LlmAnalysis>> {
         LlmClient::analyze_image_url(self, config, image_url, context_text, published_at, now).await
     }
 
@@ -1495,6 +1516,17 @@ mod tests {
         let b = analysis_cache_key("1", "digest-b", "model", "v1");
         assert_ne!(a, b);
         assert!(a.contains(":model:v1"));
+    }
+
+    #[test]
+    fn animated_gif_images_are_skipped_instead_of_rejected() {
+        assert!(is_skippable_image("image/gif", b""));
+        assert!(is_skippable_image("IMAGE/GIF", b""));
+        assert!(is_skippable_image("image/png", b"GIF89a-rest-of-payload"));
+
+        let png = png_bytes(8, 8);
+        assert!(!is_skippable_image("image/png", &png));
+        assert!(!is_skippable_image("image/jpeg", b""));
     }
 
     #[test]

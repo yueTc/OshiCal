@@ -1021,7 +1021,16 @@ h3 {
 .tiny-badge.room-owner { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-label { color: var(--live); background: var(--live-soft); }
 .group-label { flex: 0 0 auto; color: var(--primary-strong); background: var(--primary-soft); white-space: nowrap; }
-.card-more { align-self: start; opacity: 0; }
+/* 更多操作按钮固定在卡片内右上角，保证在时间线/日历任何栏宽下都不越出卡片边框。 */
+.card-more {
+  position: absolute;
+  top: 9px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  opacity: 0;
+}
 .schedule-card:hover .card-more,
 .schedule-card:focus-within .card-more { opacity: 1; }
 
@@ -1215,6 +1224,7 @@ h3 {
 .context-menu button:hover { background: var(--surface-soft); }
 .context-menu button:disabled:hover { background: transparent; }
 .context-menu button.danger { color: var(--danger); }
+.context-menu button.live-room-entry.is-live { color: var(--live); font-weight: 750; }
 
 .creator-context-menu {
   width: 188px;
@@ -2391,8 +2401,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .day-heading { position: static; padding-block: 8px 0; }
   .day-heading-grip { top: 9px; }
   .schedule-card { grid-template-columns: 58px 38px minmax(0,1fr); }
-  .card-more { opacity: 1; position: absolute; right: 5px; top: 5px; }
-  .schedule-content h3 { padding-right: 24px; }
+  .card-more { opacity: 1; position: absolute; right: 8px; top: 8px; }
+  .schedule-content h3 { padding-right: 32px; }
   .schedule-time { font-size: 15px; }
   .mode-grid, .import-stats { grid-template-columns: 1fr; }
   .device-sync-header { flex-direction: column; }
