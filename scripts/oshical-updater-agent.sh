@@ -686,6 +686,10 @@ record_installed_version() {
 ' "$1" | safe_replace_file "$installed_version_file"
 }
 
+# installed-version 状态校验引用了 $semver_regex，但脚本从未定义它。
+# 在 set -u 下第一次真正处理请求就会以 unbound variable 退出，
+# 表现为状态停在 requested/queued、journal 里只有这一行错误。
+semver_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 if ! current_version="$(health_version 2>/dev/null)"; then
   write_status "failed" "failed" "无法读取当前服务器版本，稍后重试" "server health request failed" "$target_version"
   exit 1
