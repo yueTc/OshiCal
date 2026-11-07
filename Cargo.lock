@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-desktop"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "futures-util",
