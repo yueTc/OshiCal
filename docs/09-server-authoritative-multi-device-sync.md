@@ -819,6 +819,7 @@ device_id 不随服务器迁移改变，也不在设备间共享。
 - dynamic_poll_seconds
 - auto_analyze_images
 - live_stats_enabled
+- fertility_enabled
 - llm_base_url
 - llm_model
 - llm_prompt_version

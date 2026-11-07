@@ -1,0 +1,10 @@
+[Unit]
+Description=Check LAPLACE crawler health every 3 hours
+
+[Timer]
+OnCalendar=*-*-* 00/3:47:00
+Persistent=true
+Unit=laplace-watchdog.service
+
+[Install]
+WantedBy=timers.target

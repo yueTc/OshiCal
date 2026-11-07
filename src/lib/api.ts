@@ -291,9 +291,11 @@ export class ServerApi {
     return this.request(`/api/live-sessions/by-schedule/${scheduleId}`);
   }
 
+  /** 读取 LAPLACE 生理期数据；refresh 为 true 时绕过服务端 6 小时缓存。 */
   fertility(refresh = false): Promise<FertilitySnapshot> {
     return this.request(`/api/fertility?refresh=${refresh ? "true" : "false"}`);
   }
+
   settings(): Promise<AppSettings> {
     return this.request("/api/settings");
   }
@@ -600,9 +602,11 @@ export class LocalApi {
     return invoke("live_session_for_schedule", { scheduleId });
   }
 
+  /** 「寻血猎犬」关闭时返回 enabled=false 的空快照，不会触网。 */
   fertility(refresh = false): Promise<FertilitySnapshot> {
     return invoke("list_fertility_statuses", { refresh });
   }
+
   settings(): Promise<AppSettings> {
     return invoke("get_settings");
   }
@@ -759,7 +763,7 @@ export async function openExternalUrl(url: string): Promise<void> {
     parsed.protocol !== "https:" ||
     !["live.bilibili.com", "space.bilibili.com", "t.bilibili.com", "www.bilibili.com", "laplace.live"].includes(parsed.hostname)
   ) {
-    throw new Error("只允许打开 B 站直播间、个人主页、动态、站内作品页面或 LAPLACE 魔法期页面");
+    throw new Error("只允许打开 B 站直播间、个人主页、动态、站内作品页面或 LAPLACE 生理期页面");
   }
   window.open(parsed.toString(), "_blank", "noopener,noreferrer");
 }

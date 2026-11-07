@@ -10,6 +10,7 @@ export interface AppSettings {
   autoAnalyzeImages: boolean;
   notificationsEnabled: boolean;
   liveStatsEnabled: boolean;
+  fertilityEnabled: boolean;
   llmBaseUrl: string;
   llmModel: string;
   llmPromptVersion: string;
@@ -247,9 +248,12 @@ export interface FertilityStatus {
   cycleLength: number | null;
   periodLength: number | null;
   dataPoints: number;
+  matchedMid: string;
 }
 
 export interface FertilitySnapshot {
+  /** 「寻血猎犬」开关状态；false 时服务端不会抓取，也不会读取缓存。 */
+  enabled: boolean;
   fetchedAt: string;
   source: string;
   stale: boolean;
@@ -504,6 +508,7 @@ export interface ServerSettings {
   dynamicPollSeconds?: number;
   autoAnalyzeImages?: boolean;
   liveStatsEnabled?: boolean;
+  fertilityEnabled?: boolean;
   llmBaseUrl?: string;
   llmModel?: string;
   llmPromptVersion?: string;

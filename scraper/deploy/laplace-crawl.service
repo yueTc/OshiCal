@@ -1,0 +1,36 @@
+[Unit]
+Description=LAPLACE daily crawler
+Documentation=file:/opt/laplace/DEPLOY_DAILY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/laplace
+ExecStart=/usr/bin/python3 /opt/laplace/laplace_daemon.py \
+    --out /var/lib/laplace \
+    --once --digest \
+    --workers 6 --rate 6 \
+    --cycle-retries 3 \
+    --full-interval 604800
+# 单次作业最长 30 分钟，超时即失败（有 cycle-retries 兜底）
+TimeoutStartSec=1800
+# 失败自动重试一次
+Restart=on-failure
+RestartSec=300
+StandardOutput=append:/var/log/laplace/cron.log
+StandardError=append:/var/log/laplace/cron.log
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/laplace /var/log/laplace
+Environment=TZ=Asia/Shanghai
+# 需要代理时取消注释
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
+# Environment=LAPLACE_ALERT_WEBHOOK=https://your-webhook-endpoint
+
+[Install]
+WantedBy=multi-user.target

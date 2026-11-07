@@ -69,6 +69,7 @@ pub struct FertilityStatus {
     pub mid: String,
     pub streamer_name: String,
     pub streamer_avatar: String,
+    /// `menstruating` / `fertile` / `ovulating` / `normal`，未知值原样透出。
     pub status: String,
     pub day_in_cycle: Option<i64>,
     pub ovulation_day: Option<i64>,
@@ -76,11 +77,14 @@ pub struct FertilityStatus {
     pub cycle_length: Option<i64>,
     pub period_length: Option<i64>,
     pub data_points: i64,
+    pub matched_mid: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FertilitySnapshot {
+    /// 「寻血猎犬」开关状态；false 时不抓取也不读缓存。
+    pub enabled: bool,
     pub fetched_at: DateTime<Utc>,
     pub source: String,
     pub stale: bool,
@@ -88,6 +92,21 @@ pub struct FertilitySnapshot {
     pub total_available: usize,
     pub matched: usize,
     pub statuses: Vec<FertilityStatus>,
+}
+
+impl FertilitySnapshot {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            fetched_at: Utc::now(),
+            source: "disabled".to_owned(),
+            stale: false,
+            warning: None,
+            total_available: 0,
+            matched: 0,
+            statuses: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -469,6 +488,9 @@ pub struct ServerSettings {
     pub dynamic_poll_seconds: u64,
     pub auto_analyze_images: bool,
     pub live_stats_enabled: bool,
+    /// 「寻血猎犬」开关：开启后服务端才会抓取 LAPLACE 生理期数据。
+    #[serde(default)]
+    pub fertility_enabled: bool,
     pub llm_base_url: String,
     pub llm_model: String,
     pub llm_prompt_version: String,
@@ -484,6 +506,7 @@ impl Default for ServerSettings {
             dynamic_poll_seconds: 300,
             auto_analyze_images: true,
             live_stats_enabled: false,
+            fertility_enabled: false,
             llm_base_url: "https://api.openai.com/v1".to_owned(),
             llm_model: String::new(),
             llm_prompt_version: "schedule-v1".to_owned(),

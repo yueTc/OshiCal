@@ -1794,6 +1794,7 @@ async fn apply_server_settings(
         ("dynamicPollSeconds", "dynamic_poll_seconds"),
         ("autoAnalyzeImages", "auto_analyze_images"),
         ("liveStatsEnabled", "live_stats_enabled"),
+        ("fertilityEnabled", "fertility_enabled"),
         ("llmBaseUrl", "llm_base_url"),
         ("llmModel", "llm_model"),
         ("llmPromptVersion", "llm_prompt_version"),

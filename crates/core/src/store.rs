@@ -299,6 +299,7 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
+/// LAPLACE 抓取结果的单行缓存，`id` 恒为 1。
 #[derive(Debug, Clone)]
 pub struct FertilityCache {
     pub payload_json: String,
@@ -3201,8 +3202,8 @@ impl SqliteStore {
                     "SELECT COALESCE(MAX(revision), 0) + 1 FROM settings
                      WHERE key IN (
                         'live_poll_seconds', 'dynamic_poll_seconds', 'auto_analyze_images',
-                        'live_stats_enabled', 'llm_base_url', 'llm_model',
-                        'llm_prompt_version', 'proxy_port'
+                        'live_stats_enabled', 'fertility_enabled', 'llm_base_url',
+                        'llm_model', 'llm_prompt_version', 'proxy_port'
                      )",
                 )
                 .fetch_one(&mut *tx)
@@ -3247,7 +3248,7 @@ impl SqliteStore {
         };
         let fetched_at: String = row.try_get("fetched_at")?;
         let fetched_at = DateTime::parse_from_rfc3339(&fetched_at)
-            .map_err(|error| AppError::validation(format!("魔法期缓存时间无效: {error}")))?
+            .map_err(|error| AppError::validation(format!("生理期缓存时间无效: {error}")))?
             .with_timezone(&Utc);
         Ok(Some(FertilityCache {
             payload_json: row.try_get("payload_json")?,
@@ -3272,6 +3273,13 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn clear_fertility_cache(&self) -> AppResult<u64> {
+        let result = sqlx::query("DELETE FROM fertility_cache WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn enqueue_mutation(&self, mutation: &SyncMutation) -> AppResult<()> {
@@ -3648,6 +3656,7 @@ fn is_server_setting_key(key: &str) -> bool {
             | "dynamic_poll_seconds"
             | "auto_analyze_images"
             | "live_stats_enabled"
+            | "fertility_enabled"
             | "llm_base_url"
             | "llm_model"
             | "llm_prompt_version"

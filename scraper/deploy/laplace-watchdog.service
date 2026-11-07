@@ -1,0 +1,21 @@
+[Unit]
+Description=LAPLACE crawler watchdog (alert if last success too old)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/laplace
+# 超过 30 小时没成功就告警（日更正常为 24 小时一次）
+ExecStart=/usr/bin/python3 /opt/laplace/laplace_daemon.py \
+    --out /var/lib/laplace \
+    --check-age-hours 30
+StandardOutput=append:/var/log/laplace/watchdog.log
+StandardError=append:/var/log/laplace/watchdog.log
+Environment=TZ=Asia/Shanghai
+# Environment=LAPLACE_ALERT_WEBHOOK=https://your-webhook-endpoint
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

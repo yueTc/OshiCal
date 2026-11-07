@@ -36,7 +36,7 @@ import type {
 } from "../types";
 import type { SecretInput } from "../lib/secret-types";
 import type { AppearanceSettings } from "../lib/appearance";
-import { explainError } from "../lib/api";
+import { explainError, openExternalUrl } from "../lib/api";
 import {
   readClientGithubMirror,
   saveClientGithubMirror,
@@ -86,6 +86,7 @@ function settingsEqual(left: AppSettings, right: AppSettings): boolean {
     left.autoAnalyzeImages === right.autoAnalyzeImages &&
     left.notificationsEnabled === right.notificationsEnabled &&
     left.liveStatsEnabled === right.liveStatsEnabled &&
+    left.fertilityEnabled === right.fertilityEnabled &&
     left.llmBaseUrl === right.llmBaseUrl &&
     left.llmModel === right.llmModel &&
     left.llmPromptVersion === right.llmPromptVersion &&
@@ -279,6 +280,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [githubMirrorSaving, setGithubMirrorSaving] = useState(false);
   const [githubMirrorError, setGithubMirrorError] = useState<string | null>(null);
   const [serverMirrorError, setServerMirrorError] = useState<string | null>(null);
+  const [bloodhoundOpen, setBloodhoundOpen] = useState(false);
+  const [bloodhoundBusy, setBloodhoundBusy] = useState(false);
+  const bloodhoundBusyRef = useRef(false);
   const serverUpdateDirtyRef = useRef(false);
   const serverUpdateRef = useRef<ServerUpdateInfo | null>(serverUpdate);
   const serverUpdateDraftRef = useRef(serverUpdateDraft);
@@ -370,6 +374,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         "dynamicPollSeconds",
         "autoAnalyzeImages",
         "liveStatsEnabled",
+        "fertilityEnabled",
         "llmBaseUrl",
         "llmModel",
         "llmPromptVersion",
@@ -386,6 +391,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     settings.dynamicPollSeconds,
     settings.livePollSeconds,
     settings.liveStatsEnabled,
+    settings.fertilityEnabled,
     settings.llmBaseUrl,
     settings.llmModel,
     settings.llmPromptVersion,
@@ -869,8 +875,57 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
-  async function saveAndLeave() {
-    if (leaveSavingRef.current) {
+  /**
+   * 「寻血猎犬」开关：开启必须经过确认弹窗，关闭立即生效。
+   * 这里只用已保存的配置草稿提交单个字段，不会把手上的其他未保存编辑一起写下去。
+   */
+  async function setBloodhound(next: boolean): Promise<boolean> {
+    if (bloodhoundBusyRef.current) {
+      return false;
+    }
+    bloodhoundBusyRef.current = true;
+    setBloodhoundBusy(true);
+    setError(null);
+    try {
+      const base = savedDraftRef.current;
+      const payload: AppSettings = { ...base, fertilityEnabled: next };
+      const savedSettings = await actions.save(payload, {}, savedAutoLaunch);
+      savedDraftRef.current = savedSettings;
+      setSavedDraft(savedSettings);
+      // 只有当用户没有在别处继续改动时才把草稿整体对齐，避免吞掉未保存编辑。
+      setDraft((current) =>
+        current.fertilityEnabled === base.fertilityEnabled
+          ? { ...current, fertilityEnabled: savedSettings.fertilityEnabled }
+          : current,
+      );
+      setSaved(true);
+      return true;
+    } catch (saveError) {
+      const message = explainError(saveError);
+      setError(message);
+      onError(message);
+      return false;
+    } finally {
+      bloodhoundBusyRef.current = false;
+      setBloodhoundBusy(false);
+    }
+  }
+
+  async function confirmBloodhound() {
+    if (await setBloodhound(true)) {
+      setBloodhoundOpen(false);
+    }
+  }
+
+  async function openLaplaceSite() {
+    try {
+      await openExternalUrl("https://laplace.live/ovu");
+    } catch (openError) {
+      onError(explainError(openError));
+    }
+  }
+
+  async function saveAndLeave() {    if (leaveSavingRef.current) {
       return;
     }
     leaveSavingRef.current = true;
@@ -1391,7 +1446,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         </div>
 
         <section className="settings-card span-2">
-          <header><h2>网络代理</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>B 站、日程模型和魔法期等 HTTP 请求统一通过 HTTP 代理。</span></header>
+          <header><h2>网络代理</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>B 站和日程模型等 HTTP 请求统一通过 HTTP 代理。</span></header>
           <div className="form-grid proxy-grid">
             <label>
               <span>本机代理端口</span>
@@ -1472,6 +1527,57 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               label="直播数据统计"
             />
             <p className="form-hint">开启后可在主播库为单个主播订阅直播数据；原始弹幕和礼物事件不落盘。</p>
+          </div>
+        </section>
+
+        <section className="settings-card bloodhound-card">
+          <header>
+            <h2>寻血猎犬</h2>
+            <span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span>
+            <span>从 LAPLACE 抓取生理期数据，展示在主播库的主播粉丝数旁边。</span>
+          </header>
+          <div className="settings-stack">
+            {draft.fertilityEnabled ? (
+              <>
+                <div className="bloodhound-status is-on">
+                  <span className="bloodhound-dot" aria-hidden="true" />
+                  <div>
+                    <strong>已开启</strong>
+                    <span>
+                      {serverMode ? "服务端" : "本机"}每 6 小时抓取一次 LAPLACE 全量列表，仅在主播库匹配展示；
+                      关闭后立即停止抓取。
+                    </span>
+                  </div>
+                  <button
+                    className="button secondary"
+                    onClick={() => void setBloodhound(false)}
+                    disabled={bloodhoundBusy}
+                  >
+                    {bloodhoundBusy ? "处理中…" : "关闭"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="bloodhound-status">
+                  <span className="bloodhound-dot" aria-hidden="true" />
+                  <div>
+                    <strong>未开启</strong>
+                    <span>默认关闭。开启前需要确认免责声明与数据来源说明，未开启时不会发出任何 LAPLACE 请求。</span>
+                  </div>
+                  <button
+                    className="button primary"
+                    onClick={() => setBloodhoundOpen(true)}
+                    disabled={bloodhoundBusy}
+                  >
+                    {bloodhoundBusy ? "处理中…" : "开启寻血猎犬"}
+                  </button>
+                </div>
+              </>
+            )}
+            <p className="form-hint">
+              数据由 LAPLACE（laplace.live）及其投稿者整理与预测，本项目只做只读抓取，不上传任何数据。
+            </p>
           </div>
         </section>
 
@@ -1743,6 +1849,67 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           </section>
         ) : null}
       </div>
+
+      {bloodhoundOpen ? (
+        <Modal
+          title="开启寻血猎犬？"
+          onClose={() => {
+            if (!bloodhoundBusy) {
+              setBloodhoundOpen(false);
+            }
+          }}
+          footer={
+            <>
+              <button
+                className="button secondary"
+                onClick={() => setBloodhoundOpen(false)}
+                disabled={bloodhoundBusy}
+              >
+                取消
+              </button>
+              <button
+                className="button secondary"
+                onClick={() => void openLaplaceSite()}
+                disabled={bloodhoundBusy}
+              >
+                <ExternalLink size={16} />前往 LAPLACE
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void confirmBloodhound()}
+                disabled={bloodhoundBusy}
+              >
+                {bloodhoundBusy ? "正在保存…" : "已阅读并同意，开启寻血猎犬"}
+              </button>
+            </>
+          }
+        >
+          <div className="bloodhound-confirm">
+            <section>
+              <h3>免责声明</h3>
+              <ul>
+                <li>生理期数据由 LAPLACE 的投稿者提交，并由其模型推算；本应用只做只读抓取，不生成也不校验内容。</li>
+                <li>这些数据仅供娱乐参考，<strong>不是医疗信息</strong>，不构成任何健康建议或诊断依据。</li>
+                <li>预测存在误差，可能滞后、缺失或与实际情况不符；请勿据此做出任何医疗、法律或人身决定。</li>
+                <li>数据涉及第三方个人信息；开启后这些信息只保存在{serverMode ? "你的服务器" : "本机"}数据库，不会回传给我们。</li>
+                <li>「寻血猎犬」默认关闭；关闭后会立即停止抓取，已缓存的数据会保留在本地数据库中。</li>
+              </ul>
+            </section>
+            <section>
+              <h3>致谢</h3>
+              <p>
+                感谢 <strong>LAPLACE</strong>（<a href="https://laplace.live/ovu" target="_blank" rel="noreferrer">laplace.live/ovu</a>）
+                及其所有投稿者、维护者。没有他们长期整理与公开的数据，这个功能无法存在。
+                如果 LAPLACE 认为本接入方式不妥，我们会立刻下线该功能。
+              </p>
+            </section>
+            <p className="form-hint">
+              点击下方按钮表示你已阅读并理解以上说明，同意{serverMode ? "服务端" : "本机"}每 6 小时抓取一次
+              LAPLACE 公开列表；关闭不受限制。
+            </p>
+          </div>
+        </Modal>
+      ) : null}
 
       {leavePromptOpen ? (
         <Modal

@@ -632,3 +632,61 @@ async fn llm_test_endpoint_runs_fixed_calendar_fixture() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["data"], json!(["fixture-vision", "fixture-text"]));
 }
+
+#[tokio::test]
+async fn fertility_endpoint_stays_disabled_until_the_switch_is_on() {
+    let app = build_router(state().await);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/fertility?refresh=true")
+                .header(header::AUTHORIZATION, auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("disabled fertility response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["enabled"], false);
+    assert_eq!(value["data"]["matched"], 0);
+    assert_eq!(value["data"]["source"], "disabled");
+    assert_eq!(value["data"]["statuses"], json!([]));
+
+    // 打开开关会把 fertilityEnabled 写进服务端设置并原样返回。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/settings")
+                .header(header::AUTHORIZATION, auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("settings response");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let mut settings: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(settings["data"]["fertilityEnabled"], false);
+    settings["data"]["fertilityEnabled"] = json!(true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings")
+                .header(header::AUTHORIZATION, auth_header())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(settings["data"].to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("settings save response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let saved: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(saved["data"]["fertilityEnabled"], true);
+}

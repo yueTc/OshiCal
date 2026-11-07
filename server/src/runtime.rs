@@ -6,6 +6,7 @@ use tokio::time::Instant;
 use chrono::{Duration as ChronoDuration, Utc};
 use oshical_core::{
     load_settings, AppService, SqliteStore, SyncPrunePolicy, FAN_POLL_INTERVAL_SECONDS,
+    FERTILITY_POLL_INTERVAL_SECONDS,
 };
 use tokio::sync::broadcast;
 
@@ -167,6 +168,27 @@ pub fn spawn_background_tasks(state: AppState) {
                             "粉丝数采集完成，部分主播失败"
                         ),
                         Err(error) => tracing::warn!(%error, "粉丝数采集失败"),
+                    }
+                }
+            },
+        )
+        .await;
+    });
+
+    let fertility_state = state.clone();
+    tokio::spawn(async move {
+        run_poll_loop(
+            || async { Duration::from_secs(FERTILITY_POLL_INTERVAL_SECONDS) },
+            move |_| {
+                let service = fertility_state.service.clone();
+                async move {
+                    // 开关关闭时 refresh_fertility_if_enabled 直接返回 Ok(None)，不会发出请求。
+                    match service.refresh_fertility_if_enabled().await {
+                        Ok(Some(matched)) => {
+                            tracing::info!(matched, "LAPLACE 生理期数据采集完成")
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "LAPLACE 生理期数据采集失败"),
                     }
                 }
             },

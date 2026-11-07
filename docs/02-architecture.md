@@ -201,6 +201,17 @@ crates/core
 | payload_json | TEXT | 事件内容 |
 | created_at | TEXT | 创建时间 |
 
+### fertility_cache
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | INTEGER PK CHECK (id = 1) | 单行缓存 |
+| payload_json | TEXT | LAPLACE 全量列表原始 JSON |
+| fetched_at | TEXT | 抓取时间；超过 6 小时视为过期 |
+| source | TEXT | `laplace` 直连或 `jina-reader` 代理 |
+
+只在设置项 `fertility_enabled` 开启时写入；关闭开关不会自动删除已有缓存，方便再次开启时立即展示。
+
 ## 5. HTTP 契约
 
 成功响应使用 `{ "ok": true, "data": {} }`，失败响应使用 `{ "ok": false, "error": { "code": "VALIDATION_ERROR", "message": "非法时间" } }`。
@@ -226,6 +237,7 @@ crates/core
 | GET | `/api/live-status` | 当前开播状态 |
 | GET | `/api/live-sessions?streamerId=&limit=` | 直播场次列表 |
 | GET | `/api/live-sessions/by-schedule/:id` | 日程最接近的直播场次数据 |
+| GET | `/api/fertility?refresh=` | LAPLACE 生理期快照；开关关闭时只返回 `enabled=false` 的空快照 |
 | GET | `/api/sync/snapshot` | 全量订阅、官号、日程、游标 |
 | POST | `/api/sync/mutations` | 幂等提交离线队列 |
 | GET | `/api/sync/conflicts` | 查询待处理冲突 |

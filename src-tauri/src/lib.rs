@@ -13,7 +13,7 @@ use oshical_core::{
     DataMode, FanHistory, FertilitySnapshot, LlmConfig, LlmDiscoveryConfig, LlmTestReport,
     NewSchedule, NewWeeklyScheduleRule, ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule,
     Streamer, SyncMutation, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule,
-    WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS,
+    WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS, FERTILITY_POLL_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -902,6 +902,15 @@ async fn live_session_for_schedule(
         .await
         .map_err(map_error)
 }
+
+#[tauri::command]
+async fn check_live_now(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<oshical_core::LiveStatus>, String> {
+    state.service.check_live_all().await.map_err(map_error)
+}
+
+/// 「寻血猎犬」开关关闭时只返回空快照，不读取缓存也不发起网络请求。
 #[tauri::command]
 async fn list_fertility_statuses(
     state: State<'_, DesktopState>,
@@ -912,13 +921,6 @@ async fn list_fertility_statuses(
         .list_fertility_statuses(refresh)
         .await
         .map_err(map_error)
-}
-
-#[tauri::command]
-async fn check_live_now(
-    state: State<'_, DesktopState>,
-) -> Result<Vec<oshical_core::LiveStatus>, String> {
-    state.service.check_live_all().await.map_err(map_error)
 }
 
 #[tauri::command]
@@ -1298,6 +1300,41 @@ fn spawn_local_monitor(app: AppHandle) {
                     Ok(_) => {}
                     Err(error) => {
                         let _ = fan_app.emit("monitor-error", error.to_string());
+                    }
+                }
+            }
+        }
+    });
+
+    let fertility_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut previous = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let state = fertility_app.state::<DesktopState>();
+            let settings = match load_settings(state.service.store()).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let _ = fertility_app.emit("monitor-error", error.to_string());
+                    continue;
+                }
+            };
+            if settings.data_mode != DataMode::Local || !settings.fertility_enabled {
+                // 关闭开关时重置计时，重新开启后立即触发一次采集。
+                previous = None;
+                continue;
+            }
+            if previous.is_none_or(|started: Instant| {
+                started.elapsed() >= Duration::from_secs(FERTILITY_POLL_INTERVAL_SECONDS)
+            }) {
+                previous = Some(Instant::now());
+                match state.service.refresh_fertility_if_enabled().await {
+                    Ok(Some(_)) => {
+                        let _ = fertility_app.emit("fertility-updated", Utc::now().to_rfc3339());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = fertility_app.emit("monitor-error", error.to_string());
                     }
                 }
             }
@@ -1828,7 +1865,7 @@ fn validate_external_url(value: &str) -> Result<url::Url, String> {
         );
     if !allowed {
         return Err(
-            "只允许打开 B 站直播间、个人主页、动态、站内作品页面或 LAPLACE 魔法期页面，且必须使用 HTTPS"
+            "只允许打开 B 站直播间、个人主页、动态、站内作品页面或 LAPLACE 生理期页面，且必须使用 HTTPS"
                 .to_owned(),
         );
     }

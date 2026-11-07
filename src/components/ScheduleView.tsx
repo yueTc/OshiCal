@@ -9,7 +9,6 @@ import {
   ChevronRight,
   Clock3,
   Grid3X3,
-  GripHorizontal,
   GripVertical,
   List,
   LoaderCircle,
@@ -34,6 +33,7 @@ import type {
 import { addDays, eventDayKey, inputDateTime, localDateKey, rangeAroundDays, rollingDays, timeLabel } from "../lib/dates";
 import { explainError, openExternalUrl } from "../lib/api";
 import { matchLiveSchedules } from "../lib/live-schedule";
+import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
 import { Avatar, EmptyState, ErrorBanner, Modal, SubscriptionSelect } from "./ui";
 
 function formatLiveDuration(seconds: number): string {
@@ -98,8 +98,7 @@ const TIMELINE_CARD_MIN_WIDTH = 250;
 const TIMELINE_EVENT_GAP = 10;
 const TIMELINE_DATE_GAP = 8;
 const TIMELINE_GAP = 18;
-const TIMELINE_SWIPE_THRESHOLD = 32;
-const TIMELINE_SWIPE_DAY_STEP = 78;
+const TIMELINE_VISIBLE_MIN_PX = 2;
 
 function clampGridDayWidth(width: number): number {
   return Math.min(GRID_DAY_WIDTH_MAX, Math.max(GRID_DAY_WIDTH_MIN, width));
@@ -117,12 +116,6 @@ function clampTimelineColumns(columns: number): number {
 function readTimelineColumnsPreference(): number {
   const stored = Number.parseInt(readLocalPreference(TIMELINE_COLUMNS_KEY) ?? "", 10);
   return Number.isFinite(stored) ? clampTimelineColumns(stored) : TIMELINE_COLUMNS_DEFAULT;
-}
-
-function timelineDaysForDelta(deltaY: number): number {
-  if (Math.abs(deltaY) < TIMELINE_SWIPE_THRESHOLD) return 0;
-  const raw = Math.round(-deltaY / TIMELINE_SWIPE_DAY_STEP);
-  return raw === 0 ? (deltaY < 0 ? 1 : -1) : raw;
 }
 
 function prefersReducedMotion(): boolean {
@@ -248,10 +241,13 @@ export default function ScheduleView({
   const longPressTriggered = useRef(false);
   const suppressClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gridWheelTimerRef = useRef<number | null>(null);
-  const timelineWheelTimerRef = useRef<number | null>(null);
   const pageRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+  const timelineViewportRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+  const timelineVisibleFrameRef = useRef<number | null>(null);
+  const timelineTopAnchorRef = useRef<{ key: string; offset: number } | null>(null);
+  const timelineScrollTargetRef = useRef<string | null>(localDateKey(new Date()));
   const menuRef = useRef<HTMLDivElement>(null);
   const loadedWindowRef = useRef<{ from: number; to: number } | null>(null);
   const hasLoadedScheduleRef = useRef(false);
@@ -263,10 +259,9 @@ export default function ScheduleView({
   const removingScheduleIdsRef = useRef<Set<number>>(new Set());
   const liveRequestRef = useRef(0);
   const gridDragRef = useRef<{ startX: number; deltaX: number } | null>(null);
-  const timelineSwipeRef = useRef<{ startY: number; deltaY: number } | null>(null);
+  const timelineSwipeRef = useRef<{ startY: number; startScrollTop: number; moved: boolean } | null>(null);
   const suppressCardClickRef = useRef(false);
   const gridWheelLockRef = useRef(false);
-  const timelineWheelLockRef = useRef(false);
   const [gridDayWidth, setGridDayWidth] = useState(readGridDayWidthPreference);
   const [timelineColumns, setTimelineColumns] = useState(readTimelineColumnsPreference);
   const [calendarWidth, setCalendarWidth] = useState(0);
@@ -293,12 +288,9 @@ export default function ScheduleView({
   const effectiveTimelineColumns = Math.min(timelineColumns, timelineColumnsMax);
   const [gridWindowStart, setGridWindowStart] = useState(() => addDays(new Date(), -GRID_WINDOW_BEFORE));
   const [dragDayDelta, setDragDayDelta] = useState(0);
-  const [timelineSwipeDayDelta, setTimelineSwipeDayDelta] = useState(0);
+  const [gridPanRemainder, setGridPanRemainder] = useState(0);
+  const [timelineVisibleDays, setTimelineVisibleDays] = useState<Date[]>([]);
   const [timelineViewportHeight, setTimelineViewportHeight] = useState(0);
-  const [timelineOffsetY, setTimelineOffsetY] = useState(0);
-  const pendingDragReleaseRef = useRef(false);
-  const pendingTimelineReleaseRef = useRef(false);
-  const releaseFrameRef = useRef<number | null>(null);
   draftRef.current = draft;
 
   const timelineDays = useMemo(() => rollingDays(anchor), [anchor]);
@@ -319,13 +311,29 @@ export default function ScheduleView({
   );
   const stripDays = viewMode === "grid"
     ? gridWindowDays.slice(previewStartIndex, previewStartIndex + visibleDayCount)
-    : rollingDays(addDays(anchor, timelineSwipeDayDelta));
+    : timelineVisibleDays.length
+      ? timelineVisibleDays
+      : timelineDays.slice(0, 1);
   const rangeDays = stripDays;
-  const displayDays = viewMode === "grid" ? visibleDays : timelineDays;
+  const peekBefore = viewMode === "grid" && gridPanRemainder > 0;
+  const peekAfter = viewMode === "grid" && gridPanRemainder < 0;
+  const displayDays = useMemo(() => {
+    const days = viewMode === "grid" ? visibleDays : timelineVisibleDays.length ? timelineVisibleDays : timelineDays;
+    return [
+      ...(peekBefore ? [addDays(days[0], -1)] : []),
+      ...days,
+      ...(peekAfter ? [addDays(days[days.length - 1], 1)] : []),
+    ];
+  }, [peekAfter, peekBefore, timelineDays, timelineVisibleDays, viewMode, visibleDays]);
+  const timelineVisibleKeySet = useMemo(
+    () => new Set(timelineVisibleDays.map(localDateKey)),
+    [timelineVisibleDays],
+  );
   const visibleStartTime = startOfLocalDay(displayDays[0] ?? anchor);
   const visibleEndTime = startOfLocalDay(addDays(displayDays[displayDays.length - 1] ?? anchor, 1));
-  const gridOffset = -visibleStartIndex * (gridDayWidth + GRID_GAP);
+  const gridOffset = -visibleStartIndex * (gridDayWidth + GRID_GAP) + gridPanRemainder;
   const changeGridDayWidth = (delta: number) => {
+    setGridPanRemainder(0);
     setGridDayWidth((current) => clampGridDayWidth(current + delta));
   };
   const changeTimelineColumns = (delta: number) => {
@@ -335,6 +343,12 @@ export default function ScheduleView({
   };
   const changeViewMode = (next: ViewMode) => {
     if (next === viewMode) return;
+    setGridPanRemainder(0);
+    setTimelineVisibleDays([]);
+    timelineTopAnchorRef.current = null;
+    if (next === "timeline") {
+      timelineScrollTargetRef.current = localDateKey(anchor);
+    }
     setViewEnterAnimation(false);
     if (prefersReducedMotion()) {
       setViewMode(next);
@@ -439,59 +453,181 @@ export default function ScheduleView({
     return () => observer.disconnect();
   }, []);
 
+  const captureTimelineTopAnchor = useCallback(() => {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    const days = viewport.querySelectorAll<HTMLElement>("[data-timeline-day]");
+    for (const day of days) {
+      const rect = day.getBoundingClientRect();
+      if (rect.bottom > viewportRect.top + 1 && rect.top < viewportRect.bottom) {
+        const key = day.dataset.timelineDay;
+        if (key) {
+          timelineTopAnchorRef.current = { key, offset: rect.top - viewportRect.top };
+        }
+        return;
+      }
+    }
+  }, []);
+
+  const restoreTimelineTopAnchor = useCallback(() => {
+    const viewport = timelineViewportRef.current;
+    const snapshot = timelineTopAnchorRef.current;
+    if (!viewport || !snapshot || timelineSwipeRef.current) return;
+    const day = viewport.querySelector<HTMLElement>(`[data-timeline-day="${snapshot.key}"]`);
+    if (!day) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    const currentOffset = day.getBoundingClientRect().top - viewportRect.top;
+    const compensation = timelineAnchorCompensation(currentOffset, snapshot.offset);
+    if (Math.abs(compensation) > 0.5) {
+      viewport.scrollTop += compensation;
+    }
+  }, []);
+
+  const readTimelineVisibleDays = useCallback(() => {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    const visibleTop = Math.max(0, viewportRect.top);
+    const visibleBottom = Math.min(window.innerHeight, viewportRect.bottom);
+    const rects = Array.from(viewport.querySelectorAll<HTMLElement>("[data-timeline-day]"))
+      .map((day) => ({
+        key: day.dataset.timelineDay ?? "",
+        top: day.getBoundingClientRect().top,
+        bottom: day.getBoundingClientRect().bottom,
+      }))
+      .filter((day) => day.key);
+    const keys = visibleTimelineDayKeys(rects, visibleTop, visibleBottom, TIMELINE_VISIBLE_MIN_PX);
+    const byKey = new Map(gridWindowDays.map((day) => [localDateKey(day), day]));
+    const next = keys.flatMap((key) => {
+      const day = byKey.get(key);
+      return day ? [day] : [];
+    });
+    setTimelineVisibleDays((current) => {
+      if (current.length === next.length && current.every((day, index) => localDateKey(day) === localDateKey(next[index]))) {
+        return current;
+      }
+      return next;
+    });
+    captureTimelineTopAnchor();
+    const topDay = next[0];
+    if (topDay && !timelineSwipeRef.current && localDateKey(topDay) !== localDateKey(anchor)) {
+      setAnchor(topDay);
+    }
+  }, [anchor, captureTimelineTopAnchor, gridWindowDays]);
+
+  const scheduleTimelineMeasurement = useCallback(() => {
+    if (timelineVisibleFrameRef.current !== null) return;
+    timelineVisibleFrameRef.current = requestAnimationFrame(() => {
+      timelineVisibleFrameRef.current = null;
+      readTimelineVisibleDays();
+    });
+  }, [readTimelineVisibleDays]);
+
+  const updateTimelineViewportHeight = useCallback(() => {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const top = Math.max(0, viewport.getBoundingClientRect().top);
+    const height = Math.min(900, Math.max(240, window.innerHeight - top - 24));
+    setTimelineViewportHeight((current) => Math.abs(current - height) < 0.5 ? current : height);
+  }, []);
+
   useLayoutEffect(() => {
     if (viewMode !== "timeline" || loading) return;
     const timeline = timelineRef.current;
     if (!timeline) return;
     const measure = () => {
-      const firstDay = timeline.firstElementChild;
-      const currentDay = timeline.querySelector<HTMLElement>(`[data-timeline-day="${localDateKey(anchor)}"]`);
-      const nextWindowDay = timeline.querySelector<HTMLElement>(`[data-timeline-day="${localDateKey(addDays(anchor, timelineDays.length))}"]`);
-      if (!(firstDay instanceof HTMLElement) || !currentDay || !nextWindowDay) return;
-      const nextOffset = nextWindowDay.offsetTop - currentDay.offsetTop - TIMELINE_GAP;
-      setTimelineOffsetY(currentDay.offsetTop - firstDay.offsetTop);
-      setTimelineViewportHeight(Math.max(0, nextOffset));
+      updateTimelineViewportHeight();
+      restoreTimelineTopAnchor();
+      scheduleTimelineMeasurement();
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
     observer.observe(timeline);
     return () => observer.disconnect();
-  }, [anchor, calendarWidth, effectiveTimelineColumns, gridWindowStart, loading, schedules, viewMode]);
+  }, [
+    calendarWidth,
+    effectiveTimelineColumns,
+    gridWindowStart,
+    loading,
+    restoreTimelineTopAnchor,
+    scheduleTimelineMeasurement,
+    schedules,
+    updateTimelineViewportHeight,
+    viewMode,
+  ]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const offset = differenceInCalendarDays(anchor, gridWindowStart);
-    const maxOffset = GRID_WINDOW_DAYS - visibleDayCount - 2;
+    const maxOffset = viewMode === "timeline"
+      ? GRID_WINDOW_DAYS - 8
+      : GRID_WINDOW_DAYS - visibleDayCount - 2;
     if (offset < 2 || offset > maxOffset) {
+      if (viewMode === "timeline" && timelineScrollTargetRef.current === null) {
+        captureTimelineTopAnchor();
+      }
       setGridWindowStart(addDays(anchor, -GRID_WINDOW_BEFORE));
     }
-  }, [anchor, gridWindowStart, visibleDayCount]);
+  }, [anchor, captureTimelineTopAnchor, gridWindowStart, viewMode, visibleDayCount]);
 
   useLayoutEffect(() => {
-    if (!pendingDragReleaseRef.current) return;
-    pendingDragReleaseRef.current = false;
-    const grid = gridRef.current;
-    if (!grid) return;
-    if (releaseFrameRef.current !== null) cancelAnimationFrame(releaseFrameRef.current);
-    releaseFrameRef.current = requestAnimationFrame(() => {
-      releaseFrameRef.current = null;
-      grid.classList.remove("is-dragging");
-      grid.style.removeProperty("--drag-x");
-    });
-  }, [anchorIndex]);
+    if (viewMode !== "timeline" || loading) return;
+    const viewport = timelineViewportRef.current;
+    const targetKey = timelineScrollTargetRef.current;
+    if (!viewport || !targetKey || timelineViewportHeight <= 0) return;
+    const target = viewport.querySelector<HTMLElement>(`[data-timeline-day="${targetKey}"]`);
+    if (!target) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    viewport.scrollTop += target.getBoundingClientRect().top - viewportRect.top;
+    timelineScrollTargetRef.current = null;
+    captureTimelineTopAnchor();
+    scheduleTimelineMeasurement();
+  }, [
+    anchor,
+    captureTimelineTopAnchor,
+    effectiveTimelineColumns,
+    gridWindowStart,
+    loading,
+    scheduleTimelineMeasurement,
+    schedules,
+    timelineViewportHeight,
+    viewMode,
+  ]);
 
-  useLayoutEffect(() => {
-    if (!pendingTimelineReleaseRef.current) return;
-    pendingTimelineReleaseRef.current = false;
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    if (releaseFrameRef.current !== null) cancelAnimationFrame(releaseFrameRef.current);
-    releaseFrameRef.current = requestAnimationFrame(() => {
-      releaseFrameRef.current = null;
-      timeline.classList.remove("is-dragging");
-      timeline.style.removeProperty("--timeline-drag-y");
-    });
-  }, [anchorIndex]);
+  useEffect(() => {
+    if (!active || viewMode !== "timeline" || loading) return;
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    const onScroll = () => {
+      captureTimelineTopAnchor();
+      scheduleTimelineMeasurement();
+    };
+    const onWindowScroll = () => {
+      scheduleTimelineMeasurement();
+    };
+    const onWindowResize = () => {
+      updateTimelineViewportHeight();
+      restoreTimelineTopAnchor();
+      scheduleTimelineMeasurement();
+    };
+    viewport.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("scroll", onWindowScroll, { passive: true });
+    window.addEventListener("resize", onWindowResize);
+    return () => {
+      viewport.removeEventListener("scroll", onScroll);
+      window.removeEventListener("scroll", onWindowScroll);
+      window.removeEventListener("resize", onWindowResize);
+    };
+  }, [
+    active,
+    captureTimelineTopAnchor,
+    loading,
+    restoreTimelineTopAnchor,
+    scheduleTimelineMeasurement,
+    updateTimelineViewportHeight,
+    viewMode,
+  ]);
 
   useEffect(() => {
     if (!active) return;
@@ -502,14 +638,22 @@ export default function ScheduleView({
       if (viewMode === "grid" && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault();
         const daysToMove = event.shiftKey ? 7 : 1;
+        setGridPanRemainder(0);
         setAnchor((value) => addDays(value, event.key === "ArrowLeft" ? -daysToMove : daysToMove));
       } else if (viewMode === "timeline" && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
         event.preventDefault();
         const daysToMove = event.shiftKey ? 7 : 1;
-        setAnchor((value) => addDays(value, event.key === "ArrowUp" ? -daysToMove : daysToMove));
+        setAnchor((value) => {
+          const next = addDays(value, event.key === "ArrowUp" ? -daysToMove : daysToMove);
+          timelineScrollTargetRef.current = localDateKey(next);
+          return next;
+        });
       } else if (event.key === "Home" || event.key.toLowerCase() === "t") {
         event.preventDefault();
-        setAnchor(new Date());
+        setGridPanRemainder(0);
+        const today = new Date();
+        timelineScrollTargetRef.current = localDateKey(today);
+        setAnchor(today);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -528,6 +672,7 @@ export default function ScheduleView({
       event.preventDefault();
       if (gridWheelLockRef.current) return;
       gridWheelLockRef.current = true;
+      setGridPanRemainder(0);
       setAnchor((value) => addDays(value, delta > 0 ? 1 : -1));
       if (gridWheelTimerRef.current !== null) {
         window.clearTimeout(gridWheelTimerRef.current);
@@ -540,29 +685,6 @@ export default function ScheduleView({
     element.addEventListener("wheel", onWheel, { passive: false });
     return () => element.removeEventListener("wheel", onWheel);
   }, [active, anchor, loading, schedules.length, viewMode]);
-
-  useEffect(() => {
-    if (!active || viewMode !== "timeline" || loading) return;
-    const element = timelineRef.current;
-    if (!element) return;
-    const onWheel = (event: WheelEvent) => {
-      if (event.ctrlKey || !event.deltaY) return;
-      if (!(event.target instanceof Element) || !event.target.closest(".day-heading")) return;
-      event.preventDefault();
-      if (timelineWheelLockRef.current) return;
-      timelineWheelLockRef.current = true;
-      setAnchor((value) => addDays(value, event.deltaY > 0 ? 1 : -1));
-      if (timelineWheelTimerRef.current !== null) {
-        window.clearTimeout(timelineWheelTimerRef.current);
-      }
-      timelineWheelTimerRef.current = window.setTimeout(() => {
-        timelineWheelTimerRef.current = null;
-        timelineWheelLockRef.current = false;
-      }, 180);
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
-    return () => element.removeEventListener("wheel", onWheel);
-  }, [active, loading, viewMode]);
 
   useEffect(() => {
     if (active) return;
@@ -588,11 +710,9 @@ export default function ScheduleView({
     if (gridWheelTimerRef.current !== null) {
       clearTimeout(gridWheelTimerRef.current);
     }
-    if (timelineWheelTimerRef.current !== null) {
-      clearTimeout(timelineWheelTimerRef.current);
-    }
-    if (releaseFrameRef.current !== null) {
-      cancelAnimationFrame(releaseFrameRef.current);
+    if (timelineVisibleFrameRef.current !== null) {
+      cancelAnimationFrame(timelineVisibleFrameRef.current);
+      timelineVisibleFrameRef.current = null;
     }
   }, []);
 
@@ -891,16 +1011,33 @@ export default function ScheduleView({
     }, 120);
   }
 
-  function shiftAnchor(delta: number) {
-    setAnchor((value) => addDays(value, delta));
+  function resetPanPositions() {
+    setGridPanRemainder(0);
   }
 
+  function shiftAnchor(delta: number) {
+    resetPanPositions();
+    setAnchor((value) => {
+      const next = addDays(value, delta);
+      timelineScrollTargetRef.current = localDateKey(next);
+      return next;
+    });
+  }
+
+  function navigateToDate(day: Date) {
+    resetPanPositions();
+    timelineScrollTargetRef.current = localDateKey(day);
+    setAnchor(day);
+  }
+
+  // @decision TL-SCROLL-1 时间线使用原生 scrollTop 作为唯一位移坐标，避免锚点、像素余量和布局测量互相补偿产生回弹。
   function beginTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0 || !(event.target instanceof Element)) return;
     if (event.target.closest("button, a, input, textarea, select")) return;
-    if (event.pointerType === "touch" && !event.target.closest(".day-heading")) return;
-    setTimelineSwipeDayDelta(0);
-    timelineSwipeRef.current = { startY: event.clientY, deltaY: 0 };
+    if (event.pointerType === "touch") return;
+    const viewport = timelineViewportRef.current;
+    if (!viewport) return;
+    timelineSwipeRef.current = { startY: event.clientY, startScrollTop: viewport.scrollTop, moved: false };
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
@@ -912,19 +1049,19 @@ export default function ScheduleView({
     const swipe = timelineSwipeRef.current;
     if (!swipe) return;
     const deltaY = event.clientY - swipe.startY;
-    swipe.deltaY = deltaY;
     if (Math.abs(deltaY) > 6) {
+      swipe.moved = true;
       endLongPress();
       timelineRef.current?.classList.add("is-dragging");
-      timelineRef.current?.style.setProperty("--timeline-drag-y", `${deltaY}px`);
-      setTimelineSwipeDayDelta(timelineDaysForDelta(deltaY));
+      const viewport = timelineViewportRef.current;
+      if (viewport) {
+        viewport.scrollTop = timelineDragScrollTop(
+          swipe.startScrollTop,
+          deltaY,
+          viewport.scrollHeight - viewport.clientHeight,
+        );
+      }
     }
-  }
-
-  function resetTimelineSwipeVisual() {
-    timelineRef.current?.classList.remove("is-dragging");
-    timelineRef.current?.style.removeProperty("--timeline-drag-y");
-    setTimelineSwipeDayDelta(0);
   }
 
   function finishTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
@@ -934,22 +1071,20 @@ export default function ScheduleView({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     if (!swipe) return;
-    const daysMoved = timelineDaysForDelta(swipe.deltaY);
-    if (Math.abs(swipe.deltaY) > 6) {
-      suppressCardClickBriefly();
-    }
-    if (daysMoved !== 0) {
-      pendingTimelineReleaseRef.current = true;
-      shiftAnchor(daysMoved);
-      setTimelineSwipeDayDelta(0);
-    } else {
-      resetTimelineSwipeVisual();
+    timelineRef.current?.classList.remove("is-dragging");
+    if (swipe.moved) suppressCardClickBriefly();
+    captureTimelineTopAnchor();
+    scheduleTimelineMeasurement();
+    const topKey = timelineTopAnchorRef.current?.key;
+    const topDay = topKey ? gridWindowDays.find((day) => localDateKey(day) === topKey) : null;
+    if (topDay && localDateKey(topDay) !== localDateKey(anchor)) {
+      setAnchor(topDay);
     }
   }
 
   function cancelTimelineSwipe() {
     timelineSwipeRef.current = null;
-    resetTimelineSwipeVisual();
+    timelineRef.current?.classList.remove("is-dragging");
   }
 
   function gridDayStep(): number {
@@ -994,18 +1129,24 @@ export default function ScheduleView({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     if (!drag) return;
-    const daysMoved = dragDaysForDelta(drag.deltaX);
-    if (Math.abs(drag.deltaX) > 6) {
-      suppressCardClickBriefly();
-    }
-    if (daysMoved !== 0) {
-      pendingDragReleaseRef.current = true;
-      shiftAnchor(-daysMoved);
-    } else {
+    if (Math.abs(drag.deltaX) <= 6) {
       gridRef.current?.classList.remove("is-dragging");
       gridRef.current?.style.removeProperty("--drag-x");
+      setDragDayDelta(0);
+      return;
     }
-    setDragDayDelta(0);
+    suppressCardClickBriefly();
+    const daysMoved = dragDaysForDelta(drag.deltaX);
+    const nextRemainder = gridPanRemainder + drag.deltaX - daysMoved * gridDayStep();
+    flushSync(() => {
+      setGridPanRemainder(nextRemainder);
+      if (daysMoved !== 0) {
+        setAnchor((value) => addDays(value, -daysMoved));
+      }
+      setDragDayDelta(0);
+    });
+    gridRef.current?.classList.remove("is-dragging");
+    gridRef.current?.style.removeProperty("--drag-x");
   }
 
   function cancelGridDrag() {
@@ -1125,7 +1266,7 @@ export default function ScheduleView({
       <header className="page-header schedule-toolbar">
         <div>
           <h1 className="schedule-title">直播日程</h1>
-          <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右滑动切换` : "连续 7 天 · 上下滑动切换"}</p>
+          <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右拖动浏览` : `${Math.max(1, timelineVisibleDays.length)} 天 · 上下拖动浏览`}</p>
         </div>
         <div className="toolbar-actions">
           {viewMode === "timeline" ? (
@@ -1196,7 +1337,7 @@ export default function ScheduleView({
               <Grid3X3 size={17} />
             </button>
           </div>
-          <button className="button secondary" onClick={() => setAnchor(new Date())}>
+          <button className="button secondary" onClick={() => navigateToDate(new Date())}>
             <RotateCcw size={16} />
             回到今天
           </button>
@@ -1228,7 +1369,7 @@ export default function ScheduleView({
               key={localDateKey(day)}
               className={`day-pill ${index === 0 ? "active" : ""}`}
               aria-current={index === 0 ? "date" : undefined}
-              onClick={() => setAnchor(day)}
+              onClick={() => navigateToDate(day)}
             >
               <span>{["日", "一", "二", "三", "四", "五", "六"][day.getDay()]}</span>
               <strong>{day.getDate()}</strong>
@@ -1247,15 +1388,13 @@ export default function ScheduleView({
           {Array.from({ length: 5 }, (_, index) => <div key={index} className="skeleton-row" />)}
         </div>
       ) : viewMode === "timeline" ? (
-        visibleScheduleCount === 0 ? (
-          <EmptyState
-            title={displayDays.length === 1 ? "这一天还没有日程" : `这 ${displayDays.length} 天还没有日程`}
-            description={subscriptions.length ? "可以刷新订阅，或手动新增一条日程。" : "先搜索并订阅一位主播。"}
-            action={!subscriptions.length ? <span className="muted">前往“主播库”添加订阅</span> : null}
-          />
-        ) : (
         <div className="timeline-shell">
-          <div className="timeline-viewport" style={{ height: `${timelineViewportHeight}px` }}>
+          <div
+            ref={timelineViewportRef}
+            className="timeline-viewport"
+            style={{ height: `${timelineViewportHeight}px` }}
+            tabIndex={0}
+          >
             <div
               ref={timelineRef}
               className="timeline"
@@ -1263,19 +1402,20 @@ export default function ScheduleView({
               style={{
                 "--timeline-columns": effectiveTimelineColumns,
                 "--timeline-gap": `${TIMELINE_GAP}px`,
-                "--timeline-offset-y": `${-timelineOffsetY}px`,
               } as CSSProperties}
               role="group"
-              aria-label={`时间线，当前显示 ${timelineDays.length} 天，上下拖动切换日期`}
-              title="按住上下拖动切换日期；在日期栏滚动滚轮也可切换"
+              aria-label={`时间线，当前显示 ${Math.max(1, timelineVisibleDays.length)} 天，可上下拖动浏览`}
+              title="按住上下拖动浏览；松手后停留当前位置"
               onPointerDown={beginTimelineSwipe}
               onPointerMove={moveTimelineSwipe}
               onPointerUp={finishTimelineSwipe}
               onPointerCancel={cancelTimelineSwipe}
             >
-              {gridWindowDays.map((day, index) => {
+              {gridWindowDays.map((day) => {
                 const values = grouped.get(localDateKey(day)) ?? [];
-                const isVisible = index >= anchorIndex && index < anchorIndex + timelineDays.length;
+                const isVisible = timelineVisibleKeySet.size === 0
+                  ? true
+                  : timelineVisibleKeySet.has(localDateKey(day));
                 return (
                   <section
                     className="day-section"
@@ -1284,7 +1424,7 @@ export default function ScheduleView({
                     aria-hidden={!isVisible}
                     inert={!isVisible ? true : undefined}
                   >
-                    <div className="day-heading" title="上下拖动切换日期">
+                    <div className="day-heading" title="上下拖动浏览">
                       <span>{day.getMonth() + 1}月{day.getDate()}日</span>
                       <strong>{["周日", "周一", "周二", "周三", "周四", "周五", "周六"][day.getDay()]}</strong>
                       <em>{values.length} 场</em>
@@ -1298,14 +1438,16 @@ export default function ScheduleView({
               })}
             </div>
           </div>
-          <span className={`timeline-swipe-status ${timelineSwipeDayDelta !== 0 ? "is-active" : ""}`} aria-hidden="true">
-            <GripVertical size={14} />
-            <span>{timelineSwipeDayDelta === 0
-              ? "上下拖动切换日期"
-              : `${timelineSwipeDayDelta > 0 ? "向后" : "向前"} ${Math.abs(timelineSwipeDayDelta)} 天`}</span>
-          </span>
+          {visibleScheduleCount === 0 ? (
+            <div className="timeline-empty-overlay" aria-live="polite">
+              <EmptyState
+                title={displayDays.length === 1 ? "这一天还没有日程" : `这 ${displayDays.length} 天还没有日程`}
+                description={subscriptions.length ? "可以刷新订阅，或手动新增一条日程；仍可上下拖动浏览。" : "先搜索并订阅一位主播。"}
+                action={!subscriptions.length ? <span className="muted">前往“主播库”添加订阅</span> : null}
+              />
+            </div>
+          ) : null}
         </div>
-        )
       ) : (
         <div className="calendar-grid-wrap">
           <div className="calendar-viewport">
@@ -1316,8 +1458,8 @@ export default function ScheduleView({
               data-visible-days={visibleDays.length}
               data-window-days={gridWindowDays.length}
               role="group"
-              aria-label={`日历网格，当前显示 ${visibleDays.length} 天，左右拖动切换日期`}
-              title="按住左右拖动切换日期，一次可跨多天"
+              aria-label={`日历网格，当前显示 ${visibleDays.length} 天，可左右拖动浏览`}
+              title="按住左右拖动浏览；松手后停留当前位置"
               onPointerDown={beginGridDrag}
               onPointerMove={moveGridDrag}
               onPointerUp={finishGridDrag}
@@ -1325,7 +1467,8 @@ export default function ScheduleView({
             >
               {gridWindowDays.map((day, index) => {
                 const values = grouped.get(localDateKey(day)) ?? [];
-                const isVisible = index >= visibleStartIndex && index < visibleStartIndex + visibleDayCount;
+                const isVisible = index >= visibleStartIndex - (peekBefore ? 1 : 0)
+                  && index < visibleStartIndex + visibleDayCount + (peekAfter ? 1 : 0);
                 return (
                   <section
                     className="grid-day"
@@ -1346,12 +1489,6 @@ export default function ScheduleView({
           {visibleScheduleCount === 0 ? (
             <span className="calendar-empty-hint">这几天暂无日程 · 拖动可继续查看</span>
           ) : null}
-          <span className={`calendar-drag-badge ${dragDayDelta !== 0 ? "is-active" : ""}`} aria-hidden="true">
-            <GripHorizontal size={14} />
-            <span>{dragDayDelta === 0
-              ? "拖动切换日期 · 可跨多天"
-              : `${dragDayDelta > 0 ? "向后" : "向前"} ${Math.abs(dragDayDelta)} 天`}</span>
-          </span>
         </div>
       )}
       </div>

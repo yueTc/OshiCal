@@ -622,11 +622,13 @@ async fn live_session_for_schedule(
 ) -> ApiResult {
     ok(state.service.live_session_for_schedule(id).await?)
 }
+
 #[derive(Debug, Deserialize)]
 struct FertilityQuery {
     refresh: Option<bool>,
 }
 
+/// 读取 LAPLACE 生理期数据。开关关闭时返回 `enabled=false` 的空快照，不触网。
 async fn list_fertility_statuses(
     State(state): State<AppState>,
     Query(query): Query<FertilityQuery>,
@@ -746,6 +748,7 @@ fn changed_setting_values(
     changed!("auto_analyze_images", auto_analyze_images);
     changed!("notifications_enabled", notifications_enabled);
     changed!("live_stats_enabled", live_stats_enabled);
+    changed!("fertility_enabled", fertility_enabled);
     changed!("llm_base_url", llm_base_url);
     changed!("llm_model", llm_model);
     changed!("llm_prompt_version", llm_prompt_version);

@@ -23,6 +23,7 @@ import {
 import type {
   AccountSearchResult,
   FanHistory,
+  FertilitySnapshot,
   LinkedAccount,
   RefreshProgress,
   RefreshReport,
@@ -32,9 +33,17 @@ import type {
   UpdateSubscriptionInput,
   WeeklyScheduleRule,
 } from "../types";
-import { explainError } from "../lib/api";
+import { explainError, openExternalUrl } from "../lib/api";
 import { aggregateFanHistory } from "../lib/fan-history";
 import type { FanBucket, FanGranularity } from "../lib/fan-history";
+import {
+  fertilityCompactLabel,
+  fertilitySourceLabel,
+  fertilityStatusMeta,
+  findFertilityStatus,
+  formatFertilityFetchedAt,
+  formatNextPeriod,
+} from "../lib/fertility";
 import { localDateKey } from "../lib/dates";
 import { Avatar, EmptyState, ErrorBanner, Modal, Toggle } from "./ui";
 
@@ -61,6 +70,7 @@ interface CreatorActions {
   refresh: (id: number) => Promise<RefreshReport>;
   fanHistory: (streamerId: number, days?: number) => Promise<FanHistory>;
   refreshFans: (streamerId: number) => Promise<FanHistory>;
+  fertility: (refresh: boolean) => Promise<FertilitySnapshot>;
   listWeeklyRules: (streamerId: number) => Promise<WeeklyScheduleRule[]>;
   createWeeklyRule: (input: NewWeeklyScheduleRuleInput) => Promise<WeeklyScheduleRule>;
   updateWeeklyRule: (id: number, update: UpdateWeeklyScheduleRuleInput) => Promise<WeeklyScheduleRule>;
@@ -255,17 +265,21 @@ export default function CreatorsView({
   subscriptions,
   refreshProgress,
   liveStatsEnabled,
+  fertilityEnabled,
   actions,
   onChanged,
   onOpenLiveRoom,
+  onOpenSettings,
   onError,
 }: {
   subscriptions: Streamer[];
   refreshProgress: Record<number, RefreshProgress>;
   liveStatsEnabled: boolean;
+  fertilityEnabled: boolean;
   actions: CreatorActions;
   onChanged: () => Promise<void>;
   onOpenLiveRoom: (streamer: Streamer) => Promise<void>;
+  onOpenSettings: () => void;
   onError: (message: string) => void;
 }) {
   const [keyword, setKeyword] = useState("");
@@ -308,6 +322,13 @@ export default function CreatorsView({
   const weeklyTargetIdRef = useRef<number | null>(null);
   const weeklySavingRef = useRef(false);
   const [fanTarget, setFanTarget] = useState<Streamer | null>(null);
+  const [fertilitySnapshot, setFertilitySnapshot] = useState<FertilitySnapshot | null>(null);
+  const [fertilityLoading, setFertilityLoading] = useState(false);
+  const [fertilityRefreshing, setFertilityRefreshing] = useState(false);
+  const [fertilityError, setFertilityError] = useState<string | null>(null);
+  const [fertilityTarget, setFertilityTarget] = useState<Streamer | null>(null);
+  const fertilityRequestSeq = useRef(0);
+  const fertilityRefreshingRef = useRef(false);
   const [fanHistory, setFanHistory] = useState<FanHistory | null>(null);
   const [fanGranularity, setFanGranularity] = useState<FanGranularity>("hour");
   const [fanLoading, setFanLoading] = useState(false);
@@ -328,6 +349,38 @@ export default function CreatorsView({
   useEffect(() => {
     setOptimisticOrder(null);
   }, [subscriptions]);
+
+  useEffect(() => {
+    fertilityRequestSeq.current += 1;
+    const requestId = fertilityRequestSeq.current;
+    if (!fertilityEnabled) {
+      // 关闭后立刻清空，避免界面继续显示上次抓取的生理期数据。
+      setFertilitySnapshot(null);
+      setFertilityError(null);
+      setFertilityLoading(false);
+      setFertilityTarget(null);
+      return;
+    }
+    setFertilityLoading(true);
+    setFertilityError(null);
+    void (async () => {
+      try {
+        const snapshot = await actions.fertility(false);
+        if (fertilityRequestSeq.current !== requestId) {
+          return;
+        }
+        setFertilitySnapshot(snapshot);
+      } catch (error) {
+        if (fertilityRequestSeq.current === requestId) {
+          setFertilityError(explainError(error));
+        }
+      } finally {
+        if (fertilityRequestSeq.current === requestId) {
+          setFertilityLoading(false);
+        }
+      }
+    })();
+  }, [actions, fertilityEnabled]);
 
   const orderedSubscriptions = useMemo(() => {
     if (!optimisticOrder) {
@@ -1063,6 +1116,50 @@ export default function CreatorsView({
     setFanRefreshing(false);
   }
 
+  async function refreshFertility() {
+    if (fertilityRefreshingRef.current) {
+      return;
+    }
+    fertilityRefreshingRef.current = true;
+    const requestId = ++fertilityRequestSeq.current;
+    setFertilityRefreshing(true);
+    setFertilityError(null);
+    try {
+      const snapshot = await actions.fertility(true);
+      if (fertilityRequestSeq.current !== requestId) {
+        return;
+      }
+      setFertilitySnapshot(snapshot);
+    } catch (error) {
+      if (fertilityRequestSeq.current === requestId) {
+        const message = explainError(error);
+        setFertilityError(message);
+        onError(message);
+      }
+    } finally {
+      if (fertilityRequestSeq.current === requestId) {
+        fertilityRefreshingRef.current = false;
+        setFertilityRefreshing(false);
+      }
+    }
+  }
+
+  async function openFertilitySource() {
+    try {
+      await openExternalUrl("https://laplace.live/ovu");
+    } catch (error) {
+      onError(explainError(error));
+    }
+  }
+
+  function openFertilityDetail(streamer: Streamer) {
+    if (!fertilityEnabled) {
+      onOpenSettings();
+      return;
+    }
+    setFertilityTarget(streamer);
+  }
+
   async function refreshFanHistory() {
     if (!fanTarget || fanRefreshingRef.current) {
       return;
@@ -1323,6 +1420,44 @@ export default function CreatorsView({
                 </div>
               </div>
               <div className="creator-actions">
+                {fertilityEnabled ? (
+                  (() => {
+                    const status = findFertilityStatus(fertilitySnapshot, streamer);
+                    const meta = status ? fertilityStatusMeta(status.status) : null;
+                    return (
+                      <button
+                        type="button"
+                        className={`creator-fertility-button ${meta?.className ?? "is-missing"}`}
+                        title={
+                          status
+                            ? `${meta?.label ?? "生理期"}${status.dayInCycle ? ` · 周期第 ${status.dayInCycle} 天` : ""} · 下次 ${formatNextPeriod(status.nextPeriod)} · 点击查看详情`
+                            : "LAPLACE 暂未收录这位主播，点击查看说明"
+                        }
+                        aria-label={`${streamer.name} 的生理期数据`}
+                        onClick={() => openFertilityDetail(streamer)}
+                      >
+                        {status ? (
+                          <>
+                            <strong>{fertilityCompactLabel(status)}</strong>
+                            <em>{formatNextPeriod(status.nextPeriod)}</em>
+                          </>
+                        ) : (
+                          <strong>{fertilityLoading ? "读取中…" : "· 未收录"}</strong>
+                        )}
+                      </button>
+                    );
+                  })()
+                ) : (
+                  <button
+                    type="button"
+                    className="creator-fertility-button is-disabled"
+                    title="开启寻血猎犬后才会抓取 LAPLACE 生理期数据，点击前往设置"
+                    aria-label="开启寻血猎犬"
+                    onClick={onOpenSettings}
+                  >
+                    <strong>🐾 未开启</strong>
+                  </button>
+                )}
                 <button
                   type="button"
                   className="creator-fan-button"
@@ -1469,6 +1604,84 @@ export default function CreatorsView({
               </>
             )}
           </div>
+        </Modal>
+      ) : null}
+
+      {fertilityTarget ? (
+        <Modal
+          title={`生理期数据 · ${fertilityTarget.name}`}
+          onClose={() => setFertilityTarget(null)}
+          footer={
+            <>
+              <button
+                className="button secondary"
+                onClick={() => {
+                  setFertilityTarget(null);
+                  void openFertilitySource();
+                }}
+              >
+                <ExternalLink size={15} />前往 LAPLACE
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void refreshFertility()}
+                disabled={fertilityRefreshing}
+              >
+                <RefreshCw className={fertilityRefreshing ? "spin" : ""} size={15} />
+                {fertilityRefreshing ? "刷新中…" : "立即刷新"}
+              </button>
+            </>
+          }
+        >
+          {(() => {
+            const status = findFertilityStatus(fertilitySnapshot, fertilityTarget);
+            const meta = status ? fertilityStatusMeta(status.status) : null;
+            return (
+              <div className="fertility-detail">
+                <div className="fertility-detail-head">
+                  <Avatar url={fertilityTarget.avatarUrl} name={fertilityTarget.name} size="lg" />
+                  <div>
+                    <strong>{fertilityTarget.name}</strong>
+                    <span>UID {fertilityTarget.mid}</span>
+                  </div>
+                  <span className={`fertility-status-pill ${meta?.className ?? "is-missing"}`}>
+                    {status ? `${meta?.emoji} ${meta?.label}` : "未收录"}
+                  </span>
+                </div>
+
+                {fertilityError ? <ErrorBanner message={fertilityError} onRetry={() => void refreshFertility()} /> : null}
+
+                {status ? (
+                  <dl className="fertility-detail-grid">
+                    <div><dt>当前状态</dt><dd>{meta?.hint ?? meta?.label}</dd></div>
+                    <div><dt>周期内第几天</dt><dd>{status.dayInCycle === null ? "--" : `第 ${status.dayInCycle} 天`}</dd></div>
+                    <div><dt>下次生理期</dt><dd>{formatNextPeriod(status.nextPeriod)}</dd></div>
+                    <div><dt>排卵日</dt><dd>{status.ovulationDay === null ? "--" : `第 ${status.ovulationDay} 天`}</dd></div>
+                    <div><dt>有效周期长度</dt><dd>{status.cycleLength === null ? "--" : `${status.cycleLength} 天`}</dd></div>
+                    <div><dt>有效经期长度</dt><dd>{status.periodLength === null ? "--" : `${status.periodLength} 天`}</dd></div>
+                    <div><dt>数据点</dt><dd>{status.dataPoints} 条记录</dd></div>
+                    <div><dt>匹配账号</dt><dd>UID {status.matchedMid}</dd></div>
+                  </dl>
+                ) : (
+                  <p className="fertility-detail-empty">
+                    LAPLACE 目前没有收录这位主播。可以先去原站确认，或在 LAPLACE 提交投稿。
+                  </p>
+                )}
+
+                <div className="fertility-detail-source">
+                  <span>{fertilitySourceLabel(fertilitySnapshot?.source)}</span>
+                  <span>抓取于 {formatFertilityFetchedAt(fertilitySnapshot?.fetchedAt)}</span>
+                  {fertilitySnapshot?.stale ? <strong>使用缓存数据</strong> : null}
+                </div>
+                {fertilitySnapshot?.warning ? (
+                  <p className="fertility-detail-warning">{fertilitySnapshot.warning}</p>
+                ) : null}
+                <p className="fertility-detail-note">
+                  数据由 LAPLACE 及其投稿者整理与预测，仅供娱乐参考，不是医疗信息。
+                </p>
+              </div>
+            );
+          })()}
         </Modal>
       ) : null}
 

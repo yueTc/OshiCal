@@ -1461,6 +1461,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
                 | "dynamic_poll_seconds"
                 | "auto_analyze_images"
                 | "live_stats_enabled"
+                | "fertility_enabled"
                 | "llm_base_url"
                 | "llm_model"
                 | "llm_prompt_version"
@@ -1475,6 +1476,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
             "dynamic_poll_seconds" => settings.dynamic_poll_seconds = serde_json::from_str(&value)?,
             "auto_analyze_images" => settings.auto_analyze_images = serde_json::from_str(&value)?,
             "live_stats_enabled" => settings.live_stats_enabled = serde_json::from_str(&value)?,
+            "fertility_enabled" => settings.fertility_enabled = serde_json::from_str(&value)?,
             "llm_base_url" => settings.llm_base_url = serde_json::from_str(&value)?,
             "llm_model" => settings.llm_model = serde_json::from_str(&value)?,
             "llm_prompt_version" => settings.llm_prompt_version = serde_json::from_str(&value)?,

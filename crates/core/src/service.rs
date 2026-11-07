@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::bilibili::{BilibiliClient, QrLoginPoll, QrLoginStart};
 use crate::error::{AppError, AppResult};
-use crate::fertility::{parse_fertility_payload, FertilityClient};
+use crate::fertility::{parse_fertility_payload, FertilityClient, FERTILITY_CACHE_TTL_HOURS};
 use crate::live_stats::LiveStatsManager;
 use crate::llm::{
     analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient,
@@ -503,133 +503,6 @@ impl AppService {
         Ok(())
     }
 
-    pub async fn list_fertility_statuses(
-        &self,
-        force_refresh: bool,
-    ) -> AppResult<FertilitySnapshot> {
-        let streamers = self.store.list_streamers().await?;
-        if streamers.is_empty() {
-            return Ok(FertilitySnapshot {
-                fetched_at: Utc::now(),
-                source: "none".to_owned(),
-                stale: false,
-                warning: None,
-                total_available: 0,
-                matched: 0,
-                statuses: Vec::new(),
-            });
-        }
-
-        let cached = self.store.get_fertility_cache().await?;
-        let now = Utc::now();
-        let mut payload = None;
-        let mut meta = None;
-
-        if !force_refresh {
-            if let Some(cache) = &cached {
-                if now.signed_duration_since(cache.fetched_at) < Duration::hours(6) {
-                    match parse_fertility_payload(&cache.payload_json) {
-                        Ok(parsed) => {
-                            payload = Some(parsed);
-                            meta = Some((cache.fetched_at, cache.source.clone(), false, None));
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "cached fertility payload is invalid");
-                        }
-                    }
-                }
-            }
-        }
-
-        if payload.is_none() {
-            match self.fertility_client().fetch().await {
-                Ok((fetched, source, fetched_at)) => {
-                    let serialized = serde_json::to_string(&fetched)?;
-                    self.store
-                        .save_fertility_cache(&serialized, fetched_at, &source)
-                        .await?;
-                    payload = Some(fetched);
-                    meta = Some((fetched_at, source, false, None));
-                }
-                Err(error) => {
-                    let fallback = cached.as_ref().and_then(|cache| {
-                        parse_fertility_payload(&cache.payload_json)
-                            .ok()
-                            .map(|payload| (cache, payload))
-                    });
-                    if let Some((cache, parsed)) = fallback {
-                        payload = Some(parsed);
-                        meta = Some((
-                            cache.fetched_at,
-                            cache.source.clone(),
-                            true,
-                            Some(format!("魔法期数据刷新失败，已使用缓存：{error}")),
-                        ));
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        let payload = payload.expect("fertility payload initialized");
-        let (fetched_at, source, stale, warning) = meta.expect("fertility metadata initialized");
-        let remote_by_mid: HashMap<String, &crate::fertility::FertilityRecord> = payload
-            .data
-            .iter()
-            .map(|record| (record.uid.to_string(), record))
-            .collect();
-        let mut statuses = Vec::new();
-        for streamer in &streamers {
-            let record = remote_by_mid.get(&streamer.mid).copied().or_else(|| {
-                streamer
-                    .linked_accounts
-                    .iter()
-                    .find_map(|linked| remote_by_mid.get(&linked.mid).copied())
-            });
-            let Some(record) = record else {
-                continue;
-            };
-            statuses.push(FertilityStatus {
-                streamer_id: streamer.id,
-                mid: streamer.mid.clone(),
-                streamer_name: streamer.name.clone(),
-                streamer_avatar: if streamer.avatar_url.is_empty() {
-                    record.user.avatar.clone().unwrap_or_default()
-                } else {
-                    streamer.avatar_url.clone()
-                },
-                status: record.status.to_ascii_lowercase(),
-                day_in_cycle: record.day_in_cycle,
-                ovulation_day: record.ovulation_day,
-                next_period: record.next_period.clone(),
-                cycle_length: record.effective_cycle_length,
-                period_length: record.effective_period_length,
-                data_points: record.data_points,
-            });
-        }
-        statuses.sort_by_key(|item| {
-            let rank = match item.status.as_str() {
-                "menstruating" => 0,
-                "fertile" => 1,
-                "ovulating" => 2,
-                "normal" => 3,
-                _ => 4,
-            };
-            (rank, item.streamer_name.clone())
-        });
-        let matched = statuses.len();
-        Ok(FertilitySnapshot {
-            fetched_at,
-            source,
-            stale,
-            warning,
-            total_available: payload.total.max(payload.data.len()),
-            matched,
-            statuses,
-        })
-    }
-
     pub async fn materialize_weekly_rules(
         &self,
         from: DateTime<Utc>,
@@ -797,6 +670,119 @@ impl AppService {
                 .push(format!("粉丝快照清理: {error}"));
         }
         Ok(report)
+    }
+
+    /// 读取 LAPLACE 生理期数据，并与当前订阅主播匹配。
+    ///
+    /// 「寻血猎犬」关闭时直接返回 `enabled = false` 的空快照，**不读缓存也不发网络请求**。
+    pub async fn list_fertility_statuses(
+        &self,
+        force_refresh: bool,
+    ) -> AppResult<FertilitySnapshot> {
+        let settings = load_settings(&self.store).await?;
+        if !settings.fertility_enabled {
+            return Ok(FertilitySnapshot::disabled());
+        }
+        let streamers = self.store.list_streamers().await?;
+        if streamers.is_empty() {
+            return Ok(FertilitySnapshot {
+                enabled: true,
+                source: "none".to_owned(),
+                ..FertilitySnapshot::disabled()
+            });
+        }
+
+        let cached = self.store.get_fertility_cache().await?;
+        let now = Utc::now();
+        let mut payload = None;
+        let mut meta = None;
+
+        if !force_refresh {
+            if let Some(cache) = cached.as_ref().filter(|cache| {
+                now.signed_duration_since(cache.fetched_at)
+                    < Duration::hours(FERTILITY_CACHE_TTL_HOURS)
+            }) {
+                match parse_fertility_payload(&cache.payload_json) {
+                    Ok(parsed) => {
+                        payload = Some(parsed);
+                        meta = Some((cache.fetched_at, cache.source.clone(), false, None));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "缓存的 LAPLACE 数据无法解析，将重新抓取");
+                    }
+                }
+            }
+        }
+
+        if payload.is_none() {
+            match self.fertility_client().fetch().await {
+                Ok((fetched, source, fetched_at)) => {
+                    let serialized = serde_json::to_string(&fetched)?;
+                    if let Err(error) = self
+                        .store
+                        .save_fertility_cache(&serialized, fetched_at, &source)
+                        .await
+                    {
+                        tracing::warn!(%error, "写入 LAPLACE 缓存失败");
+                    }
+                    payload = Some(fetched);
+                    meta = Some((fetched_at, source, false, None));
+                }
+                Err(error) => {
+                    let fallback = cached.as_ref().and_then(|cache| {
+                        parse_fertility_payload(&cache.payload_json)
+                            .ok()
+                            .map(|payload| (cache, payload))
+                    });
+                    if let Some((cache, parsed)) = fallback {
+                        payload = Some(parsed);
+                        meta = Some((
+                            cache.fetched_at,
+                            cache.source.clone(),
+                            true,
+                            Some(format!("LAPLACE 抓取失败，正在使用缓存数据：{error}")),
+                        ));
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let payload = payload.expect("fertility payload initialized");
+        let (fetched_at, source, stale, warning) = meta.expect("fertility metadata initialized");
+        let mut statuses = match_fertility_statuses(&streamers, &payload);
+        let matched = statuses.len();
+        statuses.sort_by_key(|item| {
+            let rank = match item.status.as_str() {
+                "menstruating" => 0,
+                "fertile" => 1,
+                "ovulating" => 2,
+                "normal" => 3,
+                _ => 4,
+            };
+            (rank, item.streamer_name.clone())
+        });
+        Ok(FertilitySnapshot {
+            enabled: true,
+            fetched_at,
+            source,
+            stale,
+            warning,
+            total_available: payload.total.max(payload.data.len()),
+            matched,
+            statuses,
+        })
+    }
+
+    /// 采集循环入口：开关关闭时什么都不做，返回 `Ok(None)`。
+    pub async fn refresh_fertility_if_enabled(&self) -> AppResult<Option<usize>> {
+        let settings = load_settings(&self.store).await?;
+        if !settings.fertility_enabled {
+            return Ok(None);
+        }
+        let snapshot = self.list_fertility_statuses(true).await?;
+        Ok(Some(snapshot.matched))
     }
 
     pub async fn check_live_all(&self) -> AppResult<Vec<LiveStatus>> {
@@ -3086,6 +3072,55 @@ fn source_fingerprint(post: &DynamicPost, title: &str, source_kind: &str) -> Str
         .collect()
 }
 
+/// 用主播自己的 UID 匹配 LAPLACE 记录；未命中时再看关联官号。
+fn match_fertility_statuses(
+    streamers: &[Streamer],
+    payload: &crate::fertility::FertilityResponse,
+) -> Vec<FertilityStatus> {
+    let remote_by_mid: HashMap<String, &crate::fertility::FertilityRecord> = payload
+        .data
+        .iter()
+        .map(|record| (record.uid.to_string(), record))
+        .collect();
+    let mut statuses = Vec::new();
+    for streamer in streamers {
+        let mut hit: Option<(&crate::fertility::FertilityRecord, String)> = remote_by_mid
+            .get(&streamer.mid)
+            .copied()
+            .map(|record| (record, streamer.mid.clone()));
+        if hit.is_none() {
+            for linked in &streamer.linked_accounts {
+                if let Some(record) = remote_by_mid.get(&linked.mid).copied() {
+                    hit = Some((record, linked.mid.clone()));
+                    break;
+                }
+            }
+        }
+        let Some((record, matched_mid)) = hit else {
+            continue;
+        };
+        statuses.push(FertilityStatus {
+            streamer_id: streamer.id,
+            mid: streamer.mid.clone(),
+            streamer_name: streamer.name.clone(),
+            streamer_avatar: if streamer.avatar_url.is_empty() {
+                record.user.avatar.clone().unwrap_or_default()
+            } else {
+                streamer.avatar_url.clone()
+            },
+            status: record.status.to_ascii_lowercase(),
+            day_in_cycle: record.day_in_cycle,
+            ovulation_day: record.ovulation_day,
+            next_period: record.next_period.clone(),
+            cycle_length: record.effective_cycle_length,
+            period_length: record.effective_period_length,
+            data_points: record.data_points,
+            matched_mid,
+        });
+    }
+    statuses
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3151,6 +3186,110 @@ mod tests {
             schedule_enabled: true,
             live_notify_enabled: true,
             live_stats_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn fertility_is_disabled_by_default_and_never_touches_the_network() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        store
+            .add_subscription(&subscription("700", "丁"))
+            .await
+            .expect("streamer");
+        let service = AppService::new(store.clone(), RuntimeSecrets::default()).expect("service");
+
+        let snapshot = service
+            .list_fertility_statuses(true)
+            .await
+            .expect("disabled snapshot");
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.matched, 0);
+        assert!(snapshot.statuses.is_empty());
+        assert_eq!(snapshot.source, "disabled");
+
+        assert_eq!(
+            service
+                .refresh_fertility_if_enabled()
+                .await
+                .expect("noop refresh"),
+            None
+        );
+        assert!(store.get_fertility_cache().await.expect("cache").is_none());
+    }
+
+    #[tokio::test]
+    async fn fertility_matches_streamers_by_mid_then_linked_account() {
+        let payload = crate::fertility::parse_fertility_payload(
+            r#"{"data":[{"uid":900,"user":{"username":"直连","avatar":"https://example.com/a.jpg"},"status":"Menstruating","dayInCycle":2,"nextPeriod":"2026-12-04","effectiveCycleLength":28,"effectivePeriodLength":5,"dataPoints":3},{"uid":901,"user":{"username":"官号"},"status":"fertile","dayInCycle":11,"dataPoints":1}],"total":2}"#,
+        )
+        .expect("payload");
+
+        let direct = streamer_stub(1, "900", "直连主播");
+        let mut linked_owner = streamer_stub(2, "950", "挂靠主播");
+        linked_owner
+            .linked_accounts
+            .push(crate::models::LinkedAccount {
+                id: 1,
+                streamer_id: 2,
+                mid: "901".to_owned(),
+                name: "官号".to_owned(),
+                avatar_url: String::new(),
+                revision: 1,
+                created_at: Utc::now(),
+            });
+        let unmatched = streamer_stub(3, "999", "未收录主播");
+
+        let statuses = match_fertility_statuses(&[direct, linked_owner, unmatched], &payload);
+        assert_eq!(statuses.len(), 2);
+
+        let first = statuses
+            .iter()
+            .find(|item| item.streamer_id == 1)
+            .expect("direct");
+        assert_eq!(first.status, "menstruating");
+        assert_eq!(first.matched_mid, "900");
+        assert_eq!(first.cycle_length, Some(28));
+        assert_eq!(first.period_length, Some(5));
+        assert_eq!(first.day_in_cycle, Some(2));
+        assert_eq!(first.next_period.as_deref(), Some("2026-12-04"));
+        assert_eq!(first.streamer_avatar, "https://example.com/avatar-1.jpg");
+
+        let second = statuses
+            .iter()
+            .find(|item| item.streamer_id == 2)
+            .expect("linked");
+        assert_eq!(second.mid, "950");
+        assert_eq!(second.matched_mid, "901");
+        assert_eq!(second.status, "fertile");
+        assert_eq!(second.data_points, 1);
+        // 官方记录没有头像时回落到空串，绝不借用其他主播的头像。
+        assert_eq!(second.streamer_avatar, "https://example.com/avatar-2.jpg");
+    }
+
+    fn streamer_stub(id: i64, mid: &str, name: &str) -> Streamer {
+        Streamer {
+            id,
+            mid: mid.to_owned(),
+            name: name.to_owned(),
+            avatar_url: format!("https://example.com/avatar-{id}.jpg"),
+            room_id: None,
+            live_url: None,
+            aliases: Vec::new(),
+            schedule_enabled: true,
+            live_notify_enabled: true,
+            live_stats_enabled: false,
+            fans: None,
+            last_error: None,
+            last_refresh_at: None,
+            is_live: false,
+            live_title: None,
+            live_cover: None,
+            live_started_at: None,
+            live_checked_at: None,
+            linked_accounts: Vec::new(),
+            sort_order: 0,
+            revision: 1,
+            created_at: Utc::now(),
         }
     }
 

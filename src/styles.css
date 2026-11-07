@@ -731,17 +731,24 @@ h3 {
 .timeline {
   display: grid;
   --timeline-columns: 2;
-  --timeline-drag-y: 0px;
-  --timeline-offset-y: 0px;
   gap: var(--timeline-gap, 18px);
-  transform: translateY(var(--timeline-offset-y));
-  transition: transform 420ms cubic-bezier(.22, 1, .36, 1);
-  will-change: transform;
+  cursor: ns-resize;
 }
 
 .timeline-viewport {
   position: relative;
-  overflow: clip;
+  overflow-x: clip;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: auto;
+  scrollbar-width: none;
+  touch-action: pan-y;
+}
+
+.timeline-viewport::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 .timeline-shell {
@@ -749,9 +756,33 @@ h3 {
 }
 
 .timeline.is-dragging {
-  transform: translateY(calc(var(--timeline-offset-y) + var(--timeline-drag-y)));
-  transition: none;
+  cursor: ns-resize;
   user-select: none;
+}
+
+.timeline-empty-overlay {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  min-height: 220px;
+  padding: 24px 16px 0;
+  pointer-events: none;
+}
+
+.timeline-empty-overlay * {
+  pointer-events: none;
+}
+
+.timeline-empty-overlay .empty-state {
+  max-width: 420px;
+  min-height: 190px;
+  padding: 22px 28px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--text) 8%, transparent);
 }
 
 .day-section {
@@ -812,41 +843,6 @@ h3 {
   display: grid;
   grid-template-columns: repeat(var(--timeline-columns), minmax(0, 1fr));
   gap: 10px;
-}
-
-.timeline-swipe-status {
-  position: fixed;
-  left: 50%;
-  bottom: 20px;
-  z-index: 4;
-  display: inline-flex;
-  width: max-content;
-  align-items: center;
-  gap: 5px;
-  min-height: 23px;
-  padding: 3px 9px;
-  color: var(--muted);
-  background: color-mix(in srgb, var(--surface) 90%, transparent);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--text) 7%, transparent);
-  font-size: 10px;
-  line-height: 1;
-  opacity: .62;
-  pointer-events: none;
-  transform: translateX(-50%);
-  transition: opacity 160ms ease, color 160ms ease, border-color 160ms ease;
-  white-space: nowrap;
-}
-
-.timeline-shell:hover .timeline-swipe-status,
-.timeline-swipe-status.is-active {
-  opacity: 1;
-}
-
-.timeline-swipe-status.is-active {
-  color: var(--primary-strong);
-  border-color: color-mix(in srgb, var(--primary) 42%, var(--border));
 }
 
 .day-empty {
@@ -1097,42 +1093,6 @@ h3 {
 .calendar-grid.is-dragging {
   cursor: ew-resize;
   transition: none;
-}
-
-.calendar-drag-badge {
-  position: absolute;
-  left: 50%;
-  bottom: 0;
-  z-index: 3;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 22px;
-  padding: 3px 9px;
-  color: var(--muted);
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--text) 7%, transparent);
-  font-size: 10px;
-  line-height: 1;
-  opacity: .58;
-  pointer-events: none;
-  transform: translateX(-50%) translateY(2px);
-  transition: opacity 160ms ease, transform 160ms ease, color 160ms ease, border-color 160ms ease;
-  white-space: nowrap;
-}
-
-.calendar-grid-wrap:hover .calendar-drag-badge,
-.calendar-grid.is-dragging + .calendar-drag-badge,
-.calendar-drag-badge.is-active {
-  opacity: 1;
-  transform: translateX(-50%) translateY(0);
-}
-
-.calendar-drag-badge.is-active {
-  color: var(--primary-strong);
-  border-color: color-mix(in srgb, var(--primary) 42%, var(--border));
 }
 
 .calendar-empty-hint {
@@ -1668,6 +1628,73 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .creator-fan-button strong { font-size: 13px; font-variant-numeric: tabular-nums; }
 .creator-fan-button span { color: var(--muted); }
 .creator-fan-button em { margin-left: 3px; padding-left: 8px; color: var(--faint); border-left: 1px solid rgba(var(--primary-rgb), .18); font-size: 10px; font-style: normal; }
+
+.creator-fertility-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  min-height: 30px;
+  padding: 4px 10px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.creator-fertility-button:hover { border-color: var(--primary); background: var(--primary-soft); }
+.creator-fertility-button strong { font-size: 12px; font-weight: 600; }
+.creator-fertility-button em { padding-left: 7px; color: var(--faint); border-left: 1px solid rgba(var(--primary-rgb), .18); font-size: 10px; font-style: normal; }
+.creator-fertility-button.is-menstruating { color: #b12f5a; background: #ffecef; border-color: rgba(217, 48, 94, .26); }
+.creator-fertility-button.is-fertile { color: #b04a86; background: #fdf0f7; border-color: rgba(209, 101, 159, .26); }
+.creator-fertility-button.is-ovulating { color: #96631a; background: #fff6df; border-color: rgba(222, 145, 45, .28); }
+.creator-fertility-button.is-normal { color: #247a55; background: #eaf9f1; border-color: rgba(30, 166, 110, .24); }
+.creator-fertility-button.is-missing,
+.creator-fertility-button.is-disabled { color: var(--faint); background: transparent; border-style: dashed; }
+.creator-fertility-button.is-unknown { color: var(--muted); background: var(--surface-soft); }
+
+.fertility-detail { display: grid; gap: 14px; }
+.fertility-detail-head { display: flex; align-items: center; gap: 12px; }
+.fertility-detail-head > div { display: grid; gap: 3px; min-width: 0; }
+.fertility-detail-head strong { font-size: 15px; }
+.fertility-detail-head span:not(.fertility-status-pill) { color: var(--faint); font-size: 11px; }
+.fertility-status-pill {
+  margin-left: auto;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.fertility-status-pill.is-menstruating { color: #b12f5a; background: #ffecef; }
+.fertility-status-pill.is-fertile { color: #b04a86; background: #fdf0f7; }
+.fertility-status-pill.is-ovulating { color: #96631a; background: #fff6df; }
+.fertility-status-pill.is-normal { color: #247a55; background: #eaf9f1; }
+.fertility-status-pill.is-missing,
+.fertility-status-pill.is-unknown { color: var(--muted); background: var(--surface-soft); }
+.fertility-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0; }
+.fertility-detail-grid > div { padding: 10px 12px; background: color-mix(in srgb, var(--surface) 72%, transparent); border: 1px solid var(--border); border-radius: 12px; }
+.fertility-detail-grid dt { color: var(--muted); font-size: 10px; }
+.fertility-detail-grid dd { margin: 4px 0 0; color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; }
+.fertility-detail-empty { padding: 14px; color: var(--muted); background: var(--surface-soft); border: 1px dashed var(--border); border-radius: 12px; font-size: 12px; line-height: 1.6; }
+.fertility-detail-source { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--faint); font-size: 11px; }
+.fertility-detail-source strong { padding: 2px 8px; color: #96631a; background: #fff6df; border-radius: 999px; font-size: 10px; }
+.fertility-detail-warning { margin: 0; padding: 9px 11px; color: #96631a; background: #fff8e6; border: 1px solid rgba(222, 145, 45, .28); border-radius: 10px; font-size: 11px; line-height: 1.55; }
+.fertility-detail-note { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.6; }
+
+.bloodhound-card .settings-stack { display: grid; gap: 12px; }
+.bloodhound-status { display: flex; align-items: center; gap: 12px; padding: 12px; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 12px; }
+.bloodhound-status.is-on { border-color: rgba(30, 166, 110, .28); background: color-mix(in srgb, #eaf9f1 60%, var(--surface)); }
+.bloodhound-status > div { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.bloodhound-status strong { font-size: 13px; }
+.bloodhound-status span:not(.bloodhound-dot) { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.bloodhound-dot { width: 9px; height: 9px; flex: 0 0 auto; background: var(--faint); border-radius: 50%; }
+.bloodhound-status.is-on .bloodhound-dot { background: #1ea66e; box-shadow: 0 0 0 4px rgba(30, 166, 110, .16); }
+.bloodhound-confirm { display: grid; gap: 16px; }
+.bloodhound-confirm h3 { margin: 0 0 8px; font-size: 13px; color: var(--text); }
+.bloodhound-confirm ul { margin: 0; padding-left: 18px; display: grid; gap: 7px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.bloodhound-confirm p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.bloodhound-confirm a { color: var(--primary-strong); }
 
 .fan-modal { display: grid; gap: 14px; }
 .fan-modal-note {
@@ -2309,6 +2336,10 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .span-2 { grid-column: auto; }
   .day-section { grid-template-columns: 94px minmax(0,1fr); gap: 7px; }
   .creator-card { grid-template-columns: 24px 54px minmax(0,1fr) auto; gap: 10px; }
+  .creator-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .fertility-detail-grid { grid-template-columns: 1fr; }
+  .bloodhound-status { align-items: flex-start; flex-wrap: wrap; }
+  .bloodhound-status > button { margin-left: 21px; }
   .fan-stat-grid { grid-template-columns: 1fr; }
   .fan-stat-grid > div { grid-template-columns: minmax(0,1fr) auto; align-items: center; }
   .fan-stat-grid strong { font-size: 18px; }
@@ -2329,7 +2360,6 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .calendar-width-label { display: none; }
   .timeline-columns-label { display: inline; }
   .calendar-width-control { padding-left: 4px; }
-  .timeline-swipe-status { bottom: 82px; }
   .day-strip { gap: 2px; }
   .day-pill { flex-direction: column; gap: 1px; min-height: 44px; }
   .timeline .day-section { grid-template-columns: 1fr; gap: 5px; }
@@ -2355,6 +2385,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .weekly-rule-top { grid-template-columns: minmax(0,1fr) auto; }
   .weekly-enabled { grid-column: 1; grid-row: 2; }
   .weekly-time-grid { grid-template-columns: 1fr; }
+  .creator-fertility-button { max-width: 100%; }
+  .fertility-detail-head { flex-wrap: wrap; }
+  .fertility-status-pill { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2364,172 +2397,6 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
-}
-
-
-/* Magic period page */
-.fertility-note {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  margin: 18px 0;
-  padding: 14px 16px;
-  color: #6d4e60;
-  background: linear-gradient(135deg, rgba(255, 228, 239, 0.82), rgba(255, 247, 251, 0.92));
-  border: 1px solid rgba(205, 101, 146, 0.22);
-  border-radius: var(--radius-lg);
-}
-.fertility-note > svg { color: #d84f90; }
-.fertility-note strong,
-.fertility-note span { display: block; }
-.fertility-note strong { color: var(--text); font-size: 13px; }
-.fertility-note span { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.55; }
-.fertility-note .fertility-source {
-  margin: 0;
-  padding: 6px 9px;
-  color: #a63f72;
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
-  border-radius: 999px;
-  font-size: 10px;
-  white-space: nowrap;
-}
-.fertility-warning {
-  margin-bottom: 14px;
-  padding: 10px 13px;
-  color: var(--warning);
-  background: var(--warning-soft);
-  border: 1px solid rgba(188, 121, 34, 0.16);
-  border-radius: 11px;
-  font-size: 11px;
-  line-height: 1.55;
-}
-.fertility-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin: 18px 0;
-}
-.fertility-summary strong {
-  padding: 16px;
-  color: var(--primary-strong);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  font-size: 25px;
-  line-height: 1;
-}
-.fertility-summary strong span {
-  display: block;
-  margin-top: 7px;
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-}
-.fertility-groups { display: grid; gap: 22px; }
-.fertility-group {
-  padding: 16px;
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-.fertility-group.is-menstruating { border-color: rgba(217, 48, 94, 0.22); background: rgba(255, 246, 248, 0.84); }
-.fertility-group.is-fertile { border-color: rgba(209, 101, 159, 0.2); }
-.fertility-group.is-ovulating { border-color: rgba(222, 145, 45, 0.2); }
-.fertility-group.is-normal { border-color: rgba(30, 166, 110, 0.18); }
-.fertility-group-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 13px;
-}
-.fertility-group-head > div { display: flex; align-items: center; gap: 8px; }
-.fertility-group-head h2 { font-size: 16px; }
-.fertility-group-head > span { color: var(--muted); font-size: 11px; }
-.fertility-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
-  gap: 10px;
-}
-.fertility-card {
-  display: grid;
-  grid-template-columns: 56px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
-  min-width: 0;
-  padding: 13px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 15px;
-}
-.fertility-card.is-menstruating { box-shadow: inset 3px 0 0 #dd3e6e; }
-.fertility-card.is-fertile { box-shadow: inset 3px 0 0 #d8659d; }
-.fertility-card.is-ovulating { box-shadow: inset 3px 0 0 #d6923a; }
-.fertility-card.is-normal { box-shadow: inset 3px 0 0 #2ca36c; }
-.fertility-card-main { min-width: 0; }
-.fertility-card-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 7px;
-}
-.fertility-card-title strong {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 14px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.fertility-status-pill {
-  flex: 0 0 auto;
-  padding: 3px 7px;
-  color: #9a446d;
-  background: #fff1f6;
-  border-radius: 999px;
-  font-size: 9px;
-  font-weight: 700;
-}
-.fertility-card.is-menstruating .fertility-status-pill { color: #b12f5a; background: #ffecef; }
-.fertility-card.is-ovulating .fertility-status-pill { color: #9a681f; background: #fff6df; }
-.fertility-card.is-normal .fertility-status-pill { color: #247a55; background: #eaf9f1; }
-.fertility-card p {
-  margin-top: 4px;
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.fertility-card-meta {
-  display: flex;
-  gap: 8px;
-  margin-top: 7px;
-  overflow: hidden;
-  color: var(--faint);
-  font-size: 10px;
-  white-space: nowrap;
-}
-.fertility-card-meta b { color: var(--text); font-weight: 700; }
-.fertility-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-height: 220px;
-  color: var(--muted);
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-lg);
-  font-size: 12px;
-}
-
-@media (max-width: 760px) {
-  .fertility-note { grid-template-columns: auto minmax(0, 1fr); }
-  .fertility-note .fertility-source { grid-column: 2; justify-self: start; }
-  .fertility-summary { grid-template-columns: 1fr; }
-  .fertility-grid { grid-template-columns: 1fr; }
 }
 
 .live-stats-loading {

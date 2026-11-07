@@ -12,6 +12,10 @@ pub mod store;
 pub mod weekly;
 
 pub use error::{AppError, AppResult};
+pub use fertility::{
+    FertilityClient, FertilityRecord, FertilityResponse, FERTILITY_CACHE_TTL_HOURS,
+    FERTILITY_POLL_INTERVAL_SECONDS,
+};
 pub use llm::{
     ContentAnalyzer, LlmConfig, LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
 };

@@ -19,7 +19,9 @@ OSHICAL_LLM_BASE_URL=https://api.openai.com/v1
 OSHICAL_PROXY_PORT=7890
 ```
 
-`OSHICAL_PROXY_PORT` 可选，填写后服务器会把 B 站、模型和魔法期等 HTTP 请求转发到服务器本机的 `127.0.0.1:<端口>`。也可以在 Web 管理界面的“网络代理”卡片中保存端口并点击“测试代理”，页面会显示经代理访问 Google 的延迟。
+`OSHICAL_PROXY_PORT` 可选，填写后服务器会把 B 站、模型和 LAPLACE 生理期等 HTTP 请求转发到服务器本机的 `127.0.0.1:<端口>`。也可以在 Web 管理界面的“网络代理”卡片中保存端口并点击“测试代理”，页面会显示经代理访问 Google 的延迟。
+
+服务器模式的 LAPLACE 采集只在设置页开启「寻血猎犬」后运行，周期 6 小时；关闭开关即停止，不需要重启容器。
 
 启动：
 

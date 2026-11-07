@@ -10,7 +10,6 @@ import {
   CalendarRange,
   Cloud,
   ExternalLink,
-  Flower2,
   HardDrive,
   LoaderCircle,
   Minus,
@@ -26,7 +25,6 @@ import {
 } from "lucide-react";
 import ScheduleView from "./components/ScheduleView";
 import CreatorsView from "./components/CreatorsView";
-import MagicPeriodView from "./components/MagicPeriodView";
 import SettingsView, { type SettingsViewHandle } from "./components/SettingsView";
 import { Avatar, ErrorBanner, Modal } from "./components/ui";
 import BrandMark from "./components/BrandMark";
@@ -106,7 +104,7 @@ import type {
   WeeklyScheduleRule,
 } from "./types";
 
-type Page = "schedule" | "fertility" | "creators" | "settings";
+type Page = "schedule" | "creators" | "settings";
 
 const SIDEBAR_WIDTH_KEY = "oshical.sidebarWidth";
 const WEB_DEVICE_PREFERENCES_KEY = "oshical.devicePreferences";
@@ -211,6 +209,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoAnalyzeImages: true,
   notificationsEnabled: true,
   liveStatsEnabled: false,
+  fertilityEnabled: false,
   llmBaseUrl: "https://api.openai.com/v1",
   llmModel: "",
   llmPromptVersion: "schedule-v1",
@@ -237,9 +236,6 @@ const localApi = isTauri ? new LocalApi() : null;
 const desktopWindow = isTauri ? getCurrentWindow() : null;
 const initialAppearance = readAppearanceSettings();
 applyAppearance(initialAppearance);
-
-// LAPLACE 正式接口尚未接入，保留页面实现但暂时关闭入口。
-const MAGIC_PERIOD_ENABLED = false;
 
 export default function App() {
   const [page, setPage] = useState<Page>("schedule");
@@ -2194,24 +2190,6 @@ export default function App() {
     };
   }, [refreshActiveData, serverApi, settings.dataMode, settings.serverUrl, showToast]);
 
-  const fertilityActions = useMemo(() => {
-    const serverMode = !isTauri || settings.dataMode === "server";
-    return {
-      load: async (refresh: boolean): Promise<FertilitySnapshot> => {
-        if (serverMode) {
-          if (!serverApi) {
-            throw new Error("服务器未连接");
-          }
-          return serverApi.fertility(refresh);
-        }
-        if (!localApi) {
-          throw new Error("本地 API 不可用");
-        }
-        return localApi.fertility(refresh);
-      },
-    };
-  }, [serverApi, settings.dataMode]);
-
   const creatorActions = useMemo(() => {
     const serverMode = !isTauri || settings.dataMode === "server";
     return {
@@ -2386,6 +2364,18 @@ export default function App() {
           throw new Error("本地 API 不可用");
         }
         return localApi.refreshFans(streamerId);
+      },
+      fertility: async (refresh: boolean): Promise<FertilitySnapshot> => {
+        if (serverMode) {
+          if (!serverApi) {
+            throw new Error("服务器未连接");
+          }
+          return serverApi.fertility(refresh);
+        }
+        if (!localApi) {
+          throw new Error("本地 API 不可用");
+        }
+        return localApi.fertility(refresh);
       },
       listWeeklyRules: async (streamerId: number): Promise<WeeklyScheduleRule[]> => {
         if (serverMode) {
@@ -2670,7 +2660,6 @@ export default function App() {
         </div>
         <nav className="nav-list">
           <button className={page === "schedule" ? "active" : ""} onClick={() => void navigateToPage("schedule")}><CalendarRange size={19} />日程<span>{subscriptions.length}</span></button>
-          {MAGIC_PERIOD_ENABLED ? <button className={page === "fertility" ? "active" : ""} onClick={() => void navigateToPage("fertility")}><Flower2 size={19} />魔法期</button> : null}
           <button className={page === "creators" ? "active" : ""} onClick={() => void navigateToPage("creators")}><UsersRound size={19} />主播库</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => void navigateToPage("settings")}><SettingsIcon size={19} />设置</button>
         </nav>
@@ -2787,10 +2776,8 @@ export default function App() {
             onError={showToast}
           />
         </div>
-        {MAGIC_PERIOD_ENABLED && page === "fertility" ? (
-          <MagicPeriodView subscriptions={orderedSubscriptions} actions={fertilityActions} onError={showToast} />
-        ) : page === "creators" ? (
-          <CreatorsView subscriptions={orderedSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onError={showToast} />
+        {page === "creators" ? (
+          <CreatorsView subscriptions={orderedSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} fertilityEnabled={settings.fertilityEnabled} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onOpenSettings={() => void navigateToPage("settings")} onError={showToast} />
         ) : page === "settings" ? (
           <SettingsView
             ref={settingsViewRef}
