@@ -41,7 +41,7 @@ fi
 # provide requests, but it cannot redirect root writes through symlinked paths.
 safe_replace_file() {
   local target="$1"
-  python3 - "$target" <<'PY'
+  python3 - "$target" 3<&0 <<'PY'
 import os
 import secrets
 import sys
@@ -71,7 +71,7 @@ def open_parent(path):
 
 data = bytearray()
 while True:
-    chunk = sys.stdin.buffer.read(65536)
+    chunk = os.read(3, 65536)
     if not chunk:
         break
     data.extend(chunk)
@@ -114,7 +114,7 @@ PY
 
 safe_append_file() {
   local target="$1"
-  python3 - "$target" <<'PY'
+  python3 - "$target" 3<&0 <<'PY'
 import os
 import stat
 import sys
@@ -184,7 +184,7 @@ try:
     if metadata.st_uid != os.geteuid():
         raise RuntimeError("refusing updater log not owned by updater user")
     while True:
-        chunk = sys.stdin.buffer.read(65536)
+        chunk = os.read(3, 65536)
         if not chunk:
             break
         view = memoryview(chunk)

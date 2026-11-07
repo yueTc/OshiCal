@@ -15,7 +15,7 @@
     "dev:desktop": "tauri dev",
     "dev:server": "cargo run -p oshical-server",
     "test": "cargo test --workspace",
-    "test:web": "node --experimental-strip-types --test scripts/live-schedule.test.ts scripts/server-url.test.ts scripts/github-mirror.test.ts scripts/fan-history.test.ts scripts/timeline-layout.test.ts scripts/fertility.test.ts",
+    "test:web": "node --experimental-strip-types --test scripts/live-schedule.test.ts scripts/server-url.test.ts scripts/github-mirror.test.ts scripts/fan-history.test.ts scripts/timeline-layout.test.ts scripts/fertility.test.ts scripts/updater-agent.test.ts",
     "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && tsc -b --pretty false",
     "version:set": "node scripts/set-version.mjs"
   },
