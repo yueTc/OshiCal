@@ -1192,6 +1192,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const visibleModels = models.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
+  const serverUpdateRunning = serverUpdate?.status === "running";
+  const serverUpdateActive =
+    serverUpdate?.status === "requested" ||
+    serverUpdate?.status === "waiting_window" ||
+    serverUpdateRunning;
+  const serverUpdateMessage =
+    serverUpdateRunning && serverUpdate?.message === "等待宿主机更新代理上线"
+      ? "宿主机更新代理正在执行更新，心跳可能暂时中断"
+      : serverUpdate?.message ?? "";
   const leaveBusy = saving || leaveSaving;
   const updatePercent =
     updateProgress.total && updateProgress.total > 0
@@ -1296,8 +1305,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <header>
               <h2>服务器更新</h2>
               <span className="setting-scope server">服务器</span>
-              <span className={serverUpdate?.agentOnline ? "update-agent-online" : "update-agent-offline"}>
-                {serverUpdate?.agentOnline ? "更新代理在线" : "更新代理未在线"}
+              <span
+                className={
+                  serverUpdateRunning
+                    ? "update-agent-running"
+                    : serverUpdate?.agentOnline
+                      ? "update-agent-online"
+                      : "update-agent-offline"
+                }
+              >
+                {serverUpdateRunning ? "更新执行中" : serverUpdate?.agentOnline ? "更新代理在线" : "更新代理未在线"}
               </span>
               <span>由宿主机 systemd 更新代理执行镜像拉取、备份、重启和失败回滚。</span>
             </header>
@@ -1312,7 +1329,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </div>
               <div>
                 <span>更新状态</span>
-                <strong>{serverUpdate?.updateAvailable ? "有可用更新" : serverUpdate ? "已是最新" : "读取中"}</strong>
+                <strong>{serverUpdateRunning ? "更新执行中" : serverUpdate?.updateAvailable ? "有可用更新" : serverUpdate ? "已是最新" : "读取中"}</strong>
               </div>
             </div>
             {serverUpdateError ? <ErrorBanner message={serverUpdateError} /> : null}
@@ -1391,6 +1408,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 onClick={() => void installServerUpdate()}
                 disabled={
                   serverUpdateLoading !== null ||
+                  serverUpdateActive ||
                   !serverUpdate?.updateAvailable ||
                   !serverUpdate.agentOnline
                 }
@@ -1401,15 +1419,18 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </div>
             {serverUpdate ? (
               <div className="update-status" role="status">
-                <strong>{serverUpdate.message}</strong>
+                <strong>{serverUpdateMessage}</strong>
                 <span>阶段：{serverUpdate.phase}</span>
                 {serverUpdate.targetVersion ? <span>目标版本：v{serverUpdate.targetVersion}</span> : null}
+                {serverUpdateRunning && !serverUpdate.agentOnline ? (
+                  <span>更新代理正在执行长任务，心跳可能暂时中断</span>
+                ) : null}
                 {serverUpdate.lastCheckedAt ? <span>上次检查：{new Date(serverUpdate.lastCheckedAt).toLocaleString("zh-CN")}</span> : null}
                 {serverUpdate.lastUpdatedAt ? <span>状态时间：{new Date(serverUpdate.lastUpdatedAt).toLocaleString("zh-CN")}</span> : null}
                 {serverUpdate.error ? <span className="server-update-error">{serverUpdate.error}</span> : null}
               </div>
             ) : null}
-            {!serverUpdate?.agentOnline ? (
+            {serverUpdate && !serverUpdate.agentOnline && !serverUpdateRunning ? (
               <div className="server-update-agent-missing" role="status">
                 <strong>宿主机更新代理没有在线，服务器更新无法执行</strong>
                 <p>

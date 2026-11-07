@@ -2120,6 +2120,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .server-update-card { background: rgba(248, 250, 255, .9); }
 .settings-card header .update-agent-online { color: #126b49; background: rgba(22, 164, 107, .09); }
 .settings-card header .update-agent-offline { color: var(--danger); background: var(--danger-soft); }
+.settings-card header .update-agent-running { color: #7a5600; background: rgba(222, 145, 45, .13); }
 
 .server-update-agent-missing {
   display: grid;

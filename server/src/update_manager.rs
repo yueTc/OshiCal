@@ -786,7 +786,10 @@ fn effective_message(
     update_available: bool,
     agent_online: bool,
 ) -> String {
-    if !agent_online && is_active_status(&status.status) {
+    // A long pull/backup/restart can temporarily outlive the heartbeat. An
+    // update that has already reached `running` must keep its progress message
+    // instead of being reported as a queued update waiting for the agent.
+    if !agent_online && matches!(status.status.as_str(), "requested" | "waiting_window") {
         return "等待宿主机更新代理上线".to_owned();
     }
     if settings.auto_update_enabled
@@ -809,9 +812,9 @@ fn effective_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_newer_version, mirror_manifest_url, parse_hhmm, validate_image_digest,
-        validate_mirror_url, validate_update_signature, window_contains, ServerUpdateManager,
-        ServerUpdateSettings,
+        effective_message, is_newer_version, mirror_manifest_url, parse_hhmm,
+        validate_image_digest, validate_mirror_url, validate_update_signature, window_contains,
+        ServerUpdateManager, ServerUpdateSettings, UpdateStatus,
     };
 
     #[test]
@@ -923,6 +926,40 @@ mod tests {
         assert!(!is_newer_version("0.2.4", "0.2.4"));
         assert!(!is_newer_version("0.2.3", "0.2.4"));
         assert!(!is_newer_version("invalid", "0.2.4"));
+    }
+
+    #[test]
+    fn running_update_keeps_progress_when_heartbeat_is_temporarily_stale() {
+        let status = UpdateStatus {
+            status: "running".to_owned(),
+            phase: "pulling".to_owned(),
+            message: "正在拉取服务器镜像".to_owned(),
+            target_version: Some("0.3.7".to_owned()),
+            updated_at: None,
+            error: None,
+        };
+        let settings = ServerUpdateSettings::default();
+        assert_eq!(
+            effective_message(&status, &settings, true, false),
+            "正在拉取服务器镜像"
+        );
+    }
+
+    #[test]
+    fn queued_update_waits_for_offline_agent() {
+        let status = UpdateStatus {
+            status: "requested".to_owned(),
+            phase: "queued".to_owned(),
+            message: "已提交立即更新请求".to_owned(),
+            target_version: Some("0.3.7".to_owned()),
+            updated_at: None,
+            error: None,
+        };
+        let settings = ServerUpdateSettings::default();
+        assert_eq!(
+            effective_message(&status, &settings, true, false),
+            "等待宿主机更新代理上线"
+        );
     }
 
     #[test]
