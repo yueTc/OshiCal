@@ -43,12 +43,16 @@ Android 端的存在理由只有一条：**在手机上查看服务端已经算�
 | `.gitignore` | 整体忽略 `src-tauri/gen/` | 收窄为 `src-tauri/gen/schemas/`，让 CI 生成的 `gen/android` 工程壳可以提交 | 源码已改 |
 | 前端单测 | 无平台判定测试 | 新增 `scripts/platform.test.ts`，随 `npm run test:web` 覆盖 `detectMobileShell` / `resolveDesktopShell` | 源码已改 |
 
-尚未做的（不是遗漏，是本轮刻意留在范围外）：
+本轮已完成（2026-11-07）：
 
-- `src-tauri/gen/android` 工程壳还没生成（本工作区禁止构建）。`.gitignore` 的忽略范围已从 `src-tauri/gen/` 收窄为 `src-tauri/gen/schemas/`，因此 CI 首次 `npx tauri android init` 生成的工程壳可以直接提交回仓库；在提交之前，工作流每次都会重新生成。
-- APK 从未构建过（本工作区禁止任何构建命令，见 `AGENTS.md`）。
-- 没有任何真机安装、通知、扫码登录的实测证据。
-- 应用签名只是「把材料放到约定位置」，Tauri 生成的 `app/build.gradle.kts` 默认不读 `key.properties`，真正签名还需要在该文件里补 `signingConfigs`。
+- `src-tauri/gen/android` 工程壳已由 CI 生成并提交（构建产物 `jniLibs`、`build`、`.gradle` 与签名材料都用 `.gitignore` 隔离）。
+- `app/build.gradle.kts` 已接通 `key.properties` 签名（v1 + v2），签名材料缺失时由工作流生成临时密钥。
+- CI 产出 universal release APK 并下载留档：`release/android/OshiCal-0.3.6-universal-release.apk`（110.4 MiB，v1 + v2 签名，可直接侧载）；首发那次（run 42388048567）的未签名包留档为 `OshiCal-0.3.6-universal-unsigned.apk`。
+- 两次构建覆盖 4 个 ABI：`arm64-v8a`、`armeabi-v7a`、`x86`、`x86_64`。
+
+尚未做的：
+
+- 没有任何真机安装、通知点击、扫码登录的实测证据。
 
 ---
 
@@ -89,13 +93,13 @@ npx tauri android init
 1. 检出源码（`actions/checkout`，pin SHA）
 2. 安装 Node.js 24（`cache: npm`）
 3. 安装 JDK 17（temurin）
-4. 安装 Android SDK（`android-actions/setup-android@v3`）
-5. 安装 NDK，并把 `ANDROID_HOME` / `ANDROID_SDK_ROOT` / `NDK_HOME` / `ANDROID_NDK_HOME` 写入 `$GITHUB_ENV`
+4. 准备 Android SDK 与 NDK：直接用 `ubuntu-latest` 预装的 SDK（`ANDROID_HOME=/usr/local/lib/android/sdk`），用 `sdkmanager` 装 `platform-tools`、`platforms;android-35`、`build-tools;35.0.0` 与 NDK
+5. 把 `ANDROID_HOME` / `ANDROID_SDK_ROOT` / `NDK_HOME` / `ANDROID_NDK_HOME` 写入 `$GITHUB_ENV`
 6. 安装 Rust stable 与三个 Android 目标
 7. Rust 缓存（`Swatinem/rust-cache`，`workspaces: ". -> target"`，`cache-on-failure`）
 8. `npm ci`
-9. `src-tauri/gen/android` 不存在则 `npx tauri android init --ci`
-10. 展开签名材料（可选，缺 Secrets 时跳过）
+9. 检查 `src-tauri/gen/android`（已入库则跳过；只有目录被删时才 `npx tauri android init --ci`）
+10. 写签名材料：有 `ANDROID_KEY_BASE64` 用发布密钥，没有则用 `keytool` 现场生成临时密钥
 11. `npx tauri android build --apk`
 12. 上传 `src-tauri/gen/android/app/build/outputs/apk/**/*.apk`（artifact 名 `oshical-android-apk`）
 
@@ -106,11 +110,11 @@ npx tauri android init
 | 组件 | 版本 / 取值 | 来源 |
 | --- | --- | --- |
 | JDK | Temurin 17 | `actions/setup-java`（AGP 8.x 要求 17） |
-| Android SDK | `setup-android@v3` 安装的 command-line tools，包由 `sdkmanager` 管理 | 工作流第 4、5 步 |
+| Android SDK | 运行器预装的 command-line tools + `sdkmanager` | 工作流第 4 步（不再用 `android-actions/setup-android`：v3 会执行 `sdkmanager tools`，新版仓库已无该包） |
 | NDK | `27.0.12077973` | 工作流 `env.NDK_VERSION`，改这里要同步改本文 |
 | Rust | stable | `dtolnay/rust-toolchain`（pin SHA，与 `release.yml` 一致） |
 | minSdk | 24 | `src-tauri/tauri.conf.json` 的 `bundle.android.minSdkVersion` |
-| compileSdk / targetSdk | 由 Tauri 生成的工程壳默认值决定，本仓库未覆写 | `src-tauri/gen/android`（未入库） |
+| compileSdk / targetSdk | 37 / 37 | `src-tauri/gen/android/app/build.gradle.kts`（已入库） |
 | Node.js | 24 | `actions/setup-node` |
 
 ### 4.4 ABI
@@ -123,18 +127,20 @@ npx tauri android init
 
 三个目标都在工作流的 `dtolnay/rust-toolchain` 步骤里一次性装好。`tauri android build` 默认构建全部已安装目标；只想要真机包时可后续用 `--target aarch64` 收窄。
 
-### 4.5 签名 Secrets
+### 4.5 签名
 
-全部由 GitHub Actions Secrets 提供，仓库里不写任何密钥。
+`app/build.gradle.kts` 读取 `src-tauri/gen/android/key.properties`（rootProject 相对路径），存在 `signingConfigs.release` 时 release 构建就用它签名（v1 + v2）。
 
 | Secret | 含义 | 缺失时 |
 | --- | --- | --- |
-| `ANDROID_KEY_BASE64` | 签名 keystore（JKS/PKCS12）的 base64 | 跳过签名步骤，产出未签名 APK，流水线不失败 |
-| `ANDROID_KEY_ALIAS` | keystore 里的 key alias | 写入空值，签名必然失败，需与 keystore 一起配置 |
+| `ANDROID_KEY_BASE64` | 发布 keystore（JKS/PKCS12）的 base64 | 工作流用 `keytool` 现场生成临时密钥（别名 `ci`、口令 `ci-signing`）签名，APK 可直接安装，但每次运行的签名都不同 |
+| `ANDROID_KEY_ALIAS` | keystore 里的 key alias | 与 keystore 一起配置，缺了签名会失败 |
 | `ANDROID_KEY_PASSWORD` | key 口令 | 同上 |
 | `ANDROID_KEYSTORE_PASSWORD` | keystore 口令 | 同上 |
 
-工作流把这些材料展开成 `src-tauri/gen/android/oshical-release.keystore` 与 `src-tauri/gen/android/key.properties`，内容不打印到日志。是否真正签名取决于工程壳的 `app/build.gradle.kts` 有没有读取 `key.properties`；Tauri 模板默认没有这段逻辑，所以首次签名前要先在工程壳里补 `signingConfigs`。
+工作流把材料展开成 `src-tauri/gen/android/oshical-release.keystore` 与 `src-tauri/gen/android/key.properties`，两者都被 `src-tauri/gen/android/.gitignore` 排除，日志里不打印内容。
+
+**临时签名意味着**：跨 CI 运行覆盖安装会因签名不一致失败，需要先卸载（卸载会清掉 `secrets.json`、本地缓存和服务端 Token）。要稳定的升级路径，必须配置 `ANDROID_KEY_BASE64` 等四个 Secrets。
 
 ### 4.6 为什么不在这台机器上构建
 
@@ -169,8 +175,8 @@ npx tauri android init
 - **明文 HTTP 需要额外配置**：Android 9+ 默认禁止明文流量，服务端如果是 `http://` 地址，需要在工程壳的 `network_security_config.xml` 里显式放行对应域名/IP，否则请求被系统拦掉。当前工程壳未包含这份配置。
 - **无应用内更新**：升级只有一条路——下载新 APK 覆盖安装。覆盖安装要求签名一致，换签名必须先卸载，卸载会清掉应用私有目录里的 `secrets.json`、本地缓存和服务端 Token。
 - **未上架商店**：没有 Google Play 包（无 AAB、无商店签名、无审核流程），也没有应用商店的自动更新；分发与信任完全依赖侧载时用户手动放行。
-- **签名链路未完成**：如 4.5 所述，工程壳默认不读 `key.properties`。
-- **工程壳尚未入库**：`src-tauri/gen/android` 需要由 CI 首次 `tauri android init` 生成后提交回仓库（`.gitignore` 已放行该目录）。在提交之前，每次 CI 都会重新生成工程壳，工程壳里做过的手工改动（签名配置、`network_security_config`、权限声明）不会保留。
+- **签名依赖 Secrets**：未配置 `ANDROID_KEY_BASE64` 时 CI 用临时密钥签名，跨运行覆盖安装会失败（见 4.5）。
+- **工程壳需要手工维护**：`src-tauri/gen/android` 已入库，`network_security_config`、权限声明、签名配置都在这里改；改动要像普通源码一样提交，CI 不会覆盖它（只有整个目录被删时才会重新 `tauri android init`）。
 
 ---
 
@@ -202,13 +208,15 @@ CI 产出 APK 之后逐项过；任何一项没过就不要对外说「安卓端
 | FCM 推送 | 应用不在前台也能收开播通知 | 需要 Firebase 项目、服务端接入 FCM、国内网络可用性另说 |
 | AAB 上架 | 商店分发、审核、自动更新 | 需要商店账号、AAB 构建、商店签名与合规材料 |
 | 只构建 arm64 | CI 时间与 artifact 体积减半 | 模拟器与 32 位旧机装不上 |
-| 工程壳入库 + 签名配置 | 构建可复现，签名链路闭环 | 要把 `gen/android` 提交进版本库，并在 `app/build.gradle.kts` 补 `signingConfigs` |
+| 工程壳入库 + 签名配置 | 构建可复现，签名链路闭环 | 已完成：`gen/android` 入库，`signingConfigs` 读 `key.properties` |
 
 ---
 
 ## 9. 与仓库约定的待确认项
 
 1. **`src/lib/platform.ts`**：本文与 `.github/workflows/android.yml` 按其存在为前提描述移动外壳行为。该文件当前导出 `detectMobileShell(userAgent)`、`isMobileShell`、`resolveDesktopShell(tauri, mobile)`；强制服务器模式落在 `App.tsx` 的启动分支（`isMobileShell` 为真且 `settings.dataMode !== "server"` 时改写为 `server`）。若后续改名或改导出名，第 2、3、5 节要同步。
-2. **`src-tauri/gen/android`**：`.gitignore` 已把忽略范围收窄为 `src-tauri/gen/schemas/`，生成的工程壳可以直接提交；本轮没有生成（禁止构建），首次 CI 运行后需要人工提交一次。
+2. **`src-tauri/gen/android`**：已由 CI 生成并提交（`compileSdk`/`targetSdk` 37、`minSdk` 24，`app/build.gradle.kts` 带 `signingConfigs`）。改动这个目录要连同构建结果一起验证；只有整个目录被删除时工作流才会重新初始化。
 3. **`actions/upload-artifact`、`setup-java`、`setup-android`**：仓库现有工作流只 pin 了 checkout / setup-node / rust-toolchain / rust-cache；`server-binary.yml` 用的是 `upload-artifact@v4` 未 pin。新工作流按同样风格使用主版本号，并在行尾标了 `TODO: 无已核对 SHA`，补到 SHA 后替换。
 4. **`tauri` 的 `tray-icon` feature 仍全局开启**：`tray-icon` crate 在 Tauri 的清单里只挂桌面 target，所以理论上 Android 构建会直接跳过它；若某些 Cargo 版本仍尝试为 Android 解析该可选依赖而报错，把它改成 `[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]` 下的 `tauri = { version = "2", features = ["tray-icon"] }` 声明即可，业务代码无需再改（`#[cfg(desktop)]` 已经隔离）。
+
+
