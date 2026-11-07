@@ -58,10 +58,10 @@ function link(mid: string): LinkedAccount {
 
 test("known statuses map to their own labels and classes", () => {
   for (const [status, label, className] of [
-    ["menstruating", "魔法期", "is-menstruating"],
-    ["fertile", "易孕期", "is-fertile"],
-    ["ovulating", "排卵期", "is-ovulating"],
-    ["normal", "安全期", "is-normal"],
+    ["menstruating", "月隐", "is-menstruating"],
+    ["fertile", "花期", "is-fertile"],
+    ["ovulating", "月圆", "is-ovulating"],
+    ["normal", "晴日", "is-normal"],
   ] as const) {
     const meta = fertilityStatusMeta(status);
     assert.equal(meta.label, label);
@@ -77,7 +77,7 @@ test("unknown and blank statuses fall back instead of throwing", () => {
 });
 
 test("statuses are matched case-insensitively with surrounding spaces", () => {
-  assert.equal(fertilityStatusMeta("  Menstruating ").label, "魔法期");
+  assert.equal(fertilityStatusMeta("  Menstruating ").label, "月隐");
 });
 
 test("next period renders as a short Chinese date", () => {
@@ -90,10 +90,10 @@ test("next period renders as a short Chinese date", () => {
 test("compact label includes the cycle day when present", () => {
   assert.equal(
     fertilityCompactLabel(status({ status: "menstruating", dayInCycle: 2 })),
-    "🩸 魔法期 · 第 2 天",
+    "🌙 月隐 · 第 2 天",
   );
-  assert.equal(fertilityCompactLabel(status({ status: "normal", dayInCycle: 0 })), "💚 安全期");
-  assert.equal(fertilityCompactLabel(status({ status: "normal", dayInCycle: null })), "💚 安全期");
+  assert.equal(fertilityCompactLabel(status({ status: "normal", dayInCycle: 0 })), "☀️ 晴日");
+  assert.equal(fertilityCompactLabel(status({ status: "normal", dayInCycle: null })), "☀️ 晴日");
 });
 
 test("disabled snapshots never match a streamer", () => {

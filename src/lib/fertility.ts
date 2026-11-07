@@ -1,6 +1,11 @@
 import type { FertilitySnapshot, FertilityStatus, Streamer } from "../types";
 
-/** LAPLACE 原始 status → 展示文案与样式类名。 */
+/**
+ * LAPLACE 原始 status → 展示文案与样式类名。
+ *
+ * 展示层统一使用「月相」这套委婉说法，括号里保留直白解释，
+ * 既不冒犯也不至于看不懂。
+ */
 export interface FertilityStatusMeta {
   label: string;
   emoji: string;
@@ -10,28 +15,28 @@ export interface FertilityStatusMeta {
 
 const STATUS_META: Record<string, FertilityStatusMeta> = {
   menstruating: {
-    label: "魔法期",
-    emoji: "🩸",
+    label: "月隐",
+    emoji: "🌙",
     className: "is-menstruating",
-    hint: "LAPLACE 记录显示正在经期",
+    hint: "LAPLACE 记录显示正处于月隐期（经期）",
   },
   fertile: {
-    label: "易孕期",
+    label: "花期",
     emoji: "🌸",
     className: "is-fertile",
-    hint: "LAPLACE 预测处于易孕窗口",
+    hint: "LAPLACE 预测处于花期（易孕窗口）",
   },
   ovulating: {
-    label: "排卵期",
-    emoji: "🥚",
+    label: "月圆",
+    emoji: "🌕",
     className: "is-ovulating",
-    hint: "LAPLACE 预测处于排卵窗口",
+    hint: "LAPLACE 预测处于月圆期（排卵窗口）",
   },
   normal: {
-    label: "安全期",
-    emoji: "💚",
+    label: "晴日",
+    emoji: "☀️",
     className: "is-normal",
-    hint: "LAPLACE 记录显示为常规期",
+    hint: "LAPLACE 记录显示处于晴日（常规期）",
   },
 };
 
@@ -44,9 +49,9 @@ export const UNKNOWN_FERTILITY_META: FertilityStatusMeta = {
 
 export const DISABLED_FERTILITY_META: FertilityStatusMeta = {
   label: "未开启",
-  emoji: "🐾",
+  emoji: "🌫️",
   className: "is-disabled",
-  hint: "开启寻血猎犬后才会抓取 LAPLACE 数据",
+  hint: "开启「月相」后才会抓取 LAPLACE 数据",
 };
 
 export const MISSING_FERTILITY_META: FertilityStatusMeta = {
@@ -72,7 +77,7 @@ export function formatNextPeriod(value: string | null | undefined): string {
   return match ? `${Number(match[2])}月${Number(match[3])}日` : value;
 }
 
-/** 主播口径的紧凑标签：`🩸 魔法期 · 第 2 天`。 */
+/** 主播口径的紧凑标签：`🌙 月隐 · 第 2 天`。 */
 export function fertilityCompactLabel(status: FertilityStatus): string {
   const meta = fertilityStatusMeta(status.status);
   const day = status.dayInCycle;

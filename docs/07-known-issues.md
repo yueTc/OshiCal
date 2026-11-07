@@ -116,10 +116,10 @@
 - 缺口类型：外部服务不稳定。
 - 缓解：可选 SESSDATA、失败源隔离、5 分钟刷新和单批次等待。
 
-### 寻血猎犬（LAPLACE 生理期数据源）
+### 月相（LAPLACE 周期参考数据源）
 
 - 开关默认关闭：未开启时服务端与桌面端都不会发出任何 LAPLACE 请求，接口只返回 `enabled=false` 的空快照。
-- 启用方式：设置页「寻血猎犬」卡片 → 确认免责声明与致谢后才会写入 `fertilityEnabled=true`；关闭立即生效并停止采集循环。
+- 启用方式：设置页「月相」卡片 → 确认免责声明与致谢后才会写入 `fertilityEnabled=true`；关闭立即生效并停止采集循环。
 - 已实测（会话 2026-11-07）：`workers.vrp.moe` 的 `/laplace/fertilities?showOutdated=1` 零校验，不带 Origin/Referer/Cookie 也能 200；全量 1638 条、在册 998 条。
 - 采集策略：服务端 `runtime.rs` 与桌面端 `spawn_local_monitor` 各自每 6 小时跑一次；结果写入 SQLite `fertility_cache`，缓存有效期 6 小时，手动刷新可强制重抓。
 - 抓取失败时回退到最近一次成功的缓存，并在快照上标记 `stale=true` 与中文 `warning`；没有缓存时接口返回错误，不影响日程、开播与粉丝统计。

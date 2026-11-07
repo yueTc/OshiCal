@@ -876,7 +876,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }
 
   /**
-   * 「寻血猎犬」开关：开启必须经过确认弹窗，关闭立即生效。
+   * 「月相」开关：开启必须经过确认弹窗，关闭立即生效。
    * 这里只用已保存的配置草稿提交单个字段，不会把手上的其他未保存编辑一起写下去。
    */
   async function setBloodhound(next: boolean): Promise<boolean> {
@@ -1532,9 +1532,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
         <section className="settings-card bloodhound-card">
           <header>
-            <h2>寻血猎犬</h2>
+            <h2>月相</h2>
             <span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span>
-            <span>从 LAPLACE 抓取生理期数据，展示在主播库的主播粉丝数旁边。</span>
+            <span>从 LAPLACE 抓取周期参考数据（月隐 / 花期 / 月圆 / 晴日），展示在主播库的主播粉丝数旁边。</span>
           </header>
           <div className="settings-stack">
             {draft.fertilityEnabled ? (
@@ -1570,7 +1570,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     onClick={() => setBloodhoundOpen(true)}
                     disabled={bloodhoundBusy}
                   >
-                    {bloodhoundBusy ? "处理中…" : "开启寻血猎犬"}
+                    {bloodhoundBusy ? "处理中…" : "开启月相"}
                   </button>
                 </div>
               </>
@@ -1852,7 +1852,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
       {bloodhoundOpen ? (
         <Modal
-          title="开启寻血猎犬？"
+          title="开启月相？"
           onClose={() => {
             if (!bloodhoundBusy) {
               setBloodhoundOpen(false);
@@ -1879,7 +1879,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 onClick={() => void confirmBloodhound()}
                 disabled={bloodhoundBusy}
               >
-                {bloodhoundBusy ? "正在保存…" : "已阅读并同意，开启寻血猎犬"}
+                {bloodhoundBusy ? "正在保存…" : "已阅读并同意，开启月相"}
               </button>
             </>
           }
@@ -1888,11 +1888,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <section>
               <h3>免责声明</h3>
               <ul>
-                <li>生理期数据由 LAPLACE 的投稿者提交，并由其模型推算；本应用只做只读抓取，不生成也不校验内容。</li>
+                <li>周期数据由 LAPLACE 的投稿者提交，并由其模型推算；本应用只做只读抓取，不生成也不校验内容。</li>
                 <li>这些数据仅供娱乐参考，<strong>不是医疗信息</strong>，不构成任何健康建议或诊断依据。</li>
                 <li>预测存在误差，可能滞后、缺失或与实际情况不符；请勿据此做出任何医疗、法律或人身决定。</li>
                 <li>数据涉及第三方个人信息；开启后这些信息只保存在{serverMode ? "你的服务器" : "本机"}数据库，不会回传给我们。</li>
-                <li>「寻血猎犬」默认关闭；关闭后会立即停止抓取，已缓存的数据会保留在本地数据库中。</li>
+                <li>「月相」默认关闭；关闭后会立即停止抓取，已缓存的数据会保留在本地数据库中。</li>
               </ul>
             </section>
             <section>

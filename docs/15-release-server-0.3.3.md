@@ -24,7 +24,7 @@
 
 ## 沿用 0.3.2 的功能
 
-- 「寻血猎犬」开关：默认关闭，关闭时不发任何 LAPLACE 请求；开启需确认免责声明与致谢。
+- 「月相」开关：默认关闭，关闭时不发任何 LAPLACE 请求；开启需确认免责声明与致谢。
 - 服务端 6 小时采集循环、`fertility_cache` 6 小时缓存、失败回退旧缓存并标记 `stale`。
 - `GET /api/fertility?refresh=`、设置项 `fertility_enabled`。
 

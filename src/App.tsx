@@ -2777,7 +2777,7 @@ export default function App() {
           />
         </div>
         {page === "creators" ? (
-          <CreatorsView subscriptions={orderedSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} fertilityEnabled={settings.fertilityEnabled} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onOpenSettings={() => void navigateToPage("settings")} onError={showToast} />
+          <CreatorsView subscriptions={orderedSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} fertilityEnabled={settings.fertilityEnabled} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onError={showToast} />
         ) : page === "settings" ? (
           <SettingsView
             ref={settingsViewRef}

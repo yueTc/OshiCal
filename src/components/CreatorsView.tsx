@@ -269,7 +269,6 @@ export default function CreatorsView({
   actions,
   onChanged,
   onOpenLiveRoom,
-  onOpenSettings,
   onError,
 }: {
   subscriptions: Streamer[];
@@ -279,7 +278,6 @@ export default function CreatorsView({
   actions: CreatorActions;
   onChanged: () => Promise<void>;
   onOpenLiveRoom: (streamer: Streamer) => Promise<void>;
-  onOpenSettings: () => void;
   onError: (message: string) => void;
 }) {
   const [keyword, setKeyword] = useState("");
@@ -354,7 +352,7 @@ export default function CreatorsView({
     fertilityRequestSeq.current += 1;
     const requestId = fertilityRequestSeq.current;
     if (!fertilityEnabled) {
-      // 关闭后立刻清空，避免界面继续显示上次抓取的生理期数据。
+      // 关闭后立刻清空，避免界面继续显示上次抓取的周期数据。
       setFertilitySnapshot(null);
       setFertilityError(null);
       setFertilityLoading(false);
@@ -1153,8 +1151,8 @@ export default function CreatorsView({
   }
 
   function openFertilityDetail(streamer: Streamer) {
+    // 开关关闭时不渲染入口，这里只是兜底，避免任何路径把空数据弹窗打开。
     if (!fertilityEnabled) {
-      onOpenSettings();
       return;
     }
     setFertilityTarget(streamer);
@@ -1424,16 +1422,17 @@ export default function CreatorsView({
                   (() => {
                     const status = findFertilityStatus(fertilitySnapshot, streamer);
                     const meta = status ? fertilityStatusMeta(status.status) : null;
+                    // 开关关闭时整块不渲染：没有数据就没有展示价值，也不该占位。
                     return (
                       <button
                         type="button"
                         className={`creator-fertility-button ${meta?.className ?? "is-missing"}`}
                         title={
                           status
-                            ? `${meta?.label ?? "生理期"}${status.dayInCycle ? ` · 周期第 ${status.dayInCycle} 天` : ""} · 下次 ${formatNextPeriod(status.nextPeriod)} · 点击查看详情`
+                            ? `${meta?.label ?? "月相"}${status.dayInCycle ? ` · 周期第 ${status.dayInCycle} 天` : ""} · 下次 ${formatNextPeriod(status.nextPeriod)} · 点击查看详情`
                             : "LAPLACE 暂未收录这位主播，点击查看说明"
                         }
-                        aria-label={`${streamer.name} 的生理期数据`}
+                        aria-label={`${streamer.name} 的月相参考`}
                         onClick={() => openFertilityDetail(streamer)}
                       >
                         {status ? (
@@ -1447,17 +1446,7 @@ export default function CreatorsView({
                       </button>
                     );
                   })()
-                ) : (
-                  <button
-                    type="button"
-                    className="creator-fertility-button is-disabled"
-                    title="开启寻血猎犬后才会抓取 LAPLACE 生理期数据，点击前往设置"
-                    aria-label="开启寻血猎犬"
-                    onClick={onOpenSettings}
-                  >
-                    <strong>🐾 未开启</strong>
-                  </button>
-                )}
+                ) : null}
                 <button
                   type="button"
                   className="creator-fan-button"
@@ -1609,7 +1598,7 @@ export default function CreatorsView({
 
       {fertilityTarget ? (
         <Modal
-          title={`生理期数据 · ${fertilityTarget.name}`}
+          title={`月相 · ${fertilityTarget.name}`}
           onClose={() => setFertilityTarget(null)}
           footer={
             <>
@@ -1655,10 +1644,10 @@ export default function CreatorsView({
                   <dl className="fertility-detail-grid">
                     <div><dt>当前状态</dt><dd>{meta?.hint ?? meta?.label}</dd></div>
                     <div><dt>周期内第几天</dt><dd>{status.dayInCycle === null ? "--" : `第 ${status.dayInCycle} 天`}</dd></div>
-                    <div><dt>下次生理期</dt><dd>{formatNextPeriod(status.nextPeriod)}</dd></div>
-                    <div><dt>排卵日</dt><dd>{status.ovulationDay === null ? "--" : `第 ${status.ovulationDay} 天`}</dd></div>
+                    <div><dt>下次月隐</dt><dd>{formatNextPeriod(status.nextPeriod)}</dd></div>
+                    <div><dt>月圆日</dt><dd>{status.ovulationDay === null ? "--" : `第 ${status.ovulationDay} 天`}</dd></div>
                     <div><dt>有效周期长度</dt><dd>{status.cycleLength === null ? "--" : `${status.cycleLength} 天`}</dd></div>
-                    <div><dt>有效经期长度</dt><dd>{status.periodLength === null ? "--" : `${status.periodLength} 天`}</dd></div>
+                    <div><dt>月隐时长</dt><dd>{status.periodLength === null ? "--" : `${status.periodLength} 天`}</dd></div>
                     <div><dt>数据点</dt><dd>{status.dataPoints} 条记录</dd></div>
                     <div><dt>匹配账号</dt><dd>UID {status.matchedMid}</dd></div>
                   </dl>
