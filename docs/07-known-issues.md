@@ -42,6 +42,13 @@
 - MSI：未配置；当前 `tauri.conf.json` 只声明 NSIS target。
 - 便携程序：`release/windows/oshical.exe`，2026-10-26 重建并校验哈希。
 
+### 安卓端（未实测）
+
+- 未验证：APK 首次构建（`src-tauri/gen/android` 尚未入库，需 CI 生成工程壳）、真机安装与启动、通知点击跳转、扫码登录到 Cookie 落盘。构建只由 `.github/workflows/android.yml` 负责，本工作区按 `AGENTS.md` 不执行任何构建命令。
+- 平台限制：后台进程可能被系统回收，通知可能延迟或丢失；没有 FCM 通道，应用不在前台就没有推送。没有应用内更新，换版本只能侧载覆盖安装，换签名必须先卸载并会清掉本地凭据。Rust 侧 `rustls` 不读系统信任库，服务端使用自签证书时握手失败。服务端为明文 HTTP 时还需要在工程壳里补 `network_security_config`。未上架 Google Play。
+- 缺口类型：无真机与 Android 构建环境（本工作区禁止构建）。
+- 下一步：在 CI 产出 APK 后按 `docs/22-android-client.md` 第 7 节的验收清单逐项验证，并把结果回填到本节与本文件「已验证」。
+
 ### Docker
 
 - 已验证（2026-10-27，隔离 Linux Docker 环境）：Ubuntu x86_64、Docker 29.1.3、Compose 2.40.3；镜像构建成功，约 37.58 MB。

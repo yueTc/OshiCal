@@ -13,7 +13,7 @@ data/
 *.db
 *.db-shm
 *.db-wal
-src-tauri/gen/
+src-tauri/gen/schemas/
 src-tauri/target/
 src/**/*.js
 *.tsbuildinfo

@@ -52,6 +52,14 @@ B 站虚拟主播日程与开播通知工具。支持 Windows 桌面端、本地
 - SQLite / SQLx
 - React 19 / TypeScript / Vite
 
+## 平台
+
+- **Windows 桌面端**（NSIS 安装包）：完整功能——本地抓取、系统托盘、开机自启、应用内更新和 Windows 开播通知。
+- **服务器 Web UI**（桌面或手机浏览器直连）：服务器模式，数据与服务端一致，浏览器本身不做抓取。
+- **Android APK**（由 `.github/workflows/android.yml` 构建，侧载安装）：只做服务器模式；没有应用内更新，换版本需覆盖安装；通知仅在应用存活时发出。
+
+安卓端的边界、构建参数与验收清单见 `docs/22-android-client.md`；当前未做真机验证，状态以 `docs/07-known-issues.md` 为准。
+
 ## 当前交付物
 
 - Windows 便携程序：`release/windows/OshiCal.exe`
@@ -313,3 +321,9 @@ cargo test -p oshical-core real_bilibili_smoke -- --ignored --nocapture
 - `docs/14-release-0.3.2.md`（月相：LAPLACE 周期参考数据）
 - `docs/15-release-server-0.3.3.md`（服务端编译产物发布）
 - `docs/16-release-0.3.4-server-0.3.6.md`（更新代理修复与发布）
+- `docs/17-release-0.3.5-server-0.3.7.md`
+- `docs/18-release-server-0.3.8.md`
+- `docs/19-release-server-0.3.9.md`
+- `docs/20-release-server-0.3.10.md`
+- `docs/21-release-desktop-0.3.6.md`
+- `docs/22-android-client.md`（Android 服务器模式客户端：边界、构建与验收）

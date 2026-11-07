@@ -191,6 +191,7 @@ interface SettingsViewProps {
   biliConfigured: boolean;
   autostart: boolean;
   tauri: boolean;
+  mobileShell: boolean;
   serverMode: boolean;
   sync: SyncUiState;
   devices: DeviceInfo[];
@@ -215,6 +216,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   biliConfigured,
   autostart,
   tauri,
+  mobileShell,
   serverMode,
   sync,
   devices,
@@ -1241,9 +1243,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </button>
             </div>
           ) : (
-            <div className="browser-mode-note"><Cloud size={20} />当前为服务器 Web 管理界面。</div>
+            <div className="browser-mode-note"><Cloud size={20} />{mobileShell ? "安卓端固定使用服务器模式，由服务器采集和抓取。" : "当前为服务器 Web 管理界面。"}</div>
           )}
-          {tauri && draft.dataMode === "server" ? (
+          {(tauri || mobileShell) && draft.dataMode === "server" ? (
             <div className="form-grid">
               <label>
                 <span>服务器地址</span>
@@ -1628,15 +1630,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <section className="settings-card device-local-settings">
           <header><h2>提醒与运行</h2><span className="setting-scope local">仅本设备</span></header>
           <div className="settings-stack">
-            <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft((current) => ({ ...current, notificationsEnabled: value }))} label="Windows 开播通知" />
+            <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft((current) => ({ ...current, notificationsEnabled: value }))} label={mobileShell ? "开播通知" : "Windows 开播通知"} />
             {tauri ? <Toggle checked={autoLaunch} onChange={setAutoLaunch} label="开机自启" /> : null}
-            {tauri ? (
+            {tauri || mobileShell ? (
               <button className="button secondary" onClick={() => void actions.testNotification().catch((notificationError) => onError(explainError(notificationError)))}>
                 发送测试通知
               </button>
             ) : null}
-            {tauri ? (
-              <p className="form-hint">通知和窗口偏好不会同步到其他设备。关闭窗口后驻留托盘，不会补发启动时已经在直播的通知。</p>
+            {tauri || mobileShell ? (
+              <p className="form-hint">{mobileShell ? "通知偏好只保存在本机；应用被系统回收后不会补发通知。" : "通知和窗口偏好不会同步到其他设备。关闭窗口后驻留托盘，不会补发启动时已经在直播的通知。"}</p>
             ) : null}
           </div>
         </section>

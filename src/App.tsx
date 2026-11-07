@@ -48,6 +48,7 @@ import {
   installNotificationActionHandler,
   notifyLive,
 } from "./lib/notifications";
+import { isMobileShell } from "./lib/platform";
 import type { SecretInput } from "./lib/secret-types";
 import { checkForUpdate } from "./lib/updater";
 import {
@@ -233,11 +234,13 @@ const EMPTY_SECRETS: SecretStatus = {
 };
 
 const localApi = isTauri ? new LocalApi() : null;
-const desktopWindow = isTauri ? getCurrentWindow() : null;
+const desktopWindow = isTauri && !isMobileShell ? getCurrentWindow() : null;
 const initialAppearance = readAppearanceSettings();
 applyAppearance(initialAppearance);
 
 export default function App() {
+  // 安卓/iOS 上没有托盘、自启、应用内更新和窗口控制，桌面前端外壳整体关闭。
+  const desktopShell = isTauri && !isMobileShell;
   const [page, setPage] = useState<Page>("schedule");
   const settingsViewRef = useRef<SettingsViewHandle>(null);
   const [scheduleRevision, setScheduleRevision] = useState(0);
@@ -433,7 +436,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!isTauri) {
+    if (!desktopShell) {
       return;
     }
     let disposed = false;
@@ -1029,6 +1032,12 @@ export default function App() {
         const auto = await readAutostart();
         if (cancelled) {
           return;
+        }
+        // 安卓/iOS 不运行本地采集，首次启动统一落到服务器模式。
+        if (isMobileShell && boot.settings.dataMode !== "server") {
+          const nextSettings = { ...boot.settings, dataMode: "server" as const };
+          await localApi.saveSettings(nextSettings);
+          boot.settings = nextSettings;
         }
         settingsRef.current = boot.settings;
         setSettings(boot.settings);
@@ -2630,7 +2639,7 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell ${isTauri ? "is-desktop" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
+      className={`app-shell ${desktopShell ? "is-desktop" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
       {desktopWindow ? (
@@ -2788,7 +2797,8 @@ export default function App() {
             llmApiKeyHint={llmApiKeyHint}
             biliConfigured={(!isTauri || settings.dataMode === "server") ? serverBiliConfigured : secrets.biliConfigured}
             autostart={autostart}
-            tauri={isTauri}
+            tauri={desktopShell}
+            mobileShell={isMobileShell}
             serverMode={!isTauri || settings.dataMode === "server"}
             sync={syncState}
             devices={syncDevices}
@@ -2847,10 +2857,10 @@ export default function App() {
                   resyncInFlightRef.current = false;
                 });
             }}
-            onImportServer={isTauri ? () => {
+            onImportServer={desktopShell ? () => {
               void openServerImport().catch((error) => showToast(explainError(error)));
             } : undefined}
-            onMigrateToServer={isTauri ? () => {
+            onMigrateToServer={desktopShell ? () => {
               void openClientMigrationToServer().catch((error) => showToast(explainError(error)));
             } : undefined}
             onDeleteDevice={deleteSyncDeviceLog}
@@ -2957,7 +2967,7 @@ export default function App() {
               <button className="button secondary" disabled={migrationBusy} onClick={deferServerSetup}>稍后</button>
               <button
                 className="button secondary"
-                disabled={migrationBusy || !isTauri}
+                disabled={migrationBusy || !desktopShell}
                 onClick={() => void prepareClientMigration()}
               >
                 迁移本机数据到服务端
@@ -2971,7 +2981,7 @@ export default function App() {
           <p className="import-copy">请选择这台设备首次接入服务器时的数据来源。</p>
           <div className="import-stats">
             <strong>{subscriptions.length}<span>服务端订阅</span></strong>
-            <strong>{isTauri ? "可迁移" : "仅在线"}<span>本机数据</span></strong>
+            <strong>{desktopShell ? "可迁移" : "仅在线"}<span>本机数据</span></strong>
           </div>
           <p className="form-hint">
             使用服务端数据会以服务器为唯一数据源；迁移本机数据会先由服务端生成冲突预览，确认后才写入服务器。

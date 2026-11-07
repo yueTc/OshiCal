@@ -1,3 +1,4 @@
+mod secrets;
 mod sync_client;
 
 use std::collections::{BTreeMap, HashMap};
@@ -18,19 +19,28 @@ use oshical_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(desktop)]
 use tauri::menu::{Menu, MenuItem};
+#[cfg(desktop)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::Cookie;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(desktop)]
+use tauri::{WebviewUrl, WebviewWindowBuilder, WindowEvent};
+#[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
-const KEYRING_SERVICE: &str = "com.oshical.app";
 const KEY_LLM_API_KEY: &str = "llm_api_key";
 const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
+#[cfg(not(desktop))]
+const APP_UPDATE_UNSUPPORTED: &str = "当前平台不支持应用内更新，请手动安装新版本";
+#[cfg(desktop)]
 const APP_UPDATE_DIRECT_ENDPOINT: &str =
     "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+#[cfg(desktop)]
 const APP_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(desktop)]
 const APP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Default)]
@@ -197,16 +207,21 @@ struct Bootstrap {
     secrets: SecretStatus,
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+    // 开机自启、应用内更新和进程重启只存在于桌面端；Android/iOS 构建不注册这些插件。
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .setup(|app| {
             let data_dir = match std::env::var("OSHICAL_DATA_DIR") {
                 Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
@@ -218,6 +233,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let server_cache_root = data_dir.join("servers");
             std::fs::create_dir_all(&server_cache_root)?;
+            secrets::init(&data_dir);
             let db_path = data_dir.join("oshical.db");
             let store =
                 tauri::async_runtime::block_on(oshical_core::SqliteStore::connect(&db_path))
@@ -237,9 +253,13 @@ pub fn run() {
                 sync_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 server_cache_root,
             });
-            setup_window(app.handle());
-            setup_tray(app.handle())?;
-            spawn_local_monitor(app.handle().clone());
+            // 移动端没有托盘、关窗驻留和本地采集：通知与数据全部来自服务端。
+            #[cfg(desktop)]
+            {
+                setup_window(app.handle());
+                setup_tray(app.handle())?;
+                spawn_local_monitor(app.handle().clone());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -312,6 +332,7 @@ pub fn run() {
         .expect("运行推历 OshiCal 桌面端失败");
 }
 
+#[cfg(desktop)]
 fn setup_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let window_to_hide = window.clone();
@@ -324,6 +345,7 @@ fn setup_window(app: &AppHandle) {
     }
 }
 
+#[cfg(desktop)]
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -332,6 +354,7 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+#[cfg(desktop)]
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开推历 OshiCal", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "立即刷新", true, None::<&str>)?;
@@ -382,6 +405,7 @@ struct AppUpdateInfo {
     body: Option<String>,
 }
 
+#[cfg(desktop)]
 fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, String> {
     let Some(value) = mirror_url.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -407,6 +431,7 @@ fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, Str
     }))
 }
 
+#[cfg(desktop)]
 fn app_update_endpoints(mirror_url: Option<&str>) -> Result<Vec<url::Url>, String> {
     let direct = url::Url::parse(APP_UPDATE_DIRECT_ENDPOINT)
         .map_err(|error| format!("更新地址无效: {error}"))?;
@@ -419,6 +444,7 @@ fn app_update_endpoints(mirror_url: Option<&str>) -> Result<Vec<url::Url>, Strin
     Ok(vec![mirror, direct])
 }
 
+#[cfg(desktop)]
 async fn resolve_app_update(
     app: &AppHandle,
     mirror_url: Option<&str>,
@@ -452,6 +478,7 @@ async fn resolve_app_update(
     Ok(update)
 }
 
+#[cfg(desktop)]
 async fn install_resolved_update(
     app: &AppHandle,
     update: &tauri_plugin_updater::Update,
@@ -497,40 +524,57 @@ async fn check_app_update(
     app: AppHandle,
     mirror_url: Option<String>,
 ) -> Result<Option<AppUpdateInfo>, String> {
-    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
-    Ok(update.as_ref().map(|update| AppUpdateInfo {
-        current_version: update.current_version.clone(),
-        version: update.version.clone(),
-        date: update.date.map(|value| value.to_string()),
-        body: update.body.clone(),
-    }))
+    #[cfg(desktop)]
+    {
+        let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+        Ok(update.as_ref().map(|update| AppUpdateInfo {
+            current_version: update.current_version.clone(),
+            version: update.version.clone(),
+            date: update.date.map(|value| value.to_string()),
+            body: update.body.clone(),
+        }))
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (&app, mirror_url);
+        Err(APP_UPDATE_UNSUPPORTED.to_owned())
+    }
 }
 
 #[tauri::command]
 async fn install_app_update(app: AppHandle, mirror_url: Option<String>) -> Result<(), String> {
-    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
-    let Some(update) = update else {
-        return Err("当前已是最新版本".to_owned());
-    };
-    match install_resolved_update(&app, &update).await {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            let configured_mirror = normalize_mirror_base(mirror_url.as_deref())
-                .ok()
-                .flatten()
-                .is_some();
-            if !configured_mirror {
-                return Err(first_error);
+    #[cfg(desktop)]
+    {
+        let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+        let Some(update) = update else {
+            return Err("当前已是最新版本".to_owned());
+        };
+        match install_resolved_update(&app, &update).await {
+            Ok(()) => Ok(()),
+            Err(first_error) => {
+                let configured_mirror = normalize_mirror_base(mirror_url.as_deref())
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !configured_mirror {
+                    return Err(first_error);
+                }
+                let direct_update = resolve_app_update(&app, None).await?;
+                let Some(direct_update) = direct_update else {
+                    return Err(first_error);
+                };
+                install_resolved_update(&app, &direct_update).await
             }
-            let direct_update = resolve_app_update(&app, None).await?;
-            let Some(direct_update) = direct_update else {
-                return Err(first_error);
-            };
-            install_resolved_update(&app, &direct_update).await
         }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (&app, mirror_url);
+        Err(APP_UPDATE_UNSUPPORTED.to_owned())
     }
 }
 
+#[cfg(desktop)]
 async fn run_refresh_action(app: &AppHandle) -> Result<Value, String> {
     let state = app.state::<DesktopState>();
     let settings = load_settings(state.service.store())
@@ -567,32 +611,12 @@ async fn run_refresh_action(app: &AppHandle) -> Result<Value, String> {
     Ok(json!(report))
 }
 
-fn keyring_entry(user: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, user).map_err(|error| error.to_string())
-}
-
 fn get_secret(user: &str) -> Option<String> {
-    keyring_entry(user)
-        .ok()?
-        .get_password()
-        .ok()
-        .filter(|value| !value.is_empty())
+    secrets::get_secret(user)
 }
 
 fn set_secret(user: &str, value: Option<String>) -> Result<(), String> {
-    let entry = keyring_entry(user)?;
-    match value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => entry
-            .set_password(&value)
-            .map_err(|error| error.to_string()),
-        None => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        },
-    }
+    secrets::set_secret(user, value)
 }
 
 fn load_runtime_secrets() -> RuntimeSecrets {
@@ -1063,28 +1087,37 @@ fn is_bilibili_cookie_domain(domain: &str) -> bool {
 }
 
 async fn clear_bilibili_webview_cookies(app: &AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("bilibili-login") {
-        let _ = window.close();
+    // Android WebView 不暴露 Cookie 读取接口，移动端只清理应用内保存的 Cookie。
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Ok(())
     }
-    let Some(window) = app.get_webview_window("main") else {
-        return Ok(());
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        let cookies = window
-            .cookies()
-            .map_err(|error| format!("读取 B 站登录 Cookie 失败: {error}"))?;
-        for cookie in cookies {
-            if !is_bilibili_cookie_domain(cookie.domain().unwrap_or_default()) {
-                continue;
-            }
-            window
-                .delete_cookie(cookie)
-                .map_err(|error| format!("清除 B 站登录 Cookie 失败: {error}"))?;
+    #[cfg(desktop)]
+    {
+        if let Some(window) = app.get_webview_window("bilibili-login") {
+            let _ = window.close();
         }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|error| format!("清理 B 站登录 Cookie 任务失败: {error}"))?
+        let Some(window) = app.get_webview_window("main") else {
+            return Ok(());
+        };
+        tauri::async_runtime::spawn_blocking(move || {
+            let cookies = window
+                .cookies()
+                .map_err(|error| format!("读取 B 站登录 Cookie 失败: {error}"))?;
+            for cookie in cookies {
+                if !is_bilibili_cookie_domain(cookie.domain().unwrap_or_default()) {
+                    continue;
+                }
+                window
+                    .delete_cookie(cookie)
+                    .map_err(|error| format!("清除 B 站登录 Cookie 失败: {error}"))?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| format!("清理 B 站登录 Cookie 任务失败: {error}"))?
+    }
 }
 
 #[tauri::command]
@@ -1104,6 +1137,7 @@ async fn clear_bilibili_cookie(
     Ok(status)
 }
 
+#[cfg(desktop)]
 fn bili_login_url_allowed(url: &url::Url) -> bool {
     if url.scheme() == "about" {
         return true;
@@ -1153,52 +1187,61 @@ fn cookie_header_from_webview(cookies: &[Cookie<'static>]) -> Option<String> {
 
 #[tauri::command]
 async fn open_bilibili_browser_login(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("bilibili-login") {
-        window.show().map_err(|error| error.to_string())?;
-        window.set_focus().map_err(|error| error.to_string())?;
-        return Ok(());
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Err("移动端不支持内嵌 B 站登录窗口，请使用扫码登录或在服务端配置 Cookie".to_owned())
     }
-    let login_url = url::Url::parse("https://passport.bilibili.com/login")
-        .map_err(|error| error.to_string())?;
-    let window = WebviewWindowBuilder::new(&app, "bilibili-login", WebviewUrl::External(login_url))
-        .title("B 站登录 - 推历 OshiCal")
-        .inner_size(560.0, 760.0)
-        .min_inner_size(440.0, 600.0)
-        .center()
-        .on_navigation(bili_login_url_allowed)
-        .build()
-        .map_err(|error| format!("打开 B 站登录窗口失败: {error}"))?;
+    #[cfg(desktop)]
+    {
+        if let Some(window) = app.get_webview_window("bilibili-login") {
+            window.show().map_err(|error| error.to_string())?;
+            window.set_focus().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        let login_url = url::Url::parse("https://passport.bilibili.com/login")
+            .map_err(|error| error.to_string())?;
+        let window =
+            WebviewWindowBuilder::new(&app, "bilibili-login", WebviewUrl::External(login_url))
+                .title("B 站登录 - 推历 OshiCal")
+                .inner_size(560.0, 760.0)
+                .min_inner_size(440.0, 600.0)
+                .center()
+                .on_navigation(bili_login_url_allowed)
+                .build()
+                .map_err(|error| format!("打开 B 站登录窗口失败: {error}"))?;
 
-    let task_window = window.clone();
-    let task_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        for _ in 0..180 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if !task_window.is_visible().unwrap_or(false) {
+        let task_window = window.clone();
+        let task_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            for _ in 0..180 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !task_window.is_visible().unwrap_or(false) {
+                    break;
+                }
+                let probe = task_window.clone();
+                let result = tauri::async_runtime::spawn_blocking(move || probe.cookies()).await;
+                let Ok(Ok(cookies)) = result else {
+                    continue;
+                };
+                let Some(cookie) = cookie_header_from_webview(&cookies) else {
+                    continue;
+                };
+                let state = task_app.state::<DesktopState>();
+                match persist_bili_cookie(&state.service, cookie).await {
+                    Ok(status) => {
+                        let _ = task_app.emit("bili-cookie-updated", status);
+                        let _ = task_window.close();
+                    }
+                    Err(error) => {
+                        let _ = task_app.emit("bili-cookie-login-error", error);
+                    }
+                }
                 break;
             }
-            let probe = task_window.clone();
-            let result = tauri::async_runtime::spawn_blocking(move || probe.cookies()).await;
-            let Ok(Ok(cookies)) = result else {
-                continue;
-            };
-            let Some(cookie) = cookie_header_from_webview(&cookies) else {
-                continue;
-            };
-            let state = task_app.state::<DesktopState>();
-            match persist_bili_cookie(&state.service, cookie).await {
-                Ok(status) => {
-                    let _ = task_app.emit("bili-cookie-updated", status);
-                    let _ = task_window.close();
-                }
-                Err(error) => {
-                    let _ = task_app.emit("bili-cookie-login-error", error);
-                }
-            }
-            break;
-        }
-    });
-    Ok(())
+        });
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1212,6 +1255,7 @@ fn parse_datetime(value: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|error| format!("时间格式错误: {error}"))
 }
 
+#[cfg(desktop)]
 fn spawn_local_monitor(app: AppHandle) {
     let monitor_app = app.clone();
     tauri::async_runtime::spawn(async move {

@@ -1,8 +1,9 @@
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { isTauri } from "./api";
+import { isMobileShell } from "./platform";
 
 export async function readAutostart(): Promise<boolean> {
-  if (!isTauri) {
+  if (!isTauri || isMobileShell) {
     return false;
   }
   try {
@@ -13,7 +14,7 @@ export async function readAutostart(): Promise<boolean> {
 }
 
 export async function applyAutostart(enabled: boolean): Promise<void> {
-  if (!isTauri) {
+  if (!isTauri || isMobileShell) {
     return;
   }
   if (enabled) {

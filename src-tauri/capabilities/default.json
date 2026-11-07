@@ -1,7 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default desktop permissions for OshiCal",
+  "description": "Desktop permissions for OshiCal",
+  "platforms": ["linux", "macOS", "windows"],
   "windows": [
     "main"
   ],

@@ -1,0 +1,21 @@
+{
+  "name": "推历 OshiCal",
+  "short_name": "推历",
+  "description": "推历 OshiCal：虚拟主播直播日程、开播提醒与直播数据工具。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#fff8fb",
+  "theme_color": "#fff8fb",
+  "lang": "zh-CN",
+  "categories": ["lifestyle"],
+  "icons": [
+    {
+      "src": "/oshical.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

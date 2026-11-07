@@ -1,0 +1,13 @@
+{
+  "identifier": "mobile",
+  "description": "Android/iOS permissions for OshiCal: 无托盘、无自启、无应用内更新、无窗口控制",
+  "platforms": ["android", "iOS"],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "opener:default"
+  ]
+}
