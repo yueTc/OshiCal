@@ -120,10 +120,11 @@
 
 - 开关默认关闭：未开启时服务端与桌面端都不会发出任何 LAPLACE 请求，接口只返回 `enabled=false` 的空快照。
 - 启用方式：设置页「月相」卡片 → 确认免责声明与致谢后才会写入 `fertilityEnabled=true`；关闭立即生效并停止采集循环。
-- 已实测（会话 2026-11-07）：`workers.vrp.moe` 的 `/laplace/fertilities?showOutdated=1` 零校验，不带 Origin/Referer/Cookie 也能 200；全量 1638 条、在册 998 条。
-- 采集策略：服务端 `runtime.rs` 与桌面端 `spawn_local_monitor` 各自每 6 小时跑一次；结果写入 SQLite `fertility_cache`，缓存有效期 6 小时，手动刷新可强制重抓。
-- 抓取失败时回退到最近一次成功的缓存，并在快照上标记 `stale=true` 与中文 `warning`；没有缓存时接口返回错误，不影响日程、开播与粉丝统计。
-- 直连失败后回退 `r.jina.ai` Reader 文本代理；第三方代理可能限流、缓存旧数据或停止服务。
+- 已实测（会话 2026-11-07）：`workers.vrp.moe` 的 `/laplace/fertilities?showOutdated=1` 零校验，住宅/普通出口不带 Origin/Referer/Cookie 也能 200；全量 1638 条、在册 998 条。
+- Cloudflare 托管挑战：部分机房出口（实测华为云某节点）用 Rust `reqwest` + `rustls` 抓同一地址会拿到 `403` + `cf-mitigated: challenge`（`Just a moment...`）；换 UA、补 Referer/Origin、降级 HTTP/1.1 均无效，且 `rustls` 不读系统信任库，本地 MITM 代理也绕不过。用 `OSHICAL_FERTILITY_URL` 指向自建浏览器指纹中转即可（`curl_cffi` 的 Chrome 指纹实测 200）。
+- 采集策略：服务端 `runtime.rs` 与桌面端 `spawn_local_monitor` 各自每 6 小时跑一次；服务端为**单飞**采集（同进程同时只跑一个抓取），结果写入 SQLite `fertility_cache`，缓存有效期 6 小时。
+- 接口不再同步抓取：`/api/fertility` 命中缓存直接返回；缓存过期或为空时立即返回现有数据（`stale=true` + 中文 `warning`）并触发后台刷新，`?refresh=1` 最多等待 15 秒，失败或超时同样回落到缓存——界面不会长时间停在「读取中」。
+- 直连失败后回退 `r.jina.ai` Reader 文本代理；第三方代理可能限流、缓存旧数据或停止服务，部分国内机房直接不可达。
 - 数据来源与责任：所有生理期数据由 LAPLACE 投稿者提交、由 LAPLACE 模型推算，本项目只做只读抓取，不调用投稿写接口，也不上传任何数据。
 - 风险：站方改版换接口、字段改名或加鉴权时功能会失效；表现为匹配数变成 0 或接口报错，可在设置页关闭开关。
 - 下一步：如需长期使用，建议向 LAPLACE 申请正式接口授权或明确许可；站方提出异议时立刻下线该功能。

@@ -628,7 +628,8 @@ struct FertilityQuery {
     refresh: Option<bool>,
 }
 
-/// 读取 LAPLACE 生理期数据。开关关闭时返回 `enabled=false` 的空快照，不触网。
+/// 读取 LAPLACE 生理期数据。开关关闭时返回 `enabled=false` 的空快照，不触网；
+/// 缓存过期时立即返回缓存（`stale=true`）并触发后台刷新，`refresh=1` 最多等待 15 秒。
 async fn list_fertility_statuses(
     State(state): State<AppState>,
     Query(query): Query<FertilityQuery>,

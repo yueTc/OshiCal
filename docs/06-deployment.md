@@ -21,6 +21,14 @@ OSHICAL_PROXY_PORT=7890
 
 `OSHICAL_PROXY_PORT` 可选，填写后服务器会把 B 站、模型和 LAPLACE 生理期等 HTTP 请求转发到服务器本机的 `127.0.0.1:<端口>`。也可以在 Web 管理界面的“网络代理”卡片中保存端口并点击“测试代理”，页面会显示经代理访问 Google 的延迟。
 
+`OSHICAL_FERTILITY_URL` / `OSHICAL_FERTILITY_READER_URL` 可选，用来覆盖 LAPLACE 生理期数据的抓取地址。部分机房出口会被 Cloudflare 按 TLS 指纹做托管挑战（`403` + `cf-mitigated: challenge`），换 UA、补 Referer 都无效；此时把直连地址指向自建中转或镜像即可（容器内访问宿主机用 docker 网桥网关，通常是 `172.17.0.1`）：
+
+```dotenv
+OSHICAL_FERTILITY_URL=http://172.17.0.1:7861/laplace/fertilities?showOutdated=1
+```
+
+`/api/fertility` 不在请求路径上抓取：命中 6 小时缓存直接返回；缓存过期或为空时立即返回 `stale=true` 的缓存并在后台单飞刷新；`?refresh=1` 最多等待 15 秒。
+
 服务器模式的 LAPLACE 采集只在设置页开启「月相」后运行，周期 6 小时；关闭开关即停止，不需要重启容器。
 
 启动：

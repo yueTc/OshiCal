@@ -11,12 +11,27 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 
 /// 全量列表（含已过期角色），实测 1638 条，覆盖在册 998 条之外的历史角色。
-const DIRECT_URL: &str = "https://workers.vrp.moe/laplace/fertilities?showOutdated=1";
-const READER_URL: &str =
+const DEFAULT_DIRECT_URL: &str = "https://workers.vrp.moe/laplace/fertilities?showOutdated=1";
+/// 直连被拦时的兜底：Reader 文本代理。
+const DEFAULT_READER_URL: &str =
     "https://r.jina.ai/https://workers.vrp.moe/laplace/fertilities?showOutdated=1";
+/// 覆盖直连地址。可指向自建中转或镜像：部署环境里 Cloudflare 按 TLS 指纹做托管挑战
+/// 时，用它把抓取切到能过的出口（例如同机上的浏览器指纹中转）。
+const DIRECT_URL_ENV: &str = "OSHICAL_FERTILITY_URL";
+/// 覆盖 Reader 兜底地址。
+const READER_URL_ENV: &str = "OSHICAL_FERTILITY_READER_URL";
 const BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
 const MAX_ATTEMPTS: usize = 3;
+
+/// 读取环境变量里配置的地址；没配或为空时用默认值。
+fn configured_url(env_key: &str, fallback: &str) -> String {
+    std::env::var(env_key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
 
 /// 打开开关后两侧采集循环的抓取周期：6 小时。
 pub const FERTILITY_POLL_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
@@ -84,6 +99,8 @@ pub struct FertilityAccuracy {
 #[derive(Clone)]
 pub struct FertilityClient {
     http: reqwest::Client,
+    direct_url: String,
+    reader_url: String,
 }
 
 impl FertilityClient {
@@ -94,9 +111,14 @@ impl FertilityClient {
     pub fn new_with_proxy(proxy_port: Option<u16>) -> AppResult<Self> {
         let http = crate::network::client_builder(proxy_port)?
             .user_agent(BROWSER_USER_AGENT)
+            .connect_timeout(StdDuration::from_secs(10))
             .timeout(StdDuration::from_secs(45))
             .build()?;
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            direct_url: configured_url(DIRECT_URL_ENV, DEFAULT_DIRECT_URL),
+            reader_url: configured_url(READER_URL_ENV, DEFAULT_READER_URL),
+        })
     }
 
     /// 抓取全量列表。直连优先，逐次退避重试；三次都失败后回退到 Reader 文本代理。
@@ -134,7 +156,7 @@ impl FertilityClient {
     async fn fetch_direct(&self) -> AppResult<FertilityResponse> {
         let response = self
             .http
-            .get(DIRECT_URL)
+            .get(self.direct_url.as_str())
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::REFERER, "https://laplace.live/ovu")
             .send()
@@ -160,7 +182,7 @@ impl FertilityClient {
     async fn fetch_reader(&self) -> AppResult<FertilityResponse> {
         let response = self
             .http
-            .get(READER_URL)
+            .get(self.reader_url.as_str())
             .header(reqwest::header::ACCEPT, "text/plain")
             .send()
             .await

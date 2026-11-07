@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
@@ -8,7 +9,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::bilibili::{BilibiliClient, QrLoginPoll, QrLoginStart};
 use crate::error::{AppError, AppResult};
-use crate::fertility::{parse_fertility_payload, FertilityClient, FERTILITY_CACHE_TTL_HOURS};
+use crate::fertility::{
+    parse_fertility_payload, FertilityClient, FertilityResponse, FERTILITY_CACHE_TTL_HOURS,
+};
 use crate::live_stats::LiveStatsManager;
 use crate::llm::{
     analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient,
@@ -22,7 +25,7 @@ use crate::models::{
 use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
-use crate::store::SqliteStore;
+use crate::store::{FertilityCache, SqliteStore};
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
@@ -30,6 +33,28 @@ pub const FAN_POLL_INTERVAL_SECONDS: u64 = 60 * 60;
 const TITLE_REUSE_LOOKBACK_DAYS: i64 = 56;
 const TITLE_REUSE_SLOT_TOLERANCE_MINUTES: i64 = 30;
 const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
+/// 「立即刷新」最多等待的秒数：超过就回落到缓存，避免界面长时间停在「读取中」。
+const FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS: u64 = 15;
+
+/// LAPLACE 抓取单飞标记：同一进程内只允许一个抓取在跑，避免重复请求把上游刷成风控。
+static FERTILITY_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 单飞标记的 RAII 释放器：正常返回、提前 return 或 panic 都会释放。
+struct FertilityRefreshGuard;
+
+impl Drop for FertilityRefreshGuard {
+    fn drop(&mut self) {
+        FERTILITY_REFRESH_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 抢到抓取权时返回守卫，已有抓取在跑时返回 `None`。
+fn begin_fertility_refresh() -> Option<FertilityRefreshGuard> {
+    if FERTILITY_REFRESH_RUNNING.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    Some(FertilityRefreshGuard)
+}
 
 #[derive(Clone)]
 pub struct AppService {
@@ -675,6 +700,10 @@ impl AppService {
     /// 读取 LAPLACE 生理期数据，并与当前订阅主播匹配。
     ///
     /// 「寻血猎犬」关闭时直接返回 `enabled = false` 的空快照，**不读缓存也不发网络请求**。
+    ///
+    /// 命中 6 小时内的缓存时直接返回；缓存过期或为空时**不在请求路径上等网络**：立即返回
+    /// 现有缓存（标记 `stale`）并触发一次后台单飞刷新，客户端不会长时间停在「读取中」。
+    /// `force_refresh`（界面上的「立即刷新」）最多等待 15 秒，失败或超时同样回落到缓存。
     pub async fn list_fertility_statuses(
         &self,
         force_refresh: bool,
@@ -692,66 +721,130 @@ impl AppService {
             });
         }
 
+        let forced = if force_refresh {
+            self.try_force_fertility_refresh(&streamers).await
+        } else {
+            None
+        };
+        if let Some(snapshot) = forced {
+            return Ok(snapshot);
+        }
+
         let cached = self.store.get_fertility_cache().await?;
-        let now = Utc::now();
-        let mut payload = None;
-        let mut meta = None;
-
-        if !force_refresh {
-            if let Some(cache) = cached.as_ref().filter(|cache| {
-                now.signed_duration_since(cache.fetched_at)
-                    < Duration::hours(FERTILITY_CACHE_TTL_HOURS)
-            }) {
-                match parse_fertility_payload(&cache.payload_json) {
-                    Ok(parsed) => {
-                        payload = Some(parsed);
-                        meta = Some((cache.fetched_at, cache.source.clone(), false, None));
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "缓存的 LAPLACE 数据无法解析，将重新抓取");
-                    }
-                }
-            }
+        let fresh = cached.as_ref().is_some_and(|cache| {
+            Utc::now().signed_duration_since(cache.fetched_at)
+                < Duration::hours(FERTILITY_CACHE_TTL_HOURS)
+        });
+        let reusable = if fresh && !force_refresh {
+            Self::fertility_snapshot_from_cache(&streamers, cached.as_ref(), false, None)
+        } else {
+            None
+        };
+        if let Some(snapshot) = reusable {
+            return Ok(snapshot);
         }
 
-        if payload.is_none() {
-            match self.fertility_client().fetch().await {
-                Ok((fetched, source, fetched_at)) => {
-                    let serialized = serde_json::to_string(&fetched)?;
-                    if let Err(error) = self
-                        .store
-                        .save_fertility_cache(&serialized, fetched_at, &source)
-                        .await
-                    {
-                        tracing::warn!(%error, "写入 LAPLACE 缓存失败");
-                    }
-                    payload = Some(fetched);
-                    meta = Some((fetched_at, source, false, None));
-                }
-                Err(error) => {
-                    let fallback = cached.as_ref().and_then(|cache| {
-                        parse_fertility_payload(&cache.payload_json)
-                            .ok()
-                            .map(|payload| (cache, payload))
-                    });
-                    if let Some((cache, parsed)) = fallback {
-                        payload = Some(parsed);
-                        meta = Some((
-                            cache.fetched_at,
-                            cache.source.clone(),
-                            true,
-                            Some(format!("LAPLACE 抓取失败，正在使用缓存数据：{error}")),
-                        ));
-                    } else {
-                        return Err(error);
-                    }
-                }
+        let scheduled = self.spawn_fertility_refresh();
+        let warning = if scheduled {
+            "LAPLACE 数据正在后台刷新，先返回缓存数据"
+        } else {
+            "LAPLACE 数据刷新中，先返回缓存数据"
+        };
+        if let Some(snapshot) = Self::fertility_snapshot_from_cache(
+            &streamers,
+            cached.as_ref(),
+            true,
+            Some(warning.to_owned()),
+        ) {
+            return Ok(snapshot);
+        }
+        Ok(FertilitySnapshot {
+            enabled: true,
+            source: "none".to_owned(),
+            stale: true,
+            warning: Some(warning.to_owned()),
+            ..FertilitySnapshot::disabled()
+        })
+    }
+
+    /// 抓一次 LAPLACE 并写入缓存。只在后台任务或「立即刷新」里调用，会触网。
+    async fn refresh_fertility_snapshot(
+        &self,
+        streamers: &[Streamer],
+    ) -> AppResult<FertilitySnapshot> {
+        let (payload, source, fetched_at) = self.fertility_client().fetch().await?;
+        let serialized = serde_json::to_string(&payload)?;
+        if let Err(error) = self
+            .store
+            .save_fertility_cache(&serialized, fetched_at, &source)
+            .await
+        {
+            tracing::warn!(%error, "写入 LAPLACE 缓存失败");
+        }
+        Ok(Self::build_fertility_snapshot(
+            streamers, &payload, fetched_at, source, false, None,
+        ))
+    }
+
+    /// 「立即刷新」：抢到抓取权后同步抓一次，最多等 15 秒；抢不到或失败返回 `None`，
+    /// 由调用方回落到缓存数据。
+    async fn try_force_fertility_refresh(
+        &self,
+        streamers: &[Streamer],
+    ) -> Option<FertilitySnapshot> {
+        let _guard = begin_fertility_refresh()?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS),
+            self.refresh_fertility_snapshot(streamers),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "刷新 LAPLACE 生理期数据失败，回落到缓存数据");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("刷新 LAPLACE 生理期数据超时，回落到缓存数据");
+                None
             }
         }
+    }
 
-        let payload = payload.expect("fertility payload initialized");
-        let (fetched_at, source, stale, warning) = meta.expect("fertility metadata initialized");
-        let mut statuses = match_fertility_statuses(&streamers, &payload);
+    /// 把缓存里的 LAPLACE 列表转成快照；缓存解析失败时返回 `None`。
+    fn fertility_snapshot_from_cache(
+        streamers: &[Streamer],
+        cache: Option<&FertilityCache>,
+        stale: bool,
+        warning: Option<String>,
+    ) -> Option<FertilitySnapshot> {
+        let cache = cache?;
+        let payload = match parse_fertility_payload(&cache.payload_json) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%error, "缓存的 LAPLACE 数据无法解析，忽略该缓存");
+                return None;
+            }
+        };
+        Some(Self::build_fertility_snapshot(
+            streamers,
+            &payload,
+            cache.fetched_at,
+            cache.source.clone(),
+            stale,
+            warning,
+        ))
+    }
+
+    fn build_fertility_snapshot(
+        streamers: &[Streamer],
+        payload: &FertilityResponse,
+        fetched_at: DateTime<Utc>,
+        source: String,
+        stale: bool,
+        warning: Option<String>,
+    ) -> FertilitySnapshot {
+        let mut statuses = match_fertility_statuses(streamers, payload);
         let matched = statuses.len();
         statuses.sort_by_key(|item| {
             let rank = match item.status.as_str() {
@@ -763,7 +856,7 @@ impl AppService {
             };
             (rank, item.streamer_name.clone())
         });
-        Ok(FertilitySnapshot {
+        FertilitySnapshot {
             enabled: true,
             fetched_at,
             source,
@@ -772,16 +865,42 @@ impl AppService {
             total_available: payload.total.max(payload.data.len()),
             matched,
             statuses,
-        })
+        }
+    }
+
+    /// 后台单飞刷新：同一进程内只跑一个 LAPLACE 抓取。
+    fn spawn_fertility_refresh(&self) -> bool {
+        let Some(guard) = begin_fertility_refresh() else {
+            return false;
+        };
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(error) = service.refresh_fertility_if_enabled_inner().await {
+                tracing::warn!(%error, "后台刷新 LAPLACE 生理期数据失败");
+            }
+        });
+        true
     }
 
     /// 采集循环入口：开关关闭时什么都不做，返回 `Ok(None)`。
     pub async fn refresh_fertility_if_enabled(&self) -> AppResult<Option<usize>> {
+        let Some(_guard) = begin_fertility_refresh() else {
+            return Ok(None);
+        };
+        self.refresh_fertility_if_enabled_inner().await
+    }
+
+    async fn refresh_fertility_if_enabled_inner(&self) -> AppResult<Option<usize>> {
         let settings = load_settings(&self.store).await?;
         if !settings.fertility_enabled {
             return Ok(None);
         }
-        let snapshot = self.list_fertility_statuses(true).await?;
+        let streamers = self.store.list_streamers().await?;
+        if streamers.is_empty() {
+            return Ok(Some(0));
+        }
+        let snapshot = self.refresh_fertility_snapshot(&streamers).await?;
         Ok(Some(snapshot.matched))
     }
 
