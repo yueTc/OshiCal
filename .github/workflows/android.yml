@@ -63,30 +63,40 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3 # TODO: 无已核对 SHA，暂用主版本号
-
-      - name: 安装 Android NDK
+      # ubuntu-latest 运行器自带 Android SDK（ANDROID_HOME=/usr/local/lib/android/sdk）。
+      # 不再使用 android-actions/setup-android：v3 会执行 `sdkmanager tools`，新版 SDK 仓库里
+      # 已没有 `tools` 包，该步骤必然失败（run 42387880140 的实测结果）。
+      - name: 准备 Android SDK 与 NDK
         shell: bash
         run: |
           set -euo pipefail
-          # runner 上偶发未接受 SDK 许可，先统一接受，避免 sdkmanager 卡在交互提示。
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "ndk;${NDK_VERSION}"
-          # setup-android 已导出 ANDROID_SDK_ROOT / ANDROID_HOME，这里只补 NDK 路径，
-          # 并把两者显式写进 GITHUB_ENV，保证后续 tauri/cargo 步骤都能读到。
-          ndk_dir="${ANDROID_HOME}/ndk/${NDK_VERSION}"
-          if [[ ! -d "$ndk_dir" ]]; then
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_HOME
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          sdkmanager_bin="$(command -v sdkmanager || true)"
+          if [ -z "$sdkmanager_bin" ]; then
+            sdkmanager_bin="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -n1 || true)"
+          fi
+          if [ -z "$sdkmanager_bin" ]; then
+            echo "找不到 sdkmanager，运行器镜像可能没有预装 Android SDK" >&2
+            exit 1
+          fi
+          echo "使用 sdkmanager: $sdkmanager_bin"
+          # 先统一接受许可，避免 sdkmanager 卡在交互提示，也让 Gradle 能自动补齐缺失组件。
+          yes | "$sdkmanager_bin" --licenses > /dev/null 2>&1 || true
+          "$sdkmanager_bin" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+          ndk_dir="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          if [ ! -d "$ndk_dir" ]; then
             echo "NDK 安装失败，未找到 $ndk_dir" >&2
             exit 1
           fi
           {
             printf 'ANDROID_HOME=%s\n' "$ANDROID_HOME"
-            printf 'ANDROID_SDK_ROOT=%s\n' "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+            printf 'ANDROID_SDK_ROOT=%s\n' "$ANDROID_SDK_ROOT"
             printf 'NDK_HOME=%s\n' "$ndk_dir"
             printf 'ANDROID_NDK_HOME=%s\n' "$ndk_dir"
           } >> "$GITHUB_ENV"
-          printf 'NDK 已就绪：%s\n' "$ndk_dir"
+          printf 'SDK/NDK 已就绪：%s\n' "$ndk_dir"
 
       # 三个目标对应 Android ABI：aarch64 → arm64-v8a，armv7 → armeabi-v7a，
       # x86_64 → x86_64（模拟器）。与 docs/22-android-client.md 第 4 节的 ABI 表一致。
