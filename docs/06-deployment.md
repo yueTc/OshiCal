@@ -152,7 +152,7 @@ sudo systemctl enable --now oshical-updater.timer
 sudo systemctl start oshical-updater.service
 ```
 
-GitHub Secret 无法读回。如果旧 HMAC 密钥已经丢失，不要把新生成的密钥当作现有发布版本的签名密钥；现有 0.3.3 清单仍会用旧密钥验签。此时应重新发布带新签名的服务器版本，或先按手动 Docker 流程更新当前版本。
+GitHub Secret 无法读回。如果旧 HMAC 密钥已经丢失，不要把新生成的密钥当作现有发布版本的签名密钥；已发布清单仍会用旧密钥验签。此时应重新发布带新签名的服务器版本，或先按手动 Docker 流程更新当前版本。
 
 代理每 15 秒检查一次请求。手动更新会立即执行；自动更新只在设置的时间段内执行。更新时间统一按 `Asia/Shanghai` 解释，开始时间晚于结束时间表示跨午夜。
 
@@ -202,7 +202,7 @@ echo "$CR_PAT" | sudo docker login ghcr.io -u yueTc --password-stdin
 
 ```powershell
 # Windows
-Expand-Archive oshical-server-0.3.3-windows-x86_64.zip -DestinationPath server
+Expand-Archive oshical-server-0.3.6-windows-x86_64.zip -DestinationPath server
 cd server
 $env:OSHICAL_BIND = "0.0.0.0:8787"
 $env:OSHICAL_API_TOKEN = "至少32位随机令牌"
@@ -213,7 +213,7 @@ $env:OSHICAL_DB_PATH = "$PWD\data\oshical.db"
 
 ```bash
 # Linux
-tar -xzf oshical-server-0.3.3-linux-x86_64.tar.gz -C /opt/oshical
+tar -xzf oshical-server-0.3.6-linux-x86_64.tar.gz -C /opt/oshical
 cd /opt/oshical
 export OSHICAL_BIND=0.0.0.0:8787
 export OSHICAL_API_TOKEN='至少32位随机令牌'

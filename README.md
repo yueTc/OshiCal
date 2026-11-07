@@ -215,7 +215,7 @@ docker compose up -d --no-deps oshical
 生产环境建议在 `.env` 中固定版本：
 
 ```dotenv
-OSHICAL_IMAGE=ghcr.io/yuetc/oshical-server:0.3.3
+OSHICAL_IMAGE=ghcr.io/yuetc/oshical-server:0.3.6
 ```
 
 也可以每小时执行一次更新检查，只有镜像变化时才会重启：
@@ -312,3 +312,4 @@ cargo test -p oshical-core real_bilibili_smoke -- --ignored --nocapture
 - `docs/13-release-server-0.3.1.md`
 - `docs/14-release-0.3.2.md`（月相：LAPLACE 周期参考数据）
 - `docs/15-release-server-0.3.3.md`（服务端编译产物发布）
+- `docs/16-release-0.3.4-server-0.3.6.md`（更新代理修复与发布）
