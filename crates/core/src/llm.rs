@@ -34,11 +34,8 @@ const IMAGE_MIN_SHORT_SIDE: u32 = 512;
 // 256 MiB ≈ 6700 万像素，够 1080×20000（86 MB）与 4096×8192（134 MB），又不至于把后台任务撑爆。
 const IMAGE_MAX_DECODE_SIDE: u32 = 24576;
 const IMAGE_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-// 这两条契约在编译期就得成立：改常量时若破坏它们，编译直接失败，
-// 不必等到某张长图在生产里被拒才发现。
-const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
-const _: () = assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
-// 编译期不变量：解码门槛必须不低于缩放目标，体积兜底的短边下限必须小于常规长边下限。
+// 编译期不变量：解码门槛必须不低于缩放目标（缩小发生在 decode 之后），
+// 体积兜底的短边下限必须小于常规长边下限。改常量时若破坏它们，编译直接失败。
 const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
 const _: () = assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
 const RESIZED_JPEG_QUALITY: u8 = 90;
