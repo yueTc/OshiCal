@@ -1,0 +1,7 @@
+node_modules/
+
+# 大体积产物与逐帧 QA 截图可由 build.sh / preview.js 重新生成，不入库
+out/
+audio/*.wav
+qa/stills/
+qa/capture/

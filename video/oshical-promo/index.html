@@ -1,0 +1,772 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>推历 OshiCal · 宣传片</title>
+<style>
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module" src="./preview.js"></script>
+<script type="module">
+import { DUR, CUES, SHOTS, b } from './timeline.js';
+import { clamp, lerp, seg, ease, snap, glide, spring, springTo, tween, stagger, pulse, shake,
+         mix, rgba, stageSize, setupCanvas, loadFonts, loadImage } from './motion.js';
+
+// ─────────────────────────────────────────────────────────────── 舞台
+const { W, H } = stageSize();
+const canvas = document.getElementById('c');
+const ctx = setupCanvas(canvas, W, H);
+const U = Math.min(W, H) / 1080;          // 1920×1080 时 U = 1
+const cx = W / 2, cy = H / 2;
+
+const FONT_UI = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif';
+const FONT_NUM = '"Consolas", "Segoe UI", monospace';
+
+const C = {
+  paper: '#FFF8FB', surface: '#FFFFFF', soft: '#FFF2F7', strong: '#FDE9F1',
+  pink: '#E94F88', pinkStrong: '#B83263', pinkSoft: '#FFE3EE',
+  ink: '#241820', muted: '#75636D', faint: '#A3909A',
+  border: '#EEDDE5', live: '#16A46B', liveSoft: '#E4F8EF', warn: '#D88719',
+  grey: '#C3B4BB',
+};
+
+const shot = id => SHOTS.find(s => s.id === id);
+const cueT = name => CUES.filter(c => c.sfx === name).map(c => c.t);
+
+// ─────────────────────────────────────────────────────────────── 绘制原语
+function setFont(size, weight = 700, family = FONT_UI) {
+  ctx.font = `${weight} ${size * U}px ${family}`;
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, Math.max(1, w), Math.max(1, h), Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2)));
+}
+function fillRR(x, y, w, h, r, fill, { shadow = 0, alpha = 1, scale = 1 } = {}) {
+  if (w <= 0 || h <= 0 || alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  rr(x, y, w, h, r);
+  if (shadow > 0) {
+    ctx.shadowColor = `rgba(87,35,57,${0.30 * shadow})`;
+    ctx.shadowBlur = 56 * U * (0.6 + shadow);
+    ctx.shadowOffsetY = 18 * U * shadow;
+  }
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.restore();
+}
+function strokeRR(x, y, w, h, r, color, lw = 1.5, alpha = 1) {
+  if (w <= 0 || h <= 0 || alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  rr(x, y, w, h, r);
+  ctx.lineWidth = lw * U;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+  ctx.restore();
+}
+function text(s, x, y, { size = 32, weight = 700, color = C.ink, align = 'left', baseline = 'middle',
+                         alpha = 1, family = FONT_UI, spacing = 0, maxWidth = null } = {}) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  setFont(size, weight, family);
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = baseline;
+  if (spacing) ctx.letterSpacing = `${spacing * U}px`;
+  ctx.fillText(s, x, y, maxWidth ?? undefined);
+  ctx.restore();
+}
+function measure(s, size, weight = 700, family = FONT_UI, spacing = 0) {
+  ctx.save(); setFont(size, weight, family); if (spacing) ctx.letterSpacing = `${spacing * U}px`;
+  const w = ctx.measureText(s).width; ctx.restore(); return w;
+}
+/** 遮罩逐字上升：k = 0..1 */
+function riseChars(s, x, y, { size = 72, weight = 700, color = C.ink, k = 1, spacing = 2,
+                              family = FONT_UI, staggerK = 0.45, alpha = 1 } = {}) {
+  const chars = [...s];
+  const widths = chars.map(ch => measure(ch, size, weight, family, spacing));
+  const total = widths.reduce((a, v) => a + v, 0);
+  let px = x;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x - size * 0.3 * U, y - size * 1.15 * U, total + size * 0.7 * U, size * 1.5 * U); ctx.clip();
+  chars.forEach((ch, i) => {
+    const d = clamp((k - stagger(i, chars.length, staggerK, { from: 'start' })) / (1 - staggerK || 1));
+    const e = ease.outQuart(d);
+    const dy = (1 - e) * size * 1.05 * U;
+    text(ch, px, y + dy, { size, weight, color, family, spacing, alpha: alpha * clamp(d * 2.2) });
+    px += widths[i];
+  });
+  ctx.restore();
+  return total + spacing * U * (chars.length - 1);
+}
+
+/** 真实截图窗口：等比 cover 进圆角矩形，返回图片坐标 → 屏幕坐标的映射 */
+function shotWindow(img, x, y, w, h, { r = 20, shadow = 0.16, alpha = 1, radiusAlpha = 1 } = {}) {
+  const k = Math.max(w / img.width, h / img.height);
+  const dw = img.width * k, dh = img.height * k;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  rr(x, y, w, h, r * U);
+  if (shadow > 0) {
+    ctx.shadowColor = `rgba(87,35,57,${0.32 * shadow})`;
+    ctx.shadowBlur = 70 * U * (0.5 + shadow);
+    ctx.shadowOffsetY = 24 * U * shadow;
+  }
+  ctx.fillStyle = C.surface; ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  rr(x, y, w, h, r * U);
+  ctx.clip();
+  ctx.globalAlpha *= alpha;
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore();
+
+  strokeRR(x, y, w, h, r, 'rgba(228,200,213,.95)', 1.5, radiusAlpha * alpha);
+  // 图片坐标 → 屏幕坐标
+  return (ix, iy) => [x + (w - dw) / 2 + ix * k, y + (h - dh) / 2 + iy * k, k];
+}
+
+function drawLogo(x, y, size, alpha = 1, rot = 0) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.drawImage(LOGO, -size / 2, -size / 2, size, size);
+  ctx.restore();
+}
+
+/** 光标：矢量箭头，按下时缩小并扩散圆环 */
+function cursor(x, y, { press = 0, alpha = 1 } = {}) {
+  const s = 34 * U * (1 - 0.12 * press);
+  if (press > 0) {
+    ctx.save();
+    ctx.globalAlpha *= alpha * (1 - press) * 0.5;
+    ctx.beginPath(); ctx.arc(x, y, (26 + 34 * press) * U, 0, Math.PI * 2);
+    ctx.fillStyle = C.pink; ctx.fill();
+    ctx.restore();
+  }
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(x, y); ctx.scale(s / 34, s / 34);
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(0, 34); ctx.lineTo(8.6, 26); ctx.lineTo(14, 38);
+  ctx.lineTo(19.6, 35.4); ctx.lineTo(14.2, 23.6); ctx.lineTo(25, 22.4); ctx.closePath();
+  ctx.fillStyle = '#2A1B22'; ctx.fill();
+  ctx.lineWidth = 2.4; ctx.strokeStyle = '#FFFFFF'; ctx.stroke();
+  ctx.restore();
+}
+
+/** 「已结束」灰卡 / 日程卡 */
+function eventCard(x, y, w, h, { title, creator, badge, badgeColor = C.faint, badgeBg = '#F1EBEE',
+                                 time = null, alpha = 1, rot = 0, live = false } = {}) {
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(x + w / 2, y + h / 2); ctx.rotate(rot); ctx.translate(-(x + w / 2), -(y + h / 2));
+  fillRR(x, y, w, h, 16 * U, C.surface, { shadow: 0.5 });
+  strokeRR(x, y, w, h, 16, 'rgba(228,200,213,.75)', 1.4);
+  // 头像
+  ctx.beginPath(); ctx.arc(x + 44 * U, y + h / 2, 22 * U, 0, Math.PI * 2);
+  ctx.fillStyle = live ? C.liveSoft : '#F2E7EC'; ctx.fill();
+  text(creator.slice(0, 1), x + 44 * U, y + h / 2, { size: 20, weight: 700, color: live ? C.live : C.faint, align: 'center' });
+  if (time) text(time, x + 92 * U, y + h / 2, { size: 26, weight: 700, color: live ? C.ink : C.faint, family: FONT_NUM });
+  const tx = x + (time ? 178 : 92) * U;
+  text(creator, tx, y + h / 2 - 15 * U, { size: 20, weight: 700, color: live ? C.ink : C.muted });
+  text(title, tx, y + h / 2 + 15 * U, { size: 18, weight: 500, color: live ? C.muted : C.faint, maxWidth: w - (tx - x) - 110 * U });
+  if (badge) {
+    const bw = measure(badge, 16, 700) + 24 * U;
+    fillRR(x + w - bw - 18 * U, y + h / 2 - 15 * U, bw, 30 * U, 15, badgeBg);
+    text(badge, x + w - bw / 2 - 18 * U, y + h / 2, { size: 16, weight: 700, color: badgeColor, align: 'center' });
+  }
+  ctx.restore();
+}
+
+// ─────────────────────────────────────────────────────────────── 背景
+function background(t, { warm = 1, glow = 1, tint = null } = {}) {
+  const g = ctx.createLinearGradient(0, 0, W * 0.35, H);
+  g.addColorStop(0, mix('#FFF8FB', '#F4EFF2', 1 - warm));
+  g.addColorStop(0.5, mix('#FFF3F8', '#F2EDF0', 1 - warm));
+  g.addColorStop(1, mix('#FDEBF3', '#EDE7EA', 1 - warm));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const blob = (bx, by, r, a) => {
+    const rg = ctx.createRadialGradient(bx, by, 0, bx, by, r);
+    rg.addColorStop(0, rgba('#E94F88', a * glow)); rg.addColorStop(1, 'rgba(233,79,136,0)');
+    ctx.fillStyle = rg; ctx.fillRect(bx - r, by - r, r * 2, r * 2);
+  };
+  blob(W * 0.16, H * 0.10, 720 * U, 0.13);
+  blob(W * 0.88, H * 0.92, 820 * U, 0.11);
+  if (tint) { ctx.fillStyle = tint; ctx.fillRect(0, 0, W, H); }
+}
+
+// 转场：一拍闪白/闪粉
+const CUTS = [b(8), b(16), b(29), b(41), b(52)];
+function cutFlash(t) {
+  const v = pulse(t, CUTS, 0.10, 0.006);
+  if (v > 0.002) {
+    ctx.save();
+    ctx.globalAlpha = clamp(v * 0.55);
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────── 01 HOOK 0–4s
+function drawHook(t) {
+  const u = t - shot('hook').t0;
+  background(t, { warm: 0.25, glow: 0.35 });
+
+  // 顶部：21:00 时间戳
+  const st = b(1);
+  const tickK = spring(t - st, { freq: 2.6, damp: 0.6 });
+  const clockA = clamp((t - st + 0.2) / 0.4);
+  const blink = 0.55 + 0.45 * Math.abs(Math.cos((t - st) * 2.6));
+  if (clockA > 0) {
+    ctx.save(); ctx.globalAlpha = clockA;
+    text('21:00', 150 * U, 190 * U, { size: 104, weight: 700, color: C.ink, family: FONT_NUM });
+    text('开播', 158 * U, 262 * U, { size: 26, weight: 700, color: C.grey, spacing: 6 });
+    // 闪烁的红色小点
+    ctx.globalAlpha = clockA * blink;
+    ctx.beginPath(); ctx.arc(150 * U + measure('21:00', 104, 700, FONT_NUM) + 22 * U, 168 * U, 8 * U, 0, Math.PI * 2);
+    ctx.fillStyle = '#D83A52'; ctx.fill();
+    ctx.restore();
+  }
+
+  // 右下：一张张"已结束"的卡堆下来
+  const falls = [b(2), b(3.5), b(5)];
+  const rows = [
+    { time: '21:00', creator: '乃琳Queen', title: '四季歌回 —— 秋日印象' },
+    { time: '19:30', creator: '嘉然今天吃什么', title: '枝江时装周' },
+    { time: '13:00', creator: '贝拉kira', title: '【突击】继续看小当家！' },
+  ];
+  rows.forEach((r, i) => {
+    const k = spring(t - falls[i], { freq: 2.2, damp: 0.55 });
+    if (k <= 0.001) return;
+    const y0 = 360 * U - 120 * U * (1 - k) + i * 128 * U;
+    const x0 = (1060 + i * 26) * U;
+    const rot = (i - 1) * 0.014 + 0.02 * (1 - k);
+    eventCard(x0, y0, 700 * U, 108 * U, { ...r, badge: '已结束', alpha: clamp(k * 1.4), rot });
+  });
+
+  // 主文案
+  const k1 = seg(t, b(6), b(7.2));
+  if (k1 > 0) {
+    riseChars('又一次，错过了', 150 * U, 640 * U, { size: 96, weight: 700, color: C.ink, k: k1 });
+  }
+  const k2 = seg(t, b(6.6), b(7.8));
+  if (k2 > 0) {
+    ctx.save(); ctx.globalAlpha = k2;
+    text('刷完视频切回来，直播间已经黑了', 154 * U, 740 * U, { size: 30, weight: 500, color: C.muted });
+    ctx.restore();
+  }
+  // 底部细线,收束画面
+  const k3 = seg(t, b(2), b(4));
+  ctx.save();
+  ctx.globalAlpha = 0.5 * k3;
+  ctx.fillStyle = C.border;
+  ctx.fillRect(150 * U, 880 * U, (W - 300 * U) * ease.outCubic(k3), 1.5 * U);
+  ctx.restore();
+}
+
+// ─────────────────────────────────────────────────────────────── 02 REVEAL 4–8s
+function drawReveal(t) {
+  const t0 = shot('reveal').t0;
+  const u = t - t0;
+  background(t, { warm: 1, glow: 1 });
+
+  // 粉色爆发环
+  [0, b(1), b(2)].forEach((d, i) => {
+    const k = seg(t, t0 + d, t0 + d + 1.5);
+    if (k <= 0 || k >= 1) return;
+    ctx.save();
+    ctx.globalAlpha = (1 - k) * 0.5;
+    ctx.beginPath(); ctx.arc(cx, 470 * U, (120 + 720 * ease.outCubic(k)) * U, 0, Math.PI * 2);
+    ctx.lineWidth = (3 - 2 * k) * U; ctx.strokeStyle = C.pink; ctx.stroke();
+    ctx.restore();
+  });
+
+  const lg = spring(t - (t0 + 0.1), { freq: 1.9, damp: 0.62 });
+  drawLogo(cx, 430 * U, 210 * U * (0.55 + 0.45 * lg), clamp(lg * 1.6), (1 - lg) * -0.22);
+
+  const nameK = seg(t, t0 + b(2), t0 + b(3.6));
+  if (nameK > 0) {
+    const y = 620 * U;
+    const wCN = measure('推历', 88, 700);
+    const wEN = measure('OshiCal', 88, 400);
+    const gap = 26 * U;
+    const total = wCN + gap + wEN;
+    let x = cx - total / 2;
+    ctx.save(); ctx.globalAlpha = 1;
+    text('推历', x, y + (1 - ease.outQuart(nameK)) * 30 * U, { size: 88, weight: 700, color: C.ink, alpha: nameK });
+    text('OshiCal', x + wCN + gap, y + (1 - ease.outQuart(clamp((nameK - 0.2) / 0.8))) * 30 * U,
+         { size: 88, weight: 400, color: C.pinkStrong, alpha: nameK });
+    ctx.restore();
+  }
+
+  const tagK = seg(t, t0 + b(4), t0 + b(5.4));
+  if (tagK > 0) {
+    text('B 站虚拟主播的直播日程与开播提醒', cx, 712 * U, { size: 42, weight: 500, color: C.muted, align: 'center', alpha: tagK });
+  }
+
+  // 平台 chips
+  const chips = ['Windows 桌面端', '服务端', '多端同步'];
+  const chipK0 = t0 + b(5.6);
+  let totalW = 0;
+  const ws = chips.map(s => measure(s, 22, 700) + 44 * U);
+  totalW = ws.reduce((a, v) => a + v, 0) + 20 * U * (chips.length - 1);
+  let px = cx - totalW / 2;
+  chips.forEach((s, i) => {
+    const k = spring(t - (chipK0 + i * b(0.5)), { freq: 3.0, damp: 0.75 });
+    if (k > 0.001) {
+      fillRR(px, 790 * U - 24 * U, ws[i], 48 * U, 24, C.surface, { shadow: 0.25, alpha: clamp(k) });
+      strokeRR(px, 790 * U - 24 * U, ws[i], 48 * U, 24, 'rgba(228,200,213,.9)', 1.2, clamp(k));
+      text(s, px + ws[i] / 2, 790 * U, { size: 22, weight: 700, color: C.pinkStrong, align: 'center', alpha: clamp(k) });
+    }
+    px += ws[i] + 20 * U;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────── 03 PARSE 8–14.5s
+function drawParse(t) {
+  const t0 = shot('parse').t0;
+  background(t, { warm: 1, glow: 0.8 });
+
+  const headK = seg(t, t0 + b(0.2), t0 + b(1.4));
+  if (headK > 0) {
+    text('动态里的日程图，直接变成日程', 120 * U, 120 * U, { size: 54, weight: 700, color: C.ink, alpha: headK });
+    text('图片 / 直播预约卡 / 纯文本，走同一条解析链路', 122 * U, 178 * U, { size: 26, weight: 500, color: C.muted, alpha: headK });
+  }
+
+  // ── 左：B 站动态卡（示意插画）
+  const dynK = spring(t - (t0 + b(2)), { freq: 2.4, damp: 0.8 });
+  if (dynK > 0.002) {
+    const dx = 120 * U, dy = 236 * U, dw = 520 * U, dh = 470 * U;
+    ctx.save();
+    ctx.globalAlpha = clamp(dynK);
+    ctx.translate(0, (1 - dynK) * 30 * U);
+    fillRR(dx, dy, dw, dh, 22, C.surface, { shadow: 0.55 });
+    strokeRR(dx, dy, dw, dh, 22, 'rgba(228,200,213,.85)', 1.4);
+    // 动态头部
+    ctx.beginPath(); ctx.arc(dx + 52 * U, dy + 54 * U, 24 * U, 0, Math.PI * 2); ctx.fillStyle = '#FBE3EC'; ctx.fill();
+    text('嘉', dx + 52 * U, dy + 54 * U, { size: 22, weight: 700, color: C.pinkStrong, align: 'center' });
+    text('嘉然今天吃什么', dx + 88 * U, dy + 44 * U, { size: 22, weight: 700, color: C.ink });
+    text('发布了图文动态 · 11/03 直播日程', dx + 88 * U, dy + 72 * U, { size: 17, weight: 500, color: C.faint });
+    // 日程图（示意）
+    fillRR(dx + 24 * U, dy + 100 * U, dw - 48 * U, 288 * U, 16, '#FFF6FA', { shadow: 0.15 });
+    strokeRR(dx + 24 * U, dy + 100 * U, dw - 48 * U, 288 * U, 16, 'rgba(233,79,136,.22)', 1.4);
+    text('11/03 周二', dx + 52 * U, dy + 138 * U, { size: 22, weight: 700, color: C.pinkStrong });
+    const rows = [['12:00', '【突击】继续看小当家！'], ['19:30', '诺来配BGM'], ['21:00', '十二星座选择你的…']];
+    const scanK = seg(t, t0 + b(3.2), t0 + b(5.2));
+    rows.forEach((r, i) => {
+      const ry = dy + 176 * U + i * 62 * U;
+      text(r[0], dx + 52 * U, ry, { size: 22, weight: 700, color: C.ink, family: FONT_NUM });
+      text(r[1], dx + 140 * U, ry, { size: 19, weight: 500, color: C.muted, maxWidth: dw - 200 * U });
+      ctx.save(); ctx.globalAlpha *= 0.5; ctx.fillStyle = C.border;
+      ctx.fillRect(dx + 52 * U, ry + 26 * U, dw - 128 * U, 1); ctx.restore();
+    });
+    // 扫描线（解析中）
+    if (scanK > 0 && scanK < 1) {
+      const sy = dy + 100 * U + 288 * U * ease.inOutCubic(scanK);
+      const g = ctx.createLinearGradient(dx, sy - 40 * U, dx, sy + 8 * U);
+      g.addColorStop(0, 'rgba(233,79,136,0)'); g.addColorStop(1, 'rgba(233,79,136,.35)');
+      ctx.save(); rr(dx + 24 * U, dy + 100 * U, dw - 48 * U, 288 * U, 16); ctx.clip();
+      ctx.fillStyle = g; ctx.fillRect(dx + 24 * U, sy - 40 * U, dw - 48 * U, 48 * U);
+      ctx.fillStyle = C.pink; ctx.globalAlpha = 0.9; ctx.fillRect(dx + 24 * U, sy, dw - 48 * U, 2 * U);
+      ctx.restore();
+    }
+    // 标签
+    fillRR(dx + 24 * U, dy + dh - 56 * U, 148 * U, 36 * U, 18, C.pinkSoft);
+    text('日程图', dx + 98 * U, dy + dh - 38 * U, { size: 17, weight: 700, color: C.pinkStrong, align: 'center' });
+    ctx.restore();
+  }
+
+  // ── 中：视觉模型节点
+  const nodeK = spring(t - (t0 + b(3)), { freq: 2.2, damp: 0.75 });
+  const nx = 800 * U, ny = 470 * U;
+  if (nodeK > 0.002) {
+    ctx.save();
+    ctx.globalAlpha = clamp(nodeK);
+    // 旋转虚线环
+    ctx.save();
+    ctx.translate(nx, ny); ctx.rotate(t * 0.8);
+    ctx.beginPath(); ctx.arc(0, 0, 86 * U, 0, Math.PI * 2);
+    ctx.setLineDash([10 * U, 12 * U]); ctx.lineWidth = 2 * U; ctx.strokeStyle = 'rgba(233,79,136,.45)'; ctx.stroke();
+    ctx.restore();
+    fillRR(nx - 68 * U, ny - 68 * U, 136 * U, 136 * U, 40, C.surface, { shadow: 0.5 });
+    drawLogo(nx, ny - 12 * U, 58 * U, 1);
+    text('视觉模型', nx, ny + 44 * U, { size: 17, weight: 700, color: C.pinkStrong, align: 'center' });
+    // 状态点
+    const blink = 0.4 + 0.6 * Math.abs(Math.cos(t * 3.4));
+    ctx.globalAlpha = clamp(nodeK) * blink;
+    ctx.beginPath(); ctx.arc(nx + 74 * U, ny - 74 * U, 7 * U, 0, Math.PI * 2); ctx.fillStyle = C.live; ctx.fill();
+    ctx.restore();
+  }
+
+  // 连线：动态卡 → 节点
+  const linkK = seg(t, t0 + b(3.4), t0 + b(4.6));
+  if (linkK > 0) {
+    ctx.save();
+    ctx.globalAlpha = 0.55 * linkK;
+    ctx.beginPath();
+    ctx.moveTo(646 * U, 470 * U);
+    ctx.bezierCurveTo(700 * U, 470 * U, 700 * U, 470 * U, nx - 88 * U, 470 * U);
+    ctx.setLineDash([8 * U, 10 * U]); ctx.lineWidth = 2 * U; ctx.strokeStyle = C.pink; ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── 右：真实日历窗口
+  const winK = spring(t - (t0 + b(1)), { freq: 2.0, damp: 0.85 });
+  const wx = 930 * U, wy = 192 * U, ww = 880 * U;
+  const wh = ww * IMG.schedule.height / IMG.schedule.width;
+  let map = null;
+  if (winK > 0.002) {
+    ctx.save();
+    ctx.globalAlpha = clamp(winK);
+    ctx.translate(0, (1 - winK) * 40 * U);
+    map = shotWindow(IMG.schedule, wx, wy, ww, wh, { r: 18, shadow: 0.6 });
+    ctx.restore();
+  }
+
+  // ── 三张日程卡落格：真实截图里的三张卡被"解析结果"点亮
+  const targets = [
+    { r: [425, 218, 832, 313], t: b(22) },
+    { r: [425, 328, 832, 424], t: b(24) },
+    { r: [425, 432, 832, 528], t: b(26) },
+  ];
+  if (map) {
+    targets.forEach((tg, i) => {
+      const [ax, ay] = map(tg.r[0], tg.r[1]);
+      const [bx2, by2] = map(tg.r[2], tg.r[3]);
+      const rw = bx2 - ax, rh = by2 - ay;
+      const p = seg(t, tg.t, tg.t + b(1.4));
+      if (p <= 0) return;
+      const born = clamp(p * 1.8);
+      const breathe = 0.55 + 0.45 * Math.abs(Math.cos((t - tg.t) * 2.2));
+      // 高亮底 + 描边（描边像被"画"出来）
+      ctx.save();
+      ctx.globalAlpha = 0.16 * born * breathe;
+      rr(ax - 3 * U, ay - 3 * U, rw + 6 * U, rh + 6 * U, 14 * U); ctx.fillStyle = C.pink; ctx.fill();
+      ctx.restore();
+      ctx.save();
+      ctx.globalAlpha = 0.95 * born;
+      rr(ax - 4 * U, ay - 4 * U, rw + 8 * U, rh + 8 * U, 15 * U);
+      ctx.lineWidth = 3 * U; ctx.strokeStyle = C.pink;
+      ctx.setLineDash([ (rw + rh) * 2, (rw + rh) * 4 ]);
+      ctx.lineDashOffset = (rw + rh) * 4 * (1 - ease.outCubic(clamp(p)));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      // 右侧对勾徽标
+      const badgeK = spring(t - (tg.t + b(0.5)), { freq: 3.0, damp: 0.6 });
+      if (badgeK > 0.01) {
+        const bxs = ax + rw - 6 * U, bys = ay + 6 * U;
+        ctx.save();
+        ctx.globalAlpha = clamp(badgeK);
+        ctx.beginPath(); ctx.arc(bxs, bys, 17 * U * clamp(badgeK), 0, Math.PI * 2);
+        ctx.fillStyle = C.pink; ctx.fill();
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 3 * U; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(bxs - 7 * U, bys + 0.5 * U); ctx.lineTo(bxs - 2 * U, bys + 6 * U); ctx.lineTo(bxs + 8 * U, bys - 6 * U);
+        ctx.stroke();
+        ctx.restore();
+      }
+      // 飞行的小卡
+      if (p < 1) {
+        const fromX = 800 * U, fromY = 470 * U;
+        const e = ease.inOutCubic(p);
+        const fxs = lerp(fromX, ax + rw / 2, e) + Math.sin(e * Math.PI) * 30 * U;
+        const fys = lerp(fromY, ay + rh / 2, e) - Math.sin(e * Math.PI) * 110 * U;
+        const sc = lerp(0.66, 0.3, e);
+        ctx.save();
+        ctx.globalAlpha = clamp(1.25 - e * 1.15);
+        ctx.translate(fxs, fys); ctx.scale(sc, sc);
+        fillRR(-150 * U, -28 * U, 300 * U, 56 * U, 14, C.surface, { shadow: 0.7 });
+        text('已解析 → 日程', -150 * U + 18 * U, 0, { size: 20, weight: 700, color: C.pinkStrong });
+        ctx.restore();
+      }
+    });
+  }
+
+  // 底部说明
+  const footK = seg(t, t0 + b(6), t0 + b(7.5));
+  if (footK > 0) {
+    text('一条动态只调用一次模型 · 输出经长度、时间、主播归属与置信度校验后才入库',
+         120 * U, 1000 * U, { size: 21, weight: 500, color: C.faint, alpha: footK });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────── 04 ALERT 14.5–20.5s
+function drawAlert(t) {
+  const t0 = shot('alert').t0;
+  background(t, { warm: 1, glow: 0.7 });
+
+  // 桌面背景：真实界面的虚化铺垫
+  const bgK = seg(t, t0, t0 + 0.5);
+  ctx.save();
+  ctx.globalAlpha = 0.36 * bgK;
+  const bw = 1520 * U;
+  shotWindow(IMG.schedule, cx - bw / 2, 90 * U, bw, bw * IMG.schedule.height / IMG.schedule.width, { r: 22, shadow: 0.3 });
+  ctx.restore();
+  ctx.save(); ctx.globalAlpha = 0.48 * bgK; ctx.fillStyle = C.paper; ctx.fillRect(0, 0, W, H); ctx.restore();
+
+  // ── Toast
+  const toastIn = spring(t - (b(30.5)), { freq: 2.6, damp: 0.72 });
+  const click = b(34);
+  const pressed = pulse(t, click, 0.16);
+  const openK = seg(t, b(34.4), b(36.0));
+
+  const twW = 600 * U, twH = 152 * U;
+  const restX = W - twW - 90 * U, restY = H - twH - 96 * U;
+
+  // 直播间面板（点击后从 toast 形变展开）
+  if (openK > 0) {
+    const pw = 1000 * U, ph = 562 * U;
+    const px = cx - pw / 2, py = 244 * U;
+    const e = ease.outQuart(openK);
+    const rx = lerp(restX, px, e), ry = lerp(restY, py, e);
+    const rw = lerp(twW, pw, e), rh = lerp(twH, ph, e);
+    ctx.save();
+    ctx.globalAlpha = clamp(openK * 4);
+    fillRR(rx, ry, rw, rh, lerp(20, 26, e) * U, '#1A1216', { shadow: 0.9 });
+    ctx.save();
+    rr(rx, ry, rw, rh, lerp(20, 26, e) * U); ctx.clip();
+    // 画面底：粉紫渐变 + 光斑，示意直播画面
+    const g = ctx.createLinearGradient(rx, ry, rx + rw, ry + rh);
+    g.addColorStop(0, '#2A1620'); g.addColorStop(0.5, '#3A1C2C'); g.addColorStop(1, '#22121A');
+    ctx.fillStyle = g; ctx.fillRect(rx, ry, rw, rh);
+    const blob = (bx, by, r, col) => { const rg = ctx.createRadialGradient(bx, by, 0, bx, by, r); rg.addColorStop(0, col); rg.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = rg; ctx.fillRect(bx - r, by - r, r * 2, r * 2); };
+    blob(rx + rw * 0.32, ry + rh * 0.42, 380 * U, 'rgba(233,79,136,.32)');
+    blob(rx + rw * 0.72, ry + rh * 0.6, 300 * U, 'rgba(120,90,255,.22)');
+
+    if (e > 0.25) {
+      const cA = clamp((e - 0.25) / 0.5);
+      ctx.globalAlpha *= cA;
+      // 标题栏
+      text('直播间', rx + 40 * U, ry + 52 * U, { size: 24, weight: 700, color: 'rgba(255,255,255,.92)' });
+      text('乃琳Queen', rx + 132 * U, ry + 52 * U, { size: 24, weight: 500, color: 'rgba(255,255,255,.55)' });
+      // LIVE 徽标
+      const lp = 0.6 + 0.4 * Math.abs(Math.cos(t * 3));
+      fillRR(rx + rw - 132 * U, ry + 34 * U, 92 * U, 36 * U, 18, rgba('#16A46B', 0.9 * lp));
+      text('LIVE', rx + rw - 86 * U, ry + 52 * U, { size: 17, weight: 700, color: '#FFFFFF', align: 'center', spacing: 2 });
+      // 弹幕
+      const danmu = ['来了来了', '终于开播了', '今天的歌单好期待', '推历提醒是真的快', '前排', '这个点还能赶上', 'BGM 好听'];
+      danmu.forEach((d, i) => {
+        const life = ((t * 0.42 + i * 0.17) % 1);
+        const dxp = rx + rw + 40 * U - life * (rw + 560 * U);
+        const dyp = ry + rh * 0.30 + (i % 4) * 46 * U + Math.sin((t * 0.7 + i) * 1.3) * 5 * U;
+        const a = Math.sin(Math.PI * clamp(life * 1.15)) * 0.9;
+        ctx.save(); ctx.globalAlpha *= clamp(a);
+        const tw2 = measure(d, 20, 600) + 32 * U;
+        fillRR(dxp, dyp - 18 * U, tw2, 36 * U, 18, 'rgba(255,255,255,.13)');
+        text(d, dxp + 16 * U, dyp, { size: 20, weight: 600, color: 'rgba(255,255,255,.92)' });
+        ctx.restore();
+      });
+    }
+    ctx.restore();
+    ctx.restore();
+  }
+
+  // Toast 本体（点击后收起）
+  const toastA = clamp(toastIn) * (1 - clamp(openK * 10));
+  if (toastA > 0.002) {
+    const tx = lerp(W + 40 * U, restX, clamp(toastIn)) - pressed * 3 * U;
+    const ty = restY + (1 - clamp(toastIn)) * 20 * U;
+    const sc = 1 - pressed * 0.03;
+    ctx.save();
+    ctx.translate(tx + twW / 2, ty + twH / 2); ctx.scale(sc, sc); ctx.translate(-(tx + twW / 2), -(ty + twH / 2));
+    fillRR(tx, ty, twW, twH, 20, '#FFFFFF', { shadow: 0.75, alpha: toastA });
+    strokeRR(tx, ty, twW, twH, 20, 'rgba(228,200,213,.8)', 1.3, toastA);
+    drawLogo(tx + 72 * U, ty + twH / 2, 76 * U, toastA);
+    text('乃琳Queen 开播了', tx + 132 * U, ty + 56 * U, { size: 30, weight: 700, color: C.ink, alpha: toastA });
+    text('点击进入直播间', tx + 132 * U, ty + 100 * U, { size: 22, weight: 500, color: C.muted, alpha: toastA });
+    text('刚刚', tx + twW - 34 * U, ty + 40 * U, { size: 18, weight: 500, color: C.faint, align: 'right', alpha: toastA });
+    ctx.restore();
+  }
+
+  // 光标：从右下移向 toast，按下
+  const moveK = seg(t, b(31.4), click);
+  if (moveK > 0 && openK < 0.4) {
+    const cxp = lerp(restX + 320 * U, restX + 300 * U, ease.inOutCubic(moveK));
+    const cyp = lerp(H - 40 * U, restY + 100 * U, ease.inOutCubic(moveK));
+    cursor(cxp, cyp, { press: pressed });
+  }
+
+  // 文案
+  const copyK = seg(t, b(31), b(32.4));
+  if (copyK > 0) {
+    text('开播，桌面先告诉你', 120 * U, 900 * U, { size: 56, weight: 700, color: C.ink, alpha: copyK });
+    text('Windows 通知 · 托盘常驻 · 点击直达直播间 · 可选开机自启',
+         122 * U, 962 * U, { size: 24, weight: 500, color: C.muted, alpha: copyK });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────── 05 DATA 20.5–26s
+function drawData(t) {
+  const t0 = shot('data').t0;
+  background(t, { warm: 1, glow: 0.85 });
+
+  // 左：真实粉丝趋势弹窗
+  const winK = spring(t - (t0 + b(0.4)), { freq: 2.1, damp: 0.86 });
+  if (winK > 0.002) {
+    const ww = 640 * U;
+    const wh = ww * IMG.fanDialog.height / IMG.fanDialog.width;
+    ctx.save();
+    ctx.globalAlpha = clamp(winK);
+    ctx.translate(0, (1 - winK) * 46 * U);
+    shotWindow(IMG.fanDialog, 110 * U, 210 * U, ww, wh, { r: 20, shadow: 0.6 });
+    ctx.restore();
+  }
+
+  const headK = seg(t, t0 + b(1), t0 + b(2.2));
+  text('看得见的增长', 880 * U, 178 * U, { size: 56, weight: 700, color: C.ink, alpha: headK });
+  text('粉丝每小时采样一次快照，小时 / 日两种口径', 882 * U, 232 * U, { size: 24, weight: 500, color: C.muted, alpha: headK });
+
+  // 计数器（数字取自产品界面：1,206,180 / +5,848 / 4 个统计点）
+  const cK = seg(t, b(43), b(46.5));
+  const fans = Math.round(1206180 * ease.outQuart(cK));
+  const gain = Math.round(5848 * ease.outQuart(cK));
+  const fadeIn = seg(t, t0 + b(1.6), t0 + b(2.6));
+  ctx.save();
+  ctx.globalAlpha = fadeIn;
+  fillRR(880 * U, 292 * U, 900 * U, 168 * U, 22, C.surface, { shadow: 0.45 });
+  strokeRR(880 * U, 292 * U, 900 * U, 168 * U, 22, 'rgba(228,200,213,.85)', 1.3);
+  text('当前粉丝', 920 * U, 334 * U, { size: 20, weight: 500, color: C.faint });
+  text(fans.toLocaleString('en-US'), 918 * U, 404 * U, { size: 68, weight: 700, color: C.ink, family: FONT_NUM });
+  ctx.save(); ctx.globalAlpha = fadeIn * 0.6;
+  ctx.fillStyle = C.border; ctx.fillRect(1420 * U, 324 * U, 2 * U, 104 * U); ctx.restore();
+  text('近 30 天净增', 1470 * U, 334 * U, { size: 20, weight: 500, color: C.faint });
+  text(`+${gain.toLocaleString('en-US')}`, 1468 * U, 404 * U, { size: 68, weight: 700, color: C.live, family: FONT_NUM });
+  ctx.restore();
+
+  // 直播数据：能力说明（不编造数字）
+  const chipK0 = t0 + b(3.2);
+  const chips = ['时长', '营收估算', '付费人数', '最高同时在线', '互动与弹幕'];
+  let cxp = 880 * U;
+  chips.forEach((s, i) => {
+    const w = measure(s, 21, 700) + 40 * U;
+    const k = spring(t - (chipK0 + i * 0.07), { freq: 3.0, damp: 0.8 });
+    if (k > 0.002 && cxp + w < W - 80 * U) {
+      fillRR(cxp, 496 * U, w, 46 * U, 23, C.soft, { alpha: clamp(k) });
+      text(s, cxp + w / 2, 519 * U, { size: 21, weight: 700, color: C.pinkStrong, align: 'center', alpha: clamp(k) });
+      cxp += w + 14 * U;
+    }
+  });
+  const noteK = seg(t, t0 + b(4.2), t0 + b(5));
+  text('营收 / 付费按公开礼物与舰长事件估算', 882 * U, 578 * U, { size: 20, weight: 500, color: C.faint, alpha: noteK });
+
+  // 多设备同步：真实设置界面
+  const syncK = spring(t - b(48), { freq: 2.2, damp: 0.86 });
+  if (syncK > 0.002) {
+    const sw = 900 * U;
+    const sh = sw * IMG.sync.height / IMG.sync.width;
+    ctx.save();
+    ctx.globalAlpha = clamp(syncK);
+    ctx.translate(0, (1 - syncK) * 40 * U);
+    shotWindow(IMG.sync, 880 * U, 614 * U, sw, sh, { r: 20, shadow: 0.5 });
+    ctx.restore();
+    text('服务器是唯一数据源；本机只保存缓存、游标和设备设置', 884 * U, 952 * U,
+         { size: 22, weight: 500, color: C.muted, alpha: clamp(syncK) });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────── 06 END 26–30s
+function drawEnd(t) {
+  const t0 = shot('end').t0;
+  background(t, { warm: 1, glow: 1.1 });
+
+  [0, b(1.2)].forEach((d, i) => {
+    const k = seg(t, t0 + d, t0 + d + 1.8);
+    if (k <= 0 || k >= 1) return;
+    ctx.save();
+    ctx.globalAlpha = (1 - k) * 0.45;
+    ctx.beginPath(); ctx.arc(cx, 400 * U, (160 + 700 * ease.outCubic(k)) * U, 0, Math.PI * 2);
+    ctx.lineWidth = 2.5 * U; ctx.strokeStyle = C.pink; ctx.stroke();
+    ctx.restore();
+  });
+
+  const lg = spring(t - (t0 + b(0.3)), { freq: 1.8, damp: 0.7 });
+  drawLogo(cx, 380 * U, 168 * U * (0.7 + 0.3 * lg), clamp(lg * 1.5));
+
+  const nameK = seg(t, t0 + b(1), t0 + b(2.4));
+  if (nameK > 0) {
+    const wCN = measure('推历', 72, 700), wEN = measure('OshiCal', 72, 400);
+    const gap = 20 * U, total = wCN + gap + wEN;
+    const x = cx - total / 2;
+    text('推历', x, 540 * U, { size: 72, weight: 700, color: C.ink, alpha: nameK });
+    text('OshiCal', x + wCN + gap, 540 * U, { size: 72, weight: 400, color: C.pinkStrong, alpha: nameK });
+  }
+
+  const sK = seg(t, t0 + b(2.2), t0 + b(3.8));
+  if (sK > 0) {
+    const s = '不再错过你推的每一场';
+    const w = measure(s, 76, 700, FONT_UI, 3);
+    riseChars(s, cx - w / 2, 660 * U, { size: 76, weight: 700, color: C.ink, k: sK, spacing: 3 });
+  }
+
+  const footK = seg(t, t0 + b(4), t0 + b(5));
+  if (footK > 0) {
+    text('Windows 桌面端 0.3.6 · 服务端 0.3.11 · Apache-2.0 开源', cx, 760 * U,
+         { size: 24, weight: 500, color: C.muted, align: 'center', alpha: footK });
+    text('github.com/yueTc/OshiCal', cx, 806 * U, { size: 24, weight: 700, color: C.pinkStrong, align: 'center', alpha: footK });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────── 主循环
+window.DUR = DUR;
+function drawFrame(t) {
+  t = clamp(t, 0, DUR);
+  ctx.save();
+  const [sx, sy, sr] = shake(t, [b(8), b(52)], 10 * U, 0.22, 3);
+  ctx.translate(sx, sy);
+  // 全片极慢推近（1.000 → 1.030）：让"停住"的段落也在呼吸，不产生死掉的感觉
+  const push = 1 + 0.030 * (t / DUR);
+  ctx.translate(cx, cy); ctx.scale(push, push); ctx.translate(-cx, -cy);
+
+  if (t < shot('reveal').t0) drawHook(t);
+  else if (t < shot('parse').t0) drawReveal(t);
+  else if (t < shot('alert').t0) drawParse(t);
+  else if (t < shot('data').t0) drawAlert(t);
+  else if (t < shot('end').t0) drawData(t);
+  else drawEnd(t);
+
+  cutFlash(t);
+  ctx.restore();
+  ctx.getImageData(0, 0, 1, 1);   // 同步一次光栅化：截图前必须已落到画布上
+}
+
+// 每个页面第一次被截图前，等合成器真的提交一帧（否则分段渲染的每个 worker 首帧会是空的）
+let warmedUp = false;
+window.render = t => {
+  drawFrame(t);
+  if (warmedUp || !window.READY) return undefined;
+  warmedUp = true;
+  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 150))));
+};
+
+// ─────────────────────────────────────────────────────────────── 资源
+const IMG = {};
+const LOGO = await loadImage('assets/oshical.svg');
+for (const [k, p] of [['schedule', 'assets/schedule.png'], ['fan', 'assets/fan-trend.png'],
+                      ['fanDialog', 'assets/fan-dialog.png'], ['sync', 'assets/sync-card.png'],
+                      ['library', 'assets/creator-library.png']]) {
+  IMG[k] = await loadImage(p);
+}
+await loadFonts(['700 96px "Microsoft YaHei"', '500 32px "Microsoft YaHei"', '400 72px "Microsoft YaHei"',
+                 '700 96px "Microsoft YaHei UI"', '700 104px "Consolas"', '700 66px "Consolas"']);
+window.render(0);
+ctx.getImageData(0, 0, 1, 1);            // 强制光栅化一次，避免首张截图取到空画布
+// 等合成器真的提交一帧再宣布就绪（否则第一张截图可能是空白）
+await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(r))));
+await new Promise(r => setTimeout(r, 250));
+window.READY = true;
+</script>
+</body>
+</html>
