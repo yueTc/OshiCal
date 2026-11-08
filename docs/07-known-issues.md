@@ -155,7 +155,9 @@
 ### 预约日程直播间地址修复
 
 - 已改代码：`ReserveCard` 只从 `jump_url` 取房间号，`rid` 不再当房间号；服务端启动与每次刷新都会清理历史错位地址（`repair_misattributed_reserve_room_urls`），并写入同步变更推给客户端。
-- 未实测：本机不编译，改动以 CI 的 `cargo fmt`/`clippy`/测试通过为准；服务端部署后需重新点开 11 月 8 日乃琳「【突击】嘿嘿影之刃零！」确认跳到 `https://live.bilibili.com/22625027`，而不是 `5866502`。
+- 已本机构建（2026-11-08 15:35，用户当次明确要求）：`release/windows/OshiCal-0.3.6-x64-setup-20261108-1537.exe`、`release/windows/OshiCal-0.3.6-portable-20261108-1537.exe`、`release/server/oshical-server-0.3.11-20261108-1537.exe`，哈希见 `release/oshical-artifacts-20261108-1537.sha256`。
+- 本地没有 `TAURI_SIGNING_PRIVATE_KEY`，本次用 `tauri build --config .tmp-tauri-local.conf.json`（`bundle.createUpdaterArtifacts=false`）出包，因此不含 `.sig` 与 `latest.json`；自动更新仍需 CI `release.yml` 用 secrets 签名后发布。
+- 未实测：服务端部署新二进制后，重新点开 11 月 8 日乃琳「【突击】嘿嘿影之刃零！」确认跳到 `https://live.bilibili.com/22625027`；CI 的 `cargo test`/`clippy` 结果以 Actions 为准（本机未跑测试）。
 
 ## 0.3.0 发布说明
 
