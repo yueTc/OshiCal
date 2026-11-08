@@ -34,6 +34,13 @@ const IMAGE_MIN_SHORT_SIDE: u32 = 512;
 // 256 MiB ≈ 6700 万像素，够 1080×20000（86 MB）与 4096×8192（134 MB），又不至于把后台任务撑爆。
 const IMAGE_MAX_DECODE_SIDE: u32 = 24576;
 const IMAGE_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+// 这两条契约在编译期就得成立：改常量时若破坏它们，编译直接失败，
+// 不必等到某张长图在生产里被拒才发现。
+const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
+const _: () = assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
+// 编译期不变量：解码门槛必须不低于缩放目标，体积兜底的短边下限必须小于常规长边下限。
+const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
+const _: () = assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
 const RESIZED_JPEG_QUALITY: u8 = 90;
 const RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const LLM_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -1563,23 +1570,16 @@ mod tests {
         }
     }
 
-    /// 缩小发生在解码之后，所以解码门槛必须比目标长边更宽；
-    /// 否则 1080×20000 这类日程长图会在 resize 之前就被 DimensionError 拒绝。
     #[test]
-    fn decode_limits_leave_room_for_tall_schedule_images() {
-        assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
-        assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
-
-        let (width, height) = (1080u64, 20000u64);
-        assert!(height <= u64::from(IMAGE_MAX_DECODE_SIDE));
-        assert!(
-            width * height * 4 <= IMAGE_MAX_DECODE_ALLOC,
-            "1080×20000 的 RGBA 解码缓冲必须落在 IMAGE_MAX_DECODE_ALLOC 之内"
-        );
-
-        // 等比压到目标长边后，短边仍要有可读宽度（不是几十像素的细线）。
-        let scaled_width = width * u64::from(IMAGE_MAX_SIDE) / height;
-        assert!(scaled_width >= 800, "长图压完宽度只有 {scaled_width}px");
+    fn tall_image_keeps_proportional_width_when_scaled() {
+        // 1080×20000 这类日程长图按长边等比收敛：压到目标长边后短边仍有原来的比例宽度，
+        // 而不是被塞进正方形框后只剩几十像素的一条细线。
+        let original = png_bytes(300, 2000);
+        let prepared = prepare_image_for_llm_with_limits(&original, IMAGE_UPLOAD_JPEG_BYTES, 1000)
+            .expect("prepare image");
+        let decoded = image::load_from_memory(prepared.as_ref()).expect("decode jpeg");
+        assert_eq!(decoded.width().max(decoded.height()), 1000);
+        assert_eq!(decoded.width(), 150);
     }
 
     #[test]

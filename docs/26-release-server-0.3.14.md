@@ -68,5 +68,6 @@ if long_side > IMAGE_MIN_SIDE && short_side > IMAGE_MIN_SHORT_SIDE {
 - 按 `AGENTS.md`，Clippy（`-D warnings`）、测试与服务器镜像构建全部由 GitHub Actions 完成。
 - 测试调整：`downsamples_image_long_side_to_4096` 改为传参的
   `downsamples_image_long_side_to_target`（原断言跟着常量走，目标一改就失效）；
-  新增 `decode_limits_leave_room_for_tall_schedule_images`，钉住「解码门槛 ≥ 缩放目标、
-  1080×20000 装得进 alloc、压完宽度 ≥ 800」三条。
+  新增 `tall_image_keeps_proportional_width_when_scaled`，覆盖长图等比收敛后的短边宽度。
+  常量之间「解码门槛 ≥ 缩放目标」「兜底短边 < 常规长边下限」两条不变量改成 `const _: () = assert!(...)`，
+  编译期就会失败，也不再被 `clippy::assertions_on_constants` 判成断言常量。
