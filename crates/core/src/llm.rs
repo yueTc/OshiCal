@@ -22,10 +22,18 @@ const IMAGE_DOWNLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 // Keep the base64 data URL below 10 MiB while leaving room for the prompt JSON.
 const MODEL_IMAGE_DATA_URL_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const IMAGE_UPLOAD_JPEG_BYTES: usize = 7 * 1024 * 1024;
-const IMAGE_MAX_SIDE: u32 = 4096;
+// 发给模型的长边目标。原来 4096：1080×20000 的日程长图会被等比压成 221×4096，
+// 字高只剩 4~5 像素，提取必然出错。放到 16384 后同一张图是 885×16384，字号约 0.82 倍，仍可读。
+const IMAGE_MAX_SIDE: u32 = 16384;
 const IMAGE_MIN_SIDE: u32 = 1600;
-const IMAGE_MAX_DECODE_SIDE: u32 = 8192;
-const IMAGE_MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+// 体积兜底时短边的下限。只按长边等比收敛会把长图压成 87×1600 一条线，这里兜住短边，
+// 宁可报"仍超过大小限制"，也不交一张字都没了的图给模型。
+const IMAGE_MIN_SHORT_SIDE: u32 = 512;
+// 解码门槛必须高于 IMAGE_MAX_SIDE：缩小发生在 decode 之后，解码本身要按原图尺寸分配缓冲。
+// 24576 能容纳 1080×20000 这类长图；内存真正的守门人是 IMAGE_MAX_DECODE_ALLOC。
+// 256 MiB ≈ 6700 万像素，够 1080×20000（86 MB）与 4096×8192（134 MB），又不至于把后台任务撑爆。
+const IMAGE_MAX_DECODE_SIDE: u32 = 24576;
+const IMAGE_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const RESIZED_JPEG_QUALITY: u8 = 90;
 const RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const LLM_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -1001,10 +1009,19 @@ fn is_skippable_image(content_type: &str, bytes: &[u8]) -> bool {
 }
 
 fn prepare_image_for_llm(bytes: &[u8]) -> AppResult<Vec<u8>> {
-    prepare_image_for_llm_with_limit(bytes, IMAGE_UPLOAD_JPEG_BYTES)
+    prepare_image_for_llm_with_limits(bytes, IMAGE_UPLOAD_JPEG_BYTES, IMAGE_MAX_SIDE)
 }
 
+#[cfg(test)]
 fn prepare_image_for_llm_with_limit(bytes: &[u8], byte_limit: usize) -> AppResult<Vec<u8>> {
+    prepare_image_for_llm_with_limits(bytes, byte_limit, IMAGE_MAX_SIDE)
+}
+
+fn prepare_image_for_llm_with_limits(
+    bytes: &[u8],
+    byte_limit: usize,
+    max_image_side: u32,
+) -> AppResult<Vec<u8>> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(IMAGE_MAX_DECODE_SIDE);
     limits.max_image_height = Some(IMAGE_MAX_DECODE_SIDE);
@@ -1016,11 +1033,12 @@ fn prepare_image_for_llm_with_limit(bytes: &[u8], byte_limit: usize) -> AppResul
     let mut image = reader.decode().map_err(|error| {
         AppError::validation(format!("图片数据无法解析或超出尺寸限制: {error}"))
     })?;
-    if image.width().max(image.height()) > IMAGE_MAX_SIDE {
-        image = image.resize(IMAGE_MAX_SIDE, IMAGE_MAX_SIDE, FilterType::Lanczos3);
+    if image.width().max(image.height()) > max_image_side {
+        // DynamicImage::resize 是"等比适配进正方形框"：长边收敛到目标值，短边按比例缩小。
+        // 所以目标长边必须足够大，否则长图会被压成一条细线。
+        image = image.resize(max_image_side, max_image_side, FilterType::Lanczos3);
     }
 
-    let mut max_side = image.width().max(image.height());
     let mut quality = RESIZED_JPEG_QUALITY;
     loop {
         let rgb = flatten_to_rgb(&image);
@@ -1035,9 +1053,11 @@ fn prepare_image_for_llm_with_limit(bytes: &[u8], byte_limit: usize) -> AppResul
             quality -= 5;
             continue;
         }
-        if max_side > IMAGE_MIN_SIDE {
-            max_side = ((max_side as u64 * 4 / 5) as u32).max(IMAGE_MIN_SIDE);
-            image = image.resize(max_side, max_side, FilterType::Lanczos3);
+        let long_side = image.width().max(image.height());
+        let short_side = image.width().min(image.height());
+        if long_side > IMAGE_MIN_SIDE && short_side > IMAGE_MIN_SHORT_SIDE {
+            let next_side = ((long_side as u64 * 4 / 5) as u32).max(IMAGE_MIN_SIDE);
+            image = image.resize(next_side, next_side, FilterType::Lanczos3);
             quality = RESIZED_JPEG_QUALITY;
             continue;
         }
@@ -1530,15 +1550,36 @@ mod tests {
     }
 
     #[test]
-    fn downsamples_image_long_side_to_4096() {
+    fn downsamples_image_long_side_to_target() {
         for (width, height) in [(1200, 5000), (5000, 1200)] {
             let original = png_bytes(width, height);
-            let prepared = prepare_image_for_llm(&original).expect("prepare image");
+            let prepared =
+                prepare_image_for_llm_with_limits(&original, IMAGE_UPLOAD_JPEG_BYTES, 1024)
+                    .expect("prepare image");
             let decoded = image::load_from_memory(prepared.as_ref()).expect("decode resized image");
-            assert_eq!(decoded.width().max(decoded.height()), IMAGE_MAX_SIDE);
-            assert!(decoded.width() <= IMAGE_MAX_SIDE);
-            assert!(decoded.height() <= IMAGE_MAX_SIDE);
+            assert_eq!(decoded.width().max(decoded.height()), 1024);
+            assert!(decoded.width() <= 1024);
+            assert!(decoded.height() <= 1024);
         }
+    }
+
+    /// 缩小发生在解码之后，所以解码门槛必须比目标长边更宽；
+    /// 否则 1080×20000 这类日程长图会在 resize 之前就被 DimensionError 拒绝。
+    #[test]
+    fn decode_limits_leave_room_for_tall_schedule_images() {
+        assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
+        assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
+
+        let (width, height) = (1080u64, 20000u64);
+        assert!(height <= u64::from(IMAGE_MAX_DECODE_SIDE));
+        assert!(
+            width * height * 4 <= IMAGE_MAX_DECODE_ALLOC,
+            "1080×20000 的 RGBA 解码缓冲必须落在 IMAGE_MAX_DECODE_ALLOC 之内"
+        );
+
+        // 等比压到目标长边后，短边仍要有可读宽度（不是几十像素的细线）。
+        let scaled_width = width * u64::from(IMAGE_MAX_SIDE) / height;
+        assert!(scaled_width >= 800, "长图压完宽度只有 {scaled_width}px");
     }
 
     #[test]
