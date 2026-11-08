@@ -14,7 +14,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -24,6 +24,10 @@ use crate::models::{
     UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::settings::SETTING_KEYS;
+
+/// 断流重开的合并窗口：同一房间在这个间隔内重新开播，算作同一场直播的一段，而不是新的一场。
+/// 观测到的真实断流重开间隔在 45 秒到 3 分钟量级，留 10 分钟余量。
+const LIVE_SESSION_MERGE_MINUTES: i64 = 10;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -90,6 +94,8 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     super_chat_count INTEGER NOT NULL DEFAULT 0,
     guard_count INTEGER NOT NULL DEFAULT 0,
     reconnect_count INTEGER NOT NULL DEFAULT 0,
+    segment_count INTEGER NOT NULL DEFAULT 1,
+    last_segment_started_at TEXT NOT NULL DEFAULT '',
     data_quality TEXT NOT NULL DEFAULT 'collecting',
     collector_state TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL,
@@ -436,6 +442,7 @@ struct LiveSessionRow {
     super_chat_count: i64,
     guard_count: i64,
     reconnect_count: i64,
+    segment_count: i64,
     data_quality: String,
     collector_state: String,
     created_at: String,
@@ -2819,6 +2826,8 @@ impl SqliteStore {
         .bind(&started)
         .fetch_optional(&mut *tx)
         .await?;
+        // 同一条 (streamer_id, started_at) 只可能是同一场直播：B 站 live_time 没变，说明主播
+        // 只是断了一下又推流回来。这时必须续上原来的计数器，而不是清零重来。
         let (id, changed) = if let Some(row) = existing {
             let id: i64 = row.try_get("id")?;
             let existing_room_id: String = row.try_get("room_id")?;
@@ -2827,72 +2836,124 @@ impl SqliteStore {
             let existing_cover: Option<String> = row.try_get("cover_url")?;
             let existing_state: String = row.try_get("collector_state")?;
             let existing_ended_at: Option<String> = row.try_get("ended_at")?;
-            let reset_for_new_run = existing_ended_at.is_some() || existing_state != "active";
-            let changed = existing_room_id != room_id
+            let resumed = existing_ended_at.is_some() || existing_state != "active";
+            let changed = resumed
+                || existing_room_id != room_id
                 || existing_streamer_name != streamer_name
                 || existing_title != title
-                || (cover_url.is_some() && existing_cover.as_deref() != cover_url)
-                || reset_for_new_run;
-            if reset_for_new_run {
-                sqlx::query(
-                    "UPDATE live_sessions
-                     SET streamer_name = ?, room_id = ?, title = ?,
-                         cover_url = COALESCE(?, cover_url), ended_at = NULL,
-                         duration_seconds = 0, peak_online = 0, peak_high_energy = 0,
-                         avg_online = 0, online_samples = 0, online_total = 0,
-                         revenue_cents = 0, gift_revenue_cents = 0,
-                         super_chat_revenue_cents = 0, guard_revenue_cents = 0,
-                         paid_user_count = 0, interactive_user_count = 0,
-                         danmaku_count = 0, gift_count = 0, super_chat_count = 0,
-                         guard_count = 0, reconnect_count = 0, data_quality = 'collecting',
-                         collector_state = 'active', updated_at = ?, revision = revision + 1
-                     WHERE id = ?",
+                || (cover_url.is_some() && existing_cover.as_deref() != cover_url);
+            if resumed {
+                self.reopen_live_session_on(
+                    &mut tx,
+                    id,
+                    streamer_name,
+                    room_id,
+                    title,
+                    cover_url,
+                    &started,
+                    &now,
                 )
-                .bind(streamer_name)
-                .bind(room_id)
-                .bind(title)
-                .bind(cover_url)
-                .bind(&now)
-                .bind(id)
-                .execute(&mut *tx)
                 .await?;
             } else if changed {
-                sqlx::query(
-                    "UPDATE live_sessions
-                     SET streamer_name = ?, room_id = ?, title = ?,
-                         cover_url = COALESCE(?, cover_url), collector_state = 'active',
-                         updated_at = ?, revision = revision + 1
-                     WHERE id = ?",
+                self.touch_live_session_metadata_on(
+                    &mut tx,
+                    id,
+                    streamer_name,
+                    room_id,
+                    title,
+                    cover_url,
+                    &now,
                 )
-                .bind(streamer_name)
-                .bind(room_id)
-                .bind(title)
-                .bind(cover_url)
-                .bind(&now)
-                .bind(id)
-                .execute(&mut *tx)
                 .await?;
             }
             (id, changed)
         } else {
-            let id = sqlx::query(
-                "INSERT INTO live_sessions
-                 (streamer_id, streamer_name, room_id, title, cover_url, started_at,
-                  data_quality, collector_state, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'collecting', 'active', ?, ?)",
+            // B 站把断流后的重开当成了新一场（live_time 变了），所以这里没有同键记录。
+            // 先看这次重开是否已经并进来过，再看能不能并回上一段。
+            let absorbed = sqlx::query(
+                "SELECT id, ended_at
+                 FROM live_sessions
+                 WHERE streamer_id = ? AND room_id = ? AND last_segment_started_at = ?
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
             )
             .bind(streamer_id)
-            .bind(streamer_name)
-            .bind(room_id.trim())
-            .bind(title)
-            .bind(cover_url)
+            .bind(room_id)
             .bind(&started)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
-            (id, true)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = absorbed {
+                let id: i64 = row.try_get("id")?;
+                let ended_at: Option<String> = row.try_get("ended_at")?;
+                if ended_at.is_some() {
+                    self.reopen_live_session_on(
+                        &mut tx,
+                        id,
+                        streamer_name,
+                        room_id,
+                        title,
+                        cover_url,
+                        &started,
+                        &now,
+                    )
+                    .await?;
+                    (id, true)
+                } else {
+                    // 轮询会拿同一个 live_time 反复调用，这里不能每轮都再并一次。
+                    (id, false)
+                }
+            } else {
+                let merge_floor = (started_at
+                    - chrono::Duration::minutes(LIVE_SESSION_MERGE_MINUTES))
+                .to_rfc3339();
+                let resumable = sqlx::query(
+                    "SELECT id FROM live_sessions
+                     WHERE streamer_id = ? AND room_id = ? AND started_at < ?
+                       AND (ended_at IS NULL OR ended_at >= ?)
+                     ORDER BY started_at DESC, id DESC LIMIT 1",
+                )
+                .bind(streamer_id)
+                .bind(room_id)
+                .bind(&started)
+                .bind(&merge_floor)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = resumable {
+                    let id: i64 = row.try_get("id")?;
+                    self.reopen_live_session_on(
+                        &mut tx,
+                        id,
+                        streamer_name,
+                        room_id,
+                        title,
+                        cover_url,
+                        &started,
+                        &now,
+                    )
+                    .await?;
+                    (id, true)
+                } else {
+                    let id = sqlx::query(
+                        "INSERT INTO live_sessions
+                         (streamer_id, streamer_name, room_id, title, cover_url, started_at,
+                          data_quality, collector_state, segment_count, last_segment_started_at,
+                          created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, 'collecting', 'active', 1, ?, ?, ?)",
+                    )
+                    .bind(streamer_id)
+                    .bind(streamer_name)
+                    .bind(room_id.trim())
+                    .bind(title)
+                    .bind(cover_url)
+                    .bind(&started)
+                    .bind(&started)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await?
+                    .last_insert_rowid();
+                    (id, true)
+                }
+            }
         };
         if changed {
             self.emit_live_session_change(&mut tx, id, "upsert", SyncActor::collector())
@@ -2902,13 +2963,78 @@ impl SqliteStore {
         self.get_live_session(id).await
     }
 
+    /// 把一条已结束（或非 active）的场次重新打开：保留计数器与整场的开始时间，只清掉结束时间。
+    /// 断流窗口内的事件确实丢了，所以完整度降级为 partial，段数 +1。
+    #[allow(clippy::too_many_arguments)]
+    async fn reopen_live_session_on(
+        &self,
+        conn: &mut SqliteConnection,
+        id: i64,
+        streamer_name: &str,
+        room_id: &str,
+        title: &str,
+        cover_url: Option<&str>,
+        segment_started: &str,
+        now: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE live_sessions
+             SET streamer_name = ?, room_id = ?, title = ?,
+                 cover_url = COALESCE(?, cover_url), ended_at = NULL, duration_seconds = 0,
+                 collector_state = 'active',
+                 data_quality = CASE WHEN data_quality = 'collecting' THEN 'collecting' ELSE 'partial' END,
+                 segment_count = MAX(segment_count + 1, 2),
+                 last_segment_started_at = ?, updated_at = ?, revision = revision + 1
+             WHERE id = ?",
+        )
+        .bind(streamer_name)
+        .bind(room_id)
+        .bind(title)
+        .bind(cover_url)
+        .bind(segment_started)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn touch_live_session_metadata_on(
+        &self,
+        conn: &mut SqliteConnection,
+        id: i64,
+        streamer_name: &str,
+        room_id: &str,
+        title: &str,
+        cover_url: Option<&str>,
+        now: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE live_sessions
+             SET streamer_name = ?, room_id = ?, title = ?,
+                 cover_url = COALESCE(?, cover_url), collector_state = 'active',
+                 updated_at = ?, revision = revision + 1
+             WHERE id = ?",
+        )
+        .bind(streamer_name)
+        .bind(room_id)
+        .bind(title)
+        .bind(cover_url)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_live_session(&self, id: i64) -> AppResult<LiveSession> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
             "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                    super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                    super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                     created_at, updated_at, revision
              FROM live_sessions WHERE id = ?",
         )
@@ -2931,7 +3057,7 @@ impl SqliteStore {
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                        super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                        super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                         created_at, updated_at, revision
                  FROM live_sessions WHERE streamer_id = ?
                  ORDER BY started_at DESC LIMIT ?",
@@ -2946,7 +3072,7 @@ impl SqliteStore {
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                        super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                        super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                         created_at, updated_at, revision
                  FROM live_sessions ORDER BY started_at DESC LIMIT ?",
             )
@@ -2967,7 +3093,7 @@ impl SqliteStore {
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
                     ls.interactive_user_count, ls.danmaku_count, ls.gift_count, ls.super_chat_count,
-                    ls.guard_count, ls.reconnect_count, ls.data_quality, ls.collector_state,
+                    ls.guard_count, ls.reconnect_count, ls.segment_count, ls.data_quality, ls.collector_state,
                     ls.created_at, ls.updated_at, ls.revision
              FROM live_sessions ls
              JOIN schedules s ON s.streamer_id = ls.streamer_id
@@ -3078,7 +3204,7 @@ impl SqliteStore {
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                    super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                    super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                     created_at, updated_at, revision
              FROM live_sessions
              WHERE streamer_id = ? AND ended_at IS NULL
@@ -3472,6 +3598,7 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         super_chat_count: row.super_chat_count,
         guard_count: row.guard_count,
         reconnect_count: row.reconnect_count,
+        segment_count: row.segment_count.max(0) as u64,
         data_quality: row.data_quality,
         collector_state: row.collector_state,
         created_at: parse_ts(&row.created_at)?,
@@ -4330,7 +4457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopening_finished_live_session_resets_end_and_counters() {
+    async fn reopening_finished_live_session_keeps_counters() {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = store
             .add_subscription(&add_input("203", "重开主播"))
@@ -4349,6 +4476,21 @@ mod tests {
             )
             .await
             .expect("session");
+        store
+            .update_live_session_stats(
+                session.id,
+                &LiveSessionStats {
+                    danmaku_count: 42,
+                    revenue_cents: 500,
+                    paid_user_count: 3,
+                    interactive_user_count: 7,
+                    data_quality: "partial".to_owned(),
+                    collector_state: "active".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stats");
         store
             .finish_open_live_session(session.id, start + Duration::minutes(5))
             .await
@@ -4374,8 +4516,148 @@ mod tests {
                 .await
                 .expect("stored duration");
         assert_eq!(stored_duration, 0);
-        assert_eq!(reopened.danmaku_count, 0);
-        assert_eq!(reopened.revenue_cents, 0);
+        // 断流重开是同一场：计数继续累加，不能清零。
+        assert_eq!(reopened.danmaku_count, 42);
+        assert_eq!(reopened.revenue_cents, 500);
+        assert_eq!(reopened.interactive_user_count, 7);
+        assert_eq!(reopened.segment_count, 2);
+        assert_eq!(reopened.data_quality, "partial");
         assert_eq!(reopened.collector_state, "active");
+    }
+
+    #[tokio::test]
+    async fn stream_restart_with_new_start_time_merges_into_previous_session() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let streamer = store
+            .add_subscription(&add_input("205", "断流主播"))
+            .await
+            .expect("streamer");
+        let first_start = Utc::now() - Duration::minutes(30);
+        let first = store
+            .ensure_live_session(
+                streamer.id,
+                "30849777",
+                &streamer.name,
+                "【突击】周末愉快～",
+                None,
+                first_start,
+                Utc::now(),
+            )
+            .await
+            .expect("first");
+        store
+            .update_live_session_stats(
+                first.id,
+                &LiveSessionStats {
+                    danmaku_count: 786,
+                    revenue_cents: 21_670,
+                    interactive_user_count: 255,
+                    paid_user_count: 96,
+                    peak_high_energy: 789,
+                    data_quality: "partial".to_owned(),
+                    collector_state: "active".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stats");
+        store
+            .finish_open_live_session(first.id, first_start + Duration::minutes(5))
+            .await
+            .expect("finish");
+        assert!(store
+            .latest_open_live_session(streamer.id)
+            .await
+            .expect("open")
+            .is_none());
+
+        // 46 秒后主播重新推流，B 站把 live_time 更新成了新的开播时间。
+        let second_start = first_start + Duration::minutes(5) + Duration::seconds(46);
+        let merged = store
+            .ensure_live_session(
+                streamer.id,
+                "30849777",
+                &streamer.name,
+                "【突击】周末愉快～",
+                None,
+                second_start,
+                Utc::now(),
+            )
+            .await
+            .expect("merge");
+        assert_eq!(merged.id, first.id, "重开应该并回原来那一场");
+        assert_eq!(merged.started_at, first_start);
+        assert!(merged.ended_at.is_none());
+        assert_eq!(merged.segment_count, 2);
+        assert_eq!(merged.danmaku_count, 786);
+        assert_eq!(merged.revenue_cents, 21_670);
+        assert_eq!(merged.peak_high_energy, 789);
+
+        // 轮询会拿同一个 live_time 反复调用：不能每轮都再并一次。
+        let again = store
+            .ensure_live_session(
+                streamer.id,
+                "30849777",
+                &streamer.name,
+                "【突击】周末愉快～",
+                None,
+                second_start,
+                Utc::now(),
+            )
+            .await
+            .expect("idempotent merge");
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.segment_count, 2, "同一次重开只能算一段");
+        let sessions = store
+            .list_live_sessions(Some(streamer.id), 10)
+            .await
+            .expect("list");
+        assert_eq!(sessions.len(), 1, "同一场直播不应该留两条记录");
+    }
+
+    #[tokio::test]
+    async fn stream_restart_after_merge_window_stays_a_new_session() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let streamer = store
+            .add_subscription(&add_input("206", "换场主播"))
+            .await
+            .expect("streamer");
+        let first_start = Utc::now() - Duration::minutes(60);
+        let first = store
+            .ensure_live_session(
+                streamer.id,
+                "30849777",
+                &streamer.name,
+                "上午场",
+                None,
+                first_start,
+                Utc::now(),
+            )
+            .await
+            .expect("first");
+        store
+            .finish_open_live_session(first.id, first_start + Duration::minutes(5))
+            .await
+            .expect("finish");
+        // 间隔超过合并窗口，属于真正的新一场。
+        let second = store
+            .ensure_live_session(
+                streamer.id,
+                "30849777",
+                &streamer.name,
+                "下午场",
+                None,
+                first_start + Duration::minutes(20),
+                Utc::now(),
+            )
+            .await
+            .expect("second");
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.segment_count, 1);
+        let sessions = store
+            .list_live_sessions(Some(streamer.id), 10)
+            .await
+            .expect("list");
+        assert_eq!(sessions.len(), 2);
     }
 }

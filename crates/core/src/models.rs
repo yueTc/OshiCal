@@ -413,12 +413,20 @@ pub struct LiveSession {
     pub super_chat_count: i64,
     pub guard_count: i64,
     pub reconnect_count: i64,
+    /// 本场由几段拼成。主播断流重开后，同一房间、间隔在合并窗口内的场次会并回这一行，
+    /// 段数递增而不是新建一条记录。
+    #[serde(default = "default_segment_count")]
+    pub segment_count: u64,
     pub data_quality: String,
     pub collector_state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub revision: i64,
+}
+
+pub fn default_segment_count() -> u64 {
+    1
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
