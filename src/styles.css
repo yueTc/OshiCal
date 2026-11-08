@@ -8,6 +8,10 @@
   --primary-strong: #b83263;
   --primary-soft: #ffe3ee;
   --on-primary: #ffffff;
+  --brand-mark-ink: #fff8fb;
+  --brand-mark-from: #d2477a;
+  --brand-mark-to: #ad2f5d;
+  --brand-mark-plate: #d2477a;
   --text: #241820;
   --muted: #75636d;
   --faint: #a3909a;
@@ -260,12 +264,19 @@ h3 {
 }
 
 .brand-mark {
+  --brand-mark-plate: var(--brand-mark-from, var(--primary));
   display: grid;
   place-items: center;
   width: 42px;
   height: 42px;
-  color: var(--on-primary);
-  background: linear-gradient(145deg, color-mix(in srgb, var(--primary) 76%, #fff), var(--primary-strong));
+  /* The mark keeps one fixed ink colour so the artwork never flips between
+     black and white while the appearance palette changes. */
+  color: var(--brand-mark-ink, #fff8fb);
+  background: linear-gradient(
+    145deg,
+    var(--brand-mark-from, var(--primary)),
+    var(--brand-mark-to, var(--primary-strong))
+  );
   border-radius: 14px;
   box-shadow: 0 9px 22px rgba(var(--primary-rgb), 0.32);
 }

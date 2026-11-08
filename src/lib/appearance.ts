@@ -274,6 +274,29 @@ function bestForeground(backgrounds: string[]): "#000000" | "#ffffff" {
   return blackScore >= whiteScore ? "#000000" : "#ffffff";
 }
 
+/** Ink used inside the brand mark plate; must match the shipped app icon. */
+const BRAND_MARK_INK = "#fff8fb";
+
+/**
+ * The brand mark never uses `--on-primary`: that token flips between black and
+ * white at a luminance threshold, which made the logo artwork switch colour
+ * whenever the palette changed. Instead the plate is darkened until the fixed
+ * light ink stays readable (3:1, the threshold for non-text graphics).
+ */
+function brandMarkPlate(color: string, minimum = 3): string {
+  const normalized = normalizeHex(color, "#241820");
+  if (colorContrastRatio(BRAND_MARK_INK, normalized) >= minimum) {
+    return normalized;
+  }
+  for (let step = 1; step <= 20; step += 1) {
+    const candidate = mix(normalized, "#000000", step / 20);
+    if (colorContrastRatio(BRAND_MARK_INK, candidate) >= minimum) {
+      return candidate;
+    }
+  }
+  return "#241820";
+}
+
 function customPalette(custom: CustomAppearance): AppearancePalette {
   const rawPrimary = normalizeHex(custom.primary, DEFAULT_APPEARANCE.custom.primary);
   const background = normalizeHex(custom.background, DEFAULT_APPEARANCE.custom.background);
@@ -398,6 +421,8 @@ export function applyAppearance(settings: AppearanceSettings): void {
   const primaryRgb = rgbChannels(palette.primary);
   const shadowRgb = rgbChannels(mix(palette.primary, "#241820", 0.36));
   const contrast = inspectAppearanceContrast(normalized);
+  const brandMarkFrom = brandMarkPlate(mix(palette.primary, "#000000", 0.1));
+  const brandMarkTo = brandMarkPlate(mix(palette.primaryStrong, "#000000", 0.06));
   const values: Record<string, string> = {
     "--bg": palette.bg,
     "--surface": palette.surface,
@@ -407,6 +432,10 @@ export function applyAppearance(settings: AppearanceSettings): void {
     "--primary-strong": palette.primaryStrong,
     "--primary-soft": palette.primarySoft,
     "--on-primary": contrast.primaryForeground,
+    "--brand-mark-ink": BRAND_MARK_INK,
+    "--brand-mark-from": brandMarkFrom,
+    "--brand-mark-to": brandMarkTo,
+    "--brand-mark-plate": brandMarkFrom,
     "--text": palette.text,
     "--muted": palette.muted,
     "--faint": palette.faint,
