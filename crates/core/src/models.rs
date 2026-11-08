@@ -157,6 +157,10 @@ pub struct DynamicPost {
 pub struct ReserveCard {
     pub title: String,
     pub description: String,
+    /// 预约卡片能确认到的直播间号，只由 `jump_url` 解析得出。
+    /// `additional.reserve.rid` 是预约 id，不是房间号（拼成 live.bilibili.com/{rid}
+    /// 会落到别人的直播间），所以该字段忽略历史缓存里的旧值。
+    #[serde(default, skip_deserializing)]
     pub room_id: Option<String>,
     pub jump_url: Option<String>,
     /// B 站预约卡片类型：1 为视频预约，2 为直播预约。
@@ -168,6 +172,53 @@ impl ReserveCard {
     pub fn is_live(&self) -> bool {
         self.stype == Some(2)
     }
+
+    /// 预约卡片可信的直播间号：优先用解析阶段的结果，回退到现场解析 `jump_url`。
+    pub fn live_room_id(&self) -> Option<String> {
+        self.room_id
+            .clone()
+            .or_else(|| self.jump_url.as_deref().and_then(reserve_room_id_from_url))
+    }
+}
+
+/// 从直播预约卡片的跳转地址里取出房间号。
+/// 支持 `https://live.bilibili.com/22625027`、`//live.bilibili.com/22625027`
+/// 以及把房间号放在 query 里的 blackboard 活动页；其它形态一律返回 `None`，
+/// 由调用方回退到主播自己的直播间。
+pub fn reserve_room_id_from_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_owned()
+    };
+    let parsed = url::Url::parse(&normalized).ok()?;
+    if parsed.host_str() != Some("live.bilibili.com") {
+        return None;
+    }
+    let is_room_id = |value: &str| {
+        !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+    };
+    if let Some(segment) = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .map(str::trim)
+    {
+        if is_room_id(segment) {
+            return Some(segment.to_owned());
+        }
+    }
+    for (key, value) in parsed.query_pairs() {
+        let key = key.trim();
+        let value = value.trim();
+        if matches!(key, "room_id" | "roomId" | "roomid") && is_room_id(value) {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,4 +683,44 @@ pub struct ClientSyncState {
     pub key: String,
     pub value: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserve_room_id_comes_from_live_room_url_only() {
+        for (raw, expected) in [
+            ("https://live.bilibili.com/22625027", Some("22625027")),
+            ("//live.bilibili.com/22625027?spm=1", Some("22625027")),
+            (
+                "https://live.bilibili.com/blackboard/activity-reserve.html?room_id=22625027",
+                Some("22625027"),
+            ),
+            (
+                "https://live.bilibili.com/blackboard/activity-reserve.html",
+                None,
+            ),
+            ("https://www.bilibili.com/video/BV1xx", None),
+            ("", None),
+        ] {
+            assert_eq!(reserve_room_id_from_url(raw).as_deref(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn reserve_card_ignores_legacy_rid_room_id_on_deserialize() {
+        // 旧缓存把预约 id 写进 roomId，读回来必须丢掉，改由 jumpUrl 现算。
+        let card: ReserveCard = serde_json::from_value(serde_json::json!({
+            "title": "直播预约：周五杂谈",
+            "description": "10月30日 20:00 直播",
+            "roomId": "5866502",
+            "jumpUrl": "https://live.bilibili.com/22625027",
+            "stype": 2
+        }))
+        .expect("reserve card");
+        assert!(card.room_id.is_none());
+        assert_eq!(card.live_room_id().as_deref(), Some("22625027"));
+    }
 }

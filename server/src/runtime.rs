@@ -93,6 +93,12 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
 }
 
 pub fn spawn_background_tasks(state: AppState) {
+    // 历史数据把直播预约卡的 `rid`（预约 id）当成房间号写进 room_url，
+    // 客户端双击卡片会打开别人的直播间。启动时先清一次这类地址。
+    let repair_state = state.clone();
+    tokio::spawn(async move {
+        repair_state.service.repair_reserve_room_urls().await;
+    });
     // Keep slow vision/dynamic work independent of live probes and event delivery.
     let live_state = state.clone();
     tokio::spawn(async move {
