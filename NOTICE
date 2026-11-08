@@ -1,0 +1,21 @@
+OshiCal (推历)
+Copyright 2026 OshiCal contributors
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file in the root of this repository.
+
+OshiCal
+  https://github.com/yueTc/OshiCal
+
+Third-party components
+
+internal_pkg/package/
+  Type definitions of @laplace.live/internal (v1.3.42)
+  Copyright 2026 LAPLACE Live LLC
+  Licensed under the Apache License, Version 2.0
+  https://github.com/laplace-live
+
+Rust and npm runtime dependencies are distributed under their own licenses.
+See Cargo.lock and package-lock.json for the exact versions in use; run
+`cargo tree --format '{p} {l}'` / `npx license-checker` in a build environment
+to produce a full attribution list for a release artifact.
