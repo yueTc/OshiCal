@@ -22,9 +22,11 @@ const IMAGE_DOWNLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 // Keep the base64 data URL below 10 MiB while leaving room for the prompt JSON.
 const MODEL_IMAGE_DATA_URL_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const IMAGE_UPLOAD_JPEG_BYTES: usize = 7 * 1024 * 1024;
-// 发给模型的长边目标。原来 4096：1080×20000 的日程长图会被等比压成 221×4096，
-// 字高只剩 4~5 像素，提取必然出错。放到 16384 后同一张图是 885×16384，字号约 0.82 倍，仍可读。
-const IMAGE_MAX_SIDE: u32 = 16384;
+// 发给模型的上限。长边沿用 4096：上游视觉模型对 1500×9851（约 1477 万像素）的日程长图
+// 直接回 400 `image_invalid`，而 2048×4096（约 839 万像素）一直可用；所以在长边之外再加一道
+// 800 万像素的总量闸，两个约束取更紧的那个等比缩放。
+const IMAGE_MAX_SIDE: u32 = 4096;
+const IMAGE_MAX_PIXELS: u64 = 8_000_000;
 const IMAGE_MIN_SIDE: u32 = 1600;
 // 体积兜底时短边的下限。只按长边等比收敛会把长图压成 87×1600 一条线，这里兜住短边，
 // 宁可报"仍超过大小限制"，也不交一张字都没了的图给模型。
@@ -1026,6 +1028,35 @@ fn prepare_image_for_llm_with_limits(
     byte_limit: usize,
     max_image_side: u32,
 ) -> AppResult<Vec<u8>> {
+    prepare_image_for_llm_with_budget(bytes, byte_limit, max_image_side, IMAGE_MAX_PIXELS)
+}
+
+/// 把图压到「长边 ≤ max_image_side 且总像素 ≤ max_image_pixels」，
+/// 以长边与总像素两个约束里更紧的那个为准，等比缩放，不变形。
+fn fit_within(
+    image: image::DynamicImage,
+    max_image_side: u32,
+    max_image_pixels: u64,
+) -> image::DynamicImage {
+    let width = u64::from(image.width());
+    let height = u64::from(image.height());
+    if width.max(height) <= u64::from(max_image_side) && width * height <= max_image_pixels {
+        return image;
+    }
+    let side_scale = f64::from(max_image_side) / width.max(height) as f64;
+    let pixel_scale = (max_image_pixels as f64 / (width * height) as f64).sqrt();
+    let scale = side_scale.min(pixel_scale).min(1.0);
+    let target_width = ((width as f64 * scale).round() as u32).max(1);
+    let target_height = ((height as f64 * scale).round() as u32).max(1);
+    image.resize_exact(target_width, target_height, FilterType::Lanczos3)
+}
+
+fn prepare_image_for_llm_with_budget(
+    bytes: &[u8],
+    byte_limit: usize,
+    max_image_side: u32,
+    max_image_pixels: u64,
+) -> AppResult<Vec<u8>> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(IMAGE_MAX_DECODE_SIDE);
     limits.max_image_height = Some(IMAGE_MAX_DECODE_SIDE);
@@ -1037,11 +1068,7 @@ fn prepare_image_for_llm_with_limits(
     let mut image = reader.decode().map_err(|error| {
         AppError::validation(format!("图片数据无法解析或超出尺寸限制: {error}"))
     })?;
-    if image.width().max(image.height()) > max_image_side {
-        // DynamicImage::resize 是"等比适配进正方形框"：长边收敛到目标值，短边按比例缩小。
-        // 所以目标长边必须足够大，否则长图会被压成一条细线。
-        image = image.resize(max_image_side, max_image_side, FilterType::Lanczos3);
-    }
+    image = fit_within(image, max_image_side, max_image_pixels);
 
     let mut quality = RESIZED_JPEG_QUALITY;
     loop {
