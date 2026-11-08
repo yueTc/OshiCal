@@ -2999,6 +2999,7 @@ impl SqliteStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn touch_live_session_metadata_on(
         &self,
         conn: &mut SqliteConnection,
