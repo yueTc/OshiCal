@@ -269,6 +269,26 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/21-release-server-0.3.11.md](docs/21-release-server-0.3.11.md)
 - [docs/22-android-client.md](docs/22-android-client.md)
 
+## 赞助
+
+这个项目是抽空闲时间做的，服务器、模型调用、B 站接口的坑都得自己填。要是它让你少错过几场直播，可以请作者喝杯咖啡。
+
+| 渠道 | 说明 |
+| --- | --- |
+| GitHub Sponsors | [github.com/sponsors/yueTc](https://github.com/sponsors/yueTc)，可设每月固定额度 |
+| 支付宝 / 微信 | 扫下面的收款码，金额随意 |
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/sponsor/alipay.png" width="220" alt="支付宝收款码"><br><sub>支付宝</sub></td>
+    <td align="center"><img src="docs/sponsor/wechat.png" width="220" alt="微信收款码"><br><sub>微信</sub></td>
+  </tr>
+</table>
+
+<!-- 收款码：把真实的支付宝 / 微信收款码截图覆盖到 docs/sponsor/alipay.png 与 docs/sponsor/wechat.png 即可，占位图上方写着「待替换」。爱发电等其他渠道可在表格里加一行。 -->
+
+收款码是静态图，不接任何自动发货或付费解锁。赞助不换取功能优先级，issue 和 PR 该排队还是排队。
+
 ## 许可证
 
 Apache License 2.0，全文见 [LICENSE](LICENSE)，第三方归属见 [NOTICE](NOTICE)。再分发时须保留版权、许可与 `NOTICE` 声明，修改文件需显著标注；含专利授权（第 3 条）与商标限制（第 6 条），不得以 `OshiCal` / `推历` 名义为衍生品背书。提交贡献即视为按 Apache-2.0 授权。
