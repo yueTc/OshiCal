@@ -13,7 +13,10 @@ use tokio::sync::{Mutex, RwLock};
 use url::form_urlencoded::Serializer;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{AccountSearchResult, DynamicPost, LiveRoomOwner, LiveSnapshot, ReserveCard};
+use crate::models::{
+    reserve_room_id_from_url, AccountSearchResult, DynamicPost, LiveRoomOwner, LiveSnapshot,
+    ReserveCard,
+};
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 const MIXIN_KEY_ENC_TAB: [usize; 64] = [
@@ -1307,7 +1310,7 @@ fn parse_dynamic_item(item: &Value) -> Option<DynamicPost> {
     images.dedup();
     images.truncate(9);
 
-    let reserve = module_dynamic
+    let reserve_value = module_dynamic
         .pointer("/additional/reserve")
         .filter(|value| {
             module_dynamic
@@ -1315,27 +1318,28 @@ fn parse_dynamic_item(item: &Value) -> Option<DynamicPost> {
                 .and_then(Value::as_str)
                 == Some("ADDITIONAL_TYPE_RESERVE")
                 || value.is_object()
-        })
-        .map(|reserve| ReserveCard {
-            title: reserve
-                .get("title")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("预约")
-                .to_owned(),
-            description: reserve
-                .pointer("/desc1/text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            room_id: reserve.get("rid").and_then(value_to_string),
-            jump_url: reserve
-                .get("jump_url")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
-            stype: reserve.get("stype").and_then(Value::as_i64),
         });
+    let reserve_jump_url = reserve_value
+        .and_then(|value| value.get("jump_url"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let reserve = reserve_value.map(|reserve| ReserveCard {
+        title: reserve
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("预约")
+            .to_owned(),
+        description: reserve
+            .pointer("/desc1/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        // `rid` 是预约 id，不是房间号；房间号只能从 jump_url 里取。
+        room_id: reserve_jump_url.and_then(reserve_room_id_from_url),
+        jump_url: reserve_jump_url.map(ToOwned::to_owned),
+        stype: reserve.get("stype").and_then(Value::as_i64),
+    });
 
     if text.is_empty() && images.is_empty() && reserve.is_none() {
         return None;
@@ -1428,8 +1432,10 @@ mod tests {
                         "reserve": {
                             "title": "直播预约：周五杂谈",
                             "desc1": {"text": "10月30日 20:00 直播"},
-                            "rid": 12345,
-                            "jump_url": "https://live.bilibili.com/12345",
+                            // rid 是预约 id，不是房间号：这里故意给一个与
+                            // jump_url 不同的值，房间号只能来自 jump_url。
+                            "rid": 99999,
+                            "jump_url": "https://live.bilibili.com/22625027",
                             "stype": 2
                         }
                     }
@@ -1442,9 +1448,42 @@ mod tests {
         assert_eq!(post.images.len(), 1);
         let reserve = post.reserve.expect("reserve");
         assert_eq!(reserve.title, "直播预约：周五杂谈");
-        assert_eq!(reserve.room_id.as_deref(), Some("12345"));
+        assert_eq!(reserve.room_id.as_deref(), Some("22625027"));
+        assert_eq!(
+            reserve.jump_url.as_deref(),
+            Some("https://live.bilibili.com/22625027")
+        );
         assert_eq!(reserve.stype, Some(2));
         assert!(reserve.is_live());
+    }
+
+    #[test]
+    fn reservation_without_room_url_yields_no_room_id() {
+        let item = json!({
+            "id_str": "124",
+            "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {
+                "module_author": {"mid": 100, "name": "测试主播", "pub_ts": "1761390000"},
+                "module_dynamic": {
+                    "desc": {"text": "10月30日 20:00 直播"},
+                    "additional": {
+                        "type": "ADDITIONAL_TYPE_RESERVE",
+                        "reserve": {
+                            "title": "直播预约：周五杂谈",
+                            "rid": 99999,
+                            "jump_url": "https://www.bilibili.com/blackboard/activity-reserve.html",
+                            "stype": 2
+                        }
+                    }
+                }
+            }
+        });
+        let reserve = parse_dynamic_item(&item)
+            .expect("post")
+            .reserve
+            .expect("reserve");
+        assert!(reserve.room_id.is_none());
+        assert!(reserve.live_room_id().is_none());
     }
 
     #[test]

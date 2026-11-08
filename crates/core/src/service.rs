@@ -1050,6 +1050,7 @@ impl AppService {
         // A manual refresh may arrive while the periodic monitor is running.
         // Queue it instead of failing and discarding the caller's progress UI.
         let _guard = self.acquire_refresh_lock().await;
+        self.repair_reserve_room_urls().await;
         let settings = load_settings(&self.store).await?;
         let llm_config = self.current_llm_config(&settings).await;
         let streamers = self.store.list_streamers().await?;
@@ -1057,6 +1058,18 @@ impl AppService {
         let sources = sources_for_streamers(&streamers);
         self.refresh_sources(&sources, &settings, llm_config.as_ref(), None, &|_| {})
             .await
+    }
+
+    /// 历史数据里预约卡 `rid` 被当成房间号，地址会指向别人的直播间。
+    /// 清掉这类地址后，双击卡片会回退到主播自己的直播间。
+    pub async fn repair_reserve_room_urls(&self) {
+        match self.store.repair_misattributed_reserve_room_urls().await {
+            Ok(0) => {}
+            Ok(repaired) => {
+                tracing::info!(repaired, "已清空错位的预约日程直播间地址");
+            }
+            Err(error) => tracing::warn!(%error, "修复预约日程直播间地址失败"),
+        }
     }
 
     pub async fn refresh_streamer(&self, streamer_id: i64) -> AppResult<RefreshReport> {
@@ -1448,10 +1461,12 @@ impl AppService {
                     let fingerprint = source_fingerprint(post, &schedule.title, "reserve");
                     let identity = format!("reserve:{}", post.id);
                     let participants = [target.name.clone()];
+                    // 预约卡的 `rid` 是预约 id，不是房间号；只有 jump_url 里能确认的
+                    // 房间号才可信，否则回退到主播自己的直播间。
                     let reserve_room_url = post
                         .reserve
                         .as_ref()
-                        .and_then(|reserve| reserve.room_id.as_deref())
+                        .and_then(|reserve| reserve.live_room_id())
                         .filter(|room_id| {
                             !room_id.is_empty()
                                 && room_id.chars().all(|character| character.is_ascii_digit())

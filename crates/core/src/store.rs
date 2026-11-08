@@ -1955,6 +1955,47 @@ impl SqliteStore {
         self.get_schedule(id).await
     }
 
+    /// 老版本把 B 站直播预约卡的 `rid`（预约 id）当成房间号写进 `room_url`，
+    /// 双击日程就会打开别人的直播间。预约日程的房主就是所属主播时，地址只
+    /// 可能是该主播自己的直播间；对不上的清空，播放路径会回退到主播直播间。
+    pub async fn repair_misattributed_reserve_room_urls(&self) -> AppResult<u64> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT s.id FROM schedules s
+             JOIN streamers st ON st.id = s.streamer_id
+             WHERE s.source_kind = 'reserve'
+               AND s.room_url IS NOT NULL
+               AND s.room_owner_mid IS NOT NULL
+               AND s.room_owner_mid = st.mid
+               AND COALESCE(st.live_url, '') <> s.room_url
+               AND ('https://live.bilibili.com/' || COALESCE(st.room_id, '')) <> s.room_url",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut repaired: u64 = 0;
+        for id in ids {
+            let updated = sqlx::query(
+                "UPDATE schedules SET room_url = NULL, updated_at = ?, revision = revision + 1
+                 WHERE id = ? AND room_url IS NOT NULL",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+            self.emit_schedule_change(&mut tx, id, "upsert", SyncActor::collector())
+                .await?;
+            repaired += 1;
+        }
+        tx.commit().await?;
+        Ok(repaired)
+    }
+
     pub async fn mark_schedule_source_changed(&self, id: i64) -> AppResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
@@ -3909,6 +3950,63 @@ mod tests {
         assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[0].fans, 1_000);
         assert_eq!(snapshots[2].fans, 1_100);
+    }
+
+    #[tokio::test]
+    async fn repair_clears_reservation_room_urls_that_belong_to_someone_else() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("672342685", "乃琳Queen"))
+            .await
+            .expect("streamer");
+        sqlx::query("UPDATE streamers SET room_id = ?, live_url = ? WHERE id = ?")
+            .bind("22625027")
+            .bind("https://live.bilibili.com/22625027")
+            .bind(streamer.id)
+            .execute(store.pool())
+            .await
+            .expect("streamer room");
+        let start = Utc::now() + Duration::days(1);
+        // 老版本把预约 id 当房间号写进来的记录。
+        let mut wrong = new_schedule(streamer.id, start);
+        wrong.source_kind = "reserve".to_owned();
+        wrong.room_url = Some("https://live.bilibili.com/5866502".to_owned());
+        wrong.room_owner_mid = Some("672342685".to_owned());
+        wrong.room_owner_name = Some("乃琳Queen".to_owned());
+        let (wrong_schedule, _) = store.upsert_schedule(&wrong).await.expect("wrong");
+        // 指向主播本人直播间的记录不能被清掉。
+        let mut right = new_schedule(streamer.id, start + Duration::hours(4));
+        right.source_kind = "reserve".to_owned();
+        right.room_url = Some("https://live.bilibili.com/22625027".to_owned());
+        right.room_owner_mid = Some("672342685".to_owned());
+        right.room_owner_name = Some("乃琳Queen".to_owned());
+        right.source_post_id = Some("post-2".to_owned());
+        right.source_identity = Some("reserve:post-2".to_owned());
+        let (right_schedule, _) = store.upsert_schedule(&right).await.expect("right");
+
+        let repaired = store
+            .repair_misattributed_reserve_room_urls()
+            .await
+            .expect("repair");
+        assert_eq!(repaired, 1);
+        let cleared = store
+            .get_schedule(wrong_schedule.id)
+            .await
+            .expect("cleared");
+        assert!(cleared.room_url.is_none());
+        let kept = store.get_schedule(right_schedule.id).await.expect("kept");
+        assert_eq!(
+            kept.room_url.as_deref(),
+            Some("https://live.bilibili.com/22625027")
+        );
+        // 幂等：第二轮没有可清空的记录。
+        assert_eq!(
+            store
+                .repair_misattributed_reserve_room_urls()
+                .await
+                .expect("second repair"),
+            0
+        );
     }
 
     #[tokio::test]
