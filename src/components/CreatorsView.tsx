@@ -343,6 +343,39 @@ export default function CreatorsView({
   const draggingIdRef = useRef<number | null>(null);
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const [optimisticOrder, setOptimisticOrder] = useState<number[] | null>(null);
+  // 标题+搜索吸附条是否已经贴住窗口顶部：只有贴住时才铺磨砂底色，
+  // 否则未滚动时那层底色会盖住页面顶部（连接异常横幅就在那里）。
+  const stickyRef = useRef<HTMLDivElement>(null);
+  const [stickyPinned, setStickyPinned] = useState(false);
+
+  useEffect(() => {
+    const element = stickyRef.current;
+    if (!element) {
+      return;
+    }
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      // position: sticky 命中时元素顶边正好停在 0，据此判断吸附状态。
+      const pinned = element.getBoundingClientRect().top <= 0.5;
+      setStickyPinned((current) => (current === pinned ? current : pinned));
+    };
+    const schedule = () => {
+      if (!frame) {
+        frame = window.requestAnimationFrame(measure);
+      }
+    };
+    measure();
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    return () => {
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setOptimisticOrder(null);
@@ -1214,65 +1247,69 @@ export default function CreatorsView({
 
   return (
     <section className="page creators-page">
-      <header className="page-header">
-        <div>
-          <h1 className="schedule-title">主播库</h1>
-          <p className="page-subtitle">管理日程订阅、开播通知、直播数据和官号来源。</p>
-        </div>
-        <div className="stat-chip"><UsersRound size={17} />{subscriptions.length} 位主播</div>
-      </header>
-
-      <p className="creator-order-hint" role="status">
-        <GripVertical size={15} />
-        {reorderBusy ? "正在保存主播顺序…" : "拖动左侧手柄或使用上下按钮调整顺序，左侧主播栏会同步变化。"}
-      </p>
-
-      <div className="search-panel">
-        <div className="search-input">
-          <div className="search-field">
-            <Search size={18} />
-            <input
-              ref={searchInputRef}
-              value={keyword}
-              onChange={(event) => handleKeywordChange(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  cancelSearchTimer();
-                  void performSearch(keyword);
-                } else if (event.key === "Escape" && keyword) {
-                  clearSearch();
-                }
-              }}
-              placeholder="输入 B 站昵称、UID、@昵称或空间链接"
-            />
-            {keyword ? (
-              <button
-                type="button"
-                className="search-clear"
-                aria-label="清空搜索内容"
-                title="清空搜索内容"
-                onClick={clearSearch}
-              >
-                <X size={15} />
-              </button>
-            ) : null}
+      <div ref={stickyRef} className={`creators-sticky ${stickyPinned ? "is-pinned" : ""}`}>
+        <header className="page-header">
+          <div>
+            <h1 className="schedule-title">主播库</h1>
+            <p className="page-subtitle">管理日程订阅、开播通知、直播数据和官号来源。</p>
           </div>
-          <button
-            className="button primary"
-            onClick={() => {
-              cancelSearchTimer();
-              void performSearch(keyword);
-            }}
-            disabled={searching || !keyword.trim()}
-          >
-            {searching ? "搜索中…" : "搜索"}
-          </button>
+          <div className="stat-chip" role="status">
+            <UsersRound size={17} />{reorderBusy ? "正在保存顺序…" : `${subscriptions.length} 位主播`}
+          </div>
+        </header>
+
+        <div className="search-panel">
+          <div className="search-input">
+            <div className="search-field">
+              <Search size={18} />
+              <input
+                ref={searchInputRef}
+                value={keyword}
+                onChange={(event) => handleKeywordChange(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    cancelSearchTimer();
+                    void performSearch(keyword);
+                  } else if (event.key === "Escape" && keyword) {
+                    clearSearch();
+                  }
+                }}
+                placeholder="输入 B 站昵称、UID、@昵称或空间链接"
+              />
+              {keyword ? (
+                <button
+                  type="button"
+                  className="search-clear"
+                  aria-label="清空搜索内容"
+                  title="清空搜索内容"
+                  onClick={clearSearch}
+                >
+                  <X size={15} />
+                </button>
+              ) : null}
+            </div>
+            <button
+              className="button primary"
+              onClick={() => {
+                cancelSearchTimer();
+                void performSearch(keyword);
+              }}
+              disabled={searching || !keyword.trim()}
+            >
+              {searching ? "搜索中…" : "搜索"}
+            </button>
+          </div>
+          {searchError ? <ErrorBanner message={searchError} onRetry={() => void performSearch(keyword)} /> : null}
         </div>
-        {searchError ? <ErrorBanner message={searchError} onRetry={() => void performSearch(keyword)} /> : null}
-        {hasSearched && !searching && !searchError && results.length === 0 ? (
+      </div>
+
+      {hasSearched && !searching && !searchError && results.length === 0 ? (
+        <div className="search-panel search-results-panel">
           <div className="search-empty">未找到匹配主播，请尝试完整昵称、UID 或 @昵称。</div>
-        ) : null}
-        {results.length ? (
+        </div>
+      ) : null}
+      {results.length ? (
+        <div className="search-panel search-results-panel">
           <div className="search-results">
             <div className="search-result-count">找到 {results.length} 位主播</div>
             {results.slice(0, 20).map((account) => {
@@ -1296,8 +1333,8 @@ export default function CreatorsView({
               );
             })}
           </div>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
 
       {subscriptions.length === 0 ? (
         <EmptyState title="还没有订阅主播" description="在上方搜索 B 站账号并添加。" />

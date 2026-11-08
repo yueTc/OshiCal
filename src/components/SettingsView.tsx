@@ -116,53 +116,64 @@ function serverUpdateSettingsEqual(left: ServerUpdateSettings, right: ServerUpda
     && left.githubMirrorUrl === right.githubMirrorUrl;
 }
 
-interface GithubMirrorCardProps {
-  title: string;
-  scopeLabel: string;
-  scopeClass: "local" | "server";
+interface GithubMirrorFieldProps {
+  label: string;
+  ariaLabel: string;
   description: string;
   value: string;
   effectiveValue: string;
-  saving: boolean;
-  error: string | null;
+  dirty?: boolean;
+  saving?: boolean;
+  error?: string | null;
+  disabled?: boolean;
   onChange: (value: string) => void;
-  onSave: (value: string) => void;
+  onClear: () => void;
+  onSave?: (value: string) => void;
   scopeNote: string;
 }
 
-function GithubMirrorCard({
-  title,
-  scopeLabel,
-  scopeClass,
+/**
+ * GitHub 镜像加速子区块：嵌在「服务器更新」和「软件更新」卡片内部。
+ * 服务端随「保存更新设置」一起提交（不传 onSave）；客户端需要立即落盘本机（传 onSave）。
+ */
+function GithubMirrorField({
+  label,
+  ariaLabel,
   description,
   value,
   effectiveValue,
-  saving,
-  error,
+  dirty = false,
+  saving = false,
+  error = null,
+  disabled = false,
   onChange,
+  onClear,
   onSave,
   scopeNote,
-}: GithubMirrorCardProps) {
+}: GithubMirrorFieldProps) {
+  const busy = saving || disabled;
   return (
-    <section className="settings-card span-2 github-mirror-card">
-      <header>
-        <h2>{title}</h2>
-        <span className={`setting-scope ${scopeClass}`}>{scopeLabel}</span>
+    <div className="update-mirror-block">
+      <div className="update-mirror-head">
+        <strong>{label}</strong>
         <span>{description}</span>
-      </header>
-      <div className="github-mirror-input-row">
+        {dirty ? <em>未保存</em> : null}
+      </div>
+      <div className={`github-mirror-input-row${onSave ? "" : " no-save"}`}>
         <input
           value={value}
           onChange={(event) => onChange(event.target.value)}
           placeholder="https://gh-proxy.com/"
-          aria-label={`${title}地址`}
-          disabled={saving}
+          aria-label={ariaLabel}
+          disabled={busy}
         />
-        <button className="button primary" onClick={() => onSave(value)} disabled={saving}>
-          {saving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
-          保存
-        </button>
-        <button className="button secondary" onClick={() => onSave("")} disabled={saving || !value.trim()}>
+        {onSave ? (
+          <button className="button primary" onClick={() => onSave(value)} disabled={busy}>
+            {saving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
+            保存
+          </button>
+        ) : null}
+        <button className="button secondary" onClick={onClear} disabled={busy || !value.trim()}>
           清除
         </button>
       </div>
@@ -170,7 +181,7 @@ function GithubMirrorCard({
       <div className="github-mirror-presets">
         <span>常用</span>
         {["https://gh-proxy.com/", "https://gh-proxy.org/"].map((preset) => (
-          <button type="button" key={preset} onClick={() => onChange(preset)} disabled={saving}>
+          <button type="button" key={preset} onClick={() => onChange(preset)} disabled={busy}>
             {preset}
           </button>
         ))}
@@ -178,7 +189,7 @@ function GithubMirrorCard({
       <p className="form-hint">
         当前生效：{effectiveValue}。{scopeNote}
       </p>
-    </section>
+    </div>
   );
 }
 
@@ -281,7 +292,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [githubMirrorEffective, setGithubMirrorEffective] = useState(readClientGithubMirror);
   const [githubMirrorSaving, setGithubMirrorSaving] = useState(false);
   const [githubMirrorError, setGithubMirrorError] = useState<string | null>(null);
-  const [serverMirrorError, setServerMirrorError] = useState<string | null>(null);
   const [bloodhoundOpen, setBloodhoundOpen] = useState(false);
   const [bloodhoundBusy, setBloodhoundBusy] = useState(false);
   const bloodhoundBusyRef = useRef(false);
@@ -1038,41 +1048,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
-  async function saveServerMirror(mirrorUrl: string) {
-    const currentServerUpdate = serverUpdateRef.current;
-    if (!currentServerUpdate) {
-      setServerMirrorError("服务器更新配置尚未加载，请稍后重试。");
-      return;
-    }
-    if (!beginServerUpdateAction("save")) {
-      return;
-    }
-    setServerMirrorError(null);
-    const savedSettings = serverUpdateSettingsFromInfo(currentServerUpdate);
-    try {
-      const value = await actions.saveServerUpdateSettings({
-        ...savedSettings,
-        githubMirrorUrl: mirrorUrl,
-      });
-      const latestDraft = serverUpdateDraftRef.current;
-      const nextDraft = !serverUpdateAutoSettingsEqual(latestDraft, serverUpdateSettingsFromInfo(value))
-        ? { ...latestDraft, githubMirrorUrl: value.githubMirrorUrl }
-        : serverUpdateSettingsFromInfo(value);
-      serverUpdateRef.current = value;
-      serverUpdateDraftRef.current = nextDraft;
-      serverUpdateDirtyRef.current = !serverUpdateSettingsEqual(
-        nextDraft,
-        serverUpdateSettingsFromInfo(value),
-      );
-      setServerUpdate(value);
-      setServerUpdateDraft(nextDraft);
-    } catch (updateError) {
-      setServerMirrorError(explainError(updateError));
-    } finally {
-      finishServerUpdateAction();
-    }
-  }
-
   async function saveServerUpdateSettings(): Promise<boolean> {
     if (!beginServerUpdateAction("save")) {
       return false;
@@ -1388,6 +1363,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 <small>时间按 Asia/Shanghai 解释；开始时间晚于结束时间表示跨午夜。</small>
               </div>
             </div>
+            <GithubMirrorField
+              label="GitHub 镜像加速"
+              ariaLabel="服务端 GitHub 镜像加速地址"
+              description="检查服务器版本时优先使用镜像，失败自动回退 GitHub 直连。"
+              value={serverUpdateDraft.githubMirrorUrl}
+              effectiveValue={serverUpdate ? serverUpdate.githubMirrorUrl || "GitHub 直连" : "读取中…"}
+              dirty={
+                serverUpdate !== null
+                && serverUpdateDraft.githubMirrorUrl !== serverUpdate.githubMirrorUrl
+              }
+              disabled={serverUpdateLoading !== null}
+              onChange={(value) => {
+                updateServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: value }));
+              }}
+              onClear={() => {
+                updateServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: "" }));
+              }}
+              scopeNote="只影响服务器版本检查；修改后点「保存更新设置」写入服务器，留空表示 GitHub 直连。"
+            />
             <div className="inline-actions server-update-actions">
               <button
                 className="button secondary"
@@ -1454,25 +1448,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </div>
             ) : null}
           </section>
-        ) : null}
-
-        {serverMode ? (
-          <GithubMirrorCard
-            title="服务端 GitHub 镜像加速"
-            scopeLabel="服务器"
-            scopeClass="server"
-            description="检查服务器版本时优先使用镜像，失败自动回退 GitHub 直连。"
-            value={serverUpdateDraft.githubMirrorUrl}
-            effectiveValue={serverUpdate ? serverUpdate.githubMirrorUrl || "GitHub 直连" : "读取中…"}
-            saving={serverUpdateLoading === "save"}
-            error={serverMirrorError}
-            onChange={(value) => {
-              setServerMirrorError(null);
-              updateServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: value }));
-            }}
-            onSave={(value) => void saveServerMirror(value)}
-            scopeNote="此设置只影响服务器版本检查，与客户端镜像分开保存。"
-          />
         ) : null}
 
         <div className="settings-section-heading span-2">
@@ -1644,25 +1619,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         </section>
 
         {tauri ? (
-          <GithubMirrorCard
-            title="客户端 GitHub 镜像加速"
-            scopeLabel="仅当前设备"
-            scopeClass="local"
-            description="检查桌面端更新和下载发布包时优先使用镜像，失败自动回退 GitHub 直连。"
-            value={githubMirrorDraft}
-            effectiveValue={githubMirrorEffective || "GitHub 直连"}
-            saving={githubMirrorSaving}
-            error={githubMirrorError}
-            onChange={(value) => {
-              githubMirrorDraftRef.current = value;
-              setGithubMirrorDraft(value);
-            }}
-            onSave={(value) => void saveGithubMirror(value)}
-            scopeNote="此设置只影响当前设备的桌面端更新，与服务器镜像分开保存。"
-          />
-        ) : null}
-
-        {tauri ? (
           <section className="settings-card span-2 software-update-card">
             <header>
               <h2>软件更新</h2>
@@ -1715,6 +1671,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 </span>
               </div>
             ) : null}
+            <GithubMirrorField
+              label="GitHub 镜像加速"
+              ariaLabel="客户端 GitHub 镜像加速地址"
+              description="检查桌面端更新和下载发布包时优先使用镜像，失败自动回退 GitHub 直连。"
+              value={githubMirrorDraft}
+              effectiveValue={githubMirrorEffective || "GitHub 直连"}
+              dirty={clientMirrorDirty}
+              saving={githubMirrorSaving}
+              error={githubMirrorError}
+              onChange={(value) => {
+                githubMirrorDraftRef.current = value;
+                setGithubMirrorDraft(value);
+              }}
+              onSave={(value) => void saveGithubMirror(value)}
+              onClear={() => void saveGithubMirror("")}
+              scopeNote="只影响当前设备的桌面端更新，保存在本机，不下发服务器。"
+            />
             <p className="form-hint">
               更新安装需要网络连接。Windows 会在安装完成后自动退出并重新启动；服务器 Web 界面随服务端镜像更新，不在此处处理。
             </p>

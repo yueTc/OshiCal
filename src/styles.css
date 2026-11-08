@@ -50,6 +50,9 @@ body,
   max-width: 100%;
   margin: 0;
   overflow-x: hidden;
+  /* `clip` 与 `hidden` 同样裁掉横向溢出，但不会把元素变成滚动容器；
+     否则祖先会成为“不滚动的滚动容器”，让主播库顶部吸附条（position: sticky）失效。 */
+  overflow-x: clip;
 }
 
 body {
@@ -140,6 +143,7 @@ h3 {
   width: 100%;
   max-width: 100%;
   overflow-x: hidden;
+  overflow-x: clip;
 }
 
 .app-shell.is-desktop { --window-chrome-offset: 8px; }
@@ -352,6 +356,7 @@ h3 {
   width: 100%;
   padding: 7px 8px;
   border-radius: 10px;
+  cursor: pointer;
   user-select: none;
 }
 
@@ -873,6 +878,9 @@ h3 {
   border-radius: var(--radius-lg);
   box-shadow: 0 5px 16px rgba(var(--shadow-rgb), 0.035);
   transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+  user-select: none;
+  /* 双击打开直播间：关掉双击缩放，触屏上 dblclick 才能立即触发 */
+  touch-action: manipulation;
 }
 
 .schedule-card:hover {
@@ -1531,6 +1539,10 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .search-results { display: grid; gap: 8px; margin-top: 14px; }
 .search-result-count { color: var(--faint); font-size: 11px; }
 .search-empty { margin-top: 14px; padding: 16px; color: var(--muted); background: var(--surface-soft); border-radius: 12px; font-size: 12px; }
+/* 搜索结果独立成卡片，滚动时跟着列表走，不占吸附区域的高度。 */
+.search-results-panel { margin-top: -4px; }
+.search-results-panel .search-results,
+.search-results-panel .search-empty { margin-top: 0; }
 .search-result {
   display: grid;
   grid-template-columns: 62px minmax(0, 1fr) auto;
@@ -1546,15 +1558,41 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .search-result p { margin-top: 3px; color: var(--muted); font-size: 11px; }
 .result-sign { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.creator-order-hint {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: -2px 2px 12px;
-  color: var(--muted);
-  font-size: 11px;
+/* 标题与搜索条固定在窗口顶部，滚动主播列表时始终可见。 */
+/* --creators-sticky-lift 是吸附时标题与窗口上沿之间的缝隙：桌面端右上角有
+   最小化/最大化/关闭按钮（占顶部 32px），留 36px 避开。margin-top 抵消
+   padding-top，未滚动时排版与原来完全一致；lift 必须小于 main-content 的
+   上内边距，否则未滚动时元素顶边已经越界，会被误判成已吸附。 */
+.creators-page { --creators-sticky-lift: 10px; }
+.app-shell.is-desktop .creators-page { --creators-sticky-lift: 36px; }
+.creators-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  isolation: isolate;
+  margin-top: calc(var(--creators-sticky-lift) * -1);
+  margin-inline: -12px;
+  margin-bottom: 12px;
+  padding-top: var(--creators-sticky-lift);
+  padding-inline: 12px;
+  padding-bottom: 14px;
 }
-.creator-order-hint svg { flex: 0 0 auto; color: var(--primary); }
+.creators-sticky::before {
+  content: "";
+  position: absolute;
+  inset: -2px -6px 0;
+  z-index: -1;
+  background: var(--bg);
+  border-radius: 0 0 var(--radius) var(--radius);
+  box-shadow: 0 12px 18px -16px rgba(var(--shadow-rgb), .55);
+  pointer-events: none;
+  /* 只有真正贴住窗口顶部时才铺底色，避免未滚动时盖住页面顶部的连接横幅。 */
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+.creators-sticky.is-pinned::before { opacity: 1; }
+.creators-sticky .page-header { margin-bottom: 14px; }
+.creators-sticky .search-panel { margin-bottom: 0; }
 .creator-list { display: grid; gap: 12px; min-width: 0; }
 .creator-card {
   display: grid;
@@ -2170,11 +2208,16 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .update-status { display: grid; gap: 4px; }
 .update-status strong { color: var(--text); }
 .server-update-error { color: var(--danger); }
-.github-mirror-card { background: rgba(252, 250, 255, .88); }
 .github-mirror-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; }
+.github-mirror-input-row.no-save { grid-template-columns: minmax(0, 1fr) auto; }
 .github-mirror-input-row input { min-width: 0; }
 .github-mirror-presets { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; color: var(--muted); font-size: 10px; }
 .github-mirror-presets button { padding: 3px 8px; color: var(--primary-strong); background: var(--primary-soft); border: 0; border-radius: 999px; font-size: 10px; cursor: pointer; }
+.update-mirror-block { display: grid; gap: 9px; margin-top: 14px; padding-top: 13px; border-top: 1px dashed var(--border); }
+.update-mirror-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.update-mirror-head strong { color: var(--text); font-size: 12px; }
+.update-mirror-head span { flex: 1 1 100%; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.update-mirror-head em { padding: 1px 7px; color: #7a5600; background: rgba(222, 145, 45, .13); border-radius: 999px; font-size: 10px; font-style: normal; font-weight: 600; }
 .device-sync-panel { overflow: hidden; }
 .device-sync-header {
   display: flex !important;
@@ -2365,8 +2408,12 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .sidebar-resizer { display: none; }
   .main-content { padding: calc(24px + var(--window-chrome-offset)) 18px 34px; }
   .page-header { flex-direction: column; }
+  /* 主播库标题跟着搜索条一起吸附，窄屏下改成单行，避免吸附条占掉过多高度。 */
+  .creators-sticky .page-header { flex-direction: row; align-items: center; gap: 12px; }
+  .creators-sticky .page-header > div { flex: 1; }
   .toolbar-actions { width: 100%; }
   .settings-layout, .form-grid { grid-template-columns: 1fr; }
+  .github-mirror-input-row, .github-mirror-input-row.no-save { grid-template-columns: 1fr; }
   .device-sync-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .proxy-test-result { grid-template-columns: auto minmax(0, 1fr); }
   .proxy-latency { grid-column: 2; justify-items: start; }
@@ -2393,6 +2440,10 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .nav-list button { font-size: 0; min-height: 48px; }
   .nav-list button svg { width: 22px; height: 22px; }
   .main-content { margin-left: 0; padding: calc(18px + var(--window-chrome-offset)) 12px; padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
+  .creators-sticky { margin-inline: -8px; margin-bottom: 10px; padding-inline: 8px; padding-bottom: 12px; }
+  .creators-sticky .page-subtitle { margin-top: 4px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .creators-sticky .page-header { margin-bottom: 10px; }
+  .creators-sticky .search-panel { padding: 12px; border-radius: var(--radius); }
   .toast { bottom: max(22px, calc(env(safe-area-inset-bottom) + 78px)); }
   h1 { font-size: 24px; }
   .toolbar-actions .button.secondary { padding-inline: 10px; }
