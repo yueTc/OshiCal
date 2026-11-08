@@ -1722,9 +1722,9 @@ async fn apply_live_session(
             started_at, ended_at, duration_seconds, peak_online, peak_high_energy, avg_online,
             online_samples, online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
             guard_revenue_cents, paid_user_count, interactive_user_count, danmaku_count,
-            gift_count, super_chat_count, guard_count, reconnect_count, data_quality,
+            gift_count, super_chat_count, guard_count, reconnect_count, segment_count, data_quality,
             collector_state, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id, streamer_name = excluded.streamer_name,
             room_id = excluded.room_id, title = excluded.title,
@@ -1743,6 +1743,7 @@ async fn apply_live_session(
             super_chat_count = excluded.super_chat_count,
             guard_count = excluded.guard_count,
             reconnect_count = excluded.reconnect_count,
+            segment_count = excluded.segment_count,
             data_quality = excluded.data_quality,
             collector_state = excluded.collector_state, updated_at = excluded.updated_at",
     )
@@ -1771,6 +1772,7 @@ async fn apply_live_session(
     .bind(value.super_chat_count)
     .bind(value.guard_count)
     .bind(value.reconnect_count)
+    .bind(value.segment_count as i64)
     .bind(&value.data_quality)
     .bind(&value.collector_state)
     .bind(value.created_at.to_rfc3339())

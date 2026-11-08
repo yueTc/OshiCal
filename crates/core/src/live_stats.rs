@@ -191,7 +191,9 @@ impl Default for CollectorStats {
 }
 
 impl CollectorStats {
-    fn from_session(session: &LiveSession) -> Self {
+    /// `resumed` 表示这条场次此前已经被采集过（换进程继续采，或断流重开后并回同一行）。
+    /// 只有它才需要放弃“完整”的承诺：内存里的 UID/去重集合已经不存在了。
+    fn from_session(session: &LiveSession, resumed: bool) -> Self {
         Self {
             peak_high_energy: i64::try_from(session.peak_high_energy).unwrap_or(i64::MAX),
             danmaku_count: session.danmaku_count,
@@ -205,13 +207,8 @@ impl CollectorStats {
             reconnect_count: session.reconnect_count,
             base_interactive_user_count: session.interactive_user_count,
             base_paid_user_count: session.paid_user_count,
-            // A resumed active session has lost the in-memory UID/dedup sets.
-            // Preserve its counters, but never claim exact unique-user totals.
-            data_degraded: session.data_quality == "partial" || session.collector_state == "active",
-            has_connected_once: matches!(
-                session.collector_state.as_str(),
-                "active" | "reconnecting"
-            ),
+            data_degraded: session.data_quality == "partial" || resumed,
+            has_connected_once: resumed,
             ..Self::default()
         }
     }
@@ -286,7 +283,10 @@ impl LiveStatsManager {
             expected: expected_generation,
         };
         let (stop_tx, stop_rx) = oneshot::channel();
-        let handle = tokio::spawn(run_collector(store, bili, session, stop_rx, token));
+        // 这条场次已经被写过（检查点、断流重开合并都会推 updated_at），说明采集端在它身上
+        // 已经跑过一轮：内存里的 UID 与去重集合都没了，不能承诺“完整”。
+        let resumed = session.updated_at > session.created_at;
+        let handle = tokio::spawn(run_collector(store, bili, session, stop_rx, token, resumed));
         tasks.insert(
             streamer_id,
             TaskHandle {
@@ -331,8 +331,9 @@ async fn run_collector(
     session: LiveSession,
     mut stop_rx: oneshot::Receiver<DateTime<Utc>>,
     token: CollectorToken,
+    resumed: bool,
 ) {
-    let mut stats = CollectorStats::from_session(&session);
+    let mut stats = CollectorStats::from_session(&session, resumed);
     let mut retry_delay = RECONNECT_DELAY;
     loop {
         if !token.is_current() {
@@ -1855,6 +1856,78 @@ mod tests {
         parse_live_packets(&mut stats, &packet, 0);
         let snapshot = stats.snapshot("complete", "finished");
         assert_eq!(snapshot.data_quality, "partial");
+    }
+
+    #[tokio::test]
+    async fn only_a_resumed_session_starts_out_degraded() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        let streamer = store
+            .add_subscription(&AddSubscription {
+                mid: "672328094".to_owned(),
+                name: Some("直播完整度测试".to_owned()),
+                avatar_url: None,
+                room_id: Some("22637261".to_owned()),
+                aliases: None,
+                schedule_enabled: true,
+                live_notify_enabled: false,
+                live_stats_enabled: true,
+            })
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let fresh = store
+            .ensure_live_session(
+                streamer.id,
+                "22637261",
+                &streamer.name,
+                "开播",
+                None,
+                now,
+                now,
+            )
+            .await
+            .expect("session");
+
+        let mut stats = CollectorStats::from_session(&fresh, false);
+        assert_eq!(
+            stats.snapshot("complete", "active").data_quality,
+            "partial",
+            "还没连上之前不能声称完整"
+        );
+        stats.has_connected_once = true;
+        stats.connection_established = true;
+        assert_eq!(
+            stats.snapshot("complete", "active").data_quality,
+            "complete",
+            "全新场次连上之后应当可以给出 complete"
+        );
+
+        store
+            .finish_open_live_session(fresh.id, now + chrono::Duration::minutes(5))
+            .await
+            .expect("finish");
+        let resumed = store
+            .ensure_live_session(
+                streamer.id,
+                "22637261",
+                &streamer.name,
+                "开播",
+                None,
+                now,
+                Utc::now(),
+            )
+            .await
+            .expect("resume");
+        assert!(
+            resumed.updated_at > resumed.created_at,
+            "续开的场次应当已经被写过"
+        );
+        let resumed_stats = CollectorStats::from_session(&resumed, true);
+        assert_eq!(
+            resumed_stats.snapshot("complete", "finished").data_quality,
+            "partial",
+            "续开的场次丢了内存里的 UID/去重集合，必须降级"
+        );
     }
 
     #[tokio::test]

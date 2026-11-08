@@ -8,6 +8,7 @@ import {
   BarChart3,
   ChevronRight,
   Clock3,
+  ExternalLink,
   Grid3X3,
   GripVertical,
   List,
@@ -71,11 +72,48 @@ function liveCollectionFailed(session: LiveSession): boolean {
     && session.guardCount === 0;
 }
 
+// @decision LIVE-QUALITY-1 “部分缺失”是整场标记：任意一次掉线重连、任意一个无法解析的
+// 弹幕包、任意一条缺少 UID 的礼物都会把整场降级，所以徽标必须带上原因，否则用户只会看到
+// 一堆正常数字旁边挂着一个没有解释的“部分缺失”。
+// 断流重开现在会并回同一场（segmentCount > 1），这同样是一次真实的数据空洞，要一起报出来。
+function liveInterruptions(session: LiveSession): number {
+  return Math.max(0, (session.segmentCount ?? 1) - 1);
+}
+
 function liveQualityLabel(session: LiveSession): string {
   if (liveCollectionFailed(session)) return "采集失败";
   if (session.dataQuality === "complete") return "数据完整";
-  if (session.dataQuality === "partial") return "部分缺失";
+  if (session.dataQuality === "partial") {
+    const reasons: string[] = [];
+    if (session.reconnectCount > 0) reasons.push(`重连 ${session.reconnectCount} 次`);
+    const interruptions = liveInterruptions(session);
+    if (interruptions > 0) reasons.push(`断流 ${interruptions} 次`);
+    return reasons.length > 0 ? `部分缺失 · ${reasons.join(" · ")}` : "部分缺失";
+  }
   return "采集中";
+}
+
+function liveQualityDetail(session: LiveSession): string {
+  if (liveCollectionFailed(session)) {
+    return "弹幕连接始终没有建立：营收、付费人数、互动人数和弹幕不可用，时长仍来自直播状态轮询。";
+  }
+  if (session.dataQuality === "complete") return "弹幕采集全程在线，事件类指标完整。";
+  if (session.dataQuality === "partial") {
+    const reasons: string[] = [];
+    if (session.reconnectCount > 0) reasons.push(`重连 ${session.reconnectCount} 次`);
+    const interruptions = liveInterruptions(session);
+    if (interruptions > 0) {
+      reasons.push(`断流重开 ${interruptions} 次（已合并为同一场，共 ${session.segmentCount} 段）`);
+    }
+    if (reasons.length > 0) {
+      return `采集期间${reasons.join("、")}，断线窗口内的弹幕和礼物可能没有被计入，数值偏保守。`;
+    }
+    if (session.collectorState === "active" || session.collectorState === "reconnecting") {
+      return "采集端仍在统计这场直播，数字会继续增长。";
+    }
+    return "采集过程中出现过无法解析的数据包或缺少 UID 的事件，个别指标可能偏低。";
+  }
+  return "采集端正在统计，直播结束后给出完整度。";
 }
 type ViewMode = "timeline" | "grid";
 
@@ -944,6 +982,30 @@ export default function ScheduleView({
     }
   }
 
+  // @decision SCHEDULE-INTERACTION-2 右键菜单的“查看个人主页”按主播 UID 打开 space 主页，
+  // 和主播库右键的同一入口保持一致；UID 缺失时不跳转，避免落到错误账号。
+  function resolveProfileMid(schedule: Schedule): string | null {
+    const streamer = subscriptions.find((value) => value.id === schedule.streamerId);
+    const mid = (streamer?.mid ?? schedule.roomOwnerMid ?? "").trim();
+    return mid ? mid : null;
+  }
+
+  async function openStreamerProfile(schedule: Schedule) {
+    setMenu(null);
+    const mid = resolveProfileMid(schedule);
+    if (!mid) {
+      onError(`「${schedule.streamerName}」缺少 UID，无法打开个人主页。`);
+      return;
+    }
+    try {
+      await openExternalUrl(`https://space.bilibili.com/${encodeURIComponent(mid)}`);
+    } catch (openError) {
+      onError(explainError(openError));
+    }
+  }
+
+  // @decision SCHEDULE-INTERACTION-1 打开直播间绑定在双击上：卡片单击只做聚焦和长按菜单，
+  // 双击（或键盘 Enter）才跳外部直播间，避免拖动时间线、长按菜单或误触时被浏览器抢走焦点。
   async function openSchedule(schedule: Schedule) {
     if (suppressCardClickRef.current) {
       suppressCardClickRef.current = false;
@@ -1197,7 +1259,8 @@ export default function ScheduleView({
         className={`schedule-card ${isLiveSchedule ? "is-live" : ""}`}
         tabIndex={0}
         role="button"
-        onClick={(event) => {
+        title={`双击进入直播间 · ${displayName}`}
+        onDoubleClick={(event) => {
           if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
             return;
           }
@@ -1290,6 +1353,7 @@ export default function ScheduleView({
     ? `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日`
     : `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日 - ${rangeDays[rangeDays.length - 1].getMonth() + 1}月${rangeDays[rangeDays.length - 1].getDate()}日`;
   const liveEventsUnavailable = liveModal?.session ? liveCollectionFailed(liveModal.session) : false;
+  const menuProfileMid = menu ? resolveProfileMid(menu.schedule) : null;
 
   return (
     <section ref={pageRef} className="page schedule-page" aria-label="直播日程">
@@ -1540,16 +1604,24 @@ export default function ScheduleView({
             <MonitorPlay size={15} />进入直播间
           </button>
           <button onClick={() => void openLiveData(menu.schedule)}><BarChart3 size={15} />查看直播数据</button>
+          {menu.schedule.sourcePostId ? (
+            <button onClick={() => void openExternalUrl(`https://t.bilibili.com/${menu.schedule.sourcePostId}`).catch((error) => onError(explainError(error)))}>
+              <ExternalLink size={15} />查看来源
+            </button>
+          ) : null}
+          {menuProfileMid ? (
+            <button
+              onClick={() => void openStreamerProfile(menu.schedule)}
+              title={`https://space.bilibili.com/${menuProfileMid}`}
+            >
+              <UserRound size={15} />查看个人主页
+            </button>
+          ) : null}
           <button onClick={() => openEdit(menu.schedule)}><Pencil size={15} />编辑</button>
           <button onClick={() => void removeSchedule(menu.schedule)} className="danger">
             <Trash2 size={15} />
             {menu.schedule.sourceKind === "weekly" ? "跳过本次" : "删除"}
           </button>
-          {menu.schedule.sourcePostId ? (
-            <button onClick={() => void openExternalUrl(`https://t.bilibili.com/${menu.schedule.sourcePostId}`).catch((error) => onError(explainError(error)))}>
-              <UserRound size={15} />查看来源
-            </button>
-          ) : null}
         </div>
       ) : null}
 
@@ -1573,7 +1645,10 @@ export default function ScheduleView({
                     {liveModal.session.endedAt ? ` - ${formatLiveTime(liveModal.session.endedAt)}` : " · 直播中"}
                   </span>
                 </div>
-                <em className={`live-data-quality ${liveEventsUnavailable ? "failed" : liveModal.session.dataQuality}`}>
+                <em
+                  className={`live-data-quality ${liveEventsUnavailable ? "failed" : liveModal.session.dataQuality}`}
+                  title={liveQualityDetail(liveModal.session)}
+                >
                   {liveQualityLabel(liveModal.session)}
                 </em>
               </div>
@@ -1594,11 +1669,7 @@ export default function ScheduleView({
                 <p className="form-hint live-stats-error-note">
                   本次未能建立 B 站弹幕采集连接（重试 {formatCount(liveModal.session.reconnectCount)} 次），事件类指标不可用；时长仍来自直播状态轮询。
                 </p>
-              ) : (
-                <p className="form-hint">
-                  最高同时在线来自公开“高能用户数”事件。营收与付费人数由公开直播事件估算，不含平台分成和活动特殊规则。
-                </p>
-              )}
+              ) : null}
             </div>
           ) : (
             <EmptyState

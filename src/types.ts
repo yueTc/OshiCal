@@ -203,6 +203,8 @@ export interface LiveSession {
   superChatCount: number;
   guardCount: number;
   reconnectCount: number;
+  /** 本场由几段拼成：主播断流重开后并回同一场，段数递增。 */
+  segmentCount: number;
   dataQuality: string;
   collectorState: string;
   createdAt: string;

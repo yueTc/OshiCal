@@ -156,6 +156,18 @@ pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResu
             "revision",
             "ALTER TABLE live_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
         ),
+        // 主播断流重开后，同一房间、间隔在合并窗口内的场次会并回上一行；这两列记录并了多少段、
+        // 最后并进来的是哪一段，避免同一次重开被反复合并。
+        (
+            "live_sessions",
+            "segment_count",
+            "ALTER TABLE live_sessions ADD COLUMN segment_count INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "live_sessions",
+            "last_segment_started_at",
+            "ALTER TABLE live_sessions ADD COLUMN last_segment_started_at TEXT NOT NULL DEFAULT ''",
+        ),
     ] {
         add_column_if_missing(conn, table, column, definition).await?;
     }
@@ -1545,7 +1557,7 @@ async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSe
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                 created_at, updated_at, revision
          FROM live_sessions ORDER BY started_at DESC, id DESC",
     )
@@ -1560,7 +1572,7 @@ async fn load_live_session_by_id(conn: &mut SqliteConnection, id: i64) -> AppRes
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                super_chat_count, guard_count, reconnect_count, data_quality, collector_state,
+                super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
                 created_at, updated_at, revision
          FROM live_sessions WHERE id = ?",
     )
