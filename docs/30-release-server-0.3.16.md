@@ -69,6 +69,10 @@
 删除的函数：`post_reserve_start`、`post_text_has_extra_schedule_time`、
 `remove_stale_model_schedules_for_reserved_post` —— 它们都建立在「卡片正则=权威」之上。
 
+已知取舍：原来 `remove_stale_model_schedules_for_reserved_post` 会顺手清掉卡片动态下
+「和卡片不同槽」的旧模型日程。模型成为主来源后这一步被去掉了——模型这次不再输出的旧场次
+会留在日历里，由用户手动删除，或等下一次抓取按同一 `source_identity` 覆盖。
+
 ### 回归测试
 
 `crates/core/src/schedule.rs`：
