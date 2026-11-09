@@ -2385,10 +2385,10 @@ impl AppService {
             .await?
         {
             if existing.source_identity.as_deref() != Some(source_identity) {
-                // 模型（text/image）同槽覆盖已有 reserve 是正常路径，不算冲突；
-                // 反过来兜底 reserve 遇到标题不同的既有日程才需要让路。
-                let incompatible_reservation = input.source_kind == "reserve"
-                    && existing.source_kind != "reserve"
+                // 卡片场次与模型事件撞在同一个槽位时，标题对不上就各留一条：
+                // 卡片是官方文案，模型说的是另一场，别硬合并。
+                let incompatible_reservation = (existing.source_kind == "reserve"
+                    || input.source_kind == "reserve")
                     && !cancellation_titles_match(&existing.title, &input.title);
                 if !incompatible_reservation {
                     self.store
@@ -3080,9 +3080,20 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
 }
 
 fn merge_input_for_existing(existing: &Schedule, incoming: &NewSchedule) -> NewSchedule {
-    // 卡片那一场由文字模型接管后，模型结果就是主来源：同槽时以 incoming 为准，
-    // 不再把 existing 的 reserve 标题/来源盖回去。
+    // 同槽时时间以 incoming（模型）为准，但标题与来源仍归卡片：
+    // 卡片标题是官方文案，文字里的“明天下午三点就来”只是改期通知，
+    // 不该把【突击】影之刃零DAY5！ 改成“和奶淇琳见面”。
     let mut merged = incoming.clone();
+    if existing.source_kind == "reserve" && incoming.source_kind != "reserve" {
+        merged.title = existing.title.clone();
+        merged.source_kind = existing.source_kind.clone();
+        merged.source_post_id = existing.source_post_id.clone();
+        merged.source_image_url = existing.source_image_url.clone();
+        merged.source_author_mid = existing.source_author_mid.clone();
+        merged.source_fingerprint = existing.source_fingerprint.clone();
+        merged.source_identity = existing.source_identity.clone();
+        merged.source_published_at = existing.source_published_at;
+    }
     if schedule_title_is_placeholder(&merged.title)
         && !schedule_title_is_placeholder(&existing.title)
     {
@@ -4552,12 +4563,13 @@ mod tests {
         // 带卡片的动态照样送模型；模型给的是取消，就按取消处理。
         assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats.new_schedules, 1);
-        // 取消落到标题里的「歌回」那一场，旧的突击场不受影响。
-        assert!(store.get_schedule(old_schedule.id).await.is_ok());
+        // 事件标题是“歌回和突击”，两场都被点名取消。
         let remaining = store.list_all_schedules().await.expect("remaining");
-        assert!(remaining
-            .iter()
-            .all(|schedule| schedule.id != old_song.id || schedule.cancelled));
+        for cancelled_id in [old_schedule.id, old_song.id] {
+            assert!(remaining
+                .iter()
+                .all(|schedule| schedule.id != cancelled_id || schedule.cancelled));
+        }
         // 模型没给卡片那一场，正则兜底把预约场次补上。
         assert!(remaining.iter().any(|schedule| {
             schedule.source_post_id.as_deref() == Some("current-post")
@@ -5599,7 +5611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_llm_event_takes_over_the_card_schedule() {
+    async fn reserved_llm_event_updates_the_card_slot() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("100", "甲"))
@@ -5656,7 +5668,8 @@ mod tests {
 
         let llm_schedule = ParsedSchedule {
             title: "电台".to_owned(),
-            start_at: reservation.start_at,
+            // 模型给的时间比卡片晚 5 分钟：同槽内以模型为准，标题仍归卡片。
+            start_at: reservation.start_at + Duration::minutes(5),
             end_at: None,
             confidence: 0.95,
         };
@@ -5682,8 +5695,13 @@ mod tests {
             .await
             .expect("schedules");
         assert_eq!(schedules.len(), 1);
-        assert_eq!(schedules[0].title, "电台");
-        assert_eq!(schedules[0].source_kind, "text");
+        // 同一场只留一条：时间换成模型给的，标题与来源保持卡片。
+        assert_eq!(schedules[0].title, "【突击】电台电台！");
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(
+            schedules[0].start_at,
+            reservation.start_at + Duration::minutes(5)
+        );
     }
 
     #[tokio::test]

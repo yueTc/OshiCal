@@ -151,9 +151,12 @@ fn resolve_date(text: &str, published_date: NaiveDate, today: NaiveDate) -> Opti
     }
     //    正文里的“今晚吃饭都更香了”会先命中“今晚”，可真正的场次另写着
     //    “下周一 18:00”。说到“下周X/下个星期X”时，让星期几优先。
-    if relative == Some(today) && (text.contains("下周") || text.contains("下个星期")) {
+    //    这里的相对词可能落在发布日（发布后隔两天才刷新），所以只要不晚于今天就都让位。
+    if relative.is_some_and(|date| date <= today)
+        && (text.contains("下周") || text.contains("下个星期"))
+    {
         if let Some(date) = parse_weekday_date(text, published_date) {
-            if date > today {
+            if date >= today && relative.is_none_or(|relative| date > relative) {
                 return Some(date);
             }
         }
