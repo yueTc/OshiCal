@@ -1053,6 +1053,13 @@ impl AppService {
     }
 
     pub async fn refresh_all(&self) -> AppResult<RefreshReport> {
+        self.refresh_all_with_progress(|_| {}).await
+    }
+
+    pub async fn refresh_all_with_progress<P>(&self, on_progress: P) -> AppResult<RefreshReport>
+    where
+        P: Fn(RefreshProgress) + Send + Sync,
+    {
         // A manual refresh may arrive while the periodic monitor is running.
         // Queue it instead of failing and discarding the caller's progress UI.
         let _guard = self.acquire_refresh_lock().await;
@@ -1062,8 +1069,16 @@ impl AppService {
         let streamers = self.store.list_streamers().await?;
         self.backfill_avatar_captures(&streamers).await;
         let sources = sources_for_streamers(&streamers);
-        self.refresh_sources(&sources, &settings, llm_pool.as_ref(), None, &|_| {})
-            .await
+        // 全量刷新没有“当前主播”，用合成条目播报整体进度。
+        let target = ProgressTarget::all();
+        self.refresh_sources(
+            &sources,
+            &settings,
+            llm_pool.as_ref(),
+            Some(&target),
+            &on_progress,
+        )
+        .await
     }
 
     /// 历史数据里预约卡 `rid` 被当成房间号，地址会指向别人的直播间。
@@ -1097,8 +1112,9 @@ impl AppService {
         let streamer = self.store.get_streamer(streamer_id).await?;
         self.backfill_avatar_captures(std::slice::from_ref(&streamer))
             .await;
+        let target = ProgressTarget::for_streamer(&streamer);
         emit_progress(
-            &streamer,
+            &target,
             "准备抓取主播与官号动态",
             0,
             0,
@@ -1115,7 +1131,7 @@ impl AppService {
                 &sources,
                 &settings,
                 llm_pool.as_ref(),
-                Some(&streamer),
+                Some(&target),
                 &on_progress,
             )
             .await
@@ -1125,7 +1141,7 @@ impl AppService {
             Ok(report) => {
                 let failed = !report.failed_streamers.is_empty();
                 emit_progress(
-                    &streamer,
+                    &target,
                     if failed {
                         "刷新完成，但部分来源失败"
                     } else {
@@ -1141,7 +1157,7 @@ impl AppService {
             }
             Err(error) => {
                 emit_progress(
-                    &streamer,
+                    &target,
                     &format!("刷新失败: {error}"),
                     1,
                     1,
@@ -1215,7 +1231,7 @@ impl AppService {
         sources: &[(String, Vec<Streamer>)],
         settings: &AppSettings,
         llm_pool: Option<&LlmPool>,
-        progress_streamer: Option<&Streamer>,
+        progress: Option<&ProgressTarget>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> AppResult<RefreshReport> {
         let mut report = RefreshReport {
@@ -1234,9 +1250,9 @@ impl AppService {
             if index > 0 && index % 5 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             }
-            if let Some(streamer) = progress_streamer {
+            if let Some(target) = progress {
                 emit_progress(
-                    streamer,
+                    target,
                     &format!("拉取动态 {}/{}", index + 1, sources.len()),
                     index,
                     sources.len(),
@@ -1256,7 +1272,7 @@ impl AppService {
                             settings,
                             llm_pool,
                             &mut event_state,
-                            progress_streamer,
+                            progress,
                             on_progress,
                             index,
                             sources.len(),
@@ -1317,9 +1333,9 @@ impl AppService {
                             .entry(target.id)
                             .or_insert_with(|| message.clone());
                     }
-                    if let Some(streamer) = progress_streamer {
+                    if let Some(target) = progress {
                         emit_progress(
-                            streamer,
+                            target,
                             "拉取动态失败",
                             index,
                             sources.len(),
@@ -1431,7 +1447,7 @@ impl AppService {
         settings: &AppSettings,
         llm_pool: Option<&LlmPool>,
         event_state: &mut RefreshEventState,
-        progress_streamer: Option<&Streamer>,
+        progress: Option<&ProgressTarget>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
         source_index: usize,
         source_count: usize,
@@ -1448,7 +1464,7 @@ impl AppService {
         let source_span = (80 / source_count.max(1)).saturating_sub(5).max(1) as u8;
         let report_step =
             |stage: &str, completed_steps: usize, total_steps: usize, failed: bool| {
-                let Some(streamer) = progress_streamer else {
+                let Some(target) = progress else {
                     return;
                 };
                 let fraction = completed_steps
@@ -1456,7 +1472,7 @@ impl AppService {
                     .and_then(|value| value.checked_div(total_steps))
                     .unwrap_or(60) as u8;
                 emit_progress(
-                    streamer,
+                    target,
                     stage,
                     completed_steps,
                     total_steps,
@@ -2371,8 +2387,35 @@ impl AppService {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 进度播报对象。全量刷新没有“当前主播”，用一条合成条目代替，
+/// 这样前端的任务卡也能看到真实百分比，而不是一直停在 0%。
+#[derive(Debug, Clone)]
+struct ProgressTarget {
+    id: i64,
+    name: String,
+}
+
+impl ProgressTarget {
+    fn for_streamer(streamer: &Streamer) -> Self {
+        Self {
+            id: streamer.id,
+            name: streamer.name.clone(),
+        }
+    }
+
+    fn all() -> Self {
+        Self {
+            id: 0,
+            name: "全部主播".to_owned(),
+        }
+    }
+}
+
+// 进度播报的参数本来就多（阶段、步数、百分比、结束/失败标记），
+// 打包成结构体只会让每个调用点更长。
+#[allow(clippy::too_many_arguments)]
 fn emit_progress(
-    streamer: &Streamer,
+    target: &ProgressTarget,
     stage: &str,
     completed: usize,
     total: usize,
@@ -2382,8 +2425,8 @@ fn emit_progress(
     on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
 ) {
     on_progress(RefreshProgress {
-        streamer_id: streamer.id,
-        streamer_name: streamer.name.clone(),
+        streamer_id: target.id,
+        streamer_name: target.name.clone(),
         stage: stage.to_owned(),
         completed,
         total,
@@ -4451,6 +4494,7 @@ mod tests {
         let captured = reports.clone();
         let mut event_state = RefreshEventState::default();
         let pool = test_pool("fixture-model");
+        let target = ProgressTarget::for_streamer(&streamer);
         service
             .process_source_posts_with_progress(
                 "100",
@@ -4459,7 +4503,7 @@ mod tests {
                 &AppSettings::default(),
                 Some(&pool),
                 &mut event_state,
-                Some(&streamer),
+                Some(&target),
                 &move |progress| captured.lock().expect("progress").push(progress),
                 0,
                 1,
@@ -7022,6 +7066,30 @@ mod tests {
         assert_eq!(third.llm_calls, 1, "过了重试窗口要重新分析");
         assert_eq!(third.llm_cache_hits, 0);
         assert_eq!(analyzer.call_count(), 2);
+    }
+
+    /// 全量刷新也要有真实进度：合成条目让前端不再一直停在 0%。
+    #[test]
+    fn all_refresh_progress_uses_synthetic_target() {
+        let reports = std::sync::Mutex::new(Vec::new());
+        let target = ProgressTarget::all();
+        emit_progress(
+            &target,
+            "拉取动态 3/16",
+            2,
+            16,
+            20,
+            false,
+            false,
+            &|progress| reports.lock().expect("progress").push(progress),
+        );
+        let reports = reports.lock().expect("reports");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].streamer_id, 0);
+        assert_eq!(reports[0].streamer_name, "全部主播");
+        assert_eq!(reports[0].stage, "拉取动态 3/16");
+        assert_eq!(reports[0].percent, 20);
+        assert!(!reports[0].done);
     }
 
     /// `ReasoningEffort::Auto` 表示不带该字段；显式指定时才随请求发送。

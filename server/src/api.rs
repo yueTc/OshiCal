@@ -479,7 +479,20 @@ async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
             ) {
                 publish_job_progress(&background, &job);
             }
-            match background.service.refresh_all().await {
+            let progress_registry = background.jobs.clone();
+            let progress_hub = background.hub.clone();
+            let progress_job_id = job_id.clone();
+            match background
+                .service
+                .refresh_all_with_progress(move |progress| {
+                    if let Some(job) =
+                        progress_registry.update_streamer_progress(&progress_job_id, &progress)
+                    {
+                        let _ = progress_hub.send(job_progress_message(&job));
+                    }
+                })
+                .await
+            {
                 Ok(report) => {
                     let stage = if report.failed_streamers.is_empty() {
                         "全量刷新完成"
