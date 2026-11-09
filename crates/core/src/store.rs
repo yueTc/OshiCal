@@ -4482,14 +4482,24 @@ mod tests {
     #[tokio::test]
     async fn dirty_llm_settings_fall_back_to_defaults() {
         let store = SqliteStore::in_memory().await.expect("db");
-        store
-            .set_settings(&[
-                ("llm_parallelism", "0".to_owned()),
-                ("llm_reasoning_effort", "\"turbo\"".to_owned()),
-                ("llm_accounts", "{".to_owned()),
-            ])
+        // 直接写库模拟「历史遗留 / 手工改坏」的脏值：set_settings 会校验并
+        // 在同步变更里解析失败，这里要绕过它。
+        for (key, value) in [
+            ("llm_parallelism", "0"),
+            ("llm_reasoning_effort", "\"turbo\""),
+            ("llm_accounts", "{"),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, updated_at, revision) VALUES (?, ?, ?, 1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(Utc::now().to_rfc3339())
+            .execute(store.pool())
             .await
             .expect("seed dirty settings");
+        }
         let loaded = load_settings(&store).await.expect("load");
         assert_eq!(loaded.llm_parallelism, 1);
         assert_eq!(loaded.llm_reasoning_effort, ReasoningEffort::Auto);

@@ -3385,13 +3385,41 @@ mod tests {
                     reasoning_effort: config.reasoning_effort,
                     input: input.clone(),
                 });
-            let raw = serde_json::to_value(&events)?;
+            let raw = events_to_model_json(&events);
             Ok(LlmAnalysis {
                 events,
                 raw,
                 source_digest: "mock-post-digest".to_owned(),
             })
         }
+    }
+
+    /// 模型原始输出是 snake_case 的 JSON，缓存里存的也是这个形状。
+    /// 直接 `to_value(&events)` 会得到 camelCase，再读回来就丢字段。
+    fn events_to_model_json(events: &[LlmEvent]) -> serde_json::Value {
+        serde_json::Value::Array(
+            events
+                .iter()
+                .map(|event| {
+                    json!({
+                        "action": match event.action {
+                            LlmEventAction::Schedule => "schedule",
+                            LlmEventAction::Cancel => "cancel",
+                        },
+                        "performer": event.performer,
+                        "aliases": event.aliases,
+                        "participants": event.participants,
+                        "room_url": event.room_url,
+                        "room_owner": event.room_owner,
+                        "room_owner_mid": event.room_owner_mid,
+                        "title": event.title,
+                        "start_at": event.start_at.map(|value| value.to_rfc3339()),
+                        "end_at": event.end_at.map(|value| value.to_rfc3339()),
+                        "confidence": event.confidence,
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn fixture_account(id: &str, model: &str) -> LlmAccount {
@@ -6154,7 +6182,8 @@ mod tests {
         assert_eq!(stats.new_schedules, 1);
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
-        assert_eq!(schedules[0].source_kind, "text");
+        // 带图动态的 identity 走 image: 前缀，来源类型也跟着变成 image。
+        assert_eq!(schedules[0].source_kind, "image");
         assert_eq!(schedules[0].start_at, start_at);
         assert!(schedules[0].title.contains("电台"), "{schedules:?}");
     }
@@ -6796,7 +6825,7 @@ mod tests {
             .process_source_posts(
                 "506",
                 std::slice::from_ref(&streamer),
-                &[post.clone()],
+                std::slice::from_ref(&post),
                 &AppSettings::default(),
                 Some(&pool),
             )
@@ -6878,11 +6907,10 @@ mod tests {
         let identities = source_identities(&store, "stale-post").await;
         assert_eq!(identities.len(), 1, "{identities:?}");
         assert!(identities[0].starts_with("text:stale-post:"));
-        // 旧日程本身暂时保留：store 没有“还剩几条来源”的查询，孤儿清理留待后续。
-        assert_eq!(
-            store.list_all_schedules().await.expect("schedules").len(),
-            2
-        );
+        // 旧日程的来源被清空后没有剩下任何 source，孤儿场次一并删掉。
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1, "{schedules:?}");
+        assert!(schedules.iter().all(|schedule| schedule.id != stale.id));
         assert_eq!(
             stale.source_identity.as_deref(),
             Some("image:stale-post:legacy-digest:0")

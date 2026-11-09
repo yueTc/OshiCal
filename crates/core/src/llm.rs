@@ -642,7 +642,7 @@ pub struct LlmTestReport {
 pub(crate) const SCHEDULE_RULES: &str = "\
 输出格式：只输出 JSON 数组，不要 Markdown 代码块，不要任何解释文字。数组元素字段固定为 action、performer、aliases、participants、room_url、room_owner、room_owner_mid、title、start_at、end_at、confidence。
 action 只能是 \"schedule\" 或 \"cancel\"（小写）。新增日程、改期后的新日程用 schedule；明确取消、停播、延期、改期、无法直播、原日程作废用 cancel。
-start_at 与 end_at 使用带时区的 RFC3339，例如 2026-10-30T20:00:00+08:00，时区固定 +08:00；end_at 不知道就填 null。
+start_at 与 end_at 使用带时区的 RFC3339，例如 2030-10-30T20:00:00+08:00，时区固定 +08:00；end_at 不知道就填 null。
 confidence 是 0 到 1 的数字。
 title 只填直播主题，不得是“直播”“动态”“日程”等泛称，也不要重复主播名；原文没有提供主题时 title 填空字符串，不要编造“未提供主题”“未知主题”等占位词，系统会复用历史信息。
 performer 填日程对应主播的可见名称；aliases 可填括号、昵称或同义称呼；participants 是这场直播的全部可见参与者姓名数组，尽量使用动态或图片里出现的完整 B 站昵称，也包含未订阅或陌生人，单人直播可只填一人。
@@ -1817,12 +1817,12 @@ mod tests {
         let text = r#"
 ```json
 [
-  {"action":"schedule","performer":"嘉然","aliases":["然然"],"title":"周五杂谈","start_at":"2026-10-30T20:00:00+08:00","end_at":"2026-10-30T22:00:00+08:00","confidence":0.95},
+  {"action":"schedule","performer":"嘉然","aliases":["然然"],"title":"周五杂谈","start_at":"2030-10-30T20:00:00+08:00","end_at":"2030-10-30T22:00:00+08:00","confidence":0.95},
   {"action":"cancel","performer":"贝拉","title":"","start_at":"2026-10-29T19:30:00+08:00","confidence":0.97},
-  {"performer":"","title":"空主播","start_at":"2026-10-30T20:00:00+08:00","confidence":0.9},
+  {"performer":"","title":"空主播","start_at":"2030-10-30T20:00:00+08:00","confidence":0.9},
   {"performer":"过去","title":"过去","start_at":"2026-10-20T20:00:00+08:00","confidence":0.9},
   {"performer":"无日期","title":"无日期","start_at":"周五直播","confidence":0.9},
-  {"action":"unknown","performer":"未知动作","title":"未知","start_at":"2026-10-30T20:00:00+08:00","confidence":0.9}
+  {"action":"unknown","performer":"未知动作","title":"未知","start_at":"2030-10-30T20:00:00+08:00","confidence":0.9}
 ]
 ```
 "#;
@@ -1868,7 +1868,7 @@ mod tests {
         [
           {"action":"schedule","performer":"甲","aliases":[],"participants":["甲","乙","外部嘉宾"],
            "room_url":"https://live.bilibili.com/987654","room_owner":"甲","title":"联合歌回",
-           "start_at":"2026-10-30T20:00:00+08:00","end_at":null,"confidence":0.97}
+           "start_at":"2030-10-30T20:00:00+08:00","end_at":null,"confidence":0.97}
         ]
         "#;
         let result = parse_llm_response(text, now()).expect("group result");
@@ -1888,7 +1888,7 @@ mod tests {
         let text = r#"
         [
           {"performer":"A-SOUL","participants":["A-SOUL"],"room_owner":"乃琳",
-           "title":"团体直播","start_at":"2026-10-30T20:00:00+08:00","confidence":0.98}
+           "title":"团体直播","start_at":"2030-10-30T20:00:00+08:00","confidence":0.98}
         ]
         "#;
         let result = parse_llm_response(text, now()).expect("A-SOUL result");
@@ -1903,7 +1903,7 @@ mod tests {
         let text = r#"
         [
           {"performer":"甲","participants":["甲","乙"],"room_url":"https://example.com/room",
-           "title":"联合直播","start_at":"2026-10-30T20:00:00+08:00","confidence":0.95}
+           "title":"联合直播","start_at":"2030-10-30T20:00:00+08:00","confidence":0.95}
         ]
         "#;
         let result = parse_llm_response(text, now()).expect("result");
@@ -1945,7 +1945,7 @@ mod regression_tests {
     fn compatible_envelope_reads_message_content_not_choices() {
         let content = json!([{
             "performer":"嘉然", "title":"周表 [联动]",
-            "start_at":"2026-10-30T20:00:00+08:00", "confidence":0.95
+            "start_at":"2030-10-30T20:00:00+08:00", "confidence":0.95
         }])
         .to_string();
         let response = json!({"choices":[{"finish_reason":"stop", "message":{
@@ -1993,7 +1993,7 @@ mod regression_tests {
                     Json(json!({"choices":[{"finish_reason":"stop", "message":{
                         "role":"assistant", "content":json!([{
                             "performer":"嘉然", "title":"HTTP 图像日程",
-                            "start_at":"2026-10-30T20:00:00+08:00", "confidence":0.95
+                            "start_at":"2030-10-30T20:00:00+08:00", "confidence":0.95
                         }]).to_string()
                     }}]}))
                 },
@@ -2087,7 +2087,7 @@ mod regression_tests {
                 Json(json!({"choices":[{"finish_reason":"stop", "message":{
                     "role":"assistant", "content":json!([{
                         "performer":"乃琳", "title":"杂谈",
-                        "start_at":"2026-10-30T20:00:00+08:00", "confidence":0.9
+                        "start_at":"2030-10-30T20:00:00+08:00", "confidence":0.9
                     }]).to_string()
                 }}]}))
             }),
@@ -2165,11 +2165,11 @@ mod regression_tests {
                     "role":"assistant", "content":json!([
                         {
                             "performer":"甲酱", "title":"杂谈",
-                            "start_at":"2026-10-30T20:00:00+08:00", "confidence":0.95
+                            "start_at":"2030-10-30T20:00:00+08:00", "confidence":0.95
                         },
                         {
                             "performer":"乙酱", "title":"游戏",
-                            "start_at":"2026-10-31T21:00:00+08:00", "confidence":0.95
+                            "start_at":"2030-10-31T21:00:00+08:00", "confidence":0.95
                         }
                     ]).to_string()
                 }}]}))

@@ -60,6 +60,14 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         .await
         .map_err(|error| format!("保存服务端设置失败: {error}"))?;
     let secret_vault = SecretVault::from_env(config.api_token.as_deref(), &config.database_path);
+    // 先把环境变量里的账号密钥写进 vault，再搬走 config.secrets。
+    match seed_llm_secrets_from_env(&store, &secret_vault, &config.env_llm_account_keys()).await {
+        Ok(seeded) if !seeded.is_empty() => {
+            tracing::info!(accounts = %seeded.join(","), "已从环境变量写入模型账号密钥");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "写入环境变量模型账号密钥失败"),
+    }
     let mut runtime_secrets = config.secrets;
     let mut persisted_llm_binding = None;
     if let Some(persisted) = load_persisted_llm_secret(&store, &secret_vault)
@@ -77,13 +85,6 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         .map_err(|error| format!("读取服务端 B 站登录失败: {error}"))?
     {
         runtime_secrets.bili_cookie = Some(persisted.cookie);
-    }
-    match seed_llm_secrets_from_env(&store, &secret_vault, &config.env_llm_account_keys()).await {
-        Ok(seeded) if !seeded.is_empty() => {
-            tracing::info!(accounts = %seeded.join(","), "已从环境变量写入模型账号密钥");
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "写入环境变量模型账号密钥失败"),
     }
     let service = AppService::new_with_proxy(store, runtime_secrets, settings.proxy_port)
         .map_err(|error| format!("初始化服务失败: {error}"))?;
