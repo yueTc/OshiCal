@@ -6,7 +6,7 @@
 
 B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 站动态、调用视觉模型解析日程，也可以部署一台服务端，让多台设备的日程与开播状态保持一致。
 
-![Windows](https://img.shields.io/badge/Windows-0.3.9-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.18-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
+![Windows](https://img.shields.io/badge/Windows-0.3.10-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.18-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
 
 ## 状态
 
@@ -67,7 +67,7 @@ docs/                 设计与发布文档
 
 从 [Releases](https://github.com/yueTc/OshiCal/releases) 下载最新的 `desktop-v*`：
 
-- `OshiCal_0.3.9_x64-setup.exe`：NSIS 安装包。
+- `OshiCal_0.3.10_x64-setup.exe`：NSIS 安装包。
 - `OshiCal.exe`：便携版，单文件运行，无需 Node.js；首次启动在应用数据目录创建 SQLite 数据库。
 
 首次启动需要配置 OpenAI 兼容的模型接口，未配置时文字与图片解析不会运行。B 站动态接口存在风控，必要时在设置中填写可选的 SESSDATA。
@@ -278,6 +278,7 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/31-release-server-0.3.17.md](docs/31-release-server-0.3.17.md)
 - [docs/32-release-server-0.3.18.md](docs/32-release-server-0.3.18.md)
 - [docs/29-release-desktop-0.3.9.md](docs/29-release-desktop-0.3.9.md)
+- [docs/33-release-desktop-0.3.10.md](docs/33-release-desktop-0.3.10.md)
 
 ## 参与贡献
 
