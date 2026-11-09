@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type { PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent } from "react";
 import { flushSync } from "react-dom";
 import { differenceInCalendarDays } from "date-fns";
 import {
@@ -297,8 +297,8 @@ export default function ScheduleView({
   const refreshRef = useRef(false);
   const removingScheduleIdsRef = useRef<Set<number>>(new Set());
   const liveRequestRef = useRef(0);
-  const gridDragRef = useRef<{ startX: number; deltaX: number } | null>(null);
-  const timelineSwipeRef = useRef<{ startY: number; startScrollTop: number; moved: boolean } | null>(null);
+  const gridDragRef = useRef<{ startX: number; deltaX: number; pointerId: number; captured: boolean } | null>(null);
+  const timelineSwipeRef = useRef<{ startY: number; startScrollTop: number; moved: boolean; pointerId: number } | null>(null);
   const suppressCardClickRef = useRef(false);
   const gridWheelLockRef = useRef(false);
   const [gridDayWidth, setGridDayWidth] = useState(readGridDayWidthPreference);
@@ -1103,6 +1103,29 @@ export default function ScheduleView({
     }, 120);
   }
 
+  function cardScheduleAtPoint(x: number, y: number): Schedule | null {
+    if (typeof document.elementFromPoint !== "function") return null;
+    const hit = document.elementFromPoint(x, y);
+    const card = hit instanceof Element ? hit.closest("[data-schedule-id]") : null;
+    const raw = card?.getAttribute("data-schedule-id");
+    if (!raw) return null;
+    const id = Number(raw);
+    if (!Number.isFinite(id)) return null;
+    return schedules.find((value) => value.id === id) ?? null;
+  }
+
+  /**
+   * 拖动容器在个别浏览器/输入设备上仍可能把 dblclick 重定向到容器自身，
+   * 这里按坐标命中卡片兜底，保证「双击日程卡片进入对应直播间」不会静默失效。
+   */
+  function handleBoardDoubleClick(event: ReactMouseEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
+    const target = cardScheduleAtPoint(event.clientX, event.clientY);
+    if (target) {
+      void openSchedule(target);
+    }
+  }
+
   function resetPanPositions() {
     setGridPanRemainder(0);
   }
@@ -1129,12 +1152,15 @@ export default function ScheduleView({
     if (event.pointerType === "touch") return;
     const viewport = timelineViewportRef.current;
     if (!viewport) return;
-    timelineSwipeRef.current = { startY: event.clientY, startScrollTop: viewport.scrollTop, moved: false };
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture keeps a drag working outside the timeline; it is not required.
-    }
+    // @decision SCHEDULE-DBLCLICK-1 指针捕获推迟到真正开始拖动时再设置：按下即捕获会把
+    // 兼容的 mouseup 重定向到容器，浏览器据此算出的 click/dblclick 目标是容器而不是卡片，
+    // 卡片上的「双击进入直播间」会静默失效。
+    timelineSwipeRef.current = {
+      startY: event.clientY,
+      startScrollTop: viewport.scrollTop,
+      moved: false,
+      pointerId: event.pointerId,
+    };
   }
 
   function moveTimelineSwipe(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1142,6 +1168,13 @@ export default function ScheduleView({
     if (!swipe) return;
     const deltaY = event.clientY - swipe.startY;
     if (Math.abs(deltaY) > 6) {
+      if (!swipe.moved) {
+        try {
+          event.currentTarget.setPointerCapture(swipe.pointerId);
+        } catch {
+          // Pointer capture keeps a drag working outside the timeline; it is not required.
+        }
+      }
       swipe.moved = true;
       endLongPress();
       timelineRef.current?.classList.add("is-dragging");
@@ -1193,12 +1226,8 @@ export default function ScheduleView({
     if (event.button !== 0 || !(event.target instanceof Element)) return;
     if (event.target.closest("button, a, input, textarea, select")) return;
     setDragDayDelta(0);
-    gridDragRef.current = { startX: event.clientX, deltaX: 0 };
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture improves dragging outside the grid; the drag still works without it.
-    }
+    // 同 SCHEDULE-DBLCLICK-1：拖动开始前不做指针捕获，否则卡片的 click/dblclick 会被容器接管。
+    gridDragRef.current = { startX: event.clientX, deltaX: 0, pointerId: event.pointerId, captured: false };
   }
 
   function moveGridDrag(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1207,6 +1236,14 @@ export default function ScheduleView({
     const deltaX = event.clientX - drag.startX;
     drag.deltaX = deltaX;
     if (Math.abs(deltaX) > 6) {
+      if (!drag.captured) {
+        try {
+          event.currentTarget.setPointerCapture(drag.pointerId);
+        } catch {
+          // Pointer capture improves dragging outside the grid; the drag still works without it.
+        }
+        drag.captured = true;
+      }
       endLongPress();
       gridRef.current?.classList.add("is-dragging");
       gridRef.current?.style.setProperty("--drag-x", `${deltaX}px`);
@@ -1257,6 +1294,7 @@ export default function ScheduleView({
       <article
         key={schedule.id}
         className={`schedule-card ${isLiveSchedule ? "is-live" : ""}`}
+        data-schedule-id={schedule.id}
         tabIndex={0}
         role="button"
         title={`双击进入直播间 · ${displayName}`}
@@ -1504,6 +1542,7 @@ export default function ScheduleView({
               onPointerMove={moveTimelineSwipe}
               onPointerUp={finishTimelineSwipe}
               onPointerCancel={cancelTimelineSwipe}
+              onDoubleClick={handleBoardDoubleClick}
             >
               {gridWindowDays.map((day) => {
                 const values = grouped.get(localDateKey(day)) ?? [];
@@ -1558,6 +1597,7 @@ export default function ScheduleView({
               onPointerMove={moveGridDrag}
               onPointerUp={finishGridDrag}
               onPointerCancel={cancelGridDrag}
+              onDoubleClick={handleBoardDoubleClick}
             >
               {gridWindowDays.map((day, index) => {
                 const values = grouped.get(localDateKey(day)) ?? [];

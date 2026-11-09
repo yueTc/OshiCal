@@ -2672,16 +2672,29 @@ export default function App() {
               <div
                 className={`mini-creator ${menuOpen ? "is-menu-open" : ""}`}
                 key={streamer.id}
-                title={`${streamer.name} · 右键打开操作菜单`}
+                title={`${streamer.name} · 双击进入直播间 · 右键打开操作菜单`}
                 tabIndex={0}
-                aria-label={`${streamer.name}，右键或按 Shift+F10 打开操作菜单`}
+                aria-label={`${streamer.name}，双击或按 Enter 进入直播间，右键或按 Shift+F10 打开操作菜单`}
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
+                onDoubleClick={(event) => {
+                  if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
+                    return;
+                  }
+                  void openCreatorLiveRoom(streamer);
+                }}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   showCreatorMenu(streamer, event.clientX, event.clientY);
                 }}
-                onKeyDown={(event) => showCreatorMenuFromKeyboard(event, streamer)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && event.target === event.currentTarget) {
+                    event.preventDefault();
+                    void openCreatorLiveRoom(streamer);
+                    return;
+                  }
+                  showCreatorMenuFromKeyboard(event, streamer);
+                }}
               >
                 <Avatar url={streamer.avatarUrl} name={streamer.name} size="sm" live={streamer.isLive} />
                 <span className="mini-creator-name">{streamer.name}</span>

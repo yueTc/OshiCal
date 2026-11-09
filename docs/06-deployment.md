@@ -193,9 +193,9 @@ cat data/system/server-update-status.json
 echo "$CR_PAT" | sudo docker login ghcr.io -u yueTc --password-stdin
 ```
 
-服务端更新设置中可单独填写“服务端 GitHub 镜像加速”，例如 `https://gh-proxy.com/`。它只影响服务器读取 GitHub 更新清单；不会影响桌面客户端的镜像设置。
+设置页「服务器更新」卡片底部有「GitHub 镜像加速」子区块，例如填写 `https://gh-proxy.com/`。它随同卡片的「保存更新设置」一起提交，只影响服务器读取 GitHub 更新清单；不会影响桌面客户端的镜像设置。
 
-客户端镜像加速在桌面端设置的“客户端 GitHub 镜像加速”卡片中单独保存，仅作用于当前设备。
+客户端镜像加速在桌面端「软件更新」卡片内的同名子区块，点「保存」立即写入本机，仅作用于当前设备。
 
 ## 2. 便携服务端
 
