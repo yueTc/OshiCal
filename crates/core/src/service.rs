@@ -39,6 +39,9 @@ const RESERVE_DUPLICATE_TOLERANCE_MINUTES: i64 = 10;
 /// 同一条动态的文字通道与图片通道撞车时的容差：低于预约卡的 10 分钟，
 /// 因为两条通道读的是同一份材料，不该出现“预约卡 06:00、正文另说 20:00”那种偏差。
 const GROUP_DUPLICATE_TOLERANCE_MINUTES: i64 = 5;
+/// 空结果的重试窗口（小时）。模型偶尔漏看一次，写进缓存后过一段时间再问；
+/// 每轮都重问会把一次全量刷新拖成几十分钟。
+const EMPTY_ANALYSIS_RETRY_HOURS: i64 = 12;
 const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 /// 「立即刷新」最多等待的秒数：超过就回落到缓存，避免界面长时间停在「读取中」。
 const FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS: u64 = 15;
@@ -1542,17 +1545,22 @@ impl AppService {
                     reserve,
                     image_urls: post.images.clone(),
                 };
-                let cached_events = match self.store.load_post_analysis(&cache_key).await? {
-                    Some(raw) => match events_from_raw(&raw, now) {
+                let cached_events = match self.store.load_post_analysis_entry(&cache_key).await? {
+                    Some((raw, created_at)) => match events_from_raw(&raw, now) {
                         Ok(events) if !events.is_empty() => {
                             stats.llm_cache_hits += 1;
                             Some(events)
                         }
+                        // 空结果也进缓存，但只认一段时间：模型偶尔看走眼，
+                        // 不能让它永久失去机会，也不能每轮都把全部动态重问一遍。
+                        Ok(events) if empty_analysis_is_fresh(&created_at, now) => {
+                            stats.llm_cache_hits += 1;
+                            Some(events)
+                        }
                         Ok(_) => {
-                            // 空结果从不进缓存；真出现了也当没分析过，重跑一次。
                             tracing::debug!(
                                 post_id = %post.id,
-                                "cached post analysis is empty, retry"
+                                "cached empty post analysis expired, retry"
                             );
                             None
                         }
@@ -1572,19 +1580,18 @@ impl AppService {
                     {
                         Ok(analysis) => {
                             stats.llm_calls += 1;
-                            // 成功且非空才入缓存：失败或空结果留给下一轮轮询重试。
-                            if !analysis.events.is_empty() {
-                                self.store
-                                    .save_post_analysis(
-                                        &cache_key,
-                                        &post.id,
-                                        &content_digest,
-                                        &config.model,
-                                        &prompt_version,
-                                        &analysis.raw,
-                                    )
-                                    .await?;
-                            }
+                            // 成功就入缓存，空结果也一样；空结果的过期重试由
+                            // `empty_analysis_is_fresh` 按写入时间判断。
+                            self.store
+                                .save_post_analysis(
+                                    &cache_key,
+                                    &post.id,
+                                    &content_digest,
+                                    &config.model,
+                                    &prompt_version,
+                                    &analysis.raw,
+                                )
+                                .await?;
                             Some(analysis.events)
                         }
                         Err(error) => {
@@ -1733,8 +1740,9 @@ impl AppService {
 
             // 应用完本轮结果后清理这条动态的历史来源：上一版提示词、旧的逐图缓存、
             // 已被合并掉的重复场次留下的 identity 都不再挂着，避免同一场直播
-            // 被旧来源反复救活。分析失败时不动 source，避免一次网络抖动清空历史。
-            if analysis_succeeded {
+            // 被旧来源反复救活。分析失败、或这一轮一条事件都没识别出来时不动
+            // source：模型偶尔看走眼，不该把还能用的场次一起删掉。
+            if analysis_succeeded && !written_identities.is_empty() {
                 let removed = self
                     .store
                     .delete_schedule_sources_except(&post.id, &written_identities)
@@ -2506,6 +2514,18 @@ fn reserve_summary(post: &DynamicPost) -> Option<String> {
 /// 同槽回落这些判断都要同时认这两种 kind。
 fn is_post_analysis_source(source_kind: &str) -> bool {
     matches!(source_kind, "text" | "image")
+}
+
+/// 缓存里的空结果还没过重试窗口：当作命中，不再问模型。
+fn empty_analysis_is_fresh(created_at: &str, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(created_at) {
+        Ok(value) => {
+            now.signed_duration_since(value.with_timezone(&Utc))
+                < Duration::hours(EMPTY_ANALYSIS_RETRY_HOURS)
+        }
+        // 时间戳坏了就当成过期，宁可多问一次也别把结果永久锁死。
+        Err(_) => false,
+    }
 }
 
 /// 两个开始时间是否指向同一场直播。日程合并与预约去重共用同一容差。
@@ -6268,8 +6288,9 @@ mod tests {
 
     /// 空结果从不写缓存；万一库里留着旧的空记录，也要当没分析过重跑一次。
     ///
-    /// 旧用例校验的是 `image_analyses` 里的空数组（那时一条动态会逐图缓存），
-    /// 合并成单次调用后缓存只剩 `post_analyses` 一层，语义不变：空结果不算命中。
+    /// 旧用例校验的是 `image_analyses` 里的空数组（那时一条动态会逐图缓存）。
+    /// 合并成单次调用后缓存只剩 `post_analyses` 一层：空结果进缓存，但只在
+    /// 重试窗口内算命中，过期后必须重新问模型。
     #[tokio::test]
     async fn empty_cached_post_analysis_is_retried() {
         let store = SqliteStore::in_memory().await.expect("db");
@@ -6309,6 +6330,14 @@ mod tests {
             )
             .await
             .expect("seed empty analysis");
+        // 把这条空结果改成过期，模拟“窗口已过”。
+        let stale = (Utc::now() - Duration::hours(EMPTY_ANALYSIS_RETRY_HOURS + 1)).to_rfc3339();
+        sqlx::query("UPDATE post_analyses SET created_at = ? WHERE cache_key = ?")
+            .bind(&stale)
+            .bind(&cache_key)
+            .execute(store.pool())
+            .await
+            .expect("age the cache row");
 
         let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
         let service =
@@ -6325,7 +6354,7 @@ mod tests {
             .await
             .expect("process");
 
-        // 旧记录是空数组：不算缓存命中，真跑一次模型。
+        // 过期的空结果不算缓存命中，真跑一次模型。
         assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.llm_calls, 1);
         assert_eq!(stats.llm_cache_hits, 0);
@@ -6917,9 +6946,9 @@ mod tests {
         );
     }
 
-    /// 模型返回空结果时不写缓存，下一轮仍会重新分析。
+    /// 空结果也进缓存，只在过了重试窗口后才重新问模型。
     #[tokio::test]
-    async fn empty_result_is_not_cached() {
+    async fn empty_result_is_cached_and_retried_after_the_window() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("508", "寅"))
@@ -6954,9 +6983,10 @@ mod tests {
             .expect("second process");
 
         assert_eq!(first.llm_calls, 1);
-        assert_eq!(second.llm_calls, 1, "空结果不入缓存，第二轮仍要请求模型");
-        assert_eq!(second.llm_cache_hits, 0);
-        assert_eq!(analyzer.call_count(), 2);
+        assert_eq!(second.llm_calls, 0, "空结果命中缓存，不该每轮都重问");
+        assert_eq!(second.llm_cache_hits, 1);
+        assert_eq!(analyzer.call_count(), 1);
+
         let settings = AppSettings::default();
         let text_hash = text_digest(&text_analysis_context(&post));
         let content_digest = content_digest_of(&text_hash, None, &post.images);
@@ -6969,7 +6999,29 @@ mod tests {
             .load_post_analysis(&cache_key)
             .await
             .expect("cache lookup")
-            .is_none());
+            .is_some());
+
+        // 把写入时间改成过期，下一轮必须重新问模型。
+        let stale = (Utc::now() - Duration::hours(EMPTY_ANALYSIS_RETRY_HOURS + 1)).to_rfc3339();
+        sqlx::query("UPDATE post_analyses SET created_at = ? WHERE cache_key = ?")
+            .bind(&stale)
+            .bind(&cache_key)
+            .execute(store.pool())
+            .await
+            .expect("age the cache row");
+        let third = service
+            .process_source_posts(
+                "508",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("third process");
+        assert_eq!(third.llm_calls, 1, "过了重试窗口要重新分析");
+        assert_eq!(third.llm_cache_hits, 0);
+        assert_eq!(analyzer.call_count(), 2);
     }
 
     /// `ReasoningEffort::Auto` 表示不带该字段；显式指定时才随请求发送。

@@ -43,7 +43,8 @@
 
 - **缓存表换了**：新的 `post_analyses(cache_key, post_id, content_digest, model, prompt_version, result_json, created_at)`。`text_analyses` / `image_analyses` 保留为只读历史，不再写入。
 - **缓存键变了**：`{post_id}:{content_digest}:{model}:{prompt_version}-post-v1`，`content_digest = sha256(sha256(文字上下文) + "|" + 预约卡 + "|" + 图片 URL 列表)`。换图、加图、改正文都会重新分析。
-- **空结果不入缓存**：模型返回 `[]` 直接丢弃，下一轮刷新会重试。以前空结果会被缓存住，等于把「没识别出来」固化成结论。
+- **空结果也入缓存，但只认 12 小时**：模型返回 `[]` 会写进 `post_analyses`，重试窗口内不再重问；窗口过了（`EMPTY_ANALYSIS_RETRY_HOURS = 12`）才重新分析。以前空结果被永久缓存，等于把「没识别出来」固化成结论；完全不缓存则每轮刷新都要把上百条动态重问一遍，一次全量刷新会拖到十几分钟。
+- **只在真的识别出新事件时才清旧来源**：一条动态这一轮返回空，不会把上一轮已经落库的场次及其来源删掉，避免模型偶发漏看把可用日程清空。
 - **纯文字动态的 source_identity 不变**：仍是 `text:{post_id}:{text_digest}:{idx}`，历史日程不会重复建条。带图动态改成 `image:{post_id}:{content_digest}:{idx}`。
 - **过期来源会被清理**：同一篇动态本轮没再产出的 identity，会从 `schedule_sources` 删掉；如果因此变成没有任何来源、且没有手动锁定，日程行也会一起删。
 - **同步状态键换前缀**：`analysis-errors:v1:{streamer_id}` 里的条目从 `text:*` / `image:*` 改成 `post:{id}`，旧前缀条目在下一轮刷新时清掉。

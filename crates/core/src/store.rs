@@ -1366,14 +1366,28 @@ impl SqliteStore {
     }
 
     pub async fn load_post_analysis(&self, cache_key: &str) -> AppResult<Option<Value>> {
-        let value: Option<String> =
-            sqlx::query_scalar("SELECT result_json FROM post_analyses WHERE cache_key = ?")
+        Ok(self
+            .load_post_analysis_entry(cache_key)
+            .await?
+            .map(|(result, _)| result))
+    }
+
+    /// 连同写入时间一起取回来：空结果要按“多久之后重试”判断是否还算命中。
+    pub async fn load_post_analysis_entry(
+        &self,
+        cache_key: &str,
+    ) -> AppResult<Option<(Value, String)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT result_json, created_at FROM post_analyses WHERE cache_key = ?")
                 .bind(cache_key)
                 .fetch_optional(&self.pool)
                 .await?;
-        value
-            .map(|text| serde_json::from_str(&text).map_err(AppError::from))
-            .transpose()
+        row.map(|(text, created_at)| {
+            serde_json::from_str(&text)
+                .map(|value| (value, created_at))
+                .map_err(AppError::from)
+        })
+        .transpose()
     }
 
     pub async fn get_image_analysis_cache_key(
