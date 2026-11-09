@@ -6,7 +6,7 @@
 
 B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 站动态、调用视觉模型解析日程，也可以部署一台服务端，让多台设备的日程与开播状态保持一致。
 
-![Windows](https://img.shields.io/badge/Windows-0.3.9-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.17-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
+![Windows](https://img.shields.io/badge/Windows-0.3.9-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.18-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
 
 ## 状态
 
@@ -104,7 +104,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 `server-v*` Release 提供 `oshical-server-<版本>-linux-x86_64.tar.gz` 与 `-windows-x86_64.zip`，内含可执行文件、`dist/`、`.env.example`、部署说明与 `.sha256`。
 
 ```bash
-tar -xzf oshical-server-0.3.17-linux-x86_64.tar.gz -C /opt/oshical
+tar -xzf oshical-server-0.3.18-linux-x86_64.tar.gz -C /opt/oshical
 cd /opt/oshical
 cp .env.example .env && vi .env
 ./oshical-server
@@ -202,8 +202,8 @@ npx tauri build --bundles nsis
 node scripts/set-version.mjs desktop 0.3.10
 git tag desktop-v0.3.10
 
-node scripts/set-version.mjs server 0.3.17
-git tag server-v0.3.17
+node scripts/set-version.mjs server 0.3.18
+git tag server-v0.3.18
 ```
 
 - `desktop-v*`：构建 NSIS 安装包、更新签名与 `latest.json`。
@@ -276,6 +276,7 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/28-release-server-0.3.15.md](docs/28-release-server-0.3.15.md)
 - [docs/30-release-server-0.3.16.md](docs/30-release-server-0.3.16.md)
 - [docs/31-release-server-0.3.17.md](docs/31-release-server-0.3.17.md)
+- [docs/32-release-server-0.3.18.md](docs/32-release-server-0.3.18.md)
 - [docs/29-release-desktop-0.3.9.md](docs/29-release-desktop-0.3.9.md)
 
 ## 参与贡献

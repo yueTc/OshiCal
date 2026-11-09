@@ -1462,11 +1462,17 @@ impl AppService {
             // 返回空事件，或没覆盖到卡片那一场时兜底。
             let mut card_slot_covered = false;
             if let Some(config) = llm_config {
-                let context = reserve_context(post);
+                // 首行带给模型「这条动态是谁发的」：正文经常只写搭档的名字，
+                // 不带发布者时模型会把作者本人漏出 participants，事件就归不到人。
+                let context = format!(
+                    "发布者：{}\n{}",
+                    post.author_name.trim(),
+                    reserve_context(post)
+                );
                 let text = context.trim();
                 if !has_combined_images && !text.is_empty() {
                     let text_digest = text_digest(text);
-                    let prompt_version = format!("{}-text-v10", config.prompt_version);
+                    let prompt_version = format!("{}-text-v11", config.prompt_version);
                     let cache_key =
                         analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
                     let mut analysis_succeeded = false;
@@ -2733,7 +2739,18 @@ fn match_event_target_for_post(
         .map(|value| normalize_alias(value))
         .filter(|value| !value.is_empty())
         .collect();
-    event_identity_matches_target(&event_names, author).then(|| author.clone())
+    if event_identity_matches_target(&event_names, author) {
+        return Some(author.clone());
+    }
+    // 单条日程、置信度够、作者本人就是订阅主播，但模型把参与者写成了搭档或
+    // 陌生称呼（例如“心宜”），名字对不上任何订阅目标。这种情况归给动态的
+    // 发布者，宁可多给一场也不要整场丢掉；多人事件仍然要求显式匹配。
+    tracing::debug!(
+        author = %author.name,
+        performer = %event.performer,
+        "event target falls back to the post author"
+    );
+    Some(author.clone())
 }
 
 fn event_identity_matches_target(event_names: &[String], target: &Streamer) -> bool {
@@ -5294,6 +5311,113 @@ mod tests {
             .await
             .expect("schedules")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_target_falls_back_to_the_post_author() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("3537115310721781", "思诺snow"))
+            .await
+            .expect("streamer");
+        let event = LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: "心宜".to_owned(),
+            aliases: Vec::new(),
+            participants: vec!["心宜".to_owned()],
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: "2D鸣潮 2.6下".to_owned(),
+            start_at: Some(Utc::now() + Duration::hours(2)),
+            end_at: None,
+            confidence: 0.78,
+        };
+        let matched = match_event_target_for_post(
+            &event,
+            std::slice::from_ref(&streamer),
+            "3537115310721781",
+        )
+        .expect("target");
+        assert_eq!(matched.id, streamer.id);
+    }
+
+    #[tokio::test]
+    async fn reserved_card_event_is_credited_to_the_post_author() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("3537115310721781", "思诺snow"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let reserve = ReserveCard {
+            title: "直播预约：【2D鸣潮】2.6下！".to_owned(),
+            description: "明天 19:00 直播".to_owned(),
+            room_id: None,
+            jump_url: None,
+            stype: Some(2),
+        };
+        let post = DynamicPost {
+            id: "sinuo-card-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "继续2.6下哦！".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/sinuo-card-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: Some(reserve.clone()),
+        };
+        let card_start = parse_reserve_schedule(&reserve, post.published_at, now)
+            .expect("card schedule")
+            .start_at;
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: vec![LlmEvent {
+                action: LlmEventAction::Schedule,
+                performer: "心宜".to_owned(),
+                aliases: Vec::new(),
+                participants: vec!["心宜".to_owned()],
+                room_url: None,
+                room_owner: None,
+                room_owner_mid: None,
+                title: "2D鸣潮 2.6下".to_owned(),
+                start_at: Some(card_start),
+                end_at: None,
+                confidence: 0.78,
+            }],
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].streamer_id, streamer.id);
+        assert_eq!(schedules[0].title, "2D鸣潮 2.6下");
+        assert_eq!(schedules[0].start_at, card_start);
+        assert_eq!(schedules[0].source_kind, "text");
     }
 
     #[tokio::test]
