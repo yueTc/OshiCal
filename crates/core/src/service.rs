@@ -1758,10 +1758,25 @@ impl AppService {
             // 已被合并掉的重复场次留下的 identity 都不再挂着，避免同一场直播
             // 被旧来源反复救活。分析失败、或这一轮一条事件都没识别出来时不动
             // source：模型偶尔看走眼，不该把还能用的场次一起删掉。
-            if analysis_succeeded && !written_identities.is_empty() {
+            //
+            // 同一条动态可能同时出现在主播本人和官号两个来源里，两条路径各自
+            // 写入自己的 identity。清理必须按「本轮全部来源的并集」判断，否则
+            // 后一条路径会把前一条刚写进去的来源当成历史脏数据删掉，下一轮再
+            // 反过来删，来回抖动。
+            let mut keep_identities: HashSet<String> = event_state
+                .written_identities
+                .entry(post.id.clone())
+                .or_default()
+                .clone();
+            keep_identities.extend(written_identities.iter().cloned());
+            if analysis_succeeded && !keep_identities.is_empty() {
+                event_state
+                    .written_identities
+                    .insert(post.id.clone(), keep_identities.clone());
+                let keep: Vec<String> = keep_identities.into_iter().collect();
                 let removed = self
                     .store
-                    .delete_schedule_sources_except(&post.id, &written_identities)
+                    .delete_schedule_sources_except(&post.id, &keep)
                     .await?;
                 if !removed.is_empty() {
                     // 来源被清空的日程如果一条来源都不剩，就从库里删掉；
@@ -2447,6 +2462,10 @@ struct PendingCancellation {
 #[derive(Debug, Default)]
 struct RefreshEventState {
     cancellations: Vec<PendingCancellation>,
+    /// 本轮已经由某条来源写入过的 schedule source identity，按动态 id 汇总。
+    /// 同一条动态可能走多遍分析（主播本人 + 官号），清理 stale source 时
+    /// 要用整轮的并集，不能用单遍的结果。
+    written_identities: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug, Default)]

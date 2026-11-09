@@ -6,7 +6,7 @@
 
 B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 站动态、调用视觉模型解析日程，也可以部署一台服务端，让多台设备的日程与开播状态保持一致。
 
-![Windows](https://img.shields.io/badge/Windows-0.3.14-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.22-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
+![Windows](https://img.shields.io/badge/Windows-0.3.15-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.23-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
 
 ## 状态
 
@@ -67,7 +67,7 @@ docs/                 设计与发布文档
 
 从 [Releases](https://github.com/yueTc/OshiCal/releases) 下载最新的 `desktop-v*`：
 
-- `OshiCal_0.3.14_x64-setup.exe`：NSIS 安装包。
+- `OshiCal_0.3.15_x64-setup.exe`：NSIS 安装包。
 - `OshiCal.exe`：便携版，单文件运行，无需 Node.js；首次启动在应用数据目录创建 SQLite 数据库。
 
 首次启动需要配置 OpenAI 兼容的模型接口，未配置时文字与图片解析不会运行。B 站动态接口存在风控，必要时在设置中填写可选的 SESSDATA。
@@ -104,7 +104,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 `server-v*` Release 提供 `oshical-server-<版本>-linux-x86_64.tar.gz` 与 `-windows-x86_64.zip`，内含可执行文件、`dist/`、`.env.example`、部署说明与 `.sha256`。
 
 ```bash
-tar -xzf oshical-server-0.3.22-linux-x86_64.tar.gz -C /opt/oshical
+tar -xzf oshical-server-0.3.23-linux-x86_64.tar.gz -C /opt/oshical
 cd /opt/oshical
 cp .env.example .env && vi .env
 ./oshical-server
@@ -199,11 +199,11 @@ npx tauri build --bundles nsis
 桌面端与服务端使用独立版本号与独立标签：
 
 ```powershell
-node scripts/set-version.mjs desktop 0.3.14
-git tag desktop-v0.3.14
+node scripts/set-version.mjs desktop 0.3.15
+git tag desktop-v0.3.15
 
-node scripts/set-version.mjs server 0.3.22
-git tag server-v0.3.22
+node scripts/set-version.mjs server 0.3.23
+git tag server-v0.3.23
 ```
 
 - `desktop-v*`：构建 NSIS 安装包、更新签名与 `latest.json`。
@@ -288,6 +288,8 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/40-release-desktop-0.3.13.md](docs/40-release-desktop-0.3.13.md)
 - [docs/41-release-server-0.3.22.md](docs/41-release-server-0.3.22.md)
 - [docs/42-release-desktop-0.3.14.md](docs/42-release-desktop-0.3.14.md)
+- [docs/43-release-server-0.3.23.md](docs/43-release-server-0.3.23.md)
+- [docs/44-release-desktop-0.3.15.md](docs/44-release-desktop-0.3.15.md)
 
 ## 参与贡献
 

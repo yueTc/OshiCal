@@ -1438,13 +1438,28 @@ impl SqliteStore {
         validate_schedule_input(input)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing_id: Option<i64> = if let Some(identity) = input.source_identity.as_deref() {
-            sqlx::query_scalar(
+            // 先按来源 identity 找同一份来源写入过的场次；找不到再退回自然键。
+            // 直接 INSERT 会撞 UNIQUE(streamer_id, start_at, title)：同一个场次
+            // 可能先由预约卡或另一条动态以别的 identity 落库，这次是正常写入，
+            // 不该把整批刷新打断。
+            let by_identity = sqlx::query_scalar(
                 "SELECT id FROM schedules WHERE streamer_id = ? AND source_identity = ?",
             )
             .bind(input.streamer_id)
             .bind(identity)
             .fetch_optional(&mut *tx)
-            .await?
+            .await?;
+            match by_identity {
+                Some(id) => Some(id),
+                None => sqlx::query_scalar(
+                    "SELECT id FROM schedules WHERE streamer_id = ? AND start_at = ? AND title = ?",
+                )
+                .bind(input.streamer_id)
+                .bind(input.start_at.to_rfc3339())
+                .bind(&input.title)
+                .fetch_optional(&mut *tx)
+                .await?,
+            }
         } else {
             sqlx::query_scalar(
                 "SELECT id FROM schedules WHERE streamer_id = ? AND start_at = ? AND title = ?",
@@ -4635,6 +4650,51 @@ mod tests {
             .get_schedule(schedule.id)
             .await
             .expect("schedule kept");
+    }
+
+    /// 同一个场次先由预约卡（或另一条动态）以别的 identity 落库后，再来一份
+    /// 来源写入同一个 (streamer, start_at, title)：应当复用它，而不是撞
+    /// UNIQUE 约束把整批刷新打断。
+    #[tokio::test]
+    async fn upserting_the_same_slot_with_a_new_identity_reuses_the_row() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("302", "主播E"))
+            .await
+            .expect("streamer");
+        let start_at = Utc::now() + Duration::hours(6);
+        let mut reservation = new_schedule(streamer.id, start_at);
+        reservation.source_kind = "reserve".to_owned();
+        reservation.source_identity = Some("reserve:post-77".to_owned());
+        reservation.source_post_id = Some("post-77".to_owned());
+        let (reserved, created) = store
+            .upsert_schedule(&reservation)
+            .await
+            .expect("reservation");
+        assert!(created);
+
+        let mut image = new_schedule(streamer.id, start_at);
+        image.source_kind = "image".to_owned();
+        image.source_identity = Some("image:post-77:digest:0".to_owned());
+        image.source_post_id = Some("post-77".to_owned());
+        let (same, created) = store.upsert_schedule(&image).await.expect("image source");
+
+        assert!(!created, "同一场次不该再插入一条");
+        assert_eq!(same.id, reserved.id);
+        assert_eq!(
+            store.list_all_schedules().await.expect("schedules").len(),
+            1
+        );
+        let identities: Vec<String> = sqlx::query_scalar(
+            "SELECT source_identity FROM schedule_sources
+             WHERE schedule_id = ? ORDER BY id",
+        )
+        .bind(reserved.id)
+        .fetch_all(store.pool())
+        .await
+        .expect("identities");
+        assert!(identities.contains(&"image:post-77:digest:0".to_owned()));
+        assert!(identities.contains(&"reserve:post-77".to_owned()));
     }
 
     #[tokio::test]
