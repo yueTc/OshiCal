@@ -639,6 +639,9 @@ pub struct LlmTestReport {
 /// 系统提示词的共享规则段：两条通道头部之后都拼这一段。
 /// 这里用 `{now}` `{pub}` `{mon}` `{sun}` `{author}` 做占位，由
 /// [`build_system_prompt`] 在运行时替换，不要用 `format!` 展开本常量。
+/// 单次模型请求的传输层重试次数（含首次）。
+const LLM_SEND_ATTEMPTS: u32 = 3;
+
 pub(crate) const SCHEDULE_RULES: &str = "\
 输出格式：只输出 JSON 数组，不要 Markdown 代码块，不要任何解释文字。数组元素字段固定为 action、performer、aliases、participants、room_url、room_owner、room_owner_mid、title、start_at、end_at、confidence。
 action 只能是 \"schedule\" 或 \"cancel\"（小写）。新增日程、改期后的新日程用 schedule；明确取消、停播、延期、改期、无法直播、原日程作废用 cancel。
@@ -918,7 +921,31 @@ impl LlmClient {
         if !config.api_key.trim().is_empty() {
             builder = builder.bearer_auth(config.api_key.trim());
         }
-        let response = builder.json(&request).send().await?;
+        // 网关偶发断连（reqwest 报 error sending request），一次失败就让整条动态白等
+        // 九十秒超时，还会连带整轮刷新被拖长。传输层失败重试两次，HTTP 错误码不重试。
+        let mut attempts = 0;
+        let response = loop {
+            attempts += 1;
+            let sent = builder
+                .try_clone()
+                .expect("request builder is clonable")
+                .json(&request)
+                .send()
+                .await;
+            match sent {
+                Ok(response) => break response,
+                Err(error) if attempts < LLM_SEND_ATTEMPTS && !error.is_builder() => {
+                    tracing::warn!(
+                        %error,
+                        attempt = attempts,
+                        max_attempts = LLM_SEND_ATTEMPTS,
+                        "日程模型请求发送失败，稍后重试"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let status = response.status();
         let body = String::from_utf8(read_bounded_body(response, RESPONSE_LIMIT_BYTES).await?)
             .map_err(|_| bad_output("日程模型响应不是有效 UTF-8"))?;
