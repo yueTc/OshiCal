@@ -163,6 +163,18 @@ CREATE TABLE IF NOT EXISTS text_analyses (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS post_analyses (
+    cache_key TEXT PRIMARY KEY,
+    post_id TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_analyses_post ON post_analyses(post_id);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -1324,6 +1336,44 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 一条动态一次调用后的整体结果缓存，按 `post_id:content_digest:model:prompt_version` 去重。
+    pub async fn save_post_analysis(
+        &self,
+        cache_key: &str,
+        post_id: &str,
+        content_digest: &str,
+        model: &str,
+        prompt_version: &str,
+        result: &Value,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO post_analyses
+                (cache_key, post_id, content_digest, model, prompt_version, result_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(cache_key)
+        .bind(post_id)
+        .bind(content_digest)
+        .bind(model)
+        .bind(prompt_version)
+        .bind(serde_json::to_string(result)?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_post_analysis(&self, cache_key: &str) -> AppResult<Option<Value>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT result_json FROM post_analyses WHERE cache_key = ?")
+                .bind(cache_key)
+                .fetch_optional(&self.pool)
+                .await?;
+        value
+            .map(|text| serde_json::from_str(&text).map_err(AppError::from))
+            .transpose()
     }
 
     pub async fn get_image_analysis_cache_key(
@@ -2596,6 +2646,79 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// 删除已经没有任何 `schedule_sources` 的孤儿场次。
+    /// 手动锁定、仍有来源、或已被删掉的场次都跳过；返回真正删掉的行 id。
+    pub async fn delete_orphan_schedules(&self, candidates: &[i64]) -> AppResult<Vec<i64>> {
+        let mut deleted = Vec::new();
+        for id in candidates {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let manual_locked: Option<i64> =
+                sqlx::query_scalar("SELECT manual_locked FROM schedules WHERE id = ?")
+                    .bind(*id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(manual_locked) = manual_locked else {
+                continue;
+            };
+            if manual_locked != 0 {
+                continue;
+            }
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM schedule_sources WHERE schedule_id = ?")
+                    .bind(*id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if remaining > 0 {
+                continue;
+            }
+            let removed = self
+                .delete_schedule_on(&mut tx, *id, true, None, SyncActor::system())
+                .await?;
+            tx.commit().await?;
+            if removed {
+                deleted.push(*id);
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// 删除该动态下 identity 不在 `keep` 里的 `schedule_sources`，返回 (被删 identity, 所属 schedule_id)。
+    /// 只删 source 行，不删 schedule 行；孤儿场次由 service 层调用 `delete_schedule` 处理。
+    pub async fn delete_schedule_sources_except(
+        &self,
+        post_id: &str,
+        keep: &[String],
+    ) -> AppResult<Vec<(String, i64)>> {
+        let keep_set: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT id, source_identity, schedule_id FROM schedule_sources
+             WHERE source_post_id = ?
+             ORDER BY id",
+        )
+        .bind(post_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut removed = Vec::new();
+        for row in rows {
+            let source_id: i64 = row.try_get("id")?;
+            let identity: String = row.try_get("source_identity")?;
+            if keep_set.contains(identity.as_str()) {
+                continue;
+            }
+            let schedule_id: i64 = row.try_get("schedule_id")?;
+            self.emit_schedule_source_change(&mut tx, source_id, "delete", SyncActor::system())
+                .await?;
+            sqlx::query("DELETE FROM schedule_sources WHERE id = ?")
+                .bind(source_id)
+                .execute(&mut *tx)
+                .await?;
+            removed.push((identity, schedule_id));
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     pub async fn add_source_suppression(
         &self,
         streamer_id: i64,
@@ -3370,7 +3493,8 @@ impl SqliteStore {
                      WHERE key IN (
                         'live_poll_seconds', 'dynamic_poll_seconds', 'auto_analyze_images',
                         'live_stats_enabled', 'fertility_enabled', 'llm_base_url',
-                        'llm_model', 'llm_prompt_version', 'proxy_port'
+                        'llm_model', 'llm_prompt_version', 'llm_reasoning_effort',
+                        'llm_parallelism', 'llm_accounts', 'proxy_port'
                      )",
                 )
                 .fetch_one(&mut *tx)
@@ -3828,6 +3952,9 @@ fn is_server_setting_key(key: &str) -> bool {
             | "llm_base_url"
             | "llm_model"
             | "llm_prompt_version"
+            | "llm_reasoning_effort"
+            | "llm_parallelism"
+            | "llm_accounts"
             | "proxy_port"
     )
 }
@@ -3851,7 +3978,9 @@ fn ensure_setting_key_allowed(key: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{load_settings, save_settings, AppSettings, DataMode};
+    use crate::settings::{
+        load_settings, save_settings, AppSettings, DataMode, LlmAccount, ReasoningEffort,
+    };
     use chrono::Duration;
 
     fn add_input(mid: &str, name: &str) -> AddSubscription {
@@ -4298,6 +4427,15 @@ mod tests {
             server_url: "http://127.0.0.1:8787".to_owned(),
             data_mode: DataMode::Server,
             proxy_port: Some(7890),
+            llm_reasoning_effort: ReasoningEffort::High,
+            llm_parallelism: 3,
+            // 账号池非空时不会触发「合成 default 账号」的迁移，往返比较才有意义。
+            llm_accounts: vec![LlmAccount {
+                id: "primary".to_owned(),
+                name: "主账号".to_owned(),
+                base_url: "https://api.example.com/v1".to_owned(),
+                model: "cn:test".to_owned(),
+            }],
             ..Default::default()
         };
         save_settings(&store, &settings).await.expect("save");
@@ -4307,6 +4445,172 @@ mod tests {
             .set_settings(&[("llm_api_key", "\"secret\"".to_owned())])
             .await;
         assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_settings_synthesize_default_llm_account_in_memory() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        store
+            .set_settings(&[
+                ("llm_base_url", "\"https://api.example.com/v1\"".to_owned()),
+                ("llm_model", "\"cn:test\"".to_owned()),
+            ])
+            .await
+            .expect("seed legacy settings");
+        let loaded = load_settings(&store).await.expect("load");
+        assert_eq!(loaded.llm_reasoning_effort, ReasoningEffort::Auto);
+        assert_eq!(loaded.llm_parallelism, 1);
+        assert_eq!(
+            loaded.llm_accounts,
+            vec![LlmAccount {
+                id: "default".to_owned(),
+                name: "默认账号".to_owned(),
+                base_url: "https://api.example.com/v1".to_owned(),
+                model: "cn:test".to_owned(),
+            }]
+        );
+        // 迁移只在内存里合成，不回写 settings 表。
+        assert!(store
+            .get_setting("llm_accounts")
+            .await
+            .expect("raw accounts")
+            .is_none());
+        let reloaded = load_settings(&store).await.expect("reload");
+        assert_eq!(reloaded.llm_accounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dirty_llm_settings_fall_back_to_defaults() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        store
+            .set_settings(&[
+                ("llm_parallelism", "0".to_owned()),
+                ("llm_reasoning_effort", "\"turbo\"".to_owned()),
+                ("llm_accounts", "{".to_owned()),
+            ])
+            .await
+            .expect("seed dirty settings");
+        let loaded = load_settings(&store).await.expect("load");
+        assert_eq!(loaded.llm_parallelism, 1);
+        assert_eq!(loaded.llm_reasoning_effort, ReasoningEffort::Auto);
+        assert_eq!(loaded.llm_accounts.len(), 1);
+        assert_eq!(loaded.llm_accounts[0].id, "default");
+    }
+
+    #[test]
+    fn omitted_llm_settings_deserialize_with_defaults() {
+        let raw = r#"{
+            "dataMode": "local",
+            "serverUrl": "",
+            "livePollSeconds": 20,
+            "dynamicPollSeconds": 300,
+            "autoAnalyzeImages": true,
+            "notificationsEnabled": true,
+            "llmBaseUrl": "https://api.example.com/v1",
+            "llmModel": "cn:test",
+            "llmPromptVersion": "schedule-v1"
+        }"#;
+        let settings: AppSettings = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(settings.llm_reasoning_effort, ReasoningEffort::Auto);
+        assert_eq!(settings.llm_parallelism, 1);
+        assert!(settings.llm_accounts.is_empty());
+        settings.validate().expect("validate");
+    }
+
+    #[tokio::test]
+    async fn llm_parallelism_rejects_out_of_range() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let settings = AppSettings {
+            llm_parallelism: 9,
+            ..Default::default()
+        };
+        assert!(save_settings(&store, &settings).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn post_analysis_cache_round_trip() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let cache_key = "post-1:digest:model:prompt-v1-post-v1";
+        assert!(store
+            .load_post_analysis(cache_key)
+            .await
+            .expect("miss")
+            .is_none());
+        let first = serde_json::json!({"events": [{"title": "周五杂谈"}]});
+        store
+            .save_post_analysis(cache_key, "post-1", "digest", "model", "prompt", &first)
+            .await
+            .expect("save");
+        assert_eq!(
+            store.load_post_analysis(cache_key).await.expect("hit"),
+            Some(first)
+        );
+        let replacement = serde_json::json!({"events": []});
+        store
+            .save_post_analysis(
+                cache_key,
+                "post-1",
+                "digest",
+                "model",
+                "prompt",
+                &replacement,
+            )
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            store
+                .load_post_analysis(cache_key)
+                .await
+                .expect("hit again"),
+            Some(replacement)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_stale_schedule_sources_keeps_kept_identities() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&add_input("301", "主播D"))
+            .await
+            .expect("streamer");
+        let start_at = Utc::now() + Duration::hours(3);
+        let mut input = new_schedule(streamer.id, start_at);
+        input.source_identity = Some("image:post-9:digest:0".to_owned());
+        input.source_post_id = Some("post-9".to_owned());
+        let (schedule, created) = store.upsert_schedule(&input).await.expect("upsert");
+        assert!(created);
+
+        let mut extra = input.clone();
+        extra.source_identity = Some("image:post-9:digest:1".to_owned());
+        extra.start_at = start_at + Duration::hours(1);
+        store
+            .attach_schedule_source(schedule.id, &extra)
+            .await
+            .expect("attach");
+
+        let removed = store
+            .delete_schedule_sources_except("post-9", &["image:post-9:digest:1".to_owned()])
+            .await
+            .expect("prune");
+        assert_eq!(
+            removed,
+            vec![("image:post-9:digest:0".to_owned(), schedule.id)]
+        );
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT source_identity FROM schedule_sources
+             WHERE source_post_id = ? ORDER BY id",
+        )
+        .bind("post-9")
+        .fetch_all(store.pool())
+        .await
+        .expect("remaining sources");
+        assert_eq!(remaining, vec!["image:post-9:digest:1".to_owned()]);
+        // 本层只删来源行，场次本身留给 service 层决定。
+        store
+            .get_schedule(schedule.id)
+            .await
+            .expect("schedule kept");
     }
 
     #[tokio::test]

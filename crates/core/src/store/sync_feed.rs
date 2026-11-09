@@ -1477,6 +1477,9 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
                 | "llm_base_url"
                 | "llm_model"
                 | "llm_prompt_version"
+                | "llm_reasoning_effort"
+                | "llm_parallelism"
+                | "llm_accounts"
                 | "proxy_port"
         ) {
             continue;
@@ -1492,6 +1495,9 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
             "llm_base_url" => settings.llm_base_url = serde_json::from_str(&value)?,
             "llm_model" => settings.llm_model = serde_json::from_str(&value)?,
             "llm_prompt_version" => settings.llm_prompt_version = serde_json::from_str(&value)?,
+            "llm_reasoning_effort" => settings.llm_reasoning_effort = serde_json::from_str(&value)?,
+            "llm_parallelism" => settings.llm_parallelism = serde_json::from_str(&value)?,
+            "llm_accounts" => settings.llm_accounts = serde_json::from_str(&value)?,
             "proxy_port" => settings.proxy_port = serde_json::from_str(&value)?,
             _ => {}
         }

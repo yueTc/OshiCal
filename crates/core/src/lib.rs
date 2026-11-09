@@ -17,7 +17,8 @@ pub use fertility::{
     FERTILITY_POLL_INTERVAL_SECONDS,
 };
 pub use llm::{
-    ContentAnalyzer, LlmConfig, LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
+    ContentAnalyzer, LlmAccountLease, LlmConfig, LlmDiscoveryConfig, LlmEvent, LlmEventAction,
+    LlmPool, LlmTestReport, PostAnalysisInput,
 };
 pub use models::*;
 pub use network::{
@@ -25,5 +26,8 @@ pub use network::{
     validate_proxy_port, ProxyTestInput, ProxyTestReport, PROXY_HOST,
 };
 pub use service::{AppService, FAN_POLL_INTERVAL_SECONDS};
-pub use settings::{load_settings, save_settings, AppSettings, DataMode, RuntimeSecrets};
+pub use settings::{
+    load_settings, save_settings, AppSettings, DataMode, LlmAccount, ReasoningEffort,
+    RuntimeSecrets,
+};
 pub use store::{SqliteStore, SyncPrunePolicy, SYNC_SCHEMA_VERSION};

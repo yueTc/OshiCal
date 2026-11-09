@@ -14,8 +14,8 @@ use crate::fertility::{
 };
 use crate::live_stats::LiveStatsManager;
 use crate::llm::{
-    analysis_cache_key, events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient,
-    LlmConfig, LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmTestReport,
+    events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient, LlmConfig,
+    LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmPool, LlmTestReport, PostAnalysisInput,
 };
 use crate::models::{
     AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
@@ -24,7 +24,7 @@ use crate::models::{
 };
 use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
-use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
+use crate::settings::{load_settings, AppSettings, LlmAccount, RuntimeSecrets};
 use crate::store::{FertilityCache, SqliteStore};
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
@@ -1055,11 +1055,11 @@ impl AppService {
         let _guard = self.acquire_refresh_lock().await;
         self.repair_reserve_room_urls().await;
         let settings = load_settings(&self.store).await?;
-        let llm_config = self.current_llm_config(&settings).await;
+        let llm_pool = self.llm_pool(&settings).await;
         let streamers = self.store.list_streamers().await?;
         self.backfill_avatar_captures(&streamers).await;
         let sources = sources_for_streamers(&streamers);
-        self.refresh_sources(&sources, &settings, llm_config.as_ref(), None, &|_| {})
+        self.refresh_sources(&sources, &settings, llm_pool.as_ref(), None, &|_| {})
             .await
     }
 
@@ -1106,12 +1106,12 @@ impl AppService {
         );
         let result = async {
             let settings = load_settings(&self.store).await?;
-            let llm_config = self.current_llm_config(&settings).await;
+            let llm_pool = self.llm_pool(&settings).await;
             let sources = sources_for_streamers(std::slice::from_ref(&streamer));
             self.refresh_sources(
                 &sources,
                 &settings,
-                llm_config.as_ref(),
+                llm_pool.as_ref(),
                 Some(&streamer),
                 &on_progress,
             )
@@ -1162,14 +1162,56 @@ impl AppService {
             api_key: api_key.unwrap_or_default(),
             model: settings.llm_model.clone(),
             prompt_version: settings.llm_prompt_version.clone(),
+            reasoning_effort: settings.llm_reasoning_effort,
         })
+    }
+
+    /// 组装模型账号池：账号来自设置，密钥按账号的 `base_url` 逐个取。
+    /// 没有配置账号时退化成「默认账号」，与单账号时代的配置向后兼容。
+    async fn llm_pool(&self, settings: &AppSettings) -> Option<LlmPool> {
+        if !settings.auto_analyze_images {
+            return None;
+        }
+        let mut accounts = Vec::new();
+        let mut keys = HashMap::new();
+        for account in &settings.llm_accounts {
+            if account.id.trim().is_empty()
+                || account.base_url.trim().is_empty()
+                || account.model.trim().is_empty()
+            {
+                continue;
+            }
+            // 取不到密钥的账号直接跳过：它发不出请求，留在池里只会让
+            // 下一次 acquire 选中一个必然失败的账号。
+            let Some(api_key) = self.llm_key_for_base_url(&account.base_url).await else {
+                continue;
+            };
+            keys.insert(account.id.clone(), api_key);
+            accounts.push(account.clone());
+        }
+        if accounts.is_empty() {
+            let config = self.current_llm_config(settings).await?;
+            let fallback = LlmAccount {
+                id: "default".to_owned(),
+                name: "默认账号".to_owned(),
+                base_url: config.base_url,
+                model: config.model,
+            };
+            keys.insert(fallback.id.clone(), config.api_key);
+            accounts.push(fallback);
+        }
+        Some(LlmPool::new(
+            settings.llm_parallelism.max(1),
+            accounts,
+            keys,
+        ))
     }
 
     async fn refresh_sources(
         &self,
         sources: &[(String, Vec<Streamer>)],
         settings: &AppSettings,
-        llm_config: Option<&LlmConfig>,
+        llm_pool: Option<&LlmPool>,
         progress_streamer: Option<&Streamer>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> AppResult<RefreshReport> {
@@ -1181,7 +1223,6 @@ impl AppService {
             llm_calls: 0,
             llm_cache_hits: 0,
         };
-        let mut analysis_cache: HashMap<String, CachedImageAnalysis> = HashMap::new();
         let mut event_state = RefreshEventState::default();
         let mut attempted_streamer_ids = HashSet::new();
         let mut successfully_analyzed_streamer_ids = HashSet::new();
@@ -1210,8 +1251,7 @@ impl AppService {
                             targets,
                             &posts,
                             settings,
-                            llm_config,
-                            &mut analysis_cache,
+                            llm_pool,
                             &mut event_state,
                             progress_streamer,
                             on_progress,
@@ -1231,6 +1271,11 @@ impl AppService {
                             .map(serde_json::from_str)
                             .transpose()?
                             .unwrap_or_default();
+                        // 旧的 text:/image: 前缀属于双通道时代，单次调用后不会再更新，
+                        // 留着会让前端一直显示早就解决的历史报错，这里一次性清掉。
+                        unresolved.retain(|identity, _| {
+                            !identity.starts_with("text:") && !identity.starts_with("image:")
+                        });
                         for (identity, outcome) in &stats.analysis_outcomes {
                             if let Some(message) = outcome {
                                 unresolved.insert(identity.clone(), message.clone());
@@ -1347,15 +1392,13 @@ impl AppService {
     }
 
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     async fn process_source_posts(
         &self,
         source_mid: &str,
         targets: &[Streamer],
         posts: &[DynamicPost],
         settings: &AppSettings,
-        llm_config: Option<&LlmConfig>,
-        analysis_cache: &mut HashMap<String, CachedImageAnalysis>,
+        llm_pool: Option<&LlmPool>,
     ) -> AppResult<ProcessStats> {
         let mut event_state = RefreshEventState::default();
         let mut stats = self
@@ -1364,8 +1407,7 @@ impl AppService {
                 targets,
                 posts,
                 settings,
-                llm_config,
-                analysis_cache,
+                llm_pool,
                 &mut event_state,
                 None,
                 &|_| {},
@@ -1384,8 +1426,7 @@ impl AppService {
         targets: &[Streamer],
         posts: &[DynamicPost],
         settings: &AppSettings,
-        llm_config: Option<&LlmConfig>,
-        analysis_cache: &mut HashMap<String, CachedImageAnalysis>,
+        llm_pool: Option<&LlmPool>,
         event_state: &mut RefreshEventState,
         progress_streamer: Option<&Streamer>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
@@ -1396,17 +1437,9 @@ impl AppService {
         let ordered_posts = ordered_posts_oldest_first(posts);
         let posts = ordered_posts.as_slice();
         let mut stats = ProcessStats::default();
-        let analyze_images = llm_config.is_some() && settings.auto_analyze_images;
-        let total_steps = posts.len()
-            + if analyze_images {
-                posts
-                    .iter()
-                    .filter(|post| post.reserve.is_none())
-                    .map(|post| post.images.len())
-                    .sum::<usize>()
-            } else {
-                0
-            };
+        // 一条动态只调一次模型，进度也按动态条数计步：9 张图的动态以前要发
+        // 10 次请求、占 10 步，现在只占 1 步。
+        let total_steps = posts.len().max(1);
         let mut completed_steps = 0;
         let source_base = 10 + (source_index * 80 / source_count.max(1)) as u8;
         let source_span = (80 / source_count.max(1)).saturating_sub(5).max(1) as u8;
@@ -1430,9 +1463,9 @@ impl AppService {
                     on_progress,
                 );
             };
-        for post in posts {
+        for (post_index, post) in posts.iter().enumerate() {
             report_step(
-                &format!("识别动态日程（{} 条）", posts.len()),
+                &format!("分析动态日程（{}/{}）", post_index + 1, posts.len()),
                 completed_steps,
                 total_steps,
                 false,
@@ -1453,153 +1486,205 @@ impl AppService {
                     self.remove_stale_non_live_reserve_schedule(post).await?;
             }
 
-            self.apply_deterministic_reservation_time_change(source_mid, targets, post)
-                .await?;
+            // 本次真正写入日程的 source_identity。stale 清理只保留这些：
+            // 被去重或跳过的身份不算“写入”，否则会把旧来源误删。
+            let mut written_identities: Vec<String> = Vec::new();
+            if let Some(identity) = self
+                .apply_deterministic_reservation_time_change(source_mid, targets, post)
+                .await?
+            {
+                written_identities.push(identity);
+            }
 
-            // 图片通道与文字通道是并集关系，不再互斥：图片模型只看图，
-            // 遇到封面/表情包这类图会返回空事件，若此时把正文一路跳过，
-            // 写在文字里的时间点（“八点见”）就彻底丢了。
-            // 图片通道照常跑，文字通道也照常跑，两路结果按时间槽合并。
-            let mut text_events_seen: Vec<LlmEvent> = Vec::new();
-            // 预约卡片同样交给文字模型：卡片标题与描述拼在正文后面一起送，
-            // 由模型给出最终时间与标题。卡片正则只在模型不可用、调用失败、
-            // 返回空事件，或没覆盖到卡片那一场时兜底。
+            // 带图动态与纯文字动态走同一条通道：正文（含预约卡）与全部图片
+            // 只在这一次请求里送出，任何一侧出现时间点都能被提取。
+            let has_images = !post.images.is_empty();
+            // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
+            // 后面不再补正则兜底。模型给的取消同样采信。
             let mut card_slot_covered = false;
-            if let Some(config) = llm_config {
-                // 首行带给模型「这条动态是谁发的」：正文经常只写搭档的名字，
-                // 不带发布者时模型会把作者本人漏出 participants，事件就归不到人。
-                let context = format!(
-                    "发布者：{}\n{}",
-                    post.author_name.trim(),
-                    reserve_context(post)
+            // 模型偶尔把同一场说两遍（正文一次、图片一次），按时间槽去重。
+            let mut applied_events: Vec<LlmEvent> = Vec::new();
+            let mut analysis_succeeded = false;
+            // 既没有正文也没有图片的动态没有东西可送模型：不占一次调用，
+            // 但仍然算“分析成功”，让上一版提示词留下的旧来源照常清理。
+            let has_content = !post.text.trim().is_empty() || !post.images.is_empty();
+            if llm_pool.is_some() && !has_content {
+                analysis_succeeded = true;
+                stats
+                    .analysis_outcomes
+                    .insert(format!("post:{}", post.id), None);
+            }
+            if let Some(pool) = llm_pool.filter(|_| has_content) {
+                // 纯文字动态的 identity 仍沿用「发布者 + 正文 + 预约卡」的旧摘要，
+                // 升级后历史日程才能原地更新，而不是再造一条。
+                let text_hash = text_digest(&text_analysis_context(post));
+                let reserve = reserve_summary(post);
+                let content_digest =
+                    content_digest_of(&text_hash, reserve.as_deref(), &post.images);
+                let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+                // 每篇动态取一次号：同一账号串行、不同账号并行。
+                let lease = pool.acquire().await;
+                let config = LlmConfig {
+                    base_url: lease.account.base_url.clone(),
+                    api_key: lease.api_key.clone(),
+                    model: lease.account.model.clone(),
+                    prompt_version: prompt_version.clone(),
+                    reasoning_effort: settings.llm_reasoning_effort,
+                };
+                let cache_key = format!(
+                    "{}:{content_digest}:{}:{prompt_version}",
+                    post.id, config.model
                 );
-                let text = context.trim();
-                if !text.is_empty() {
-                    let text_digest = text_digest(text);
-                    // v12：带图动态重新走文字通道，旧版本的空结果一并失效。
-                    let prompt_version = format!("{}-text-v12", config.prompt_version);
-                    let cache_key =
-                        analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
-                    let mut analysis_succeeded = false;
-                    let cached_events = match self.store.get_text_analysis(&cache_key).await? {
-                        Some(raw) => match events_from_raw(&raw, now) {
-                            Ok(events) => {
-                                stats.llm_cache_hits += 1;
-                                analysis_succeeded = true;
-                                Some(events)
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, post_id = %post.id, "cached text analysis invalid");
-                                None
-                            }
-                        },
-                        None => None,
-                    };
-                    let events = match cached_events {
-                        Some(events) => Some(events),
-                        None => match self
-                            .llm_analyzer()
-                            .analyze_text(config, text, post.published_at, now)
-                            .await
-                        {
-                            Ok(analysis) => {
-                                stats.llm_calls += 1;
-                                analysis_succeeded = true;
+                let analysis_input = PostAnalysisInput {
+                    author: post.author_name.trim().to_owned(),
+                    published_at: post.published_at,
+                    text: post.text.clone(),
+                    reserve,
+                    image_urls: post.images.clone(),
+                };
+                let cached_events = match self.store.load_post_analysis(&cache_key).await? {
+                    Some(raw) => match events_from_raw(&raw, now) {
+                        Ok(events) if !events.is_empty() => {
+                            stats.llm_cache_hits += 1;
+                            Some(events)
+                        }
+                        Ok(_) => {
+                            // 空结果从不进缓存；真出现了也当没分析过，重跑一次。
+                            tracing::debug!(
+                                post_id = %post.id,
+                                "cached post analysis is empty, retry"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, post_id = %post.id, "cached post analysis invalid");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let events = match cached_events {
+                    Some(events) => Some(events),
+                    None => match self
+                        .llm_analyzer()
+                        .analyze_post(&config, &analysis_input)
+                        .await
+                    {
+                        Ok(analysis) => {
+                            stats.llm_calls += 1;
+                            // 成功且非空才入缓存：失败或空结果留给下一轮轮询重试。
+                            if !analysis.events.is_empty() {
                                 self.store
-                                    .save_text_analysis(
+                                    .save_post_analysis(
                                         &cache_key,
                                         &post.id,
-                                        &text_digest,
+                                        &content_digest,
                                         &config.model,
                                         &prompt_version,
                                         &analysis.raw,
                                     )
                                     .await?;
-                                Some(analysis.events)
                             }
-                            Err(error) => {
-                                tracing::warn!(%error, post_id = %post.id, "text analysis failed");
-                                let message = format!("动态文字分析失败: {error}");
+                            Some(analysis.events)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, post_id = %post.id, "post analysis failed");
+                            let message = format!("动态日程分析失败: {error}");
+                            stats
+                                .analysis_outcomes
+                                .insert(format!("post:{}", post.id), Some(message.clone()));
+                            for target in targets {
+                                let _ = self.store.record_streamer_error(target.id, &message).await;
                                 stats
-                                    .analysis_outcomes
-                                    .insert(format!("text:{}", post.id), Some(message.clone()));
-                                for target in targets {
-                                    let _ =
-                                        self.store.record_streamer_error(target.id, &message).await;
-                                    stats
-                                        .analysis_errors
-                                        .entry(target.id)
-                                        .or_insert_with(|| message.clone());
-                                }
-                                None
+                                    .analysis_errors
+                                    .entry(target.id)
+                                    .or_insert_with(|| message.clone());
                             }
-                        },
-                    };
-                    if analysis_succeeded {
-                        stats
-                            .analysis_outcomes
-                            .insert(format!("text:{}", post.id), None);
-                        stats
-                            .analyzed_streamer_ids
-                            .extend(targets.iter().map(|target| target.id));
+                            None
+                        }
+                    },
+                };
+                analysis_succeeded = events.is_some();
+                if analysis_succeeded {
+                    stats
+                        .analysis_outcomes
+                        .insert(format!("post:{}", post.id), None);
+                    stats
+                        .analyzed_streamer_ids
+                        .extend(targets.iter().map(|target| target.id));
+                }
+                // 租约覆盖整个事件应用过程，Drop 时才归还账号许可。
+                let _lease = lease;
+                for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
+                    let event = canonicalize_event_participants(event, targets);
+                    if applied_events
+                        .iter()
+                        .any(|seen| llm_events_equivalent(seen, &event))
+                    {
+                        // 同一场直播模型说了两遍：只落一条。
+                        continue;
                     }
-                    for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
-                        let event = canonicalize_event_participants(event, targets);
-                        // 记下文本通道已经覆盖的场次，图片通道随后按它去重：
-                        // 同一条动态的文字与图片经常描述同一场直播。
-                        text_events_seen.push(event.clone());
-                        // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
-                        // 后面不再补正则兜底。模型给的取消同样采信。
-                        if let Some(reserve_start) = reserve_start {
-                            if event.start_at.is_some_and(|start_at| {
-                                same_schedule_slot(
-                                    start_at,
-                                    reserve_start,
-                                    RESERVE_DUPLICATE_TOLERANCE_MINUTES,
-                                )
-                            }) {
-                                card_slot_covered = true;
-                            }
+                    applied_events.push(event.clone());
+                    if let Some(reserve_start) = reserve_start {
+                        if event.start_at.is_some_and(|start_at| {
+                            same_schedule_slot(
+                                start_at,
+                                reserve_start,
+                                RESERVE_DUPLICATE_TOLERANCE_MINUTES,
+                            )
+                        }) {
+                            card_slot_covered = true;
                         }
-                        if let Some(target) =
-                            match_event_target_for_post(&event, targets, &post.author_mid)
-                        {
-                            if event.action == LlmEventAction::Cancel {
-                                event_state.cancellations.push(PendingCancellation {
-                                    target,
-                                    event: event.clone(),
-                                    source_post_id: post.id.clone(),
-                                    published_at: post.published_at,
-                                });
-                                continue;
-                            }
-                            let fingerprint = format!(
-                                "{}:{}:{}:{}",
-                                source_fingerprint(post, &event.title, "text"),
-                                event_index,
-                                event.performer,
-                                event.participant_names().join("|")
-                            );
-                            let identity = format!("text:{}:{text_digest}:{event_index}", post.id);
-                            let (inserted, cancelled) = self
-                                .apply_llm_event(
-                                    &target,
-                                    targets,
-                                    &event,
-                                    "text",
-                                    post,
-                                    "editor",
-                                    &identity,
-                                    &fingerprint,
-                                )
-                                .await?;
-                            if inserted {
-                                stats.new_schedules += 1;
-                            }
-                            if cancelled {
-                                stats.cancelled_schedules += 1;
-                            }
-                        }
+                    }
+                    let Some(target) =
+                        match_event_target_for_post(&event, targets, &post.author_mid)
+                    else {
+                        continue;
+                    };
+                    if event.action == LlmEventAction::Cancel {
+                        event_state.cancellations.push(PendingCancellation {
+                            target,
+                            event: event.clone(),
+                            source_post_id: post.id.clone(),
+                            published_at: post.published_at,
+                        });
+                        continue;
+                    }
+                    // 纯文字动态保持 `text:{post_id}:{digest}:{idx}`（历史日程原地更新）；
+                    // 带图动态改用整条动态的 content_digest，图片增减或换图都会换 identity。
+                    let source_kind = if has_images { "image" } else { "text" };
+                    let identity = if has_images {
+                        format!("image:{}:{content_digest}:{event_index}", post.id)
+                    } else {
+                        format!("text:{}:{text_hash}:{event_index}", post.id)
+                    };
+                    let fingerprint = format!(
+                        "{}:{}:{}:{}",
+                        source_fingerprint(post, &event.title, source_kind),
+                        event_index,
+                        event.performer,
+                        event.participant_names().join("|")
+                    );
+                    // 多张图只发一次请求，日程卡片沿用第一张图当封面。
+                    let image_url = post.images.first().map(String::as_str).unwrap_or_default();
+                    let (inserted, cancelled) = self
+                        .apply_llm_event(
+                            &target,
+                            targets,
+                            &event,
+                            source_kind,
+                            post,
+                            image_url,
+                            &identity,
+                            &fingerprint,
+                        )
+                        .await?;
+                    written_identities.push(identity);
+                    if inserted {
+                        stats.new_schedules += 1;
+                    }
+                    if cancelled {
+                        stats.cancelled_schedules += 1;
                     }
                 }
             }
@@ -1623,7 +1708,7 @@ impl AppService {
                                 && room_id.chars().all(|character| character.is_ascii_digit())
                         })
                         .map(|room_id| format!("https://live.bilibili.com/{room_id}"));
-                    if self
+                    let inserted = self
                         .upsert_candidate(
                             &target,
                             schedule,
@@ -1637,234 +1722,52 @@ impl AppService {
                             Some(target.name.as_str()),
                             &participants,
                         )
-                        .await?
-                    {
+                        .await?;
+                    // 兜底卡片也是本轮真实写入的来源，不能被随后的清理删掉。
+                    written_identities.push(identity);
+                    if inserted {
                         stats.new_schedules += 1;
                     }
                 }
             }
 
-            if let Some(config) = llm_config.filter(|_| post.reserve.is_none()) {
-                if settings.auto_analyze_images && !post.images.is_empty() {
-                    let context_digest = text_digest(post.text.trim());
-                    // v6：图片提示词改成“图文都可能为主来源”，旧版本里
-                    // 大量 result_json='[]' 的记录随之失效，重新分析。
-                    let image_prompt_version = format!(
-                        "{}-image-context-v6-{}",
-                        config.prompt_version,
-                        &context_digest[..12]
-                    );
-                    for (image_index, image_url) in post.images.iter().enumerate() {
-                        let image_cache_key = format!(
-                            "{}:{}:{image_url}:{image_prompt_version}",
-                            post.id,
-                            post.published_at.timestamp()
+            // 应用完本轮结果后清理这条动态的历史来源：上一版提示词、旧的逐图缓存、
+            // 已被合并掉的重复场次留下的 identity 都不再挂着，避免同一场直播
+            // 被旧来源反复救活。分析失败时不动 source，避免一次网络抖动清空历史。
+            if analysis_succeeded {
+                let removed = self
+                    .store
+                    .delete_schedule_sources_except(&post.id, &written_identities)
+                    .await?;
+                if !removed.is_empty() {
+                    // 来源被清空的日程如果一条来源都不剩，就从库里删掉；
+                    // 手动锁定或还有其它来源的场次由 store 侧跳过。
+                    let mut orphan_schedule_ids: Vec<i64> = removed
+                        .iter()
+                        .map(|(_, schedule_id)| *schedule_id)
+                        .collect();
+                    orphan_schedule_ids.sort_unstable();
+                    orphan_schedule_ids.dedup();
+                    let deleted = self
+                        .store
+                        .delete_orphan_schedules(&orphan_schedule_ids)
+                        .await?;
+                    if !deleted.is_empty() {
+                        tracing::info!(
+                            post_id = %post.id,
+                            deleted_schedules = ?deleted,
+                            "removed orphan schedules left by stale sources"
                         );
-                        report_step(
-                            &format!("识别图片日程（{}/{}）", image_index + 1, post.images.len()),
-                            completed_steps,
-                            total_steps,
-                            false,
-                        );
-                        // 空结果的缓存不进命中路径：图片模型对封面/表情包
-                        // 经常返回 []，把它当“已分析”会让这条动态永远拿不到结论。
-                        // 只有已有非空事件时才走内存缓存。
-                        let analysis = if let Some(cached) = analysis_cache
-                            .get(&image_cache_key)
-                            .filter(|cached| !cached.events.is_empty())
-                            .cloned()
-                        {
-                            stats.llm_cache_hits += 1;
-                            Some(cached)
-                        } else if let Some(cache_key) = self
-                            .store
-                            .get_image_analysis_cache_key(
-                                &post.id,
-                                image_url,
-                                &config.model,
-                                &image_prompt_version,
-                            )
-                            .await?
-                        {
-                            match self.store.get_image_analysis(&cache_key).await? {
-                                Some(raw) => match events_from_raw(&raw, now) {
-                                    Ok(events) if events.is_empty() => {
-                                        // 旧记录里存的是空数组：当作没分析过，
-                                        // 让下面的真实调用重跑一次。
-                                        tracing::debug!(
-                                            post_id = %post.id,
-                                            %image_url,
-                                            "cached image analysis is empty, retry"
-                                        );
-                                        None
-                                    }
-                                    Ok(events) => {
-                                        stats.llm_cache_hits += 1;
-                                        let _ = raw;
-                                        Some(CachedImageAnalysis {
-                                            events,
-                                            source_digest: cache_key_digest(&cache_key),
-                                        })
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, post_id = %post.id, "cached llm result invalid");
-                                        None
-                                    }
-                                },
-                                None => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let analysis = match analysis {
-                            Some(value) => value,
-                            None => {
-                                match self
-                                    .llm_analyzer()
-                                    .analyze_image_url(
-                                        config,
-                                        image_url,
-                                        &post.text,
-                                        post.published_at,
-                                        now,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(result)) => {
-                                        stats.llm_calls += 1;
-                                        let cache_key = analysis_cache_key(
-                                            &post.id,
-                                            &result.source_digest,
-                                            &config.model,
-                                            &image_prompt_version,
-                                        );
-                                        self.store
-                                            .save_image_analysis(
-                                                &cache_key,
-                                                &post.id,
-                                                image_url,
-                                                &config.model,
-                                                &image_prompt_version,
-                                                &result.raw,
-                                            )
-                                            .await?;
-                                        self.store
-                                            .save_image_analysis_cache_key(
-                                                &post.id,
-                                                image_url,
-                                                &config.model,
-                                                &image_prompt_version,
-                                                &cache_key,
-                                            )
-                                            .await?;
-                                        CachedImageAnalysis {
-                                            events: result.events,
-                                            source_digest: result.source_digest,
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        // 动图等不支持的图片按“跳过”处理：不报错、不落缓存，
-                                        // 并清掉这张图历史上残留的失败记录，避免主播卡片长期飘红。
-                                        tracing::debug!(
-                                            post_id = %post.id,
-                                            %image_url,
-                                            "skip unsupported image"
-                                        );
-                                        stats
-                                            .analysis_outcomes
-                                            .insert(format!("image:{}:{image_url}", post.id), None);
-                                        stats
-                                            .analyzed_streamer_ids
-                                            .extend(targets.iter().map(|target| target.id));
-                                        completed_steps += 1;
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, post_id = %post.id, "image analysis failed");
-                                        let message = format!("图片日程分析失败: {error}");
-                                        stats.analysis_outcomes.insert(
-                                            format!("image:{}:{image_url}", post.id),
-                                            Some(message.clone()),
-                                        );
-                                        for target in targets {
-                                            let _ = self
-                                                .store
-                                                .record_streamer_error(target.id, &message)
-                                                .await;
-                                            stats
-                                                .analysis_errors
-                                                .entry(target.id)
-                                                .or_insert_with(|| message.clone());
-                                        }
-                                        completed_steps += 1;
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-                        stats
-                            .analyzed_streamer_ids
-                            .extend(targets.iter().map(|target| target.id));
-                        stats
-                            .analysis_outcomes
-                            .insert(format!("image:{}:{image_url}", post.id), None);
-                        let digest = analysis.source_digest.clone();
-                        let events = analysis.events.clone();
-                        analysis_cache.insert(image_cache_key, analysis);
-                        for (event_index, event) in events.iter().enumerate() {
-                            let event = canonicalize_event_participants(event, targets);
-                            // 文字通道已经给出同一场时跳过图片那条：
-                            // 两路都成功时不该把一场直播写两遍。
-                            if text_events_seen
-                                .iter()
-                                .any(|seen| llm_events_equivalent(seen, &event))
-                            {
-                                continue;
-                            }
-                            if let Some(target) =
-                                match_event_target_for_post(&event, targets, &post.author_mid)
-                            {
-                                if event.action == LlmEventAction::Cancel {
-                                    event_state.cancellations.push(PendingCancellation {
-                                        target,
-                                        event: event.clone(),
-                                        source_post_id: post.id.clone(),
-                                        published_at: post.published_at,
-                                    });
-                                    continue;
-                                }
-                                let fingerprint = format!(
-                                    "{}:{}:{}:{}",
-                                    source_fingerprint(post, &event.title, "image"),
-                                    event_index,
-                                    event.performer,
-                                    event.participant_names().join("|")
-                                );
-                                let identity = format!("image:{}:{digest}:{event_index}", post.id);
-                                let (inserted, cancelled) = self
-                                    .apply_llm_event(
-                                        &target,
-                                        targets,
-                                        &event,
-                                        "image",
-                                        post,
-                                        image_url,
-                                        &identity,
-                                        &fingerprint,
-                                    )
-                                    .await?;
-                                if inserted {
-                                    stats.new_schedules += 1;
-                                }
-                                if cancelled {
-                                    stats.cancelled_schedules += 1;
-                                }
-                            }
-                        }
-                        completed_steps += 1;
                     }
+                    tracing::info!(
+                        post_id = %post.id,
+                        removed = removed.len(),
+                        orphan_schedules = orphan_schedule_ids.len(),
+                        "pruned stale schedule sources"
+                    );
                 }
             }
+
             completed_steps += 1;
             report_step("写入日程结果", completed_steps, total_steps, false);
         }
@@ -2158,25 +2061,25 @@ impl AppService {
         source_mid: &str,
         targets: &[Streamer],
         post: &DynamicPost,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<String>> {
         if post.reserve.is_some() || !text_looks_like_schedule_time_change(&post.text) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(target) = choose_text_target(source_mid, targets, &post.text) else {
-            return Ok(());
+            return Ok(None);
         };
         // Relative dates such as “tomorrow” refer to the post publication date, not
         // the later refresh time. Matching still requires a unique existing reservation.
         let Some(schedule) =
             parse_text_schedule(&post.text, post.published_at, post.published_at, "直播")
         else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(existing) = self
             .find_reservation_time_change_candidate(&target, schedule.start_at, post)
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let fingerprint = source_fingerprint(post, &schedule.title, "text");
         let digest = text_digest(post.text.trim());
@@ -2196,7 +2099,8 @@ impl AppService {
             &participants,
         )
         .await?;
-        Ok(())
+        // 这条 identity 也属于本次真实写入，stale 清理必须保留它。
+        Ok(Some(identity))
     }
 
     async fn cancel_schedule_from_event(
@@ -2403,7 +2307,9 @@ impl AppService {
                 return Ok(false);
             }
         }
-        if source_kind == "text" && post.reserve.is_none() {
+        // 单次分析后图片来源与文字来源等价：带图动态的正文里常写“明天八点改到九点”，
+        // 这类时间变更必须同样能改到预约卡对应的日程上。
+        if is_post_analysis_source(source_kind) && post.reserve.is_none() {
             if let Some(existing) = self
                 .find_reservation_time_change_candidate(target, schedule.start_at, post)
                 .await?
@@ -2477,12 +2383,6 @@ fn emit_progress(
         done,
         failed,
     });
-}
-
-#[derive(Debug, Clone)]
-struct CachedImageAnalysis {
-    events: Vec<LlmEvent>,
-    source_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2563,6 +2463,49 @@ fn reserve_context(post: &DynamicPost) -> String {
         context.push_str(&reserve.description);
     }
     context
+}
+
+/// 纯文字动态的分析上下文：发布者 + 正文 + 预约卡文本。
+/// 单次调用后模型拿到的仍是同一段文字，摘要因此保持一致，
+/// 历史日程的 `text:{post_id}:{digest}:{idx}` identity 才能原地更新。
+fn text_analysis_context(post: &DynamicPost) -> String {
+    format!(
+        "发布者：{}\n{}",
+        post.author_name.trim(),
+        reserve_context(post)
+    )
+    .trim()
+    .to_owned()
+}
+
+/// 整条动态的内容摘要：正文摘要 + 预约卡摘要 + 全部图片地址。
+/// 任一组成变化都会得到新摘要，缓存条目与图片来源 identity 随之失效。
+fn content_digest_of(text_hash: &str, reserve: Option<&str>, image_urls: &[String]) -> String {
+    text_digest(&format!(
+        "{text_hash}|{}|{}",
+        reserve.unwrap_or_default(),
+        image_urls.join(",")
+    ))
+}
+
+/// 预约卡只把标题与简介送进模型；卡片 id 之类的元数据与分析无关。
+fn reserve_summary(post: &DynamicPost) -> Option<String> {
+    let reserve = post.reserve.as_ref()?;
+    let title = reserve.title.trim();
+    let description = reserve.description.trim();
+    let summary = match (title.is_empty(), description.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => title.to_owned(),
+        (true, false) => description.to_owned(),
+        (false, false) => format!("{title}\n{description}"),
+    };
+    (!summary.is_empty()).then_some(summary)
+}
+
+/// 单次分析的来源种类。文字与图片不再是两条通道，合并、预约时间变更、
+/// 同槽回落这些判断都要同时认这两种 kind。
+fn is_post_analysis_source(source_kind: &str) -> bool {
+    matches!(source_kind, "text" | "image")
 }
 
 /// 两个开始时间是否指向同一场直播。日程合并与预约去重共用同一容差。
@@ -3279,10 +3222,6 @@ fn normalize_alias(value: &str) -> String {
         .collect()
 }
 
-fn cache_key_digest(cache_key: &str) -> String {
-    cache_key.split(':').nth(1).unwrap_or("unknown").to_owned()
-}
-
 fn text_digest(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -3380,48 +3319,98 @@ mod tests {
 
     use crate::llm::LlmAnalysis;
     use crate::models::ReserveCard;
+    use crate::settings::ReasoningEffort;
 
+    /// 一次 `analyze_post` 调用收到的完整输入，供断言使用。
+    struct CapturedCall {
+        model: String,
+        reasoning_effort: ReasoningEffort,
+        input: PostAnalysisInput,
+    }
+
+    /// 模型桩：一条动态只该产生一次调用，输入全部留档。
     struct CountingAnalyzer {
         calls: AtomicUsize,
-        text_calls: AtomicUsize,
         events: Vec<LlmEvent>,
         text_events: Vec<LlmEvent>,
+        captured: std::sync::Mutex<Vec<CapturedCall>>,
+    }
+
+    impl CountingAnalyzer {
+        fn new(events: Vec<LlmEvent>, text_events: Vec<LlmEvent>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                events,
+                text_events,
+                captured: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn captured_calls(&self) -> std::sync::MutexGuard<'_, Vec<CapturedCall>> {
+            self.captured.lock().expect("captured calls")
+        }
+
+        fn last_call(&self) -> CapturedCall {
+            let captured = self.captured.lock().expect("captured calls");
+            let last = captured.last().expect("analyzer was never called");
+            CapturedCall {
+                model: last.model.clone(),
+                reasoning_effort: last.reasoning_effort,
+                input: last.input.clone(),
+            }
+        }
     }
 
     #[async_trait]
     impl ContentAnalyzer for CountingAnalyzer {
-        async fn analyze_image_url(
+        // 合并成单次调用后，正文事件排在前面：同槽不同标题时仍是
+        // 「正文那一版先落库」，与旧双通道的行为一致。
+        async fn analyze_post(
             &self,
-            _config: &LlmConfig,
-            _image_url: &str,
-            _context_text: &str,
-            _published_at: DateTime<Utc>,
-            _now: DateTime<Utc>,
-        ) -> AppResult<Option<LlmAnalysis>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let raw = serde_json::to_value(&self.events)?;
-            Ok(Some(LlmAnalysis {
-                events: self.events.clone(),
-                raw,
-                source_digest: "mock-digest".to_owned(),
-            }))
-        }
-
-        async fn analyze_text(
-            &self,
-            _config: &LlmConfig,
-            _text: &str,
-            _published_at: DateTime<Utc>,
-            _now: DateTime<Utc>,
+            config: &LlmConfig,
+            input: &PostAnalysisInput,
         ) -> AppResult<LlmAnalysis> {
-            self.text_calls.fetch_add(1, Ordering::SeqCst);
-            let raw = serde_json::to_value(&self.text_events)?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut events = self.text_events.clone();
+            events.extend(self.events.clone());
+            self.captured
+                .lock()
+                .expect("captured calls")
+                .push(CapturedCall {
+                    model: config.model.clone(),
+                    reasoning_effort: config.reasoning_effort,
+                    input: input.clone(),
+                });
+            let raw = serde_json::to_value(&events)?;
             Ok(LlmAnalysis {
-                events: self.text_events.clone(),
+                events,
                 raw,
-                source_digest: "mock-text-digest".to_owned(),
+                source_digest: "mock-post-digest".to_owned(),
             })
         }
+    }
+
+    fn fixture_account(id: &str, model: &str) -> LlmAccount {
+        LlmAccount {
+            id: id.to_owned(),
+            name: format!("账号{id}"),
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
+    /// 单账号、单并发的池子：与 `AppSettings::default()` 的 `llm_parallelism`
+    /// 一致，只把模型名换成用例关心的值。
+    fn test_pool(model: &str) -> LlmPool {
+        LlmPool::new(
+            1,
+            vec![fixture_account("default", model)],
+            HashMap::from([("default".to_owned(), "fixture-key".to_owned())]),
+        )
     }
 
     fn subscription(mid: &str, name: &str) -> AddSubscription {
@@ -3560,7 +3549,7 @@ mod tests {
         let store = SqliteStore::in_memory().await.expect("db");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -3714,7 +3703,7 @@ mod tests {
             .expect("sinuo");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -3803,7 +3792,7 @@ mod tests {
             .expect("sinuo");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -3869,7 +3858,6 @@ mod tests {
             .await
             .expect("upsert candidate"));
 
-        let mut cache = HashMap::new();
         let stats = service
             .process_source_posts(
                 "402",
@@ -3877,14 +3865,13 @@ mod tests {
                 std::slice::from_ref(&reserve_post),
                 &AppSettings::default(),
                 None,
-                &mut cache,
             )
             .await
             .expect("process reservation");
 
         assert_eq!(stats.llm_calls, 0);
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 0);
+        // 没有池子就完全不碰模型：卡片正则兜底独立完成。
+        assert_eq!(analyzer.call_count(), 0);
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].source_kind, "reserve");
@@ -3910,7 +3897,7 @@ mod tests {
             .expect("second");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -4158,7 +4145,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -4278,7 +4265,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -4395,7 +4382,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -4414,22 +4401,15 @@ mod tests {
         };
         let reports = Arc::new(std::sync::Mutex::new(Vec::<RefreshProgress>::new()));
         let captured = reports.clone();
-        let mut cache = HashMap::new();
         let mut event_state = RefreshEventState::default();
-        let llm_config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
+        let pool = test_pool("fixture-model");
         service
             .process_source_posts_with_progress(
                 "100",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&llm_config),
-                &mut cache,
+                Some(&pool),
                 &mut event_state,
                 Some(&streamer),
                 &move |progress| captured.lock().expect("progress").push(progress),
@@ -4439,14 +4419,17 @@ mod tests {
             .await
             .expect("process");
         let reports = reports.lock().expect("reports");
-        assert!(reports.len() >= 3);
+        // 一条动态只报两步（开始分析、写入结果）：9 张图的动态以前要报 11 步。
+        assert!(reports.len() >= 2);
         assert!(reports
             .windows(2)
             .all(|pair| pair[0].percent <= pair[1].percent));
         assert!(reports.iter().any(|report| report.stage == "写入日程结果"));
+        // 图片与正文合并成一次分析后，进度按动态条数计步：
+        // 单张图的动态只有一步「分析动态日程」，不再有逐图阶段。
         assert!(reports
             .iter()
-            .any(|report| report.stage.starts_with("识别图片日程")));
+            .any(|report| report.stage.starts_with("分析动态日程")));
         assert!(
             reports.iter().any(|report| report.percent >= 75),
             "{reports:?}"
@@ -4484,7 +4467,7 @@ mod tests {
             .expect("schedule");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Cancel,
@@ -4513,21 +4496,14 @@ mod tests {
             raw_kind: "dynamic".to_owned(),
             reserve: None,
         };
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
@@ -4592,7 +4568,7 @@ mod tests {
             .expect("old song");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Cancel,
@@ -4628,27 +4604,20 @@ mod tests {
                 stype: Some(2),
             }),
         };
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 带卡片的动态照样送模型；模型给的是取消，就按取消处理。
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 1);
         // 事件标题是“歌回和突击”，两场都被点名取消。
         let remaining = store.list_all_schedules().await.expect("remaining");
@@ -4855,7 +4824,7 @@ mod tests {
         ];
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events,
             text_events: Vec::new(),
         });
@@ -4877,28 +4846,20 @@ mod tests {
             llm_model: "mock-vision".to_owned(),
             ..Default::default()
         };
-        let config = LlmConfig {
-            base_url: "https://example.com/v1".to_owned(),
-            api_key: String::new(),
-            model: "mock-vision".to_owned(),
-            prompt_version: "v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("mock-vision");
         let stats = service
             .process_source_posts(
                 "900",
                 &targets,
                 std::slice::from_ref(&post),
                 &settings,
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
-        // 带图动态现在也会跑一次文字通道；这条动态的正文没有时间点，文字通道返回空。
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(stats.llm_calls, 2);
+        // 正文与图片在同一次请求里送出：一条动态只调一次模型，llm_calls 也只加一。
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(stats.llm_calls, 1);
         assert_eq!(stats.new_schedules, 2);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
@@ -4960,7 +4921,7 @@ mod tests {
         ];
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events,
         });
@@ -4985,30 +4946,23 @@ mod tests {
             raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
             reserve: None,
         };
-        let mut cache = HashMap::new();
         let settings = AppSettings {
             llm_model: "mock-text".to_owned(),
             ..Default::default()
         };
-        let config = LlmConfig {
-            base_url: "https://example.com/v1".to_owned(),
-            api_key: String::new(),
-            model: "mock-text".to_owned(),
-            prompt_version: "v1".to_owned(),
-        };
+        let pool = test_pool("mock-text");
         let stats = service
             .process_source_posts(
                 "900",
                 &targets,
                 std::slice::from_ref(&post),
                 &settings,
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
         assert_eq!(stats.new_schedules, 2);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(4), false)
             .await
@@ -5023,15 +4977,15 @@ mod tests {
             .any(|schedule| schedule.streamer_name == "乙酱"));
         assert!(schedules.iter().any(|schedule| schedule.title == "杂谈"));
         assert!(schedules.iter().any(|schedule| schedule.title == "游戏"));
-        let mut second_cache = HashMap::new();
+        // 第二轮命中 post_analyses：同一条动态、同一个模型与提示词版本，
+        // 缓存键（含 content_digest）完全一致，不再发请求。
         let second_stats = service
             .process_source_posts(
                 "900",
                 &targets,
                 std::slice::from_ref(&post),
                 &settings,
-                Some(&config),
-                &mut second_cache,
+                Some(&pool),
             )
             .await
             .expect("cached process");
@@ -5050,7 +5004,7 @@ mod tests {
         let target = targets.first().expect("target");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -5157,7 +5111,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -5245,7 +5199,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -5315,7 +5269,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -5362,7 +5316,6 @@ mod tests {
             .await
             .expect("upsert candidate"));
 
-        let mut cache = HashMap::new();
         let stats = service
             .process_source_posts(
                 "100",
@@ -5370,7 +5323,6 @@ mod tests {
                 &[post],
                 &AppSettings::default(),
                 None,
-                &mut cache,
             )
             .await
             .expect("process");
@@ -5444,7 +5396,7 @@ mod tests {
             .start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
@@ -5463,25 +5415,18 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 &streamer.mid,
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 1);
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
@@ -5525,7 +5470,7 @@ mod tests {
         .start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
@@ -5544,28 +5489,21 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 带预约卡片的动态也要跑文字模型，卡片那一场由模型给出。
         assert_eq!(stats.llm_calls, 1);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
             .await
@@ -5611,13 +5549,12 @@ mod tests {
             RuntimeSecrets::default(),
             Arc::new(CountingAnalyzer {
                 calls: AtomicUsize::new(0),
-                text_calls: AtomicUsize::new(0),
+                captured: std::sync::Mutex::new(Vec::new()),
                 events: Vec::new(),
                 text_events: Vec::new(),
             }),
         )
         .expect("service");
-        let mut cache = HashMap::new();
         let stats = service
             .process_source_posts(
                 "100",
@@ -5625,7 +5562,6 @@ mod tests {
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
                 None,
-                &mut cache,
             )
             .await
             .expect("process");
@@ -5677,33 +5613,26 @@ mod tests {
         .start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 1);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
@@ -5749,7 +5678,7 @@ mod tests {
         let other_start = now + Duration::days(2);
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
@@ -5768,27 +5697,20 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 模型只给了正文那一场，卡片场次由正则补进来。
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 2);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
@@ -5814,7 +5736,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -5933,7 +5855,7 @@ mod tests {
         let extra_start = now + Duration::days(3);
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![
                 LlmEvent {
@@ -5967,27 +5889,20 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 卡片那一场和正文第二场都由模型给出：同槽事件不再丢弃，也不补正则兜底。
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 2);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(4), false)
@@ -6034,7 +5949,7 @@ mod tests {
         let start_at = now + Duration::days(1) + Duration::hours(2);
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
@@ -6053,27 +5968,20 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 视频预约不进直播日程，正文里的直播时间必须照常识别。
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 1);
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
@@ -6091,7 +5999,7 @@ mod tests {
             .expect("streamer");
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             events: Vec::new(),
             text_events: Vec::new(),
         });
@@ -6190,7 +6098,7 @@ mod tests {
             .with_timezone(&Utc);
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             // 图片模型照旧什么都不给，模型只从正文里读出“八点”。
             events: Vec::new(),
             text_events: vec![LlmEvent {
@@ -6224,30 +6132,23 @@ mod tests {
             raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
             reserve: None,
         };
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "2132180406",
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
-        // 图片通道和文字通道都要跑。
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        // 合并成一次调用后，正文和图片一起送进模型：正文里的“八点见”
+        // 这次真的到了模型手里，一条请求就把这场电台排进日程。
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(
-            stats.analysis_outcomes.get("text:1268658714237206552"),
+            stats.analysis_outcomes.get("post:1268658714237206552"),
             Some(&None)
         );
         assert_eq!(stats.new_schedules, 1);
@@ -6283,7 +6184,7 @@ mod tests {
         };
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
             // 图片通道在同一个时间槽给出同一场，只是标题措辞不同。
             events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
@@ -6314,27 +6215,21 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "2132180406",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        // 一次调用同时返回文字与图片两版描述：同槽等价事件只落一条，
+        // 桩里正文事件排在前面，所以最终标题来自正文那版。
+        assert_eq!(analyzer.call_count(), 1);
         assert_eq!(stats.new_schedules, 1);
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
@@ -6342,90 +6237,68 @@ mod tests {
         assert_eq!(schedules[0].title, "电台杂谈");
     }
 
-    /// 图片通道返回的历史空结果不再当“已分析”，会重跑一次。
+    /// 空结果从不写缓存；万一库里留着旧的空记录，也要当没分析过重跑一次。
+    ///
+    /// 旧用例校验的是 `image_analyses` 里的空数组（那时一条动态会逐图缓存），
+    /// 合并成单次调用后缓存只剩 `post_analyses` 一层，语义不变：空结果不算命中。
     #[tokio::test]
-    async fn empty_cached_image_analysis_is_retried() {
+    async fn empty_cached_post_analysis_is_retried() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("2132180406", "明前奶绿"))
             .await
             .expect("streamer");
         let now = Utc::now();
-        let image_url = "https://i0.hdslb.com/bfs/new_dyn/cached.jpg".to_owned();
         let post = DynamicPost {
             id: "cached-empty-post".to_owned(),
             author_mid: streamer.mid.clone(),
             author_name: streamer.name.clone(),
             published_at: now,
             text: "八点见".to_owned(),
-            images: vec![image_url.clone()],
+            images: vec!["https://i0.hdslb.com/bfs/new_dyn/cached.jpg".to_owned()],
             source_url: "https://t.bilibili.com/cached-empty-post".to_owned(),
             raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
             reserve: None,
         };
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let image_prompt_version = format!(
-            "{}-image-context-v6-{}",
-            config.prompt_version,
-            &text_digest(post.text.trim())[..12]
-        );
-        let cache_key = analysis_cache_key(
-            &post.id,
-            "mock-digest",
-            &config.model,
-            &image_prompt_version,
-        );
+        let settings = AppSettings::default();
+        let model = "fixture-model";
+        let pool = test_pool(model);
+        // 手工塞一条空事件的缓存记录，键与流水线里算出来的完全一致。
+        let text_hash = text_digest(&text_analysis_context(&post));
+        let reserve = reserve_summary(&post);
+        let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
+        let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+        let cache_key = format!("{}:{content_digest}:{model}:{prompt_version}", post.id);
         store
-            .save_image_analysis(
+            .save_post_analysis(
                 &cache_key,
                 &post.id,
-                &image_url,
-                &config.model,
-                &image_prompt_version,
+                &content_digest,
+                model,
+                &prompt_version,
                 &serde_json::json!([]),
             )
             .await
-            .expect("save empty analysis");
-        store
-            .save_image_analysis_cache_key(
-                &post.id,
-                &image_url,
-                &config.model,
-                &image_prompt_version,
-                &cache_key,
-            )
-            .await
-            .expect("save cache key");
+            .expect("seed empty analysis");
 
-        let analyzer = Arc::new(CountingAnalyzer {
-            calls: AtomicUsize::new(0),
-            text_calls: AtomicUsize::new(0),
-            events: Vec::new(),
-            text_events: Vec::new(),
-        });
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let mut cache = HashMap::new();
         let stats = service
             .process_source_posts(
                 "2132180406",
                 std::slice::from_ref(&streamer),
                 &[post],
-                &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                &settings,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         // 旧记录是空数组：不算缓存命中，真跑一次模型。
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(stats.llm_calls, 1);
         assert_eq!(stats.llm_cache_hits, 0);
     }
 
@@ -6438,29 +6311,18 @@ mod tests {
 
         #[async_trait]
         impl ContentAnalyzer for SkipAllImages {
-            async fn analyze_image_url(
+            // 动图这类图片解码不出来时模型什么也读不到。单次调用没有“跳过”这种
+            // 返回值，空事件集本身就等于“这条动态没有日程”，不是失败。
+            async fn analyze_post(
                 &self,
                 _config: &LlmConfig,
-                _image_url: &str,
-                _context_text: &str,
-                _published_at: DateTime<Utc>,
-                _now: DateTime<Utc>,
-            ) -> AppResult<Option<LlmAnalysis>> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            }
-
-            async fn analyze_text(
-                &self,
-                _config: &LlmConfig,
-                _text: &str,
-                _published_at: DateTime<Utc>,
-                _now: DateTime<Utc>,
+                _input: &PostAnalysisInput,
             ) -> AppResult<LlmAnalysis> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(LlmAnalysis {
                     events: Vec::new(),
                     raw: serde_json::json!([]),
-                    source_digest: "mock-text-digest".to_owned(),
+                    source_digest: "mock-post-digest".to_owned(),
                 })
             }
         }
@@ -6487,33 +6349,22 @@ mod tests {
             raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
             reserve: None,
         };
-        let config = LlmConfig {
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            api_key: String::new(),
-            model: "fixture-model".to_owned(),
-            prompt_version: "fixture-v1".to_owned(),
-        };
-        let mut cache = HashMap::new();
+        let pool = test_pool("fixture-model");
         let stats = service
             .process_source_posts(
                 "2132180406",
                 std::slice::from_ref(&streamer),
                 &[post],
                 &AppSettings::default(),
-                Some(&config),
-                &mut cache,
+                Some(&pool),
             )
             .await
             .expect("process");
 
         assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
         assert!(stats.analysis_errors.is_empty(), "{stats:?}");
-        assert_eq!(
-            stats
-                .analysis_outcomes
-                .get("image:gif-post:https://i0.hdslb.com/bfs/new_dyn/skip.gif"),
-            Some(&None)
-        );
+        // 空事件是正常结果：记一条“已分析，无日程”，不写错误。
+        assert_eq!(stats.analysis_outcomes.get("post:gif-post"), Some(&None));
     }
 
     #[test]
@@ -6563,5 +6414,659 @@ mod tests {
             &make("电台", base, vec!["明前奶绿".to_owned()]),
             &cancel,
         ));
+    }
+    fn dynamic_post(
+        id: &str,
+        author_mid: &str,
+        author_name: &str,
+        published_at: DateTime<Utc>,
+        text: &str,
+        images: Vec<&str>,
+    ) -> DynamicPost {
+        let has_images = !images.is_empty();
+        DynamicPost {
+            id: id.to_owned(),
+            author_mid: author_mid.to_owned(),
+            author_name: author_name.to_owned(),
+            published_at,
+            text: text.to_owned(),
+            images: images.into_iter().map(str::to_owned).collect(),
+            source_url: format!("https://t.bilibili.com/{id}"),
+            raw_kind: if has_images {
+                "DYNAMIC_TYPE_DRAW"
+            } else {
+                "DYNAMIC_TYPE_WORD"
+            }
+            .to_owned(),
+            reserve: None,
+        }
+    }
+
+    fn schedule_event(title: &str, start_at: Option<DateTime<Utc>>, performer: &str) -> LlmEvent {
+        LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: performer.to_owned(),
+            aliases: Vec::new(),
+            participants: vec![performer.to_owned()],
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: title.to_owned(),
+            start_at,
+            end_at: None,
+            confidence: 0.95,
+        }
+    }
+
+    async fn source_identities(store: &SqliteStore, post_id: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT source_identity FROM schedule_sources WHERE source_post_id = ? ORDER BY id",
+        )
+        .bind(post_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("source identities")
+    }
+
+    /// 9 张图的动态只发一次请求，图片全部随这次请求送出。
+    #[tokio::test]
+    async fn nine_images_go_in_one_request() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("500", "戊"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let images: Vec<String> = (0..9)
+            .map(|index| format!("https://i0.hdslb.com/bfs/new_dyn/nine-{index}.jpg"))
+            .collect();
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("杂谈", Some(now + Duration::days(1)), "戊")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = DynamicPost {
+            id: "nine-image-post".to_owned(),
+            author_mid: "500".to_owned(),
+            author_name: "戊".to_owned(),
+            published_at: now,
+            text: "明天20:00杂谈，图都在这条动态里".to_owned(),
+            images: images.clone(),
+            source_url: "https://t.bilibili.com/nine-image-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let pool = test_pool("mock-vision");
+        let stats = service
+            .process_source_posts(
+                "500",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        // 旧实现是「每张图一次 + 正文一次」= 10 次请求，现在只剩 1 次。
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(analyzer.captured_calls().len(), 1);
+        assert_eq!(stats.llm_calls, 1);
+        assert_eq!(analyzer.last_call().input.image_urls, images);
+        assert_eq!(stats.new_schedules, 1);
+    }
+
+    /// 单图动态同样只发一次请求。
+    #[tokio::test]
+    async fn one_image_goes_in_one_request() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("501", "己"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("歌回", Some(now + Duration::days(1)), "己")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "one-image-post",
+            "501",
+            "己",
+            now,
+            "明晚八点歌回",
+            vec!["https://i0.hdslb.com/bfs/new_dyn/one.jpg"],
+        );
+        let pool = test_pool("mock-vision");
+        let stats = service
+            .process_source_posts(
+                "501",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(stats.llm_calls, 1);
+        assert_eq!(analyzer.last_call().input.image_urls.len(), 1);
+        assert_eq!(stats.new_schedules, 1);
+    }
+
+    /// 纯文字动态不带任何图片片段，模型输入里 `image_urls` 为空。
+    #[tokio::test]
+    async fn text_only_post_has_no_image_parts() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("502", "庚"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("杂谈", Some(now + Duration::days(1)), "庚")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "text-only-post",
+            "502",
+            "庚",
+            now,
+            "明天20:00杂谈",
+            Vec::new(),
+        );
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "502",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        let call = analyzer.last_call();
+        assert!(call.input.image_urls.is_empty());
+        assert_eq!(call.input.text, "明天20:00杂谈");
+        // 纯文字动态的 identity 仍是 `text:{post_id}:{digest}:{idx}`。
+        let identities = source_identities(&store, "text-only-post").await;
+        assert_eq!(identities.len(), 1);
+        assert!(
+            identities[0].starts_with("text:text-only-post:"),
+            "{identities:?}"
+        );
+    }
+
+    /// 作者与发布时间随请求送出：模型要靠它们解析“明天”“下周”这类相对日期。
+    #[tokio::test]
+    async fn prompt_carries_author_and_publish_time() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("503", "辛"))
+            .await
+            .expect("streamer");
+        let published_at = Utc::now() - Duration::hours(3);
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "author-post",
+            "503",
+            "  辛  ",
+            published_at,
+            "明天20:00杂谈",
+            Vec::new(),
+        );
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "503",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        let call = analyzer.last_call();
+        assert_eq!(call.input.author, "辛");
+        assert_eq!(call.input.published_at, published_at);
+    }
+
+    /// 取消事件与新增事件来自同一次调用，两者都要生效。
+    #[tokio::test]
+    async fn cancel_event_survives_single_call() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("504", "壬"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let cancelled_start = now + Duration::days(1);
+        let (cancelled, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: streamer.id,
+                participants: Vec::new(),
+                title: "杂谈".to_owned(),
+                start_at: cancelled_start,
+                end_at: None,
+                room_url: streamer.live_url.clone(),
+                room_owner_mid: None,
+                room_owner_name: None,
+                source_kind: "text".to_owned(),
+                source_post_id: Some("older-post".to_owned()),
+                source_image_url: None,
+                source_author_mid: Some("504".to_owned()),
+                source_fingerprint: Some("older-fingerprint".to_owned()),
+                source_identity: Some("text:older-post:1".to_owned()),
+                source_published_at: None,
+                confidence: 0.9,
+            })
+            .await
+            .expect("schedule");
+        let mut cancel = schedule_event("杂谈", Some(cancelled_start), "壬");
+        cancel.action = LlmEventAction::Cancel;
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![
+                cancel,
+                schedule_event("歌回", Some(now + Duration::days(2)), "壬"),
+            ],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "cancel-single-post",
+            "504",
+            "壬",
+            now,
+            "明天的杂谈取消，改成后天歌回",
+            Vec::new(),
+        );
+        let pool = test_pool("fixture-model");
+        let stats = service
+            .process_source_posts(
+                "504",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        // 一次调用同时给出取消和新日程：取消走延迟队列，新增立即落库。
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(stats.cancelled_schedules, 1);
+        assert_eq!(stats.new_schedules, 1);
+        assert!(store.get_schedule(cancelled.id).await.is_err());
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].title, "歌回");
+    }
+
+    /// 同一场直播被模型用不同标题说两遍，也只落一条日程。
+    #[tokio::test]
+    async fn varying_titles_merge_into_one_slot() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("505", "癸"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let start_at = now + Duration::days(1);
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![
+                schedule_event("电台", Some(start_at), "癸"),
+                schedule_event("电台杂谈", Some(start_at), "癸"),
+            ],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "varying-title-post",
+            "505",
+            "癸",
+            now,
+            "明天20:00电台杂谈",
+            Vec::new(),
+        );
+        let pool = test_pool("fixture-model");
+        let stats = service
+            .process_source_posts(
+                "505",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        assert_eq!(analyzer.call_count(), 1);
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        // 先出现的那条留在日程里，后一条按时间槽判为同一场。
+        assert_eq!(schedules[0].title, "电台");
+    }
+
+    /// 纯文字动态的 identity 在重复分析后保持稳定，历史日程才能原地更新。
+    #[tokio::test]
+    async fn text_identity_is_stable_for_text_posts() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("506", "子"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("杂谈", Some(now + Duration::days(1)), "子")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "stable-identity-post",
+            "506",
+            "子",
+            now,
+            "明天20:00杂谈",
+            Vec::new(),
+        );
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "506",
+                std::slice::from_ref(&streamer),
+                &[post.clone()],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("first process");
+        let first = source_identities(&store, "stable-identity-post").await;
+
+        // 第二轮命中缓存，事件重新应用一次：identity 必须一字不差。
+        let stats = service
+            .process_source_posts(
+                "506",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("cached process");
+        let second = source_identities(&store, "stable-identity-post").await;
+
+        assert_eq!(stats.llm_cache_hits, 1);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].starts_with("text:stable-identity-post:"));
+        assert!(first[0].ends_with(":0"), "{first:?}");
+    }
+
+    /// 同一动态的旧来源在分析成功后清掉：旧提示词、旧图集留下的 identity 不再挂着。
+    #[tokio::test]
+    async fn stale_identities_are_pruned() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("507", "丑"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        // 先造一条同 post 的历史日程来源，identity 形如旧版图片通道。
+        let (stale, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: streamer.id,
+                participants: Vec::new(),
+                title: "旧日程".to_owned(),
+                start_at: now + Duration::days(5),
+                end_at: None,
+                room_url: streamer.live_url.clone(),
+                room_owner_mid: None,
+                room_owner_name: None,
+                source_kind: "image".to_owned(),
+                source_post_id: Some("stale-post".to_owned()),
+                source_image_url: Some("https://i0.hdslb.com/bfs/new_dyn/stale.jpg".to_owned()),
+                source_author_mid: Some("507".to_owned()),
+                source_fingerprint: Some("stale-fingerprint".to_owned()),
+                source_identity: Some("image:stale-post:legacy-digest:0".to_owned()),
+                source_published_at: None,
+                confidence: 0.9,
+            })
+            .await
+            .expect("stale schedule");
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("杂谈", Some(now + Duration::days(1)), "丑")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post("stale-post", "507", "丑", now, "明天20:00杂谈", Vec::new());
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "507",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process");
+
+        let identities = source_identities(&store, "stale-post").await;
+        assert_eq!(identities.len(), 1, "{identities:?}");
+        assert!(identities[0].starts_with("text:stale-post:"));
+        // 旧日程本身暂时保留：store 没有“还剩几条来源”的查询，孤儿清理留待后续。
+        assert_eq!(
+            store.list_all_schedules().await.expect("schedules").len(),
+            2
+        );
+        assert_eq!(
+            stale.source_identity.as_deref(),
+            Some("image:stale-post:legacy-digest:0")
+        );
+    }
+
+    /// 模型返回空结果时不写缓存，下一轮仍会重新分析。
+    #[tokio::test]
+    async fn empty_result_is_not_cached() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("508", "寅"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post("empty-post", "508", "寅", now, "随手一发", Vec::new());
+        let pool = test_pool("fixture-model");
+        let first = service
+            .process_source_posts(
+                "508",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("first process");
+        let second = service
+            .process_source_posts(
+                "508",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("second process");
+
+        assert_eq!(first.llm_calls, 1);
+        assert_eq!(second.llm_calls, 1, "空结果不入缓存，第二轮仍要请求模型");
+        assert_eq!(second.llm_cache_hits, 0);
+        assert_eq!(analyzer.call_count(), 2);
+        let settings = AppSettings::default();
+        let text_hash = text_digest(&text_analysis_context(&post));
+        let content_digest = content_digest_of(&text_hash, None, &post.images);
+        let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+        let cache_key = format!(
+            "{}:{content_digest}:fixture-model:{prompt_version}",
+            post.id
+        );
+        assert!(store
+            .load_post_analysis(&cache_key)
+            .await
+            .expect("cache lookup")
+            .is_none());
+    }
+
+    /// `ReasoningEffort::Auto` 表示不带该字段；显式指定时才随请求发送。
+    #[tokio::test]
+    async fn reasoning_effort_auto_omits_field() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("509", "卯"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            Vec::new(),
+            vec![schedule_event("杂谈", Some(now + Duration::days(1)), "卯")],
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let auto_post = dynamic_post("auto-post", "509", "卯", now, "明天20:00杂谈", Vec::new());
+        let default_settings = AppSettings::default();
+        assert_eq!(default_settings.llm_reasoning_effort, ReasoningEffort::Auto);
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "509",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&auto_post),
+                &default_settings,
+                Some(&pool),
+            )
+            .await
+            .expect("auto process");
+        let auto_call = analyzer.last_call();
+        assert_eq!(auto_call.reasoning_effort, ReasoningEffort::Auto);
+        assert!(auto_call.reasoning_effort.as_request_value().is_none());
+
+        // 换一个 post id，避开缓存，验证显式档位会被带上。
+        let high_post = dynamic_post("high-post", "509", "卯", now, "明天20:00杂谈", Vec::new());
+        let high_settings = AppSettings {
+            llm_reasoning_effort: ReasoningEffort::High,
+            ..Default::default()
+        };
+        service
+            .process_source_posts(
+                "509",
+                std::slice::from_ref(&streamer),
+                &[high_post],
+                &high_settings,
+                Some(&pool),
+            )
+            .await
+            .expect("high process");
+        let high_call = analyzer.last_call();
+        assert_eq!(high_call.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(high_call.reasoning_effort.as_request_value(), Some("high"));
+    }
+
+    /// 同一账号在同一时刻只跑一个请求，第二个租约必须排队。
+    #[tokio::test]
+    async fn same_account_never_runs_twice_concurrently() {
+        let pool = LlmPool::new(
+            4,
+            vec![fixture_account("only", "model-a")],
+            HashMap::from([("only".to_owned(), "key-a".to_owned())]),
+        );
+        let first = pool.acquire().await;
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(120), pool.acquire()).await;
+        assert!(blocked.is_err(), "同账号的第二个租约必须等第一个归还");
+        drop(first);
+        let after_release =
+            tokio::time::timeout(std::time::Duration::from_millis(500), pool.acquire()).await;
+        assert!(after_release.is_ok(), "归还后应立即拿到租约");
+    }
+
+    /// 不同账号可以同时持租约，并行度来自账号数。
+    #[tokio::test]
+    async fn different_accounts_run_in_parallel() {
+        let pool = LlmPool::new(
+            2,
+            vec![
+                fixture_account("a", "model-a"),
+                fixture_account("b", "model-b"),
+            ],
+            HashMap::from([
+                ("a".to_owned(), "key-a".to_owned()),
+                ("b".to_owned(), "key-b".to_owned()),
+            ]),
+        );
+        let first = pool.acquire().await;
+        let second = tokio::time::timeout(std::time::Duration::from_millis(500), pool.acquire())
+            .await
+            .expect("第二个账号无需等待");
+        assert_ne!(first.account.id, second.account.id);
+        assert_eq!(pool.effective_parallelism(), 2);
+    }
+
+    /// 有效并行度取 `min(并行个数, 账号数)`，没有账号时按 1 算。
+    #[tokio::test]
+    async fn parallelism_clamped_to_account_count() {
+        let accounts = vec![
+            fixture_account("a", "model-a"),
+            fixture_account("b", "model-b"),
+        ];
+        let keys = HashMap::from([
+            ("a".to_owned(), "key-a".to_owned()),
+            ("b".to_owned(), "key-b".to_owned()),
+        ]);
+        assert_eq!(
+            LlmPool::new(8, accounts.clone(), keys.clone()).effective_parallelism(),
+            2
+        );
+        assert_eq!(LlmPool::new(2, accounts, keys).effective_parallelism(), 2);
+        assert_eq!(
+            LlmPool::new(
+                8,
+                vec![fixture_account("a", "model-a")],
+                HashMap::from([("a".to_owned(), "key-a".to_owned())])
+            )
+            .effective_parallelism(),
+            1
+        );
+        assert_eq!(
+            LlmPool::new(5, Vec::new(), HashMap::new()).effective_parallelism(),
+            1
+        );
     }
 }
