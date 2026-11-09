@@ -9,8 +9,9 @@ use crate::jobs::{
     job_progress_message, RefreshJob, RefreshJobAccepted, RefreshJobManager, RefreshJobProgress,
 };
 use crate::secrets::{
-    bind_persisted_llm_secret_url, load_persisted_llm_secret, save_persisted_llm_secret,
-    SecretVault,
+    bind_persisted_llm_secret_url, llm_secret_status_for_account, load_persisted_llm_secret,
+    load_persisted_llm_secret_for_account, save_persisted_llm_secret_for_account,
+    validate_llm_account_id, SecretVault, DEFAULT_LLM_ACCOUNT_ID,
 };
 use crate::sync_api;
 use crate::update_manager::{ServerUpdateManager, ServerUpdateSettings, ServerUpdateView};
@@ -24,6 +25,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::SinkExt;
+use oshical_core::settings::ReasoningEffort;
 use oshical_core::{
     load_settings, AppError, AppService, AppSettings, LlmConfig, LlmDiscoveryConfig, NewSchedule,
     NewWeeklyScheduleRule, ProxyTestInput, SqliteStore, SyncMutation, UpdateSchedule,
@@ -559,19 +561,138 @@ async fn refresh_job_status(
     ok(job)
 }
 
-async fn test_llm(State(state): State<AppState>, Json(config): Json<LlmConfig>) -> ApiResult {
-    ok(state.service.test_llm(config).await?)
+/// `/api/llm/test` 的请求体。
+///
+/// 与 `LlmConfig` 的差别只在宽松度：账号相关字段都可缺省，
+/// 缺省时由服务端按 `accountId` 补齐，所以旧客户端发的 JSON 仍然照旧工作。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmProbeInput {
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    prompt_version: Option<String>,
+    /// 缺省即 `default` 账号。
+    #[serde(default)]
+    account_id: Option<String>,
+    /// `auto` / `low` / `medium` / `high`；`auto` 等价于不发该字段。
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
-async fn test_proxy(State(state): State<AppState>, Json(input): Json<ProxyTestInput>) -> ApiResult {
-    ok(state.service.test_proxy(input.proxy_port).await?)
+/// `/api/llm/models` 的请求体。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmModelsInput {
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    /// 与 `/api/llm/test` 保持同一份请求体形状。列表接口不发送思考程度，
+    /// 但传了非法值仍然报错，免得界面以为写错了字段却毫无反应。
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+/// 把 `reasoningEffort` 字符串翻译成枚举。
+///
+/// 空值 / 缺省视为 `Auto`；能解析就直接用；无法解析时明确报错，
+/// 免得界面写错一个值却被静默降级成默认行为。
+fn parse_reasoning_effort(raw: Option<&str>) -> Result<ReasoningEffort, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(ReasoningEffort::Auto);
+    };
+    ReasoningEffort::parse(raw).ok_or_else(|| {
+        ApiError::from(AppError::validation(
+            "思考程度必须是 auto、low、medium 或 high 之一",
+        ))
+    })
+}
+
+/// 解析一次 LLM 探测要用的密钥。
+///
+/// - 请求里带了非空 `apiKey` → 直接用它（与改造前一致，方便临时试别的 key）；
+/// - `default` 账号 → 返回空串，交给 `AppService` 用它掌握的运行时绑定关系补默钥；
+/// - 其它账号 → 读该账号自己的持久化密钥，没配就报错，绝不拿默认密钥顶替。
+async fn llm_probe_api_key(
+    state: &AppState,
+    account_id: Option<&str>,
+    provided: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(api_key) = provided.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(api_key.to_owned());
+    }
+    let account = validate_llm_account_id(account_id.unwrap_or(DEFAULT_LLM_ACCOUNT_ID))?;
+    if account == DEFAULT_LLM_ACCOUNT_ID {
+        return Ok(String::new());
+    }
+    let persisted =
+        load_persisted_llm_secret_for_account(state.service.store(), &state.secret_vault, &account)
+            .await?;
+    match persisted {
+        Some(persisted) => Ok(persisted.api_key),
+        None => Err(ApiError::from(AppError::validation(format!(
+            "账号 {account} 还没有保存 API Key"
+        )))),
+    }
+}
+
+async fn test_llm(State(state): State<AppState>, Json(input): Json<LlmProbeInput>) -> ApiResult {
+    let api_key = llm_probe_api_key(
+        &state,
+        input.account_id.as_deref(),
+        input.api_key.as_deref(),
+    )
+    .await?;
+    let prompt_version = match input
+        .prompt_version
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            load_settings(state.service.store())
+                .await?
+                .llm_prompt_version
+        }
+    };
+    let config = LlmConfig {
+        base_url: input.base_url,
+        api_key,
+        model: input.model,
+        prompt_version,
+        reasoning_effort: parse_reasoning_effort(input.reasoning_effort.as_deref())?,
+    };
+    ok(state.service.test_llm(config).await?)
 }
 
 async fn list_llm_models(
     State(state): State<AppState>,
-    Json(config): Json<LlmDiscoveryConfig>,
+    Json(input): Json<LlmModelsInput>,
 ) -> ApiResult {
+    // 只做校验：列表请求本身不带思考程度，传了就照同一套规则判合法。
+    parse_reasoning_effort(input.reasoning_effort.as_deref())?;
+    let api_key = llm_probe_api_key(
+        &state,
+        input.account_id.as_deref(),
+        input.api_key.as_deref(),
+    )
+    .await?;
+    let config = LlmDiscoveryConfig {
+        base_url: input.base_url,
+        api_key,
+    };
     ok(state.service.list_llm_models(config).await?)
+}
+
+async fn test_proxy(State(state): State<AppState>, Json(input): Json<ProxyTestInput>) -> ApiResult {
+    ok(state.service.test_proxy(input.proxy_port).await?)
 }
 
 async fn list_live_status(State(state): State<AppState>) -> ApiResult {
@@ -753,6 +874,10 @@ fn changed_setting_values(
     changed!("llm_base_url", llm_base_url);
     changed!("llm_model", llm_model);
     changed!("llm_prompt_version", llm_prompt_version);
+    // 下面三项由 docs/38 引入：不加进来 PUT /api/settings 就会静默丢弃它们。
+    changed!("llm_reasoning_effort", llm_reasoning_effort);
+    changed!("llm_parallelism", llm_parallelism);
+    changed!("llm_accounts", llm_accounts);
     changed!("proxy_port", proxy_port);
     Ok(values)
 }
@@ -896,15 +1021,28 @@ fn emit_server_update(state: &AppState, update: &ServerUpdateView) {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct LlmSecretQuery {
+    /// 缺省即 `default` 账号。
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LlmSecretInput {
     api_key: String,
     #[serde(default)]
     base_url: Option<String>,
+    /// 缺省即 `default` 账号。
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LlmSecretResponse {
+    /// 归一化后的账号 id，方便客户端确认自己写到哪个槽位。
+    account_id: String,
     configured: bool,
     revision: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -913,24 +1051,29 @@ struct LlmSecretResponse {
     bound_base_url: Option<String>,
 }
 
-async fn get_llm_secret(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let response = if let Some(persisted) =
-        load_persisted_llm_secret(state.service.store(), &state.secret_vault).await?
-    {
-        ok(LlmSecretResponse {
-            configured: true,
-            revision: persisted.revision,
-            api_key: None,
-            bound_base_url: persisted.bound_base_url,
-        })?
-    } else {
-        ok(LlmSecretResponse {
-            configured: state.service.llm_api_key().await.is_some(),
-            revision: 0,
-            api_key: None,
-            bound_base_url: None,
-        })?
-    };
+async fn get_llm_secret(
+    State(state): State<AppState>,
+    Query(query): Query<LlmSecretQuery>,
+) -> Result<Response, ApiError> {
+    let account = validate_llm_account_id(
+        query
+            .account_id
+            .as_deref()
+            .unwrap_or(DEFAULT_LLM_ACCOUNT_ID),
+    )?;
+    let status =
+        llm_secret_status_for_account(state.service.store(), &state.secret_vault, &account).await?;
+    // `default` 账号历史上可能只有环境变量注入的密钥，没有持久化记录；
+    // 这里保持改造前的语义：运行时有没有 key 也要算进 configured。
+    let configured = status.configured
+        || (account == DEFAULT_LLM_ACCOUNT_ID && state.service.llm_api_key().await.is_some());
+    let response = ok(LlmSecretResponse {
+        account_id: account,
+        configured,
+        revision: status.revision,
+        api_key: None,
+        bound_base_url: status.bound_base_url,
+    })?;
     Ok((
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -945,6 +1088,12 @@ async fn put_llm_secret(
     State(state): State<AppState>,
     Json(input): Json<LlmSecretInput>,
 ) -> ApiResult {
+    let account = validate_llm_account_id(
+        input
+            .account_id
+            .as_deref()
+            .unwrap_or(DEFAULT_LLM_ACCOUNT_ID),
+    )?;
     let api_key = input.api_key.trim();
     if api_key.is_empty() || api_key.chars().count() > 4096 {
         return Err(ApiError::from(AppError::validation(
@@ -969,32 +1118,46 @@ async fn put_llm_secret(
         None => None,
     };
     let _guard = SERVER_SETTINGS_WRITE_LOCK.lock().await;
-    let persisted = save_persisted_llm_secret(
+    let persisted = save_persisted_llm_secret_for_account(
         state.service.store(),
         &state.secret_vault,
+        &account,
         api_key,
         bound_base_url.as_deref(),
     )
     .await?;
-    state
-        .service
-        .update_bound_llm_api_key(api_key.to_owned(), persisted.bound_base_url.clone())
-        .await?;
+    if account == DEFAULT_LLM_ACCOUNT_ID {
+        // 只有默认账号进运行时单密钥槽：分析循环、探测与 URL 绑定都读它。
+        state
+            .service
+            .update_bound_llm_api_key(api_key.to_owned(), persisted.bound_base_url.clone())
+            .await?;
+    }
     // Re-emit the same revision when the value is unchanged. This makes a
     // retry repair a previous failure after the secret row was persisted but
     // its sync notification was not.
+    let entity_id = if account == DEFAULT_LLM_ACCOUNT_ID {
+        "llm_api_key".to_owned()
+    } else {
+        format!("llm_api_key:{account}")
+    };
     state
         .service
         .store()
         .append_sync_change(
             "server_secret",
-            "llm_api_key",
+            &entity_id,
             "upsert",
             persisted.revision,
-            Some(json!({"id": "llm_api_key", "configured": true})),
+            Some(json!({
+                "id": entity_id.clone(),
+                "accountId": persisted.account_id.clone(),
+                "configured": true
+            })),
         )
         .await?;
     ok(LlmSecretResponse {
+        account_id: persisted.account_id,
         configured: true,
         revision: persisted.revision,
         api_key: None,

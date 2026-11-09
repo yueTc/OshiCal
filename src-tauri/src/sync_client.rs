@@ -1800,6 +1800,9 @@ async fn apply_server_settings(
         ("llmBaseUrl", "llm_base_url"),
         ("llmModel", "llm_model"),
         ("llmPromptVersion", "llm_prompt_version"),
+        ("llmReasoningEffort", "llm_reasoning_effort"),
+        ("llmParallelism", "llm_parallelism"),
+        ("llmAccounts", "llm_accounts"),
         ("proxyPort", "proxy_port"),
     ] {
         let Some(value) = object.get(json_key) else {

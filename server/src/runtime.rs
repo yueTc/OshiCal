@@ -13,7 +13,9 @@ use tokio::sync::broadcast;
 use crate::api::{build_router, persist_changed_settings, AppState};
 use crate::config::ServerConfig;
 use crate::jobs::RefreshJobManager;
-use crate::secrets::{load_persisted_bili_secret, load_persisted_llm_secret, SecretVault};
+use crate::secrets::{
+    load_persisted_bili_secret, load_persisted_llm_secret, seed_llm_secrets_from_env, SecretVault,
+};
 use crate::sync_api;
 use crate::update_manager::ServerUpdateManager;
 
@@ -40,6 +42,20 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     if let Some(value) = config.proxy_port {
         settings.proxy_port = Some(value);
     }
+    settings.llm_reasoning_effort =
+        config.effective_llm_reasoning_effort(settings.llm_reasoning_effort);
+    settings.llm_parallelism = config.effective_llm_parallelism(settings.llm_parallelism);
+    for env_account in &config.llm_accounts {
+        let account = env_account.account.clone();
+        match settings
+            .llm_accounts
+            .iter_mut()
+            .find(|existing| existing.id == account.id)
+        {
+            Some(existing) => *existing = account,
+            None => settings.llm_accounts.push(account),
+        }
+    }
     persist_changed_settings(&store, &persisted_settings, &settings)
         .await
         .map_err(|error| format!("保存服务端设置失败: {error}"))?;
@@ -61,6 +77,13 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         .map_err(|error| format!("读取服务端 B 站登录失败: {error}"))?
     {
         runtime_secrets.bili_cookie = Some(persisted.cookie);
+    }
+    match seed_llm_secrets_from_env(&store, &secret_vault, &config.env_llm_account_keys()).await {
+        Ok(seeded) if !seeded.is_empty() => {
+            tracing::info!(accounts = %seeded.join(","), "已从环境变量写入模型账号密钥");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "写入环境变量模型账号密钥失败"),
     }
     let service = AppService::new_with_proxy(store, runtime_secrets, settings.proxy_port)
         .map_err(|error| format!("初始化服务失败: {error}"))?;
