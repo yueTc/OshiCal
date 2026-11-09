@@ -6918,7 +6918,7 @@ mod tests {
             .process_source_posts(
                 "508",
                 std::slice::from_ref(&streamer),
-                &[post],
+                std::slice::from_ref(&post),
                 &AppSettings::default(),
                 Some(&pool),
             )
