@@ -45,6 +45,11 @@ const IMAGE_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
 const _: () = assert!(IMAGE_MIN_SHORT_SIDE < IMAGE_MIN_SIDE);
 const RESIZED_JPEG_QUALITY: u8 = 90;
+/// 一次请求里所有图片加起来的 base64 预算。九宫格动态按 7 MiB/张压出来能到 40 MB，
+/// 网关会直接 413 或者拖到超时；压到这个量级后同一批图能稳定在十几秒内返回。
+const MODEL_REQUEST_IMAGE_BUDGET_BYTES: usize = 3 * 1024 * 1024;
+/// 每张图至少留这么大的空间，避免图片特别多时压得看不清。
+const MODEL_MIN_IMAGE_BYTES: usize = 160 * 1024;
 const RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const LLM_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const LLM_HOST_ALLOWLIST_ENV: &str = "OSHICAL_LLM_ALLOWED_HOSTS";
@@ -783,11 +788,21 @@ impl LlmClient {
             return Err(AppError::validation("动态既没有文字也没有图片"));
         }
         let now = Utc::now();
+        // 图片越多，单张能分到的字节越少；总共不超过 MODEL_REQUEST_IMAGE_BUDGET_BYTES。
+        let image_budget = if input.image_urls.is_empty() {
+            IMAGE_UPLOAD_JPEG_BYTES
+        } else {
+            (MODEL_REQUEST_IMAGE_BUDGET_BYTES / input.image_urls.len())
+                .clamp(MODEL_MIN_IMAGE_BYTES, IMAGE_UPLOAD_JPEG_BYTES)
+        };
         let mut image_data_urls = Vec::with_capacity(input.image_urls.len());
         for image_url in &input.image_urls {
             // 单张图下载失败或被跳过不拖垮整条动态：剩下的图和正文仍走这一次调用；
             // 失败与空结果都不补发第二次请求。
-            match self.load_image_payload(image_url).await {
+            match self
+                .load_image_payload_with_budget(image_url, image_budget)
+                .await
+            {
                 Ok(Some(data_url)) => image_data_urls.push(data_url),
                 Ok(None) => {
                     tracing::debug!(
@@ -827,6 +842,15 @@ impl LlmClient {
 
     /// `Ok(None)` 表示跳过这张图（地址不可信、下载失败或动图），不算错误。
     pub async fn load_image_payload(&self, image_url: &str) -> AppResult<Option<DataUrl>> {
+        self.load_image_payload_with_budget(image_url, IMAGE_UPLOAD_JPEG_BYTES)
+            .await
+    }
+
+    async fn load_image_payload_with_budget(
+        &self,
+        image_url: &str,
+        byte_limit: usize,
+    ) -> AppResult<Option<DataUrl>> {
         let Some(image_url) = normalize_image_url(image_url) else {
             tracing::warn!(image_url, "skip image with unsupported url");
             return Ok(None);
@@ -834,11 +858,20 @@ impl LlmClient {
         let Some((_content_type, bytes)) = self.download_image(&image_url).await? else {
             return Ok(None);
         };
-        Ok(Some(Self::encode_image_data_url(&bytes).await?))
+        Ok(Some(
+            Self::encode_image_data_url_with_budget(&bytes, byte_limit).await?,
+        ))
     }
 
     /// 原始图片字节 → 压缩后的 JPEG data URL；超过模型请求上限时报错由调用方跳过。
     async fn encode_image_data_url(bytes: &[u8]) -> AppResult<DataUrl> {
+        Self::encode_image_data_url_with_budget(bytes, IMAGE_UPLOAD_JPEG_BYTES).await
+    }
+
+    async fn encode_image_data_url_with_budget(
+        bytes: &[u8],
+        byte_limit: usize,
+    ) -> AppResult<DataUrl> {
         if bytes.is_empty() {
             return Err(AppError::validation("图片内容为空"));
         }
@@ -846,10 +879,12 @@ impl LlmClient {
             return Err(AppError::validation("源图片超过 32 MiB 限制"));
         }
         let source_bytes = bytes.to_vec();
-        let upload_bytes =
-            tokio::task::spawn_blocking(move || prepare_image_for_llm(&source_bytes))
-                .await
-                .map_err(|error| AppError::validation(format!("图片处理任务失败: {error}")))??;
+        let max_side = max_side_for_budget(byte_limit);
+        let upload_bytes = tokio::task::spawn_blocking(move || {
+            prepare_image_for_llm_with_limits(&source_bytes, byte_limit, max_side)
+        })
+        .await
+        .map_err(|error| AppError::validation(format!("图片处理任务失败: {error}")))??;
         let data_url = format!(
             "data:image/jpeg;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(&upload_bytes)
@@ -934,7 +969,11 @@ impl LlmClient {
                 .await;
             match sent {
                 Ok(response) => break response,
-                Err(error) if attempts < LLM_SEND_ATTEMPTS && !error.is_builder() => {
+                Err(error)
+                    if attempts < LLM_SEND_ATTEMPTS
+                        && !error.is_builder()
+                        && !error.is_timeout() =>
+                {
                     tracing::warn!(
                         %error,
                         attempt = attempts,
@@ -1107,6 +1146,18 @@ fn is_skippable_image(content_type: &str, bytes: &[u8]) -> bool {
         || bytes.starts_with(b"GIF89a")
 }
 
+/// 单张预算越紧，长边收得越小；这样九宫格也能一次发完，而不是发到网关 413。
+fn max_side_for_budget(byte_limit: usize) -> u32 {
+    if byte_limit <= 192 * 1024 {
+        768
+    } else if byte_limit <= 512 * 1024 {
+        1024
+    } else {
+        IMAGE_MAX_SIDE
+    }
+}
+
+#[cfg(test)]
 fn prepare_image_for_llm(bytes: &[u8]) -> AppResult<Vec<u8>> {
     prepare_image_for_llm_with_limits(bytes, IMAGE_UPLOAD_JPEG_BYTES, IMAGE_MAX_SIDE)
 }
@@ -2002,6 +2053,43 @@ mod regression_tests {
                 "{value}"
             );
         }
+    }
+
+    /// 九宫格动态以前按 7 MiB/张压出来，一次请求 40 MB，网关直接 413；
+    /// 现在按图片数量分摊预算，压缩后的总字节必须留在请求预算之内。
+    #[test]
+    fn many_images_are_compressed_into_the_request_budget() {
+        let side = 1600u32;
+        let mut raw = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(side, side, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        }))
+        .write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+        .expect("encode fixture png");
+        let image_count = 9usize;
+        let budget = (MODEL_REQUEST_IMAGE_BUDGET_BYTES / image_count)
+            .clamp(MODEL_MIN_IMAGE_BYTES, IMAGE_UPLOAD_JPEG_BYTES);
+        let mut total = 0usize;
+        for _ in 0..image_count {
+            let encoded =
+                prepare_image_for_llm_with_limits(&raw, budget, max_side_for_budget(budget))
+                    .expect("compress fixture");
+            assert!(encoded.len() <= budget, "{} > {budget}", encoded.len());
+            total += encoded.len();
+        }
+        // base64 会放大 4/3，留出余量后仍必须远小于网关拒绝的量级。
+        let base64_total = total / 3 * 4;
+        assert!(
+            base64_total <= MODEL_REQUEST_IMAGE_BUDGET_BYTES * 3 / 2,
+            "base64 total {base64_total} exceeds budget"
+        );
+    }
+
+    #[test]
+    fn tighter_budgets_use_smaller_long_edges() {
+        assert_eq!(max_side_for_budget(160 * 1024), 768);
+        assert_eq!(max_side_for_budget(512 * 1024), 1024);
+        assert_eq!(max_side_for_budget(IMAGE_UPLOAD_JPEG_BYTES), IMAGE_MAX_SIDE);
     }
 
     #[tokio::test]
