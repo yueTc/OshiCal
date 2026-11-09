@@ -6300,6 +6300,17 @@ mod tests {
             }],
             text_events: vec![event],
         });
+        let post = DynamicPost {
+            id: "dedupe-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "明天晚上电台杂谈，八点见".to_owned(),
+            images: vec!["https://i0.hdslb.com/bfs/new_dyn/dedupe.jpg".to_owned()],
+            source_url: "https://t.bilibili.com/dedupe-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
@@ -6525,12 +6536,20 @@ mod tests {
         // 同一时间槽、同一批人，标题措辞不同也算同一场。
         assert!(llm_events_equivalent(
             &make("电台杂谈", base, vec!["明前奶绿".to_owned()]),
-            &make("电台", base + Duration::minutes(2), vec!["明前奶绿".to_owned()]),
+            &make(
+                "电台",
+                base + Duration::minutes(2),
+                vec!["明前奶绿".to_owned()]
+            ),
         ));
         // 时间槽差太多就是两场。
         assert!(!llm_events_equivalent(
             &make("电台", base, vec!["明前奶绿".to_owned()]),
-            &make("电台", base + Duration::hours(2), vec!["明前奶绿".to_owned()]),
+            &make(
+                "电台",
+                base + Duration::hours(2),
+                vec!["明前奶绿".to_owned()]
+            ),
         ));
         // 人对不上就不是同一场。
         assert!(!llm_events_equivalent(
