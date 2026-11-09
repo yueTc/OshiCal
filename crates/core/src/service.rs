@@ -36,6 +36,9 @@ const TITLE_REUSE_SLOT_TOLERANCE_MINUTES: i64 = 30;
 /// 超过这个差值就当成两场不同的日程：预约只管卡片那一场，
 /// 正文里另写的时间点（例如预约 06:00 的比赛、正文另说“今晚20:00来杂谈”）仍要入库。
 const RESERVE_DUPLICATE_TOLERANCE_MINUTES: i64 = 10;
+/// 同一条动态的文字通道与图片通道撞车时的容差：低于预约卡的 10 分钟，
+/// 因为两条通道读的是同一份材料，不该出现“预约卡 06:00、正文另说 20:00”那种偏差。
+const GROUP_DUPLICATE_TOLERANCE_MINUTES: i64 = 5;
 const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 /// 「立即刷新」最多等待的秒数：超过就回落到缓存，避免界面长时间停在「读取中」。
 const FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS: u64 = 15;
@@ -1453,10 +1456,11 @@ impl AppService {
             self.apply_deterministic_reservation_time_change(source_mid, targets, post)
                 .await?;
 
-            let has_combined_images = post.reserve.is_none()
-                && llm_config.is_some()
-                && settings.auto_analyze_images
-                && !post.images.is_empty();
+            // 图片通道与文字通道是并集关系，不再互斥：图片模型只看图，
+            // 遇到封面/表情包这类图会返回空事件，若此时把正文一路跳过，
+            // 写在文字里的时间点（“八点见”）就彻底丢了。
+            // 图片通道照常跑，文字通道也照常跑，两路结果按时间槽合并。
+            let mut text_events_seen: Vec<LlmEvent> = Vec::new();
             // 预约卡片同样交给文字模型：卡片标题与描述拼在正文后面一起送，
             // 由模型给出最终时间与标题。卡片正则只在模型不可用、调用失败、
             // 返回空事件，或没覆盖到卡片那一场时兜底。
@@ -1470,9 +1474,10 @@ impl AppService {
                     reserve_context(post)
                 );
                 let text = context.trim();
-                if !has_combined_images && !text.is_empty() {
+                if !text.is_empty() {
                     let text_digest = text_digest(text);
-                    let prompt_version = format!("{}-text-v11", config.prompt_version);
+                    // v12：带图动态重新走文字通道，旧版本的空结果一并失效。
+                    let prompt_version = format!("{}-text-v12", config.prompt_version);
                     let cache_key =
                         analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
                     let mut analysis_succeeded = false;
@@ -1540,6 +1545,9 @@ impl AppService {
                     }
                     for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                         let event = canonicalize_event_participants(event, targets);
+                        // 记下文本通道已经覆盖的场次，图片通道随后按它去重：
+                        // 同一条动态的文字与图片经常描述同一场直播。
+                        text_events_seen.push(event.clone());
                         // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
                         // 后面不再补正则兜底。模型给的取消同样采信。
                         if let Some(reserve_start) = reserve_start {
@@ -1639,8 +1647,10 @@ impl AppService {
             if let Some(config) = llm_config.filter(|_| post.reserve.is_none()) {
                 if settings.auto_analyze_images && !post.images.is_empty() {
                     let context_digest = text_digest(post.text.trim());
+                    // v6：图片提示词改成“图文都可能为主来源”，旧版本里
+                    // 大量 result_json='[]' 的记录随之失效，重新分析。
                     let image_prompt_version = format!(
-                        "{}-image-context-v5-{}",
+                        "{}-image-context-v6-{}",
                         config.prompt_version,
                         &context_digest[..12]
                     );
@@ -1656,8 +1666,13 @@ impl AppService {
                             total_steps,
                             false,
                         );
-                        let analysis = if let Some(cached) =
-                            analysis_cache.get(&image_cache_key).cloned()
+                        // 空结果的缓存不进命中路径：图片模型对封面/表情包
+                        // 经常返回 []，把它当“已分析”会让这条动态永远拿不到结论。
+                        // 只有已有非空事件时才走内存缓存。
+                        let analysis = if let Some(cached) = analysis_cache
+                            .get(&image_cache_key)
+                            .filter(|cached| !cached.events.is_empty())
+                            .cloned()
                         {
                             stats.llm_cache_hits += 1;
                             Some(cached)
@@ -1673,6 +1688,16 @@ impl AppService {
                         {
                             match self.store.get_image_analysis(&cache_key).await? {
                                 Some(raw) => match events_from_raw(&raw, now) {
+                                    Ok(events) if events.is_empty() => {
+                                        // 旧记录里存的是空数组：当作没分析过，
+                                        // 让下面的真实调用重跑一次。
+                                        tracing::debug!(
+                                            post_id = %post.id,
+                                            %image_url,
+                                            "cached image analysis is empty, retry"
+                                        );
+                                        None
+                                    }
                                     Ok(events) => {
                                         stats.llm_cache_hits += 1;
                                         let _ = raw;
@@ -1788,6 +1813,14 @@ impl AppService {
                         analysis_cache.insert(image_cache_key, analysis);
                         for (event_index, event) in events.iter().enumerate() {
                             let event = canonicalize_event_participants(event, targets);
+                            // 文字通道已经给出同一场时跳过图片那条：
+                            // 两路都成功时不该把一场直播写两遍。
+                            if text_events_seen
+                                .iter()
+                                .any(|seen| llm_events_equivalent(seen, &event))
+                            {
+                                continue;
+                            }
                             if let Some(target) =
                                 match_event_target_for_post(&event, targets, &post.author_mid)
                             {
@@ -2880,6 +2913,43 @@ impl ResolvedRoom {
             owner_name: Some(target.name),
         }
     }
+}
+
+/// 同一条动态里，文字通道与图片通道给出的两个事件是否指向同一场直播。
+/// 只看时间槽与参与者：标题由两条通道各自描述，措辞不同不代表是两场。
+fn llm_events_equivalent(left: &LlmEvent, right: &LlmEvent) -> bool {
+    if left.action != right.action {
+        return false;
+    }
+    match (left.start_at, right.start_at) {
+        (Some(left_start), Some(right_start)) => {
+            if !same_schedule_slot(left_start, right_start, GROUP_DUPLICATE_TOLERANCE_MINUTES) {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    let left_names: Vec<String> = left
+        .participant_names()
+        .iter()
+        .map(|name| normalize_alias(name))
+        .collect();
+    let right_names: Vec<String> = right
+        .participant_names()
+        .iter()
+        .map(|name| normalize_alias(name))
+        .collect();
+    if left_names == right_names {
+        return true;
+    }
+    let shared = left_names
+        .iter()
+        .filter(|name| right_names.iter().any(|other| other == *name))
+        .count();
+    let min_participants = left_names.len().min(right_names.len());
+    // 一场单人直播时 min_participants 为 1，要求同一个人重合才算同一场。
+    shared >= 1 && shared * 2 >= min_participants
 }
 
 fn group_schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
@@ -4826,8 +4896,9 @@ mod tests {
             .await
             .expect("process");
         assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(stats.llm_calls, 1);
+        // 带图动态现在也会跑一次文字通道；这条动态的正文没有时间点，文字通道返回空。
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.llm_calls, 2);
         assert_eq!(stats.new_schedules, 2);
         let schedules = store
             .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
@@ -6096,5 +6167,382 @@ mod tests {
         assert!(updated
             .iter()
             .all(|schedule| schedule.title == "新的固定主题"));
+    }
+
+    /// 回归：明前奶绿动态 1268658714237206552（“八点来啵一下电台噢…八点见”）
+    /// 同时带一张表情包。图片模型对这类图返回空数组，旧逻辑把带图动态
+    /// 整条短路出文字通道，正文里的时间点因此丢失。
+    #[tokio::test]
+    async fn image_dynamic_still_runs_the_text_channel() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("2132180406", "明前奶绿"))
+            .await
+            .expect("streamer");
+        let china = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let now = Utc::now();
+        let start_at = (now.with_timezone(&china).date_naive() + Duration::days(1))
+            .and_hms_opt(20, 0, 0)
+            .expect("eight pm")
+            .and_local_timezone(china)
+            .single()
+            .expect("local eight pm")
+            .with_timezone(&Utc);
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            // 图片模型照旧什么都不给，模型只从正文里读出“八点”。
+            events: Vec::new(),
+            text_events: vec![LlmEvent {
+                action: LlmEventAction::Schedule,
+                performer: "明前奶绿".to_owned(),
+                aliases: Vec::new(),
+                participants: vec!["明前奶绿".to_owned()],
+                room_url: None,
+                room_owner: None,
+                room_owner_mid: None,
+                title: "电台".to_owned(),
+                start_at: Some(start_at),
+                end_at: None,
+                confidence: 0.92,
+            }],
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = DynamicPost {
+            id: "1268658714237206552".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "八点来啵一下电台噢  ᖰ⌯'▾'⌯ᖳ\n八点见八点见[怪怪小黄豆_祈祷]".to_owned(),
+            images: vec![
+                "https://i0.hdslb.com/bfs/new_dyn/a3e6bab19c88da4d855ab7ff6ea7fa182132180406.jpg"
+                    .to_owned(),
+            ],
+            source_url: "https://t.bilibili.com/1268658714237206552".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "2132180406",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        // 图片通道和文字通道都要跑。
+        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stats.analysis_outcomes.get("text:1268658714237206552"),
+            Some(&None)
+        );
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].source_kind, "text");
+        assert_eq!(schedules[0].start_at, start_at);
+        assert!(schedules[0].title.contains("电台"), "{schedules:?}");
+    }
+
+    /// 同一条动态里文字和图片都识别出同一场时只落一条。
+    #[tokio::test]
+    async fn image_event_duplicating_the_text_event_is_dropped() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("2132180406", "明前奶绿"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let start_at = now + Duration::days(1);
+        let event = LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: "明前奶绿".to_owned(),
+            aliases: Vec::new(),
+            participants: vec!["明前奶绿".to_owned()],
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: "电台杂谈".to_owned(),
+            start_at: Some(start_at),
+            end_at: None,
+            confidence: 0.95,
+        };
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            // 图片通道在同一个时间槽给出同一场，只是标题措辞不同。
+            events: vec![LlmEvent {
+                action: LlmEventAction::Schedule,
+                performer: "明前奶绿".to_owned(),
+                aliases: Vec::new(),
+                participants: vec!["明前奶绿".to_owned()],
+                room_url: None,
+                room_owner: None,
+                room_owner_mid: None,
+                title: "电台".to_owned(),
+                start_at: Some(start_at),
+                end_at: None,
+                confidence: 0.9,
+            }],
+            text_events: vec![event],
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "2132180406",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        // 文字通道先跑，落库的是它给出的标题。
+        assert_eq!(schedules[0].title, "电台杂谈");
+    }
+
+    /// 图片通道返回的历史空结果不再当“已分析”，会重跑一次。
+    #[tokio::test]
+    async fn empty_cached_image_analysis_is_retried() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("2132180406", "明前奶绿"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let image_url = "https://i0.hdslb.com/bfs/new_dyn/cached.jpg".to_owned();
+        let post = DynamicPost {
+            id: "cached-empty-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "八点见".to_owned(),
+            images: vec![image_url.clone()],
+            source_url: "https://t.bilibili.com/cached-empty-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let image_prompt_version = format!(
+            "{}-image-context-v6-{}",
+            config.prompt_version,
+            &text_digest(post.text.trim())[..12]
+        );
+        let cache_key = analysis_cache_key(
+            &post.id,
+            "mock-digest",
+            &config.model,
+            &image_prompt_version,
+        );
+        store
+            .save_image_analysis(
+                &cache_key,
+                &post.id,
+                &image_url,
+                &config.model,
+                &image_prompt_version,
+                &serde_json::json!([]),
+            )
+            .await
+            .expect("save empty analysis");
+        store
+            .save_image_analysis_cache_key(
+                &post.id,
+                &image_url,
+                &config.model,
+                &image_prompt_version,
+                &cache_key,
+            )
+            .await
+            .expect("save cache key");
+
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "2132180406",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        // 旧记录是空数组：不算缓存命中，真跑一次模型。
+        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.llm_cache_hits, 0);
+    }
+
+    /// 动图这类不支持的图片按“跳过”处理，不等于分析失败。
+    #[tokio::test]
+    async fn unsupported_image_skip_is_not_an_error() {
+        struct SkipAllImages {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ContentAnalyzer for SkipAllImages {
+            async fn analyze_image_url(
+                &self,
+                _config: &LlmConfig,
+                _image_url: &str,
+                _context_text: &str,
+                _published_at: DateTime<Utc>,
+                _now: DateTime<Utc>,
+            ) -> AppResult<Option<LlmAnalysis>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+
+            async fn analyze_text(
+                &self,
+                _config: &LlmConfig,
+                _text: &str,
+                _published_at: DateTime<Utc>,
+                _now: DateTime<Utc>,
+            ) -> AppResult<LlmAnalysis> {
+                Ok(LlmAnalysis {
+                    events: Vec::new(),
+                    raw: serde_json::json!([]),
+                    source_digest: "mock-text-digest".to_owned(),
+                })
+            }
+        }
+
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("2132180406", "明前奶绿"))
+            .await
+            .expect("streamer");
+        let analyzer = Arc::new(SkipAllImages {
+            calls: AtomicUsize::new(0),
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = DynamicPost {
+            id: "gif-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: Utc::now(),
+            text: String::new(),
+            images: vec!["https://i0.hdslb.com/bfs/new_dyn/skip.gif".to_owned()],
+            source_url: "https://t.bilibili.com/gif-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "2132180406",
+                std::slice::from_ref(&streamer),
+                &[post],
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert!(stats.analysis_errors.is_empty(), "{stats:?}");
+        assert_eq!(
+            stats
+                .analysis_outcomes
+                .get("image:gif-post:https://i0.hdslb.com/bfs/new_dyn/skip.gif"),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn llm_events_equivalent_matches_slot_and_participants() {
+        let base = Utc::now() + Duration::days(2);
+        let make = |title: &str, start_at: DateTime<Utc>, participants: Vec<String>| LlmEvent {
+            action: LlmEventAction::Schedule,
+            performer: participants.first().cloned().unwrap_or_default(),
+            aliases: Vec::new(),
+            participants,
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: title.to_owned(),
+            start_at: Some(start_at),
+            end_at: None,
+            confidence: 0.9,
+        };
+
+        // 同一时间槽、同一批人，标题措辞不同也算同一场。
+        assert!(llm_events_equivalent(
+            &make("电台杂谈", base, vec!["明前奶绿".to_owned()]),
+            &make("电台", base + Duration::minutes(2), vec!["明前奶绿".to_owned()]),
+        ));
+        // 时间槽差太多就是两场。
+        assert!(!llm_events_equivalent(
+            &make("电台", base, vec!["明前奶绿".to_owned()]),
+            &make("电台", base + Duration::hours(2), vec!["明前奶绿".to_owned()]),
+        ));
+        // 人对不上就不是同一场。
+        assert!(!llm_events_equivalent(
+            &make("电台", base, vec!["明前奶绿".to_owned()]),
+            &make("电台", base, vec!["呜米".to_owned()]),
+        ));
+        // 取消和新增永远不是同一件事。
+        let mut cancel = make("电台", base, vec!["明前奶绿".to_owned()]);
+        cancel.action = LlmEventAction::Cancel;
+        assert!(!llm_events_equivalent(
+            &make("电台", base, vec!["明前奶绿".to_owned()]),
+            &cancel,
+        ));
     }
 }
