@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-desktop"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "chrono",
  "futures-util",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-server"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "aes-gcm",
  "axum",

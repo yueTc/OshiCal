@@ -177,10 +177,6 @@ impl AppService {
         test_google(proxy_port).await
     }
 
-    async fn acquire_refresh_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.refresh_lock.lock().await
-    }
-
     async fn live_check_lock(&self, streamer_id: i64) -> Arc<Mutex<()>> {
         self.live_check_locks
             .lock()
@@ -1062,7 +1058,8 @@ impl AppService {
     {
         // A manual refresh may arrive while the periodic monitor is running.
         // Queue it instead of failing and discarding the caller's progress UI.
-        let _guard = self.acquire_refresh_lock().await;
+        let target = ProgressTarget::all();
+        let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
         self.repair_reserve_room_urls().await;
         let settings = load_settings(&self.store).await?;
         let llm_pool = self.llm_pool(&settings).await;
@@ -1070,7 +1067,6 @@ impl AppService {
         self.backfill_avatar_captures(&streamers).await;
         let sources = sources_for_streamers(&streamers);
         // 全量刷新没有“当前主播”，用合成条目播报整体进度。
-        let target = ProgressTarget::all();
         self.refresh_sources(
             &sources,
             &settings,
@@ -1079,6 +1075,37 @@ impl AppService {
             &on_progress,
         )
         .await
+    }
+
+    /// 拿刷新锁。锁被后台轮询占着的时候（一次全量刷新可能十几分钟），
+    /// 手工触发的刷新会一直排队；这里把等待状态播报出去，界面就不会
+    /// 停在「准备全量刷新 0%」看起来像卡死。
+    async fn wait_for_refresh_lock<'a>(
+        &'a self,
+        target: &ProgressTarget,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+    ) -> tokio::sync::MutexGuard<'a, ()> {
+        let started = std::time::Instant::now();
+        let mut waited_seconds = 0u64;
+        loop {
+            match self.refresh_lock.try_lock() {
+                Ok(guard) => return guard,
+                Err(_) => {
+                    emit_progress(
+                        target,
+                        &format!("等待上一轮刷新结束（已等待 {waited_seconds} 秒）"),
+                        0,
+                        1,
+                        1,
+                        false,
+                        false,
+                        on_progress,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    waited_seconds = started.elapsed().as_secs();
+                }
+            }
+        }
     }
 
     /// 历史数据里预约卡 `rid` 被当成房间号，地址会指向别人的直播间。
@@ -1108,11 +1135,11 @@ impl AppService {
     {
         // Keep one refresh in flight, but let a requested refresh wait for the
         // current background run instead of returning an immediate validation error.
-        let _guard = self.acquire_refresh_lock().await;
         let streamer = self.store.get_streamer(streamer_id).await?;
+        let target = ProgressTarget::for_streamer(&streamer);
+        let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
         self.backfill_avatar_captures(std::slice::from_ref(&streamer))
             .await;
-        let target = ProgressTarget::for_streamer(&streamer);
         emit_progress(
             &target,
             "准备抓取主播与官号动态",
@@ -3666,12 +3693,12 @@ mod tests {
         let service = Arc::new(
             AppService::with_analyzer(store, RuntimeSecrets::default(), analyzer).expect("service"),
         );
-        let first = service.acquire_refresh_lock().await;
+        let first = service.refresh_lock.lock().await;
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let queued_service = service.clone();
         let queued_acquired = acquired.clone();
         let queued = tokio::spawn(async move {
-            let _second = queued_service.acquire_refresh_lock().await;
+            let _second = queued_service.refresh_lock.lock().await;
             queued_acquired.store(true, Ordering::SeqCst);
         });
 
@@ -7109,6 +7136,33 @@ mod tests {
         assert_eq!(reports[0].stage, "拉取动态 3/16");
         assert_eq!(reports[0].percent, 20);
         assert!(!reports[0].done);
+    }
+
+    /// 手工刷新撞上后台轮询时要播报排队状态，界面不能停在「准备刷新 0%」。
+    #[tokio::test]
+    async fn waiting_for_the_refresh_lock_reports_progress() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+        let service =
+            AppService::with_analyzer(store, RuntimeSecrets::default(), analyzer).expect("service");
+        let _held = service.refresh_lock.lock().await;
+        let target = ProgressTarget::all();
+        let reports: std::sync::Mutex<Vec<RefreshProgress>> = std::sync::Mutex::new(Vec::new());
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            service.wait_for_refresh_lock(&target, &|progress| {
+                reports.lock().expect("reports").push(progress)
+            }),
+        )
+        .await;
+        assert!(waiting.is_err(), "锁被占着时不应拿到刷新锁");
+        let reports = reports.lock().expect("reports");
+        assert_eq!(reports[0].streamer_id, 0);
+        assert!(
+            reports[0].stage.contains("等待上一轮刷新结束"),
+            "{:?}",
+            reports[0].stage
+        );
     }
 
     /// `ReasoningEffort::Auto` 表示不带该字段；显式指定时才随请求发送。
