@@ -277,6 +277,15 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/30-release-server-0.3.16.md](docs/30-release-server-0.3.16.md)
 - [docs/29-release-desktop-0.3.9.md](docs/29-release-desktop-0.3.9.md)
 
+## 参与贡献
+
+欢迎提交 Issue 与 Pull Request。
+
+- **Bug 反馈 / 功能建议**：提到 [GitHub Issues](https://github.com/yueTc/OshiCal/issues)，写清版本号、系统环境与复现步骤；截图或日志能省掉来回追问。
+- **提交 PR**：从 `main` 拉分支，改完把 PR 提到 `main`。一个 PR 只做一件事，说明改动动机、实现思路与验证方式；涉及前端或 Rust 侧的改动需能通过 CI 里的单测与构建。
+- **安全问题**：报告前先核对上文「安全」与「已知限制」两节、以及 [docs/07-known-issues.md](docs/07-known-issues.md) 里核对已经列出的结论与尚未验证的部分，避免重复。
+- **交流**：欢迎到 [LinuxDO 社区](https://linux.do/) 交流 AI 工具与提示词的使用心得。
+
 ## 赞助
 
 这个项目是抽空闲时间做的，服务器、模型调用、B 站接口的坑都得自己填。要是它让你少错过几场直播，可以请作者喝杯咖啡。
