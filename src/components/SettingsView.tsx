@@ -13,6 +13,7 @@ import {
   ListChecks,
   LoaderCircle,
   LogOut,
+  Plus,
   PlugZap,
   QrCode,
   RefreshCw,
@@ -20,11 +21,14 @@ import {
   Search,
   ShieldCheck,
   Target,
+  Trash2,
 } from "lucide-react";
 import type {
   AppSettings,
   BiliQrLoginPoll,
   BiliQrLoginStart,
+  LlmAccount,
+  LlmReasoningEffort,
   LlmTestInput,
   LlmTestReport,
   LlmDiscoveryInput,
@@ -34,6 +38,7 @@ import type {
   ServerUpdateSettings,
   DataMode,
 } from "../types";
+import { LLM_PARALLELISM_MAX, LLM_PARALLELISM_MIN } from "../types";
 import type { SecretInput } from "../lib/secret-types";
 import type { AppearanceSettings } from "../lib/appearance";
 import { explainError, openExternalUrl } from "../lib/api";
@@ -41,7 +46,11 @@ import {
   readClientGithubMirror,
   saveClientGithubMirror,
 } from "../lib/github-mirror";
-import { mergeServerSettings } from "../lib/sync";
+import {
+  mergeServerSettings,
+  normalizeLlmParallelism,
+  normalizeLlmReasoningEffort,
+} from "../lib/sync";
 import {
   checkForUpdate,
   currentAppVersion,
@@ -66,6 +75,10 @@ interface SettingsActions {
   testProxy: (proxyPort: number, mode: DataMode) => Promise<ProxyTestReport>;
   testLlm: (input: LlmTestInput) => Promise<LlmTestReport>;
   listLlmModels: (input: LlmDiscoveryInput) => Promise<string[]>;
+  /** 批量读取账号密钥状态（只回 configured，密钥明文不回显）。 */
+  loadLlmAccountSecrets: (accountIds: string[]) => Promise<Record<string, boolean>>;
+  /** 写入单个账号的密钥，返回该账号是否已配置。 */
+  saveLlmAccountSecret: (accountId: string, apiKey: string) => Promise<boolean>;
   testNotification: () => Promise<void>;
   openBiliBrowserLogin: () => Promise<void>;
   startBiliQrLogin: () => Promise<BiliQrLoginStart>;
@@ -75,6 +88,22 @@ interface SettingsActions {
 
 export interface SettingsViewHandle {
   requestLeave: () => Promise<boolean>;
+}
+
+function llmAccountsEqual(left: LlmAccount[] | undefined, right: LlmAccount[] | undefined): boolean {
+  const leftAccounts = left ?? [];
+  const rightAccounts = right ?? [];
+  if (leftAccounts.length !== rightAccounts.length) {
+    return false;
+  }
+  return leftAccounts.every((account, index) => {
+    const other = rightAccounts[index];
+    return other !== undefined
+      && account.id === other.id
+      && account.name === other.name
+      && account.baseUrl === other.baseUrl
+      && account.model === other.model;
+  });
 }
 
 function settingsEqual(left: AppSettings, right: AppSettings): boolean {
@@ -90,8 +119,50 @@ function settingsEqual(left: AppSettings, right: AppSettings): boolean {
     left.llmBaseUrl === right.llmBaseUrl &&
     left.llmModel === right.llmModel &&
     left.llmPromptVersion === right.llmPromptVersion &&
+    (left.llmReasoningEffort ?? "auto") === (right.llmReasoningEffort ?? "auto") &&
+    (left.llmParallelism ?? LLM_PARALLELISM_MIN) === (right.llmParallelism ?? LLM_PARALLELISM_MIN) &&
+    llmAccountsEqual(left.llmAccounts, right.llmAccounts) &&
     left.proxyPort === right.proxyPort
   );
+}
+
+const LLM_REASONING_OPTIONS: ReadonlyArray<{ value: LlmReasoningEffort; label: string }> = [
+  { value: "auto", label: "自动" },
+  { value: "low", label: "低" },
+  { value: "medium", label: "中" },
+  { value: "high", label: "高" },
+];
+
+interface AccountSecretState {
+  /** 待写入的密钥明文，保存成功后清空。 */
+  draft: string;
+  saving: boolean;
+  configured: boolean;
+  error: string | null;
+}
+
+function emptyAccountSecret(): AccountSecretState {
+  return { draft: "", saving: false, configured: false, error: null };
+}
+
+/** 并行度的有效值：不超过账号数，至少 1。 */
+function effectiveParallelism(parallelism: number, accountCount: number): number {
+  return Math.max(LLM_PARALLELISM_MIN, Math.min(parallelism, Math.max(1, accountCount)));
+}
+
+function nextAccountId(existing: LlmAccount[]): string {
+  const generated =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `account-${Date.now().toString(36)}`;
+  if (!existing.some((account) => account.id === generated)) {
+    return generated;
+  }
+  let index = 2;
+  while (existing.some((account) => account.id === `${generated}-${index}`)) {
+    index += 1;
+  }
+  return `${generated}-${index}`;
 }
 
 function serverUpdateSettingsFromInfo(info: ServerUpdateInfo): ServerUpdateSettings {
@@ -257,6 +328,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [modelsOpen, setModelsOpen] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [modelSearch, setModelSearch] = useState("");
+  const [accountSecrets, setAccountSecrets] = useState<Record<string, AccountSecretState>>({});
+  const [parallelismNotice, setParallelismNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [connectionText, setConnectionText] = useState<string | null>(null);
@@ -308,6 +381,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const llmTestingRef = useRef(false);
   const modelDiscoverySeq = useRef(0);
   const modelsLoadingRef = useRef(false);
+  const accountSecretSeq = useRef(0);
   const proxyTestSeq = useRef(0);
   const proxyTestingRef = useRef(false);
   const updateActionRef = useRef<"check" | "install" | null>(null);
@@ -388,6 +462,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         "llmBaseUrl",
         "llmModel",
         "llmPromptVersion",
+        "llmReasoningEffort",
+        "llmParallelism",
+        "llmAccounts",
         "proxyPort",
       ] as const) {
         mergeUntouched(key);
@@ -405,6 +482,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     settings.llmBaseUrl,
     settings.llmModel,
     settings.llmPromptVersion,
+    settings.llmReasoningEffort,
+    settings.llmParallelism,
+    settings.llmAccounts,
     settings.proxyPort,
   ]);
 
@@ -418,6 +498,51 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   useEffect(() => {
     actionsRef.current = actions;
   }, [actions]);
+
+  const accountIdsSignature = (draft.llmAccounts ?? []).map((account) => account.id).join("|");
+  useEffect(() => {
+    if (!serverMode) {
+      return;
+    }
+    const ids = accountIdsSignature ? accountIdsSignature.split("|") : [];
+    if (!ids.length) {
+      return;
+    }
+    let disposed = false;
+    const seq = ++accountSecretSeq.current;
+    void (async () => {
+      try {
+        const statuses = await actionsRef.current.loadLlmAccountSecrets(ids);
+        if (disposed || accountSecretSeq.current !== seq) {
+          return;
+        }
+        setAccountSecrets((current) => {
+          const next = { ...current };
+          for (const id of ids) {
+            const previous = next[id] ?? emptyAccountSecret();
+            next[id] = { ...previous, configured: statuses[id] === true };
+          }
+          return next;
+        });
+      } catch (secretError) {
+        if (disposed || accountSecretSeq.current !== seq) {
+          return;
+        }
+        const message = explainError(secretError);
+        setAccountSecrets((current) => {
+          const next = { ...current };
+          for (const id of ids) {
+            const previous = next[id] ?? emptyAccountSecret();
+            next[id] = { ...previous, error: message };
+          }
+          return next;
+        });
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [accountIdsSignature, serverMode]);
 
   useEffect(() => {
     if (!serverMode) {
@@ -742,6 +867,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       apiKey: llmApiKey.trim() || undefined,
       model: current.llmModel.trim(),
       promptVersion: current.llmPromptVersion,
+      reasoningEffort: normalizeLlmReasoningEffort(current.llmReasoningEffort),
     };
     llmTestingRef.current = true;
     setLlmTesting(true);
@@ -837,6 +963,95 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  function updateAccountSecret(accountId: string, patch: Partial<AccountSecretState>) {
+    setAccountSecrets((current) => {
+      const previous = current[accountId] ?? emptyAccountSecret();
+      return { ...current, [accountId]: { ...previous, ...patch } };
+    });
+  }
+
+  function updateAccountField(accountId: string, patch: Partial<Omit<LlmAccount, "id">>) {
+    markFormChanged();
+    setDraft((current) => ({
+      ...current,
+      llmAccounts: (current.llmAccounts ?? []).map((account) =>
+        account.id === accountId ? { ...account, ...patch } : account,
+      ),
+    }));
+  }
+
+  function addLlmAccount() {
+    markFormChanged();
+    setParallelismNotice(null);
+    const current = draftRef.current;
+    const existing = current.llmAccounts ?? [];
+    setDraft({
+      ...current,
+      llmAccounts: [
+        ...existing,
+        {
+          id: nextAccountId(existing),
+          name: `账号 ${existing.length + 1}`,
+          baseUrl: current.llmBaseUrl.trim(),
+          model: current.llmModel.trim(),
+        },
+      ],
+    });
+  }
+
+  function removeLlmAccount(accountId: string) {
+    markFormChanged();
+    const current = draftRef.current;
+    const remaining = (current.llmAccounts ?? []).filter((account) => account.id !== accountId);
+    const parallelism = current.llmParallelism ?? LLM_PARALLELISM_MIN;
+    const clamped = effectiveParallelism(parallelism, remaining.length);
+    if (clamped !== parallelism) {
+      setParallelismNotice(
+        `并行个数已从 ${parallelism} 调整为 ${clamped}：账号数只有 ${remaining.length}，同一账号始终串行。`,
+      );
+    }
+    setDraft({ ...current, llmAccounts: remaining, llmParallelism: clamped });
+    setAccountSecrets((currentSecrets) => {
+      if (!(accountId in currentSecrets)) {
+        return currentSecrets;
+      }
+      const next = { ...currentSecrets };
+      delete next[accountId];
+      return next;
+    });
+  }
+
+  function changeReasoningEffort(value: LlmReasoningEffort) {
+    markFormChanged();
+    setLlmReport(null);
+    setDraft((current) => ({ ...current, llmReasoningEffort: value }));
+  }
+
+  function changeParallelism(raw: string) {
+    markFormChanged();
+    setParallelismNotice(null);
+    const numeric = raw.trim() === "" ? LLM_PARALLELISM_MIN : Number(raw);
+    const clamped = normalizeLlmParallelism(numeric, LLM_PARALLELISM_MIN);
+    setDraft((current) => ({ ...current, llmParallelism: clamped }));
+  }
+
+  async function saveAccountSecret(accountId: string) {
+    const state = accountSecrets[accountId] ?? emptyAccountSecret();
+    const apiKey = state.draft.trim();
+    if (!apiKey || state.saving) {
+      return;
+    }
+    updateAccountSecret(accountId, { saving: true, error: null });
+    try {
+      const configured = await actionsRef.current.saveLlmAccountSecret(accountId, apiKey);
+      updateAccountSecret(accountId, { saving: false, configured, draft: "", error: null });
+    } catch (secretError) {
+      const message = explainError(secretError);
+      updateAccountSecret(accountId, { saving: false, error: message });
+      onError(message);
+    }
+  }
+
   async function save(): Promise<boolean> {
     if (savingRef.current) {
       return false;
@@ -847,7 +1062,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     const submittedBiliCookie = biliCookie.trim();
     const submittedServerToken = serverToken.trim();
     const submittedAutoLaunch = autoLaunch;
-    const submittedDraft = draftRef.current;
+    const currentDraft = draftRef.current;
+    const submittedAccounts = currentDraft.llmAccounts ?? [];
+    const requestedParallelism = normalizeLlmParallelism(
+      currentDraft.llmParallelism,
+      LLM_PARALLELISM_MIN,
+    );
+    const clampedParallelism = effectiveParallelism(requestedParallelism, submittedAccounts.length);
+    // 同一账号始终串行，所以并行度不该超过账号数；超出时保存前先裁剪并提示。
+    const submittedDraft: AppSettings =
+      clampedParallelism === requestedParallelism
+        ? currentDraft
+        : { ...currentDraft, llmParallelism: clampedParallelism };
+    if (clampedParallelism !== requestedParallelism) {
+      setParallelismNotice(
+        `并行个数已从 ${requestedParallelism} 调整为 ${clampedParallelism}：只有 ${submittedAccounts.length} 个账号，同一账号始终串行。`,
+      );
+      draftRef.current = submittedDraft;
+      setDraft(submittedDraft);
+    } else {
+      setParallelismNotice(null);
+    }
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -1167,6 +1402,10 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const visibleModels = models.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
+  const llmAccounts = draft.llmAccounts ?? [];
+  const llmReasoningEffort = normalizeLlmReasoningEffort(draft.llmReasoningEffort);
+  const llmParallelism = normalizeLlmParallelism(draft.llmParallelism, LLM_PARALLELISM_MIN);
+  const llmEffectiveParallelism = effectiveParallelism(llmParallelism, llmAccounts.length);
   const serverUpdateRunning = serverUpdate?.status === "running";
   const serverUpdateActive =
     serverUpdate?.status === "requested" ||
@@ -1766,6 +2005,142 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     ? "模型密钥已安全保存"
                     : "尚未配置模型密钥"}
               </span>
+            </div>
+            <div className="span-2 stacked-field">
+              <span>思考程度</span>
+              <div className="segmented" role="group" aria-label="思考程度">
+                {LLM_REASONING_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={llmReasoningEffort === option.value ? "active" : ""}
+                    onClick={() => changeReasoningEffort(option.value)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <p className="form-hint">
+                自动不发送该参数；高思考对日程提取提升有限，延迟会从约 6 秒升到 8 秒以上、token 消耗约 3 倍。
+              </p>
+            </div>
+            <label>
+              <span>并行个数</span>
+              <div className="input-suffix">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={LLM_PARALLELISM_MIN}
+                  max={LLM_PARALLELISM_MAX}
+                  step={1}
+                  value={llmParallelism}
+                  onChange={(event) => changeParallelism(event.target.value)}
+                />
+                <em>路</em>
+              </div>
+              <p className="form-hint">
+                只有不同账号能真正并行，同一账号始终串行；当前有效并行度 = min(设置值, 账号数) = {llmEffectiveParallelism}。
+              </p>
+              {parallelismNotice ? <p className="form-hint">{parallelismNotice}</p> : null}
+            </label>
+            <div className="settings-stack span-2">
+              <div className="inline-actions">
+                <strong>多账号并行</strong>
+                <span className="muted">同一账号始终串行，只有不同账号才会并行。</span>
+                <button className="button secondary small" type="button" onClick={() => addLlmAccount()}>
+                  <Plus size={15} />
+                  添加账号
+                </button>
+              </div>
+              {llmAccounts.length === 0 ? (
+                <p className="form-hint">
+                  还没有账号：留空时沿用上方的 Base URL / 模型名与主密钥（accountId = default）。
+                </p>
+              ) : (
+                llmAccounts.map((account, index) => {
+                  const secret = accountSecrets[account.id] ?? emptyAccountSecret();
+                  return (
+                    <div key={account.id} className="settings-stack">
+                      <div className="form-grid">
+                        <label>
+                          <span>名称</span>
+                          <input
+                            value={account.name}
+                            onChange={(event) => updateAccountField(account.id, { name: event.target.value })}
+                            placeholder={`账号 ${index + 1}`}
+                          />
+                        </label>
+                        <label>
+                          <span>Base URL</span>
+                          <input
+                            value={account.baseUrl}
+                            onChange={(event) => updateAccountField(account.id, { baseUrl: event.target.value })}
+                            placeholder="https://api.example.com/v1"
+                          />
+                        </label>
+                        <label>
+                          <span>模型名</span>
+                          <input
+                            value={account.model}
+                            onChange={(event) => updateAccountField(account.id, { model: event.target.value })}
+                            placeholder="该账号使用的模型名称"
+                          />
+                        </label>
+                        <label>
+                          <span>账号 ID</span>
+                          <div className="model-field-row">
+                            <input value={account.id} readOnly aria-label="账号 ID" />
+                            <button
+                              className="button danger small"
+                              type="button"
+                              onClick={() => removeLlmAccount(account.id)}
+                            >
+                              <Trash2 size={15} />
+                              删除
+                            </button>
+                          </div>
+                        </label>
+                      </div>
+                      {serverMode ? (
+                        <>
+                          <div className="model-field-row">
+                            <input
+                              type="password"
+                              autoComplete="off"
+                              value={secret.draft}
+                              onChange={(event) => updateAccountSecret(account.id, { draft: event.target.value })}
+                              placeholder={
+                                secret.configured
+                                  ? "已配置（不会明文回显），留空则沿用"
+                                  : "为该账号保存密钥"
+                              }
+                            />
+                            <button
+                              className="button secondary small"
+                              type="button"
+                              onClick={() => void saveAccountSecret(account.id)}
+                              disabled={secret.saving || !secret.draft.trim()}
+                            >
+                              {secret.saving ? <LoaderCircle className="spin" size={15} /> : <KeyRound size={15} />}
+                              {secret.saving ? "保存中…" : "更新密钥"}
+                            </button>
+                          </div>
+                          <div className="secret-state">
+                            <ShieldCheck size={16} />
+                            <span>{secret.configured ? "已配置" : "未配置"}</span>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="secret-state">
+                          <KeyRound size={16} />
+                          <span>账号密钥在服务器模式下按账号保存；本机模式沿用上方 API Key。</span>
+                        </div>
+                      )}
+                      {secret.error ? <p className="form-hint">{secret.error}</p> : null}
+                    </div>
+                  );
+                })
+              )}
             </div>
             <div className="settings-stack span-2">
               <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft((current) => ({ ...current, autoAnalyzeImages: value }))} label="自动分析动态文字和日程图片" />
