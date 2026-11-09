@@ -1796,7 +1796,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </div>
             <div className="settings-stack span-2">
               <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft((current) => ({ ...current, autoAnalyzeImages: value }))} label="自动分析动态文字和日程图片" />
-              <p className="form-hint">动态自由文本只使用大模型分析；带预约卡片的动态不再调用模型；未配置模型时仅处理预约卡片中明确的结构化时间。</p>
+              <p className="form-hint">动态自由文本与带预约卡片的动态都交给大模型分析，卡片标题/描述会和正文一起送进模型；未配置模型或模型调用失败时，才回退到预约卡片里的结构化时间。</p>
             </div>
             <div className="llm-test-panel span-2">
               <div className="inline-actions">

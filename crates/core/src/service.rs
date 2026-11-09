@@ -1440,61 +1440,11 @@ impl AppService {
                 .as_ref()
                 .and_then(|reserve| parse_reserve_schedule(reserve, post.published_at, now));
             let reserve_start = reserve_schedule.as_ref().map(|schedule| schedule.start_at);
-            if post.reserve.is_some() {
-                stats.cancelled_schedules += self
-                    .remove_stale_model_schedules_for_reserved_post(post, targets, reserve_start)
-                    .await?;
-            }
-            // 预约卡片只代表卡片上那一场。正文里另写了别的时间点时
-            // （预约 06:00 比赛 + 正文“今晚20:00来杂谈”），文字模型仍要跑，
-            // 否则这类“同一条动态里第二场直播”会整条被漏掉。
-            // 卡片时间解析不出来（或本来就是视频预约）时卡片进不了日程，
-            // 正文就是唯一来源，也必须跑。
-            let reserved_text_needs_analysis = post.reserve.is_some()
-                && match reserve_start {
-                    Some(start) => post_text_has_extra_schedule_time(post, start),
-                    None => true,
-                };
-            if let Some(schedule) = reserve_schedule {
-                let context = reserve_context(post);
-                if let Some(target) = choose_text_target(source_mid, targets, &context) {
-                    let fingerprint = source_fingerprint(post, &schedule.title, "reserve");
-                    let identity = format!("reserve:{}", post.id);
-                    let participants = [target.name.clone()];
-                    // 预约卡的 `rid` 是预约 id，不是房间号；只有 jump_url 里能确认的
-                    // 房间号才可信，否则回退到主播自己的直播间。
-                    let reserve_room_url = post
-                        .reserve
-                        .as_ref()
-                        .and_then(|reserve| reserve.live_room_id())
-                        .filter(|room_id| {
-                            !room_id.is_empty()
-                                && room_id.chars().all(|character| character.is_ascii_digit())
-                        })
-                        .map(|room_id| format!("https://live.bilibili.com/{room_id}"));
-                    if self
-                        .upsert_candidate(
-                            &target,
-                            &schedule,
-                            "reserve",
-                            post,
-                            "editor",
-                            &identity,
-                            &fingerprint,
-                            reserve_room_url.as_deref().or(target.live_url.as_deref()),
-                            Some(target.mid.as_str()),
-                            Some(target.name.as_str()),
-                            &participants,
-                        )
-                        .await?
-                    {
-                        stats.new_schedules += 1;
-                    }
-                }
-            } else if post
-                .reserve
-                .as_ref()
-                .is_some_and(|reserve| !reserve.is_live())
+            if reserve_schedule.is_none()
+                && post
+                    .reserve
+                    .as_ref()
+                    .is_some_and(|reserve| !reserve.is_live())
             {
                 stats.cancelled_schedules +=
                     self.remove_stale_non_live_reserve_schedule(post).await?;
@@ -1507,13 +1457,16 @@ impl AppService {
                 && llm_config.is_some()
                 && settings.auto_analyze_images
                 && !post.images.is_empty();
-            if let Some(config) =
-                llm_config.filter(|_| post.reserve.is_none() || reserved_text_needs_analysis)
-            {
-                let text = post.text.trim();
+            // 预约卡片同样交给文字模型：卡片标题与描述拼在正文后面一起送，
+            // 由模型给出最终时间与标题。卡片正则只在模型不可用、调用失败、
+            // 返回空事件，或没覆盖到卡片那一场时兜底。
+            let mut card_slot_covered = false;
+            if let Some(config) = llm_config {
+                let context = reserve_context(post);
+                let text = context.trim();
                 if !has_combined_images && !text.is_empty() {
                     let text_digest = text_digest(text);
-                    let prompt_version = format!("{}-text-v9", config.prompt_version);
+                    let prompt_version = format!("{}-text-v10", config.prompt_version);
                     let cache_key =
                         analysis_cache_key(&post.id, &text_digest, &config.model, &prompt_version);
                     let mut analysis_succeeded = false;
@@ -1581,20 +1534,17 @@ impl AppService {
                     }
                     for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                         let event = canonicalize_event_participants(event, targets);
+                        // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
+                        // 后面不再补正则兜底。模型给的取消同样采信。
                         if let Some(reserve_start) = reserve_start {
-                            // 预约动态只补正文里额外的那几场：与预约同时间的文字事件
-                            // 丢掉（卡片比正文准，避免把预约标题改成正文口播标题）；
-                            // 预约动态里的取消也不采信，取消仍走不带预约的公告，
-                            // 免得一句随口话把本条预约自己删掉。
                             if event.start_at.is_some_and(|start_at| {
                                 same_schedule_slot(
                                     start_at,
                                     reserve_start,
                                     RESERVE_DUPLICATE_TOLERANCE_MINUTES,
                                 )
-                            }) || event.action == LlmEventAction::Cancel
-                            {
-                                continue;
+                            }) {
+                                card_slot_covered = true;
                             }
                         }
                         if let Some(target) =
@@ -1636,6 +1586,46 @@ impl AppService {
                                 stats.cancelled_schedules += 1;
                             }
                         }
+                    }
+                }
+            }
+
+            // 兜底：模型不可用、调用失败、返回空事件，或模型没覆盖卡片那一场时，
+            // 用卡片正则补一条 reserve 日程，保证卡片场次不会因为模型漏掉而消失。
+            if let Some(schedule) = reserve_schedule.as_ref().filter(|_| !card_slot_covered) {
+                let context = reserve_context(post);
+                if let Some(target) = choose_text_target(source_mid, targets, &context) {
+                    let fingerprint = source_fingerprint(post, &schedule.title, "reserve");
+                    let identity = format!("reserve:{}", post.id);
+                    let participants = [target.name.clone()];
+                    // 预约卡的 `rid` 是预约 id，不是房间号；只有 jump_url 里能确认的
+                    // 房间号才可信，否则回退到主播自己的直播间。
+                    let reserve_room_url = post
+                        .reserve
+                        .as_ref()
+                        .and_then(|reserve| reserve.live_room_id())
+                        .filter(|room_id| {
+                            !room_id.is_empty()
+                                && room_id.chars().all(|character| character.is_ascii_digit())
+                        })
+                        .map(|room_id| format!("https://live.bilibili.com/{room_id}"));
+                    if self
+                        .upsert_candidate(
+                            &target,
+                            schedule,
+                            "reserve",
+                            post,
+                            "editor",
+                            &identity,
+                            &fingerprint,
+                            reserve_room_url.as_deref().or(target.live_url.as_deref()),
+                            Some(target.mid.as_str()),
+                            Some(target.name.as_str()),
+                            &participants,
+                        )
+                        .await?
+                    {
+                        stats.new_schedules += 1;
                     }
                 }
             }
@@ -2075,44 +2065,6 @@ impl AppService {
         }
     }
 
-    /// 预约卡片出现后，清掉同一条动态此前由文字/图片得出的「同一场」重复日程。
-    ///
-    /// 只清理与预约时间一致的那些：正文里另写的第二场（例如预约 06:00 比赛、
-    /// 正文另有“今晚20:00来杂谈”）不是重复项，必须留着。
-    async fn remove_stale_model_schedules_for_reserved_post(
-        &self,
-        post: &DynamicPost,
-        targets: &[Streamer],
-        reserve_start: Option<DateTime<Utc>>,
-    ) -> AppResult<usize> {
-        let Some(reserve_start) = reserve_start else {
-            // 预约时间解析不出来时不做清理：这时正文可能是唯一来源。
-            return Ok(0);
-        };
-        let target_ids = targets
-            .iter()
-            .map(|target| target.id)
-            .collect::<HashSet<_>>();
-        let mut removed = 0;
-        for schedule in self.store.list_all_schedules().await? {
-            if schedule.manual_locked
-                || !target_ids.contains(&schedule.streamer_id)
-                || schedule.source_post_id.as_deref() != Some(post.id.as_str())
-                || !matches!(schedule.source_kind.as_str(), "text" | "image")
-                || !same_schedule_slot(
-                    schedule.start_at,
-                    reserve_start,
-                    RESERVE_DUPLICATE_TOLERANCE_MINUTES,
-                )
-            {
-                continue;
-            }
-            self.store.delete_schedule(schedule.id).await?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
-
     async fn remove_stale_non_live_reserve_schedule(&self, post: &DynamicPost) -> AppResult<usize> {
         let source_identity = format!("reserve:{}", post.id);
         let mut removed = 0;
@@ -2337,20 +2289,10 @@ impl AppService {
             .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
             .await?;
         let schedule = &schedule;
-        // 带预约卡片的动态：卡片那一场以预约为准，文字/图片只允许补「另一个时间」的场次。
-        // 这里按时间差判断，而不是一刀切拒绝，否则正文里的第二场会连带被丢掉。
-        if matches!(source_kind, "text" | "image")
-            && post.reserve.is_some()
-            && post_reserve_start(post).is_some_and(|reserve_start| {
-                same_schedule_slot(
-                    schedule.start_at,
-                    reserve_start,
-                    RESERVE_DUPLICATE_TOLERANCE_MINUTES,
-                )
-            })
-        {
-            return Ok(false);
-        }
+        // 带预约卡片的动态不再在这里按卡片时间拦文字/图片候选：
+        // 卡片那一场现在也由文字模型给出，模型结果就是主来源。
+        // 卡片正则的兜底在 process_source_posts 里按“是否已被模型覆盖”决定，
+        // 不会和模型事件重复落库。
         if self
             .store
             .is_source_suppressed(target.id, &post.id, source_fingerprint)
@@ -2443,8 +2385,10 @@ impl AppService {
             .await?
         {
             if existing.source_identity.as_deref() != Some(source_identity) {
-                let incompatible_reservation = (existing.source_kind == "reserve"
-                    || input.source_kind == "reserve")
+                // 模型（text/image）同槽覆盖已有 reserve 是正常路径，不算冲突；
+                // 反过来兜底 reserve 遇到标题不同的既有日程才需要让路。
+                let incompatible_reservation = input.source_kind == "reserve"
+                    && existing.source_kind != "reserve"
                     && !cancellation_titles_match(&existing.title, &input.title);
                 if !incompatible_reservation {
                     self.store
@@ -2585,36 +2529,6 @@ fn reserve_context(post: &DynamicPost) -> String {
 /// 两个开始时间是否指向同一场直播。日程合并与预约去重共用同一容差。
 fn same_schedule_slot(left: DateTime<Utc>, right: DateTime<Utc>, tolerance_minutes: i64) -> bool {
     (left - right).num_minutes().abs() <= tolerance_minutes
-}
-
-/// 本条动态自带预约卡片的开始时间；卡片时间解析不出来时返回 `None`。
-///
-/// 用发布时间当“现在”解析，原因和 `apply_deterministic_reservation_time_change` 一致：
-/// 卡片上的“明天 06:00”是相对发布时刻说的，刷新时间再晚也不该把日期挪掉。
-fn post_reserve_start(post: &DynamicPost) -> Option<DateTime<Utc>> {
-    let reserve = post.reserve.as_ref()?;
-    parse_reserve_schedule(reserve, post.published_at, post.published_at)
-        .map(|schedule| schedule.start_at)
-}
-
-/// 正文里是否还写了与预约时间不同的另一个日程时间点。
-///
-/// 只做“要不要继续识别”的开关，不负责产出日程：命中时放行文字模型，
-/// 由模型给出结构化事件，再按预约时间去重。逐行解析是为了让
-/// “明天6:00来看IG VS geng四强战”这种时间在句首、事件在句后的写法
-/// 和“*今晚20:00来杂谈”这种带项目符号的行各算各的。
-fn post_text_has_extra_schedule_time(post: &DynamicPost, reserve_start: DateTime<Utc>) -> bool {
-    post.text.lines().any(|line| {
-        parse_text_schedule(line, post.published_at, post.published_at, "直播").is_some_and(
-            |schedule| {
-                !same_schedule_slot(
-                    schedule.start_at,
-                    reserve_start,
-                    RESERVE_DUPLICATE_TOLERANCE_MINUTES,
-                )
-            },
-        )
-    })
 }
 
 fn schedule_title_is_placeholder(title: &str) -> bool {
@@ -3166,17 +3080,9 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
 }
 
 fn merge_input_for_existing(existing: &Schedule, incoming: &NewSchedule) -> NewSchedule {
+    // 卡片那一场由文字模型接管后，模型结果就是主来源：同槽时以 incoming 为准，
+    // 不再把 existing 的 reserve 标题/来源盖回去。
     let mut merged = incoming.clone();
-    if existing.source_kind == "reserve" && incoming.source_kind != "reserve" {
-        merged.title = existing.title.clone();
-        merged.source_kind = existing.source_kind.clone();
-        merged.source_post_id = existing.source_post_id.clone();
-        merged.source_image_url = existing.source_image_url.clone();
-        merged.source_author_mid = existing.source_author_mid.clone();
-        merged.source_fingerprint = existing.source_fingerprint.clone();
-        merged.source_identity = existing.source_identity.clone();
-        merged.source_published_at = existing.source_published_at;
-    }
     if schedule_title_is_placeholder(&merged.title)
         && !schedule_title_is_placeholder(&existing.title)
     {
@@ -4537,7 +4443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_post_does_not_run_model_for_cancellation_text() {
+    async fn reserved_post_cancellation_runs_through_the_model() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("100", "甲"))
@@ -4643,13 +4549,16 @@ mod tests {
             .await
             .expect("process");
 
+        // 带卡片的动态照样送模型；模型给的是取消，就按取消处理。
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats.new_schedules, 1);
-        assert_eq!(stats.cancelled_schedules, 0);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 0);
+        // 取消落到标题里的「歌回」那一场，旧的突击场不受影响。
         assert!(store.get_schedule(old_schedule.id).await.is_ok());
-        assert!(store.get_schedule(old_song.id).await.is_ok());
         let remaining = store.list_all_schedules().await.expect("remaining");
-        assert_eq!(remaining.len(), 3);
+        assert!(remaining
+            .iter()
+            .all(|schedule| schedule.id != old_song.id || schedule.cancelled));
+        // 模型没给卡片那一场，正则兜底把预约场次补上。
         assert!(remaining.iter().any(|schedule| {
             schedule.source_post_id.as_deref() == Some("current-post")
                 && schedule.source_kind == "reserve"
@@ -5376,14 +5285,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_dynamics_skip_models_and_remove_stale_model_schedules() {
+    async fn reserved_dynamics_analyze_card_with_the_text_model() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("100", "甲"))
             .await
             .expect("streamer");
         let now = Utc::now();
-        let text_post = DynamicPost {
+        let post = DynamicPost {
             id: "reserved-text-post".to_owned(),
             author_mid: streamer.mid.clone(),
             author_name: streamer.name.clone(),
@@ -5400,45 +5309,17 @@ mod tests {
                 stype: Some(2),
             }),
         };
-        let image_post = DynamicPost {
-            id: "reserved-image-post".to_owned(),
-            author_mid: streamer.mid.clone(),
-            author_name: streamer.name.clone(),
-            published_at: now,
-            text: "图片里也有安排".to_owned(),
-            images: vec!["https://i0.hdslb.com/test-reserved-calendar.png".to_owned()],
-            source_url: "https://t.bilibili.com/reserved-image-post".to_owned(),
-            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
-            reserve: Some(ReserveCard {
-                title: "直播预约：周末杂谈".to_owned(),
-                description: "后天 20:00 直播".to_owned(),
-                room_id: Some("22637261".to_owned()),
-                jump_url: None,
-                stype: Some(2),
-            }),
-        };
-        let first_reservation = parse_reserve_schedule(
-            text_post.reserve.as_ref().expect("reserve"),
-            text_post.published_at,
+        let card_start = parse_reserve_schedule(
+            post.reserve.as_ref().expect("reserve"),
+            post.published_at,
             now,
         )
-        .expect("reservation schedule");
+        .expect("reservation schedule")
+        .start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
             text_calls: AtomicUsize::new(0),
-            events: vec![LlmEvent {
-                action: LlmEventAction::Schedule,
-                performer: "甲".to_owned(),
-                aliases: Vec::new(),
-                participants: Vec::new(),
-                room_url: None,
-                room_owner: None,
-                room_owner_mid: None,
-                title: "图片日程".to_owned(),
-                start_at: Some(now + Duration::days(2)),
-                end_at: None,
-                confidence: 0.95,
-            }],
+            events: Vec::new(),
             text_events: vec![LlmEvent {
                 action: LlmEventAction::Schedule,
                 performer: "甲".to_owned(),
@@ -5447,8 +5328,8 @@ mod tests {
                 room_url: None,
                 room_owner: None,
                 room_owner_mid: None,
-                title: "文字日程".to_owned(),
-                start_at: Some(first_reservation.start_at),
+                title: "电台".to_owned(),
+                start_at: Some(card_start),
                 end_at: None,
                 confidence: 0.95,
             }],
@@ -5456,33 +5337,6 @@ mod tests {
         let service =
             AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
                 .expect("service");
-        let stale_post = DynamicPost {
-            reserve: None,
-            ..text_post.clone()
-        };
-        let stale_text = ParsedSchedule {
-            title: "旧文字日程".to_owned(),
-            start_at: first_reservation.start_at,
-            end_at: None,
-            confidence: 0.95,
-        };
-        assert!(service
-            .upsert_candidate(
-                &streamer,
-                &stale_text,
-                "text",
-                &stale_post,
-                "editor",
-                "text:reserved-text-post:0",
-                "old-text-fingerprint",
-                None,
-                None,
-                None,
-                &[],
-            )
-            .await
-            .expect("upsert candidate"));
-
         let config = LlmConfig {
             base_url: "https://fixture.invalid/v1".to_owned(),
             api_key: String::new(),
@@ -5494,7 +5348,7 @@ mod tests {
             .process_source_posts(
                 "100",
                 std::slice::from_ref(&streamer),
-                &[text_post, image_post],
+                std::slice::from_ref(&post),
                 &AppSettings::default(),
                 Some(&config),
                 &mut cache,
@@ -5502,26 +5356,250 @@ mod tests {
             .await
             .expect("process");
 
-        assert_eq!(stats.llm_calls, 0);
-        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(stats.new_schedules, 2);
-        assert_eq!(stats.cancelled_schedules, 1);
+        // 带预约卡片的动态也要跑文字模型，卡片那一场由模型给出。
+        assert_eq!(stats.llm_calls, 1);
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
         let schedules = store
-            .list_schedules(now - Duration::hours(1), now + Duration::days(4), false)
+            .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
             .await
             .expect("schedules");
-        assert_eq!(schedules.len(), 2);
-        assert!(schedules
-            .iter()
-            .all(|schedule| schedule.source_kind == "reserve"));
-        assert!(schedules
-            .iter()
-            .all(|schedule| schedule.title != "旧文字日程"));
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].source_kind, "text");
+        assert_eq!(schedules[0].start_at, card_start);
+    }
+    #[tokio::test]
+    async fn reserved_card_falls_back_to_regex_without_llm() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "甲"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let post = DynamicPost {
+            id: "reserve-fallback-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "明晚电台见".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-fallback-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】电台电台！".to_owned(),
+                description: "明天 19:00 直播".to_owned(),
+                room_id: Some("22637261".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let card_start = parse_reserve_schedule(
+            post.reserve.as_ref().expect("reserve"),
+            post.published_at,
+            now,
+        )
+        .expect("reservation schedule")
+        .start_at;
+        let service = AppService::with_analyzer(
+            store.clone(),
+            RuntimeSecrets::default(),
+            Arc::new(CountingAnalyzer {
+                calls: AtomicUsize::new(0),
+                text_calls: AtomicUsize::new(0),
+                events: Vec::new(),
+                text_events: Vec::new(),
+            }),
+        )
+        .expect("service");
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "100",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                None,
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        // 没有模型可用时，卡片正则兜底仍然要落一条预约日程。
+        assert_eq!(stats.llm_calls, 0);
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store
+            .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
+            .await
+            .expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(schedules[0].start_at, card_start);
+        assert_eq!(schedules[0].title, "【突击】电台电台！");
     }
 
     #[tokio::test]
-    async fn llm_schedule_does_not_override_reservation_title() {
+    async fn reserved_card_falls_back_when_model_returns_nothing() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "甲"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let post = DynamicPost {
+            id: "reserve-empty-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "明晚电台见".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-empty-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】电台电台！".to_owned(),
+                description: "明天 19:00 直播".to_owned(),
+                room_id: Some("22637261".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let card_start = parse_reserve_schedule(
+            post.reserve.as_ref().expect("reserve"),
+            post.published_at,
+            now,
+        )
+        .expect("reservation schedule")
+        .start_at;
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: Vec::new(),
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "100",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.new_schedules, 1);
+        let schedules = store
+            .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
+            .await
+            .expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(schedules[0].start_at, card_start);
+    }
+
+    #[tokio::test]
+    async fn reserved_card_is_added_when_model_misses_the_card_slot() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("100", "甲"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let post = DynamicPost {
+            id: "reserve-miss-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now,
+            text: "明晚电台，后天杂谈".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/reserve-miss-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
+            reserve: Some(ReserveCard {
+                title: "直播预约：【突击】电台电台！".to_owned(),
+                description: "明天 19:00 直播".to_owned(),
+                room_id: Some("22637261".to_owned()),
+                jump_url: None,
+                stype: Some(2),
+            }),
+        };
+        let card_start = parse_reserve_schedule(
+            post.reserve.as_ref().expect("reserve"),
+            post.published_at,
+            now,
+        )
+        .expect("reservation schedule")
+        .start_at;
+        let other_start = now + Duration::days(2);
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            text_calls: AtomicUsize::new(0),
+            events: Vec::new(),
+            text_events: vec![LlmEvent {
+                action: LlmEventAction::Schedule,
+                performer: "甲".to_owned(),
+                aliases: Vec::new(),
+                participants: Vec::new(),
+                room_url: None,
+                room_owner: None,
+                room_owner_mid: None,
+                title: "杂谈".to_owned(),
+                start_at: Some(other_start),
+                end_at: None,
+                confidence: 0.95,
+            }],
+        });
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let config = LlmConfig {
+            base_url: "https://fixture.invalid/v1".to_owned(),
+            api_key: String::new(),
+            model: "fixture-model".to_owned(),
+            prompt_version: "fixture-v1".to_owned(),
+        };
+        let mut cache = HashMap::new();
+        let stats = service
+            .process_source_posts(
+                "100",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&config),
+                &mut cache,
+            )
+            .await
+            .expect("process");
+
+        // 模型只给了正文那一场，卡片场次由正则补进来。
+        assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.new_schedules, 2);
+        let schedules = store
+            .list_schedules(now - Duration::hours(1), now + Duration::days(3), false)
+            .await
+            .expect("schedules");
+        assert_eq!(schedules.len(), 2);
+        assert!(schedules.iter().any(|schedule| {
+            schedule.source_kind == "reserve" && schedule.start_at == card_start
+        }));
+        assert!(schedules
+            .iter()
+            .any(|schedule| schedule.source_kind == "text"
+                && schedule.title == "杂谈"
+                && schedule.start_at == other_start));
+    }
+
+    #[tokio::test]
+    async fn reserved_llm_event_takes_over_the_card_schedule() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("100", "甲"))
@@ -5604,57 +5682,12 @@ mod tests {
             .await
             .expect("schedules");
         assert_eq!(schedules.len(), 1);
-        assert_eq!(schedules[0].title, "【突击】电台电台！");
-        assert_eq!(schedules[0].source_kind, "reserve");
-    }
-
-    fn reserved_gate_post(published_at: DateTime<Utc>, text: &str) -> DynamicPost {
-        DynamicPost {
-            id: "reserved-gate-post".to_owned(),
-            author_mid: "100".to_owned(),
-            author_name: "甲".to_owned(),
-            published_at,
-            text: text.to_owned(),
-            images: Vec::new(),
-            source_url: "https://t.bilibili.com/reserved-gate-post".to_owned(),
-            raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
-            reserve: Some(ReserveCard {
-                title: "直播预约：小鼠,做法中: IG给我赢啊啊啊啊".to_owned(),
-                description: "明天 06:00 直播".to_owned(),
-                room_id: Some("22637261".to_owned()),
-                jump_url: None,
-                stype: Some(2),
-            }),
-        }
-    }
-
-    #[test]
-    fn reserved_body_gate_fires_only_for_a_second_time() {
-        let published = DateTime::parse_from_rfc3339("2026-11-07T18:57:00+08:00")
-            .expect("published")
-            .with_timezone(&Utc);
-        let post = reserved_gate_post(
-            published,
-            "明天6:00来看IG VS geng四强战！\n从现在开始做吧😈\n*今晚20:00来杂谈🥳",
-        );
-        let reserve_start = post_reserve_start(&post).expect("reserve start");
-        assert_eq!(reserve_start.to_string(), "2026-11-07 22:00:00 UTC");
-        assert!(post_text_has_extra_schedule_time(&post, reserve_start));
-
-        // 正文只复述预约那一场时不额外调用模型。
-        let same_time_only = reserved_gate_post(published, "明天6:00来看IG VS geng四强战！");
-        assert!(!post_text_has_extra_schedule_time(
-            &same_time_only,
-            reserve_start
-        ));
-
-        // 完全没有时间点的正文也只是复述。
-        let no_time = reserved_gate_post(published, "明晚电台见");
-        assert!(!post_text_has_extra_schedule_time(&no_time, reserve_start));
+        assert_eq!(schedules[0].title, "电台");
+        assert_eq!(schedules[0].source_kind, "text");
     }
 
     #[tokio::test]
-    async fn reserved_post_schedules_second_event_and_drops_the_duplicate() {
+    async fn reserved_post_schedules_both_model_events() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("100", "甲"))
@@ -5740,7 +5773,7 @@ mod tests {
             .await
             .expect("process");
 
-        // 预约卡片那一场照旧入库，正文里的第二场也必须入库，重复条目丢弃。
+        // 卡片那一场和正文第二场都由模型给出：同槽事件不再丢弃，也不补正则兜底。
         assert_eq!(analyzer.text_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats.new_schedules, 2);
         let schedules = store
@@ -5750,17 +5783,14 @@ mod tests {
         assert_eq!(schedules.len(), 2);
         assert!(schedules
             .iter()
-            .any(|schedule| schedule.source_kind == "reserve"
-                && schedule.title == "小鼠,做法中: IG给我赢啊啊啊啊"
+            .all(|schedule| schedule.source_kind == "text"));
+        assert!(schedules
+            .iter()
+            .any(|schedule| schedule.title == "IG四强战转播"
                 && schedule.start_at == reservation.start_at));
         assert!(schedules
             .iter()
-            .any(|schedule| schedule.source_kind == "text"
-                && schedule.title == "杂谈"
-                && schedule.start_at == extra_start));
-        assert!(!schedules
-            .iter()
-            .any(|schedule| schedule.title == "IG四强战转播"));
+            .any(|schedule| schedule.title == "杂谈" && schedule.start_at == extra_start));
     }
 
     #[tokio::test]

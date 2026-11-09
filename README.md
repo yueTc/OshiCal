@@ -6,7 +6,7 @@
 
 B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 站动态、调用视觉模型解析日程，也可以部署一台服务端，让多台设备的日程与开播状态保持一致。
 
-![Windows](https://img.shields.io/badge/Windows-0.3.9-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.15-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
+![Windows](https://img.shields.io/badge/Windows-0.3.9-4c8bf5) ![Server](https://img.shields.io/badge/Server-0.3.16-4c8bf5) ![Android](https://img.shields.io/badge/Android-branch%20only-9e9e9e)
 
 ## 状态
 
@@ -18,7 +18,7 @@ B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 
 
 ## 功能
 
-- **日程抓取**：订阅主播后抓取其动态，纯文本、直播预约卡片、日程图片走同一条解析链路，写入结构化日程。无图片时才单独走文本模型，同一条动态只调用一次模型。
+- **日程抓取**：订阅主播后抓取其动态，纯文本、直播预约卡片、日程图片走同一条解析链路，写入结构化日程。正常文本与预约卡片都交给日程模型（卡片标题/描述与正文一起送模型），同一条动态只调用一次模型；模型不可用时回退到卡片里的结构化时间。
 - **日程表**：自选中日期起连续 7 天，时间线 / 日历两种视图；桌面右键、移动端长按编辑或删除；支持手动新增。
 - **开播提醒**：Windows Toast 通知 + 托盘常驻 + 可选开机自启，点击通知跳转直播间。
 - **直播状态**：启动后静默刷新并在刷新完成时同步界面，直播间入口复用同一套地址解析规则。
@@ -104,7 +104,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 `server-v*` Release 提供 `oshical-server-<版本>-linux-x86_64.tar.gz` 与 `-windows-x86_64.zip`，内含可执行文件、`dist/`、`.env.example`、部署说明与 `.sha256`。
 
 ```bash
-tar -xzf oshical-server-0.3.15-linux-x86_64.tar.gz -C /opt/oshical
+tar -xzf oshical-server-0.3.16-linux-x86_64.tar.gz -C /opt/oshical
 cd /opt/oshical
 cp .env.example .env && vi .env
 ./oshical-server
@@ -274,6 +274,7 @@ https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.j
 - [docs/26-release-server-0.3.14.md](docs/26-release-server-0.3.14.md)
 - [docs/27-release-desktop-0.3.8.md](docs/27-release-desktop-0.3.8.md)
 - [docs/28-release-server-0.3.15.md](docs/28-release-server-0.3.15.md)
+- [docs/30-release-server-0.3.16.md](docs/30-release-server-0.3.16.md)
 - [docs/29-release-desktop-0.3.9.md](docs/29-release-desktop-0.3.9.md)
 
 ## 赞助
