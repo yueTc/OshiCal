@@ -32,19 +32,19 @@ B 站虚拟主播的直播日程与开播提醒工具。桌面端直接抓取 B 
 
 ## 截图
 
-日程表（时间线视图），卡片标注来源类型与归属直播间：
+时间线视图，卡片标注来源类型、归属直播间，以及「固定周表 / 手动锁定」等排期标记：
 
-![直播日程](docs/screenshots/schedule.png)
+![时间线视图](docs/screenshots/schedule.png)
 
-主播库，订阅与开播通知是两个独立开关：
+日历网格视图，每天一列、栏宽可调，同一份日程换个看法：
+
+![日历网格视图](docs/screenshots/calendar.png)
+
+主播库，订阅日程、开播通知、订阅直播数据是三个独立开关，卡片上带晴日进度与粉丝数：
 
 ![主播库](docs/screenshots/creator-library.png)
 
-粉丝趋势，小时 / 日两个口径：
-
-![粉丝趋势](docs/screenshots/fan-trend.png)
-
-设置页，运行模式与多设备同步状态：
+设置页，运行模式、服务器更新与多设备同步状态：
 
 ![设置与多设备同步](docs/screenshots/settings-sync.png)
 
