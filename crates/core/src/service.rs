@@ -1548,7 +1548,8 @@ impl AppService {
                     .insert(format!("post:{}", post.id), None);
             }
             if let Some(analyzer) = llm.filter(|_| has_content) {
-                let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+                // v2 改用动态发布周，不能复用 v1 按分析当天计算的周表缓存。
+                let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
                 let _permit = analyzer.pool.acquire().await;
                 let config = LlmConfig {
@@ -6567,6 +6568,92 @@ mod tests {
         assert_eq!(schedules[0].title, "电台杂谈");
     }
 
+    #[tokio::test]
+    async fn publication_week_revision_ignores_old_post_cache_in_both_channels() {
+        for images in [
+            Vec::new(),
+            vec!["https://i0.hdslb.com/bfs/new_dyn/week.png"],
+        ] {
+            let store = SqliteStore::in_memory().await.expect("db");
+            let streamer = store
+                .add_subscription(&subscription("1203217682", "泽音Melody"))
+                .await
+                .expect("streamer");
+            let now = Utc::now();
+            let post = dynamic_post(
+                "old-weekly-post",
+                &streamer.mid,
+                &streamer.name,
+                now - Duration::days(8),
+                "呵呵哈哈是周表诶……",
+                images,
+            );
+            // 自定义提示词版本也必须失效，不只针对默认 schedule-v1。
+            let settings = AppSettings {
+                llm_prompt_version: "custom-schedule-v7".to_owned(),
+                ..AppSettings::default()
+            };
+            let text_hash = text_digest(&text_analysis_context(&post));
+            let content_digest = content_digest_of(&text_hash, None, &post.images);
+            let old_version = format!("{}-post-v1", settings.llm_prompt_version);
+            let old_key = format!("{}:{content_digest}:fixture-model:{old_version}", post.id);
+            let wrong_events = vec![schedule_event(
+                "不应复用的本周日程",
+                Some(now + Duration::days(2)),
+                &streamer.name,
+            )];
+            store
+                .save_post_analysis(
+                    &old_key,
+                    &post.id,
+                    &content_digest,
+                    "fixture-model",
+                    &old_version,
+                    &events_to_model_json(&wrong_events),
+                )
+                .await
+                .expect("seed old cache");
+            let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+            let service = AppService::with_analyzer(
+                store.clone(),
+                RuntimeSecrets::default(),
+                analyzer.clone(),
+            )
+            .expect("service");
+            let pool = test_pool("fixture-model");
+            for expected_calls in [1, 0] {
+                let stats = service
+                    .process_source_posts(
+                        &streamer.mid,
+                        std::slice::from_ref(&streamer),
+                        std::slice::from_ref(&post),
+                        &settings,
+                        Some(&pool),
+                    )
+                    .await
+                    .expect("process old weekly post");
+                assert_eq!(stats.llm_calls, expected_calls);
+                assert_eq!(stats.llm_cache_hits, 1 - expected_calls);
+                assert_eq!(stats.new_schedules, 0);
+                assert!(store
+                    .list_all_schedules()
+                    .await
+                    .expect("schedules")
+                    .is_empty());
+            }
+            assert_eq!(analyzer.call_count(), 1);
+            assert_eq!(analyzer.last_call().input.published_at, post.published_at);
+            let new_key = format!(
+                "{}:{content_digest}:fixture-model:{}-post-v2",
+                post.id, settings.llm_prompt_version
+            );
+            assert_eq!(
+                store.load_post_analysis(&new_key).await.expect("new cache"),
+                Some(serde_json::json!([]))
+            );
+        }
+    }
+
     /// 空结果从不写缓存；万一库里留着旧的空记录，也要当没分析过重跑一次。
     ///
     /// 旧用例校验的是 `image_analyses` 里的空数组（那时一条动态会逐图缓存）。
@@ -6598,7 +6685,7 @@ mod tests {
         let text_hash = text_digest(&text_analysis_context(&post));
         let reserve = reserve_summary(&post);
         let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
-        let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
         let cache_key = format!("{}:{content_digest}:{model}:{prompt_version}", post.id);
         store
             .save_post_analysis(
@@ -7271,7 +7358,7 @@ mod tests {
         let settings = AppSettings::default();
         let text_hash = text_digest(&text_analysis_context(&post));
         let content_digest = content_digest_of(&text_hash, None, &post.images);
-        let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
         let cache_key = format!(
             "{}:{content_digest}:fixture-model:{prompt_version}",
             post.id
