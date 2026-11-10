@@ -7145,6 +7145,53 @@ mod tests {
         .expect("source identities")
     }
 
+    #[tokio::test]
+    async fn service_sends_only_first_two_images_but_preserves_original_post() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&subscription("9501", "测试主播"))
+            .await
+            .unwrap();
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let images: Vec<String> = (0..9)
+            .map(|i| format!("https://i0.hdslb.com/bfs/new_dyn/raw-{i}.jpg"))
+            .collect();
+        let post = DynamicPost {
+            id: "two-image-cap".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: Utc::now(),
+            text: "周表".to_owned(),
+            images: images.clone(),
+            source_url: "https://www.bilibili.com/opus/two-image-cap".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&test_pool("fixture")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(analyzer.last_call().input.image_urls, images[..2]);
+        let stored: String = sqlx::query_scalar("SELECT images_json FROM dynamic_posts WHERE id=?")
+            .bind(&post.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stored).unwrap(),
+            images
+        );
+    }
+
     /// 9 张图的动态只发一次请求，图片全部随这次请求送出。
     #[tokio::test]
     async fn nine_images_go_in_one_request() {

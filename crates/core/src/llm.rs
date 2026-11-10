@@ -778,6 +778,23 @@ impl LlmClient {
         config: &LlmConfig,
         input: &PostAnalysisInput,
     ) -> AppResult<LlmAnalysis> {
+        let load = |url: String, budget: usize| async move {
+            self.load_image_payload_with_budget(&url, budget).await
+        };
+        self.analyze_post_with_image_loader(config, input, &load)
+            .await
+    }
+
+    async fn analyze_post_with_image_loader<Load, LoadFuture>(
+        &self,
+        config: &LlmConfig,
+        input: &PostAnalysisInput,
+        load: &Load,
+    ) -> AppResult<LlmAnalysis>
+    where
+        Load: Fn(String, usize) -> LoadFuture + Sync,
+        LoadFuture: std::future::Future<Output = AppResult<Option<DataUrl>>> + Send,
+    {
         config.validate()?;
         let text = input.text.trim();
         if text.chars().count() > 30_000 {
@@ -798,10 +815,7 @@ impl LlmClient {
         for image_url in &input.image_urls {
             // 单张图下载失败或被跳过不拖垮整条动态：剩下的图和正文仍走这一次调用；
             // 失败与空结果都不补发第二次请求。
-            match self
-                .load_image_payload_with_budget(image_url, image_budget)
-                .await
-            {
+            match load(image_url.clone(), image_budget).await {
                 Ok(Some(data_url)) => image_data_urls.push(data_url),
                 Ok(None) => {
                     tracing::debug!(
@@ -2242,6 +2256,68 @@ mod regression_tests {
             .and_then(Value::as_array)
             .expect("user content parts");
         assert_eq!(parts.len(), 1, "纯文字动态没有图片片段");
+    }
+
+    #[tokio::test]
+    async fn post_analysis_never_loads_images_after_the_first_two() {
+        allow_local_http_model_endpoints();
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = bodies.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| async move {
+                observed.lock().unwrap().push(body);
+                Json(json!({"choices":[{"finish_reason":"stop","message":{"content":"[]"}}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let config = LlmConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: String::new(),
+            model: "fixture".to_owned(),
+            prompt_version: "fixture".to_owned(),
+            reasoning_effort: ReasoningEffort::Auto,
+        };
+        let input = PostAnalysisInput {
+            author: "测试主播".to_owned(),
+            published_at: now(),
+            text: "周表".to_owned(),
+            reserve: None,
+            image_urls: (0..9)
+                .map(|i| format!("https://i0.hdslb.com/bfs/new_dyn/cap-{i}.jpg"))
+                .collect(),
+        };
+        let loaded = Mutex::new(Vec::new());
+        let load = |url: String, budget: usize| {
+            loaded.lock().unwrap().push((url, budget));
+            async { Ok(Some("data:image/jpeg;base64,AA==".to_owned())) }
+        };
+        let client = LlmClient::new().unwrap();
+        let result = client
+            .analyze_post_with_image_loader(&config, &input, &load)
+            .await;
+        server.abort();
+        assert!(result.is_ok());
+        assert_eq!(
+            loaded.lock().unwrap().len(),
+            2,
+            "third and later URLs must never reach the image loader"
+        );
+        assert_eq!(loaded.lock().unwrap()[0].0, input.image_urls[0]);
+        assert_eq!(loaded.lock().unwrap()[1].0, input.image_urls[1]);
+        assert_eq!(
+            bodies.lock().unwrap()[0]["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[tokio::test]
