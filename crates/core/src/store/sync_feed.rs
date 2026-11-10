@@ -10,6 +10,12 @@ const SYNC_PAGE_MAX: i64 = 500;
 const DEVICE_ONLINE_WINDOW_SECONDS: i64 = 90;
 const META_LATEST_SEQ: &str = "latest_seq";
 const META_MIN_RETAINED_SEQ: &str = "min_retained_seq";
+const SYNC_PRUNE_BATCH_ROWS: i64 = 256;
+// MAX(seq) otherwise encourages a rowid scan over large payload pages. Keep
+// julianday comparisons for historical timestamps with different UTC offsets.
+const SYNC_PRUNE_BEFORE_BOUNDARY_SQL: &str =
+    "SELECT MAX(seq) FROM sync_changes INDEXED BY idx_sync_changes_created
+     WHERE julianday(created_at) < julianday(?)";
 
 const SYNC_FEED_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_changes (
@@ -363,16 +369,15 @@ impl SqliteStore {
     /// persistent retention boundary. Clients whose cursor is older than the
     /// new boundary receive `resetRequired` on their next change request.
     pub async fn prune_sync_changes(&self, policy: SyncPrunePolicy) -> AppResult<u64> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let started = std::time::Instant::now();
+        // Boundary discovery is read-only: even a long scan must not hold the
+        // single SQLite writer slot needed by schedules and live checkpoints.
         let boundary: Option<i64> = match policy {
             SyncPrunePolicy::Before(before_created_at) => {
-                sqlx::query_scalar(
-                    "SELECT MAX(seq) FROM sync_changes
-                     WHERE julianday(created_at) < julianday(?)",
-                )
-                .bind(before_created_at.to_rfc3339())
-                .fetch_one(&mut *tx)
-                .await?
+                sqlx::query_scalar(SYNC_PRUNE_BEFORE_BOUNDARY_SQL)
+                    .bind(before_created_at.to_rfc3339())
+                    .fetch_one(&self.pool)
+                    .await?
             }
             SyncPrunePolicy::KeepLatest(max_rows) => {
                 if max_rows < 0 {
@@ -382,23 +387,80 @@ impl SqliteStore {
                     "SELECT seq FROM sync_changes ORDER BY seq DESC LIMIT 1 OFFSET ?",
                 )
                 .bind(max_rows)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&self.pool)
                 .await?
             }
         };
+        let boundary_ms = started.elapsed().as_millis() as u64;
+        if boundary_ms >= 500 {
+            tracing::warn!(?policy, boundary_ms, "同步日志清理边界查询较慢（未持写锁）");
+        }
         let Some(boundary) = boundary else {
-            tx.commit().await?;
+            tracing::info!(?policy, boundary_ms, deleted = 0, "同步日志无需清理");
             return Ok(0);
         };
-        let deleted = sqlx::query("DELETE FROM sync_changes WHERE seq <= ?")
+        let mut deleted = 0u64;
+        let mut batches = 0u64;
+        loop {
+            let waiting = std::time::Instant::now();
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let lock_wait_ms = waiting.elapsed().as_millis() as u64;
+            let transaction_started = std::time::Instant::now();
+            let batch_boundary: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(seq) FROM (
+                     SELECT seq FROM sync_changes WHERE seq <= ? ORDER BY seq LIMIT ?
+                 )",
+            )
             .bind(boundary)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        advance_feed_meta_on(&mut tx, META_MIN_RETAINED_SEQ, boundary.saturating_add(1)).await?;
-        let latest = latest_sync_seq_on(&mut tx).await?;
-        advance_feed_meta_on(&mut tx, META_LATEST_SEQ, latest).await?;
-        tx.commit().await?;
+            .bind(SYNC_PRUNE_BATCH_ROWS)
+            .fetch_one(&mut *tx)
+            .await?;
+            let Some(batch_boundary) = batch_boundary else {
+                tx.commit().await?;
+                break;
+            };
+            let batch_deleted = sqlx::query("DELETE FROM sync_changes WHERE seq <= ?")
+                .bind(batch_boundary)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            // A client can observe between batches. The removed prefix and its
+            // reset boundary must therefore be committed in the SAME transaction.
+            advance_feed_meta_on(
+                &mut tx,
+                META_MIN_RETAINED_SEQ,
+                batch_boundary.saturating_add(1),
+            )
+            .await?;
+            let latest = latest_sync_seq_on(&mut tx).await?;
+            advance_feed_meta_on(&mut tx, META_LATEST_SEQ, latest).await?;
+            tx.commit().await?;
+            deleted += batch_deleted;
+            batches += 1;
+            let transaction_ms = transaction_started.elapsed().as_millis() as u64;
+            if lock_wait_ms >= 500 || transaction_ms >= 500 {
+                tracing::warn!(
+                    lock_wait_ms,
+                    transaction_ms,
+                    batch_deleted,
+                    "同步日志清理批次较慢"
+                );
+            }
+            if batch_boundary >= boundary {
+                break;
+            }
+            // Give pending application writes a chance to acquire the lock.
+            // The target boundary is fixed, so concurrent appends are retained.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tracing::info!(
+            ?policy,
+            deleted,
+            batches,
+            boundary_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "同步日志清理完成"
+        );
         Ok(deleted)
     }
 
@@ -2048,9 +2110,28 @@ mod tests {
             store.prune_sync_changes(SyncPrunePolicy::Before(Utc::now() - Duration::days(30))),
         )
         .await;
+        let count_result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            store.prune_sync_changes(SyncPrunePolicy::KeepLatest(1)),
+        )
+        .await;
+        let invalid = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            store.prune_sync_changes(SyncPrunePolicy::KeepLatest(-1)),
+        )
+        .await;
         writer.rollback().await.expect("release writer");
         store.pool.close().await;
         tokio::fs::remove_dir_all(directory).await.expect("cleanup");
+        assert_eq!(
+            count_result
+                .expect("count lookup must not acquire a writer")
+                .unwrap(),
+            0
+        );
+        assert!(invalid
+            .expect("invalid policy must be checked before waiting")
+            .is_err());
         assert_eq!(
             result
                 .expect("read-only boundary lookup must not acquire a write lock")
@@ -2123,6 +2204,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pruning_failed_batch_preserves_committed_cursor_and_can_resume() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 530)
+             INSERT INTO sync_changes(entity_type,entity_id,operation,entity_revision,payload_json,actor_type,created_at)
+             SELECT 'test', CAST(x AS TEXT), 'upsert', 1, '{}', 'system', '2026-11-01T00:00:00Z' FROM n",
+        ).execute(&store.pool).await.unwrap();
+        let latest = store.latest_sync_seq().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER fail_second_batch BEFORE DELETE ON sync_changes
+             WHEN OLD.seq > 256 BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store
+            .prune_sync_changes(SyncPrunePolicy::KeepLatest(7))
+            .await
+            .is_err());
+        assert_eq!(store.min_retained_sync_seq().await.unwrap(), 257);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_changes")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 274);
+        sqlx::query("DROP TRIGGER fail_second_batch")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepLatest(7))
+                .await
+                .unwrap(),
+            267
+        );
+        assert_eq!(store.min_retained_sync_seq().await.unwrap(), latest - 6);
+        assert_eq!(store.latest_sync_seq().await.unwrap(), latest);
+    }
+
+    #[tokio::test]
+    async fn pruning_fixed_boundary_retains_changes_appended_between_batches() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 530)
+             INSERT INTO sync_changes(entity_type,entity_id,operation,entity_revision,payload_json,actor_type,created_at)
+             SELECT 'test', CAST(x AS TEXT), 'upsert', 1, '{}', 'system', '2026-11-01T00:00:00Z' FROM n",
+        ).execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO sync_feed_meta(key,value,updated_at) VALUES('min_retained_seq',0,'test') ON CONFLICT(key) DO UPDATE SET value=0")
+            .execute(&store.pool).await.unwrap();
+        // Inject an append at the first prefix commit, before the following batch.
+        sqlx::raw_sql(
+            "CREATE TRIGGER append_during_prune AFTER UPDATE OF value ON sync_feed_meta
+             WHEN NEW.key='min_retained_seq' AND OLD.value=0
+             BEGIN
+                 INSERT INTO sync_changes(entity_type,entity_id,operation,entity_revision,payload_json,actor_type,created_at)
+                 VALUES('test','concurrent','upsert',1,'{}','system','2026-11-10T00:00:00Z');
+             END;",
+        ).execute(&store.pool).await.unwrap();
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepLatest(7))
+                .await
+                .unwrap(),
+            523
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_changes")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 8,
+            "new appends are not part of the original deletion boundary"
+        );
+        assert_eq!(store.latest_sync_seq().await.unwrap(), 531);
+        let page = store.sync_changes_after(530, 100).await.unwrap();
+        assert!(!page.reset_required);
+        assert_eq!(page.changes[0].entity_id, "concurrent");
+    }
+
+    #[tokio::test]
     async fn pruning_before_preserves_timezone_comparison_and_uses_covering_index() {
         let store = SqliteStore::in_memory().await.expect("store");
         for (index, timestamp) in ["2026-11-02T00:00:00+08:00", "2026-11-01T17:00:00+00:00"]
@@ -2140,6 +2302,16 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let plan = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {SYNC_PRUNE_BEFORE_BOUNDARY_SQL}"
+        ))
+        .bind("2026-11-01T16:30:00Z")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert!(plan.iter().any(|row| row
+            .get::<String, _>("detail")
+            .contains("COVERING INDEX idx_sync_changes_created")));
         let before = "2026-11-01T16:30:00Z".parse().unwrap();
         assert_eq!(
             store

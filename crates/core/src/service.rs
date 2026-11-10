@@ -1548,8 +1548,8 @@ impl AppService {
                     .insert(format!("post:{}", post.id), None);
             }
             if let Some(analyzer) = llm.filter(|_| has_content) {
-                // v2 改用动态发布周，不能复用 v1 按分析当天计算的周表缓存。
-                let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
+                // v3 保留历史日程，不能复用旧版按时间过滤后留下的空/不完整缓存。
+                let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
                 let _permit = analyzer.pool.acquire().await;
                 let config = LlmConfig {
@@ -6719,7 +6719,7 @@ mod tests {
             assert_eq!(analyzer.call_count(), 1);
             assert_eq!(analyzer.last_call().input.published_at, post.published_at);
             let new_key = format!(
-                "{}:{content_digest}:fixture-model:{}-post-v2",
+                "{}:{content_digest}:fixture-model:{}-post-v3",
                 post.id, settings.llm_prompt_version
             );
             assert_eq!(
@@ -6760,7 +6760,7 @@ mod tests {
         let text_hash = text_digest(&text_analysis_context(&post));
         let reserve = reserve_summary(&post);
         let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
-        let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
         let cache_key = format!("{}:{content_digest}:{model}:{prompt_version}", post.id);
         store
             .save_post_analysis(
@@ -7433,7 +7433,7 @@ mod tests {
         let settings = AppSettings::default();
         let text_hash = text_digest(&text_analysis_context(&post));
         let content_digest = content_digest_of(&text_hash, None, &post.images);
-        let prompt_version = format!("{}-post-v2", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
         let cache_key = format!(
             "{}:{content_digest}:fixture-model:{prompt_version}",
             post.id

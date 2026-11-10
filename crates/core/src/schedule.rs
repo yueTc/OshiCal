@@ -16,28 +16,23 @@ pub struct ParsedSchedule {
 pub fn parse_text_schedule(
     text: &str,
     published_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
     fallback_title: &str,
 ) -> Option<ParsedSchedule> {
-    parse_text_schedule_inner(text, published_at, now, fallback_title)
+    parse_text_schedule_inner(text, published_at, fallback_title)
 }
 
 fn parse_text_schedule_inner(
     text: &str,
     published_at: DateTime<Utc>,
-    now: DateTime<Utc>,
     fallback_title: &str,
 ) -> Option<ParsedSchedule> {
     let china = FixedOffset::east_opt(8 * 3600)?;
-    let now_cn = now.with_timezone(&china);
     let published_cn = published_at.with_timezone(&china);
     let time = parse_time(text)?;
-    let date = resolve_date(text, published_cn.date_naive(), now_cn.date_naive())?;
+    let date = resolve_date(text, published_cn.date_naive())?;
     let naive_start = date.and_hms_opt(time.hour, time.minute, 0)?;
     let local_start = china.from_local_datetime(&naive_start).single()?;
-    if local_start < now_cn {
-        return None;
-    }
     let start_at = local_start.with_timezone(&Utc);
     let end_at = time.end.and_then(|(hour, minute)| {
         let mut naive_end = date.and_hms_opt(hour, minute, 0).unwrap_or(naive_start);
@@ -60,7 +55,7 @@ fn parse_text_schedule_inner(
 pub fn parse_reserve_schedule(
     reserve: &ReserveCard,
     published_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> Option<ParsedSchedule> {
     // `ADDITIONAL_TYPE_RESERVE` also carries video reservations. Only live
     // reservations (`stype = 2`) belong in the live schedule.
@@ -71,22 +66,9 @@ pub fn parse_reserve_schedule(
     if !has_calendar_date(&time_text) {
         return None;
     }
-    // 卡片上的“今天/明天 18:00”是相对卡片发布时刻说的，不是相对刷新时刻。
-    // 这里用发布日的零点当“现在”解析：同一发布日的场次都能算出来，
-    // 是否已经开过由下面的真实 now 判断，刷新再晚也不会把日期往后挪一格。
-    let china = FixedOffset::east_opt(8 * 3600)?;
-    let published_cn = published_at.with_timezone(&china);
-    let publish_naive = published_cn.date_naive().and_hms_opt(0, 0, 0)?;
-    let publish_day_start = china
-        .from_local_datetime(&publish_naive)
-        .single()?
-        .with_timezone(&Utc);
-    let mut schedule =
-        parse_text_schedule(&time_text, published_at, publish_day_start, &reserve.title)?;
-    // 已经开过的场次不再进日历。
-    if schedule.start_at < now {
-        return None;
-    }
+    // Relative dates belong to the post's publication day, including past
+    // reservations. The caller's refresh time must never move or drop a slot.
+    let mut schedule = parse_text_schedule(&time_text, published_at, published_at, &reserve.title)?;
     schedule.title = reserve_title_without_bilibili_prefix(&reserve.title);
     schedule.confidence = 1.0;
     Some(schedule)
@@ -122,7 +104,7 @@ fn has_calendar_date(text: &str) -> bool {
             .any(|token| text.contains(token))
 }
 
-fn resolve_date(text: &str, published_date: NaiveDate, today: NaiveDate) -> Option<NaiveDate> {
+fn resolve_date(text: &str, published_date: NaiveDate) -> Option<NaiveDate> {
     static CN_DATE_HINT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static ISO_DATE_HINT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let cn_date = CN_DATE_HINT.get_or_init(|| {
@@ -131,53 +113,36 @@ fn resolve_date(text: &str, published_date: NaiveDate, today: NaiveDate) -> Opti
     });
     let iso_date =
         ISO_DATE_HINT.get_or_init(|| Regex::new(r"\d{4}-\d{1,2}-\d{1,2}").expect("valid iso hint"));
-    // 1. 写死的日期：ISO、`10月30日`、`11-02`、`10/31`。
-    //    文本既然写了日期，就以它为准；解析不出来（`2月30日`）说明是坏数据，不要退回发布日。
+    // Explicit dates take precedence, even when past. Invalid dates must not
+    // silently fall back to publication day or get rolled into the current week.
     if cn_date.is_match(text)
         || iso_date.is_match(text)
         || month_day_regex().is_match(text)
         || slash_date_regex().is_match(text)
     {
-        let date = parse_explicit_date(text, published_date)?;
-        return (date >= today).then_some(date);
+        return parse_explicit_date(text, published_date);
     }
-    // 2. 今天/今晚/明天/明晚/后天。相对词是相对发布时刻说的：一条“明天 20:00”的
-    //    动态过两天再被刷新，不该变成“后天”。已经过掉就继续看后面的线索。
     let relative = parse_relative_date(text, published_date);
-    if let Some(date) = relative {
-        if date > today {
-            return Some(date);
-        }
-    }
-    //    正文里的“今晚吃饭都更香了”会先命中“今晚”，可真正的场次另写着
-    //    “下周一 18:00”。说到“下周X/下个星期X”时，让星期几优先。
-    //    这里的相对词可能落在发布日（发布后隔两天才刷新），所以只要不晚于今天就都让位。
-    if relative.is_some_and(|date| date <= today)
-        && (text.contains("下周") || text.contains("下个星期"))
-    {
+    // Chatter such as "今晚吃饭更香了，下周一18:00继续2.6下" still
+    // describes next Monday. This decision must not change on a later refresh.
+    if relative.is_some() && (text.contains("下周") || text.contains("下个星期")) {
         if let Some(date) = parse_weekday_date(text, published_date) {
-            if date >= today && relative.is_none_or(|relative| date > relative) {
+            if relative.is_some_and(|relative| date > relative) {
                 return Some(date);
             }
         }
     }
-    if let Some(date) = relative {
-        return Some(date);
+    if relative.is_some() {
+        return relative;
     }
-    // 3. 周X / 下周X，同样以发布日为基准。
     if text.contains('周') || text.contains("星期") {
         if let Some(date) = parse_weekday_date(text, published_date) {
-            return (date >= today).then_some(date);
-        }
-    }
-    // 4. `11.9` 这种点分写法：和版本号（`【2D鸣潮】2.6下`）撞型，
-    //    只在前面几条都没有答案时才拿来兜底。
-    if let Some(date) = parse_dot_date(text, published_date) {
-        if date >= today {
             return Some(date);
         }
     }
-    (published_date >= today).then_some(published_date)
+    // Dot dates are ambiguous with game versions: retain the narrow date
+    // window instead of interpreting a distant "2.6" as a historical date.
+    parse_dot_date(text, published_date).or(Some(published_date))
 }
 fn parse_explicit_date(text: &str, published_date: NaiveDate) -> Option<NaiveDate> {
     static ISO_DATE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -243,7 +208,9 @@ fn parse_dot_date(text: &str, published_date: NaiveDate) -> Option<NaiveDate> {
     let day = caps.get(2)?.as_str().parse::<u32>().ok()?;
     // 点分写法误判的代价很高（版本号 `2.6` 会变成 2 月 6 日并被推到明年），
     // 跨年推断只给一个月的窗口：只有“12月底约1月初”这种才值得顺延。
-    month_day_on_publication_year_within(published_date, month, day, 31)
+    let date = month_day_on_publication_year_within(published_date, month, day, 31)
+        .or_else(|| NaiveDate::from_ymd_opt(published_date.year(), month, day))?;
+    (date >= published_date - Duration::days(31)).then_some(date)
 }
 
 fn month_day_on_publication_year(
@@ -252,6 +219,7 @@ fn month_day_on_publication_year(
     day: u32,
 ) -> Option<NaiveDate> {
     month_day_on_publication_year_within(published_date, month, day, 180)
+        .or_else(|| NaiveDate::from_ymd_opt(published_date.year(), month, day))
 }
 
 fn month_day_on_publication_year_within(
@@ -311,7 +279,7 @@ fn parse_weekday_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
     let week_offset = if text.contains("上周") {
         -7
-    } else if text.contains("下周") {
+    } else if text.contains("下周") || text.contains("下个星期") {
         7
     } else {
         0
@@ -568,10 +536,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_past_or_missing_time() {
-        assert!(
-            parse_text_schedule("上周一 20:00 直播", published(), china_now(), "直播").is_none()
-        );
+    fn keeps_past_dates_but_rejects_missing_time() {
+        let value = parse_text_schedule("上周一 20:00 直播", published(), china_now(), "直播")
+            .expect("historical slot");
+        assert_eq!(value.start_at.to_string(), "2026-10-19 12:00:00 UTC");
         assert!(parse_text_schedule("周五直播", published(), china_now(), "直播").is_none());
         assert!(parse_text_schedule("今天想吃火锅", published(), china_now(), "直播").is_none());
     }
@@ -683,7 +651,9 @@ mod tests {
         let published = DateTime::parse_from_rfc3339("2027-01-20T10:00:00+08:00")
             .expect("published")
             .with_timezone(&Utc);
-        assert!(parse_text_schedule("1-10 20:00 直播", published, now, "直播").is_none());
+        let value = parse_text_schedule("1-10 20:00 直播", published, now, "直播")
+            .expect("historical month-day");
+        assert_eq!(value.start_at.to_string(), "2027-01-10 12:00:00 UTC");
     }
 
     #[test]
@@ -720,7 +690,9 @@ mod tests {
         assert!(
             parse_text_schedule("2月30日 20:00 直播", published(), china_now(), "直播").is_none()
         );
-        assert!(parse_text_schedule("今天 09:00 直播", published(), china_now(), "直播").is_none());
+        let past = parse_text_schedule("今天 09:00 直播", published(), china_now(), "直播")
+            .expect("earlier today");
+        assert_eq!(past.start_at.to_string(), "2026-10-26 01:00:00 UTC");
     }
 
     #[test]
@@ -767,7 +739,7 @@ mod tests {
 
     #[test]
     fn reserve_relative_day_is_anchored_to_publication() {
-        // “今天 18:00” 是相对发布时刻说的；发布时 18:00 已过，就不该再产出一场。
+        // “今天18:00”相对发布日；后续刷新仍保留该历史场次，不向今天平移。
         let publish = DateTime::parse_from_rfc3339("2026-11-07T20:25:12+08:00")
             .expect("publish")
             .with_timezone(&Utc);
@@ -781,7 +753,8 @@ mod tests {
             jump_url: None,
             stype: Some(2),
         };
-        assert!(parse_reserve_schedule(&reserve, publish, now).is_none());
+        let past = parse_reserve_schedule(&reserve, publish, now).expect("historical reservation");
+        assert_eq!(past.start_at.to_string(), "2026-11-07 10:00:00 UTC");
 
         // 同一条卡片在发布当天解析，仍然给出当天的场次。
         let same_day = DateTime::parse_from_rfc3339("2026-11-07T17:00:00+08:00")
