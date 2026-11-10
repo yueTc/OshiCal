@@ -59,7 +59,7 @@ jobs:
           if ($clippyExit -ne 0) {
             $diagnostics = @(
               $clippyOutput |
-                Where-Object { $_ -match '(?i)error:|warning:' } |
+                Where-Object { $_ -match '(?i)error(?:\[[^\]]+\])?:|warning:' } |
                 Select-Object -First 25
             )
             if ($diagnostics.Count -eq 0) {
@@ -83,7 +83,7 @@ jobs:
           cargo test --workspace --locked --no-fail-fast 2>&1 | Tee-Object -Variable testOutput
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
-            $failures = $testOutput | Select-String -Pattern 'FAILED|panicked at|assertion' -Context 0,4
+            $failures = $testOutput | Select-String -Pattern 'FAILED|panicked at|assertion|error\[E[0-9]+\]' -Context 0,6
             foreach ($failure in $failures) {
               $message = $failure.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
               Write-Host "::error title=Rust test failure::$message"
