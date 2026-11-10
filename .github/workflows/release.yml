@@ -76,6 +76,7 @@ jobs:
             throw "测试版版本号必须使用 X.Y.Z-beta.N，实际为 $version"
           }
           $channel = if ($isBeta) { "beta" } else { "stable" }
+          "version=$version" >> $env:GITHUB_OUTPUT
           "channel=$channel" >> $env:GITHUB_OUTPUT
           "prerelease=$($isBeta.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
@@ -148,18 +149,23 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $notes = @(Get-ChildItem -Path 'docs' -File -Filter "*-release-desktop-$env:VERSION.md")
-          if ($notes.Count -ne 1) {
-            throw "版本 $env:VERSION 必须恰好有一份 docs/*-release-desktop-$env:VERSION.md，实际 $($notes.Count) 份"
+          try {
+            $notes = @(Get-ChildItem -Path 'docs' -File -Filter "*-release-desktop-$env:VERSION.md")
+            if ($notes.Count -ne 1) {
+              throw "版本 $env:VERSION 必须恰好有一份 docs/*-release-desktop-$env:VERSION.md，实际 $($notes.Count) 份"
+            }
+            $body = Get-Content -Raw -LiteralPath $notes[0].FullName
+            if ([string]::IsNullOrWhiteSpace($body)) {
+              throw "发布说明为空：$($notes[0].FullName)"
+            }
+            $delimiter = "OSHICAL_RELEASE_NOTES_$([guid]::NewGuid().ToString('N'))"
+            "body<<$delimiter" >> $env:GITHUB_OUTPUT
+            $body >> $env:GITHUB_OUTPUT
+            $delimiter >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "::error title=Desktop release notes::$($_.Exception.Message)"
+            throw
           }
-          $body = Get-Content -Raw -LiteralPath $notes[0].FullName
-          if ([string]::IsNullOrWhiteSpace($body)) {
-            throw "发布说明为空：$($notes[0].FullName)"
-          }
-          $delimiter = "OSHICAL_RELEASE_NOTES_$([guid]::NewGuid().ToString('N'))"
-          "body<<$delimiter" >> $env:GITHUB_OUTPUT
-          $body >> $env:GITHUB_OUTPUT
-          $delimiter >> $env:GITHUB_OUTPUT
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
