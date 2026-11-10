@@ -79,6 +79,9 @@ pub struct AppService {
     llm_key_binding: Arc<RwLock<Option<(String, String)>>>,
     live_stats: LiveStatsManager,
     refresh_lock: Arc<Mutex<()>>,
+    // Protect the cross-streamer find/merge/insert sequence for joint streams.
+    // This is never held during fetching, image preparation, or model requests.
+    auto_schedule_write_lock: Arc<Mutex<()>>,
     live_check_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
@@ -108,6 +111,7 @@ impl AppService {
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            auto_schedule_write_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -127,6 +131,7 @@ impl AppService {
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            auto_schedule_write_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -2410,6 +2415,10 @@ impl AppService {
         room_owner_name: Option<&str>,
         participants: &[String],
     ) -> AppResult<bool> {
+        // Independent streamer jobs may report the same joint event. Keep the
+        // existing lookup-and-merge decision atomic across those jobs, without
+        // serialising their network/model work or holding a SQLite transaction.
+        let _write_guard = self.auto_schedule_write_lock.lock().await;
         let mut schedule = schedule.clone();
         schedule.title = self
             .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
@@ -7894,6 +7903,7 @@ mod tests {
         active_by_author: std::sync::Mutex<HashSet<String>>,
         order: std::sync::Mutex<HashMap<String, Vec<String>>>,
         barrier: Option<tokio::sync::Barrier>,
+        joint_participants: Vec<String>,
     }
 
     impl StreamerConcurrencyAnalyzer {
@@ -7904,6 +7914,7 @@ mod tests {
                 active_by_author: std::sync::Mutex::new(HashSet::new()),
                 order: std::sync::Mutex::new(HashMap::new()),
                 barrier: parallel.then(|| tokio::sync::Barrier::new(2)),
+                joint_participants: Vec::new(),
             }
         }
     }
@@ -7946,11 +7957,15 @@ mod tests {
                 ));
             }
             let offset = if input.text == "second" { 2 } else { 1 };
-            let events = vec![schedule_event(
+            let mut events = vec![schedule_event(
                 &input.text,
                 Some(input.published_at + Duration::days(2) + Duration::hours(offset)),
                 &input.author,
             )];
+            if !self.joint_participants.is_empty() {
+                events[0].participants = self.joint_participants.clone();
+                events[0].room_url = Some("https://live.bilibili.com/12345".to_owned());
+            }
             Ok(LlmAnalysis {
                 raw: events_to_model_json(&events),
                 events,
@@ -8045,6 +8060,62 @@ mod tests {
                 .all(|pair| pair[0].percent <= pair[1].percent),
             "global progress must not go backwards"
         );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_streamer_reports_create_only_one_joint_schedule() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let a = store
+            .add_subscription(&subscription("9961", "甲"))
+            .await
+            .unwrap();
+        let b = store
+            .add_subscription(&subscription("9962", "乙"))
+            .await
+            .unwrap();
+        let mut analyzer = StreamerConcurrencyAnalyzer::new(true);
+        analyzer.joint_participants = vec!["甲".to_owned(), "乙".to_owned()];
+        let analyzer = Arc::new(analyzer);
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let sources = vec![(a.mid.clone(), vec![a]), (b.mid.clone(), vec![b])];
+        let now = Utc::now();
+        let fetch = |mid: String| {
+            let name = if mid == "9961" { "甲" } else { "乙" };
+            let post = dynamic_post(
+                &format!("{mid}-joint"),
+                &mid,
+                name,
+                now,
+                "联动歌回",
+                Vec::new(),
+            );
+            async move { Ok(vec![post]) }
+        };
+        let settings = AppSettings {
+            llm_parallelism: 2,
+            ..AppSettings::default()
+        };
+        let pool = PostAnalyzer {
+            config: test_pool("fixture-model").config,
+            pool: LlmPool::new(2),
+        };
+        let report = service
+            .refresh_sources_with_fetcher(&sources, &settings, Some(&pool), None, &|_| {}, &fetch)
+            .await
+            .unwrap();
+        assert!(report.failed_streamers.is_empty());
+        assert_eq!(
+            analyzer.peak.load(Ordering::SeqCst),
+            2,
+            "model calls remain concurrent"
+        );
+        assert_eq!(
+            report.new_schedules, 1,
+            "must not create two rows and hide the race with final deduplication"
+        );
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
