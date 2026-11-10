@@ -39,15 +39,22 @@ export function Toggle({
   checked,
   onChange,
   label,
+  ariaLabel,
   disabled = false,
+  labelFirst = false,
 }: {
   checked: boolean;
   onChange: (value: boolean) => void;
   label: string;
+  ariaLabel?: string;
   disabled?: boolean;
+  labelFirst?: boolean;
 }) {
   return (
-    <label className={`toggle ${disabled ? "is-disabled" : ""}`}>
+    <label
+      className={`toggle ${disabled ? "is-disabled" : ""} ${labelFirst && label ? "is-label-first" : ""}`}
+      aria-label={ariaLabel}
+    >
       <input
         type="checkbox"
         checked={checked}
@@ -55,7 +62,7 @@ export function Toggle({
         onChange={(event) => onChange(event.target.checked)}
       />
       <span className="toggle-track" aria-hidden="true" />
-      <span>{label}</span>
+      {label ? <span>{label}</span> : null}
     </label>
   );
 }

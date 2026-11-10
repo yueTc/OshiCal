@@ -1451,6 +1451,12 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   color: var(--muted);
   font-size: 12px;
 }
+.form-grid label.toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.toggle.is-label-first > span:last-child { order: -1; }
 .toggle input { position: absolute; opacity: 0; pointer-events: none; }
 .toggle-track {
   position: relative;
@@ -1569,26 +1575,30 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .search-result p { margin-top: 3px; color: var(--muted); font-size: 11px; }
 .result-sign { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 标题与搜索条固定在窗口顶部，滚动主播列表时始终可见。 */
-/* --creators-sticky-lift 是吸附时标题与窗口上沿之间的缝隙：桌面端右上角有
+/* 标题与操作条固定在窗口顶部，滚动内容时始终可见。 */
+/* --sticky-header-lift 是吸附时标题与窗口上沿之间的缝隙：桌面端右上角有
    最小化/最大化/关闭按钮（占顶部 32px），留 36px 避开。margin-top 抵消
    padding-top，未滚动时排版与原来完全一致；lift 必须小于 main-content 的
    上内边距，否则未滚动时元素顶边已经越界，会被误判成已吸附。 */
-.creators-page { --creators-sticky-lift: 10px; }
-.app-shell.is-desktop .creators-page { --creators-sticky-lift: 36px; }
-.creators-sticky {
+.creators-page,
+.settings-page,
+.schedule-page { --sticky-header-lift: 10px; }
+.app-shell.is-desktop .creators-page,
+.app-shell.is-desktop .settings-page,
+.app-shell.is-desktop .schedule-page { --sticky-header-lift: 36px; }
+.sticky-page-header {
   position: sticky;
   top: 0;
   z-index: 8;
   isolation: isolate;
-  margin-top: calc(var(--creators-sticky-lift) * -1);
+  margin-top: calc(var(--sticky-header-lift) * -1);
   margin-inline: -12px;
   margin-bottom: 12px;
-  padding-top: var(--creators-sticky-lift);
+  padding-top: var(--sticky-header-lift);
   padding-inline: 12px;
   padding-bottom: 14px;
 }
-.creators-sticky::before {
+.sticky-page-header::before {
   content: "";
   position: absolute;
   inset: -2px -6px 0;
@@ -1601,13 +1611,25 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   opacity: 0;
   transition: opacity 140ms ease;
 }
-.creators-sticky.is-pinned::before { opacity: 1; }
-.creators-sticky .page-header { margin-bottom: 14px; }
+.sticky-page-header.is-pinned::before { opacity: 1; }
+.sticky-page-header .page-header { margin-bottom: 14px; }
+/* 设置页和日程页没有搜索条，保留原页面标题与内容之间的 22px 间距。 */
+.settings-sticky,
+.schedule-sticky {
+  margin-bottom: 8px;
+  padding-bottom: 14px;
+}
+.settings-sticky .page-header { margin-bottom: 0; }
+.schedule-sticky .page-header { margin-bottom: 14px; }
+.schedule-sticky .day-navigator { margin-bottom: 0; }
+/* 日程页主操作固定为白色；设置页的主题色实底按钮和选中图标统一继承白色前景。 */
+.schedule-sticky .button.primary { color: #ffffff; }
+.settings-page { --on-primary: #ffffff; }
 .creators-sticky .search-panel { margin-bottom: 0; }
 .creator-list { display: grid; gap: 12px; min-width: 0; }
 .creator-card {
   display: grid;
-  grid-template-columns: 28px 64px minmax(0, 1fr) auto;
+  grid-template-columns: 28px 64px minmax(0, 1fr);
   gap: 14px;
   padding: 16px;
   background: var(--surface);
@@ -1652,10 +1674,24 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   cursor: grab;
 }
 .creator-order-tools .creator-drag-handle:active { cursor: grabbing; }
-.creator-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.creator-title h3 { font-size: 17px; }
+.creator-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 14px;
+  align-content: start;
+  align-items: start;
+  min-width: 0;
+}
+/* 右侧操作仅占首行，下方开关和官号使用完整内容宽度。 */
+.creator-main > * { grid-column: 1 / -1; }
+.creator-main > .creator-title { grid-column: 1; grid-row: 1; align-self: center; }
+.creator-main > .creator-actions { grid-column: 2; grid-row: 1; }
+.creator-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.creator-title h3 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; }
+.creator-title > span { flex-shrink: 0; }
 .creator-title > span:not(.live-label) { color: var(--faint); font-size: 11px; }
-.creator-toggles { display: flex; gap: 18px; margin-top: 12px; flex-wrap: wrap; }
+.creator-toggles { display: flex; gap: 18px; margin-top: 12px; min-width: 0; flex-wrap: nowrap; overflow-x: auto; }
+.creator-toggles > .toggle { flex-shrink: 0; white-space: nowrap; }
 .linked-row { display: flex; align-items: center; gap: 7px; margin-top: 13px; flex-wrap: wrap; }
 .linked-label { display: inline-flex; align-items: center; gap: 4px; color: var(--faint); font-size: 11px; }
 .linked-pill {
@@ -2031,7 +2067,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .custom-entry-swatch i:nth-child(3) { right: auto; left: 43px; background: #1f9f79; }
 
 .appearance-custom {
-  display: grid;
+  display: none;
   gap: 12px;
   margin-top: 13px;
   padding: 13px;
@@ -2041,6 +2077,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 
 .appearance-custom.active {
+  display: grid;
   border-color: var(--border-strong);
 }
 
@@ -2164,13 +2201,45 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 .settings-card header .setting-scope.server { color: var(--primary-strong); background: var(--primary-soft); }
 .settings-card header .setting-scope.local { color: #126b49; background: rgba(22, 164, 107, .08); }
+.settings-card header .server-login-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px !important;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.settings-card header .server-login-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+  border-radius: 50%;
+}
+.settings-card header .server-login-pill.is-online { color: #126b49; background: rgba(22, 164, 107, .09); }
+.settings-card header .server-login-pill.is-offline { color: var(--muted); background: rgba(80, 52, 68, .07); }
 .device-local-settings { background: rgba(250, 252, 251, .88); }
 .software-update-card { background: rgba(248, 252, 255, .88); }
-.update-channel-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 16px; margin-bottom: 14px; padding: 12px; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 12px; }
-.update-channel-row > div:first-child { display: grid; gap: 3px; min-width: 0; }
-.update-channel-row strong { color: var(--text); font-size: 13px; }
-.update-channel-row span { color: var(--muted); font-size: 10px; line-height: 1.55; }
-.update-channel-row .segmented { flex: none; }
+.settings-card header .card-header-toggle {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+}
+.settings-card header .update-channel-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.settings-card header .update-channel-control .segmented {
+  flex: none;
+  padding: 3px;
+  border-radius: 999px;
+}
+.settings-card header .update-channel-control .segmented button { border-radius: 999px; }
 .update-version-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
 .update-version { display: grid; gap: 2px; }
 .update-version span, .update-details small { color: var(--muted); font-size: 10px; }
@@ -2217,7 +2286,6 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .server-update-metrics span { color: var(--muted); font-size: 10px; }
 .server-update-metrics strong { color: var(--text); font-size: 18px; font-variant-numeric: tabular-nums; }
 .server-update-metrics small { color: var(--muted); font-size: 10px; }
-.server-update-channel { margin-top: 0; margin-bottom: 14px; }
 .server-update-options { margin-top: 12px; }
 .server-update-window { display: grid; grid-template-columns: repeat(2, minmax(0, 180px)) minmax(0, 1fr); align-items: end; gap: 10px; }
 .server-update-window label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
@@ -2426,9 +2494,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .sidebar-resizer { display: none; }
   .main-content { padding: calc(24px + var(--window-chrome-offset)) 18px 34px; }
   .page-header { flex-direction: column; }
-  /* 主播库标题跟着搜索条一起吸附，窄屏下改成单行，避免吸附条占掉过多高度。 */
-  .creators-sticky .page-header { flex-direction: row; align-items: center; gap: 12px; }
-  .creators-sticky .page-header > div { flex: 1; }
+  /* 吸顶标题与操作按钮在窄屏下保持单行，避免占掉过多高度。 */
+  .sticky-page-header .page-header { flex-direction: row; align-items: center; gap: 12px; }
+  .sticky-page-header .page-header > div { flex: 1; }
   .toolbar-actions { width: 100%; }
   .settings-layout, .form-grid { grid-template-columns: 1fr; }
   .github-mirror-input-row, .github-mirror-input-row.no-save { grid-template-columns: 1fr; }
@@ -2438,7 +2506,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .weekly-time-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .span-2 { grid-column: auto; }
   .day-section { grid-template-columns: 94px minmax(0,1fr); gap: 7px; }
-  .creator-card { grid-template-columns: 24px 54px minmax(0,1fr) auto; gap: 10px; }
+  .creator-card { grid-template-columns: 24px 54px minmax(0,1fr); gap: 10px; }
+  .creator-main { column-gap: 10px; }
   .creator-actions { flex-wrap: wrap; justify-content: flex-end; }
   .fertility-detail-grid { grid-template-columns: 1fr; }
   .bloodhound-status { align-items: flex-start; flex-wrap: wrap; }
@@ -2458,9 +2527,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .nav-list button { font-size: 0; min-height: 48px; }
   .nav-list button svg { width: 22px; height: 22px; }
   .main-content { margin-left: 0; padding: calc(18px + var(--window-chrome-offset)) 12px; padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
-  .creators-sticky { margin-inline: -8px; margin-bottom: 10px; padding-inline: 8px; padding-bottom: 12px; }
-  .creators-sticky .page-subtitle { margin-top: 4px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .creators-sticky .page-header { margin-bottom: 10px; }
+  .sticky-page-header { margin-inline: -8px; margin-bottom: 10px; padding-inline: 8px; padding-bottom: 12px; }
+  .sticky-page-header .page-subtitle { margin-top: 4px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sticky-page-header .page-header { margin-bottom: 10px; }
   .creators-sticky .search-panel { padding: 12px; border-radius: var(--radius); }
   .toast { bottom: max(22px, calc(env(safe-area-inset-bottom) + 78px)); }
   h1 { font-size: 24px; }

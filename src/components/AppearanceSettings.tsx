@@ -33,7 +33,6 @@ export default function AppearanceSettingsPanel({ value, onChange }: AppearanceS
       <header>
         <h2>界面配色</h2>
         <span className="setting-scope local">仅当前设备</span>
-        <span>选择常用配色，或自定义主色和背景色；修改后立即生效。</span>
       </header>
 
       <div className="appearance-presets" aria-label="常用配色">
@@ -86,7 +85,6 @@ export default function AppearanceSettingsPanel({ value, onChange }: AppearanceS
           <Palette size={17} />
           <div>
             <strong>自定义配色</strong>
-            <span>主色用于按钮、导航和强调元素；背景色用于页面底色与光晕。</span>
           </div>
         </div>
         <div className="appearance-color-grid">

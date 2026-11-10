@@ -18,7 +18,6 @@ import {
   RefreshCw,
   Save,
   Search,
-  ShieldCheck,
   Target,
 } from "lucide-react";
 import type {
@@ -44,6 +43,7 @@ import {
   readClientGithubMirror,
   saveClientGithubMirror,
 } from "../lib/github-mirror";
+import { useStickyHeader } from "../lib/sticky-header";
 import {
   mergeServerSettings,
   normalizeLlmParallelism,
@@ -106,7 +106,7 @@ function settingsEqual(left: AppSettings, right: AppSettings): boolean {
 }
 
 const LLM_REASONING_OPTIONS: ReadonlyArray<{ value: LlmReasoningEffort; label: string }> = [
-  { value: "auto", label: "自动" },
+  { value: "auto", label: "关闭" },
   { value: "low", label: "低" },
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
@@ -139,9 +139,7 @@ function serverUpdateSettingsEqual(left: ServerUpdateSettings, right: ServerUpda
 interface GithubMirrorFieldProps {
   label: string;
   ariaLabel: string;
-  description: string;
   value: string;
-  effectiveValue: string;
   dirty?: boolean;
   saving?: boolean;
   error?: string | null;
@@ -149,7 +147,6 @@ interface GithubMirrorFieldProps {
   onChange: (value: string) => void;
   onClear: () => void;
   onSave?: (value: string) => void;
-  scopeNote: string;
 }
 
 /**
@@ -159,9 +156,7 @@ interface GithubMirrorFieldProps {
 function GithubMirrorField({
   label,
   ariaLabel,
-  description,
   value,
-  effectiveValue,
   dirty = false,
   saving = false,
   error = null,
@@ -169,14 +164,12 @@ function GithubMirrorField({
   onChange,
   onClear,
   onSave,
-  scopeNote,
 }: GithubMirrorFieldProps) {
   const busy = saving || disabled;
   return (
     <div className="update-mirror-block">
       <div className="update-mirror-head">
         <strong>{label}</strong>
-        <span>{description}</span>
         {dirty ? <em>未保存</em> : null}
       </div>
       <div className={`github-mirror-input-row${onSave ? "" : " no-save"}`}>
@@ -206,9 +199,6 @@ function GithubMirrorField({
           </button>
         ))}
       </div>
-      <p className="form-hint">
-        当前生效：{effectiveValue}。{scopeNote}
-      </p>
     </div>
   );
 }
@@ -314,6 +304,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [githubMirrorError, setGithubMirrorError] = useState<string | null>(null);
   const [bloodhoundOpen, setBloodhoundOpen] = useState(false);
   const [bloodhoundBusy, setBloodhoundBusy] = useState(false);
+  const { stickyRef, stickyPinned } = useStickyHeader<HTMLDivElement>();
   const bloodhoundBusyRef = useRef(false);
   const serverUpdateDirtyRef = useRef(false);
   const serverUpdateRef = useRef<ServerUpdateInfo | null>(serverUpdate);
@@ -384,6 +375,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setSaved(false);
     }
   }, [isDirty]);
+
+  useEffect(() => {
+    if (
+      updateStatus !== "已切换到测试版渠道，将同时检查测试版和正式版中更高的版本。"
+      && updateStatus !== "已切换到正式版渠道，仅检查正式版更新。"
+    ) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setUpdateStatus((current) => (current === updateStatus ? null : current));
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [updateStatus]);
+
+  useEffect(() => {
+    if (!saved) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSaved(false), 3000);
+    return () => window.clearTimeout(timer);
+  }, [saved]);
 
   useEffect(() => {
     const merged = mergeServerSettings(settings, settings);
@@ -1286,24 +1298,24 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
   return (
     <section className="page settings-page" onChangeCapture={markFormChanged}>
-      <header className="page-header">
-        <div>
-          <p className="eyebrow">PREFERENCES</p>
-          <h1>设置</h1>
-          <p className="page-subtitle">连接与多设备同步、服务端采集参数，以及只属于这台设备的通知和运行偏好。</p>
-        </div>
-        <button className="button primary" onClick={() => void save()} disabled={saving}>
-          <Save size={16} />
-          {saving ? "保存中…" : "保存设置"}
-        </button>
-      </header>
+      <div ref={stickyRef} className={`sticky-page-header settings-sticky ${stickyPinned ? "is-pinned" : ""}`}>
+        <header className="page-header">
+          <div>
+            <h1 className="schedule-title">设置</h1>
+          </div>
+          <button className="button primary" onClick={() => void save()} disabled={saving}>
+            <Save size={16} />
+            {saving ? "保存中…" : "保存设置"}
+          </button>
+        </header>
+      </div>
 
       {error ? <ErrorBanner message={error} /> : null}
       {saved ? <div className="success-banner"><CheckCircle2 size={16} />设置已保存</div> : null}
 
       <div className="settings-layout">
         <section className="settings-card span-2">
-          <header><h2>运行模式</h2><span>抓取任务只在一处运行，避免双写。</span></header>
+          <header><h2>运行模式</h2></header>
           {tauri ? (
             <div className="mode-grid">
               <button className={`mode-card ${draft.dataMode === "local" ? "active" : ""}`} onClick={() => setMode("local")}>
@@ -1393,34 +1405,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               >
                 {serverUpdateRunning ? "更新执行中" : serverUpdate?.agentOnline ? "更新代理在线" : "更新代理未在线"}
               </span>
-              <span>由宿主机 systemd 更新代理执行镜像拉取、备份、重启和失败回滚。</span>
+              <div className="update-channel-control">
+                <div className="segmented" role="group" aria-label="服务器更新渠道">
+                  <button
+                    type="button"
+                    className={serverUpdateDraft.channel === "stable" ? "active" : undefined}
+                    onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "stable" }))}
+                    disabled={serverUpdateLoading !== null || serverUpdateActive}
+                  >
+                    正式版
+                  </button>
+                  <button
+                    type="button"
+                    className={serverUpdateDraft.channel === "beta" ? "active" : undefined}
+                    onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "beta" }))}
+                    disabled={serverUpdateLoading !== null || serverUpdateActive}
+                  >
+                    测试版
+                  </button>
+                </div>
+              </div>
             </header>
-            <div className="update-channel-row server-update-channel">
-              <div>
-                <strong>服务器更新渠道</strong>
-                <span>
-                  测试版会同时比较服务器测试版和正式版清单；从测试版切回正式版后会立即检查最新正式版，并询问是否安装。
-                </span>
-              </div>
-              <div className="segmented" role="group" aria-label="服务器更新渠道">
-                <button
-                  type="button"
-                  className={serverUpdateDraft.channel === "stable" ? "active" : undefined}
-                  onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "stable" }))}
-                  disabled={serverUpdateLoading !== null || serverUpdateActive}
-                >
-                  正式版
-                </button>
-                <button
-                  type="button"
-                  className={serverUpdateDraft.channel === "beta" ? "active" : undefined}
-                  onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "beta" }))}
-                  disabled={serverUpdateLoading !== null || serverUpdateActive}
-                >
-                  测试版
-                </button>
-              </div>
-            </div>
             <div className="server-update-metrics">
               <div>
                 <span>当前版本</span>
@@ -1489,15 +1494,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     }}
                   />
                 </label>
-                <small>时间按 Asia/Shanghai 解释；开始时间晚于结束时间表示跨午夜。</small>
               </div>
             </div>
             <GithubMirrorField
               label="GitHub 镜像加速"
               ariaLabel="服务端 GitHub 镜像加速地址"
-              description="检查服务器版本时优先使用镜像，失败自动回退 GitHub 直连。"
               value={serverUpdateDraft.githubMirrorUrl}
-              effectiveValue={serverUpdate ? serverUpdate.githubMirrorUrl || "GitHub 直连" : "读取中…"}
               dirty={
                 serverUpdate !== null
                 && serverUpdateDraft.githubMirrorUrl !== serverUpdate.githubMirrorUrl
@@ -1509,7 +1511,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               onClear={() => {
                 updateServerUpdateDraft((current) => ({ ...current, githubMirrorUrl: "" }));
               }}
-              scopeNote="只影响服务器版本检查；修改后点「保存更新设置」写入服务器，留空表示 GitHub 直连。"
             />
             <div className="inline-actions server-update-actions">
               <button
@@ -1581,15 +1582,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
         <div className="settings-section-heading span-2">
           <strong>{serverMode ? "服务端采集设置" : "本地采集设置"}</strong>
-          <span>
-            {serverMode
-              ? "这些参数由服务器执行并同步到所有设备；密钥仍只来自服务器环境变量。"
-              : "这些参数只在本机执行，不会上传到服务器。"}
-          </span>
+          {serverMode ? null : <span>这些参数只在本机执行，不会上传到服务器。</span>}
         </div>
 
         <section className="settings-card span-2">
-          <header><h2>网络代理</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>B 站和日程模型等 HTTP 请求统一通过 HTTP 代理。</span></header>
+          <header><h2>网络代理</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span></header>
           <div className="form-grid proxy-grid">
             <label>
               <span>本机代理端口</span>
@@ -1629,11 +1626,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 {proxyTesting ? <LoaderCircle className="spin" size={16} /> : <Globe2 size={16} />}
                 {proxyTesting ? "正在测试 Google…" : "测试代理"}
               </button>
-              <span className="form-hint">
-                {draft.proxyPort
-                  ? `请求将由${!tauri || draft.dataMode === "server" ? "服务器" : "本机"}发起，代理地址为 127.0.0.1:${draft.proxyPort}。`
-                  : "端口留空表示不使用代理；保存后对后续请求生效。"}
-              </span>
+              {draft.proxyPort ? (
+                <span className="form-hint">
+                  {`请求将由${!tauri || draft.dataMode === "server" ? "服务器" : "本机"}发起，代理地址为 127.0.0.1:${draft.proxyPort}。`}
+                </span>
+              ) : null}
             </div>
           </div>
           {proxyReport ? (
@@ -1668,8 +1665,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               checked={draft.liveStatsEnabled}
               onChange={(value) => setDraft((current) => ({ ...current, liveStatsEnabled: value }))}
               label="直播数据统计"
+              labelFirst
             />
-            <p className="form-hint">开启后可在主播库为单个主播订阅直播数据；原始弹幕和礼物事件不落盘。</p>
           </div>
         </section>
 
@@ -1726,7 +1723,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
         <div className="settings-section-heading span-2">
           <strong>本设备设置</strong>
-          <span>配色、通知、开机自启、侧栏宽度和窗口状态只保存在这台设备，不写入服务器。</span>
         </div>
 
         <AppearanceSettingsPanel value={appearance} onChange={onAppearanceChange} />
@@ -1741,9 +1737,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 发送测试通知
               </button>
             ) : null}
-            {tauri ? (
-              <p className="form-hint">通知和窗口偏好不会同步到其他设备。关闭窗口后驻留托盘，不会补发启动时已经在直播的通知。</p>
-            ) : null}
           </div>
         </section>
 
@@ -1752,34 +1745,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <header>
               <h2>软件更新</h2>
               <span className="setting-scope local">仅桌面端</span>
-              <span>从 GitHub Releases 检查并安装经过 Tauri 签名校验的更新。</span>
+              <div className="update-channel-control">
+                <div className="segmented" role="group" aria-label="桌面端更新渠道">
+                  <button
+                    type="button"
+                    className={updateChannel === "stable" ? "active" : undefined}
+                    onClick={() => switchUpdateChannel("stable")}
+                    disabled={updateChecking || updateInstalling}
+                  >
+                    正式版
+                  </button>
+                  <button
+                    type="button"
+                    className={updateChannel === "beta" ? "active" : undefined}
+                    onClick={() => switchUpdateChannel("beta")}
+                    disabled={updateChecking || updateInstalling}
+                  >
+                    测试版
+                  </button>
+                </div>
+              </div>
             </header>
-            <div className="update-channel-row">
-              <div>
-                <strong>更新渠道</strong>
-                <span>
-                  切回正式版会立即检查最新正式版；正式版低于当前测试版时，只有二次确认后才会显式降级。测试版会同时比较两个渠道并优先选择更高版本。
-                </span>
-              </div>
-              <div className="segmented" role="group" aria-label="桌面端更新渠道">
-                <button
-                  type="button"
-                  className={updateChannel === "stable" ? "active" : undefined}
-                  onClick={() => switchUpdateChannel("stable")}
-                  disabled={updateChecking || updateInstalling}
-                >
-                  正式版
-                </button>
-                <button
-                  type="button"
-                  className={updateChannel === "beta" ? "active" : undefined}
-                  onClick={() => switchUpdateChannel("beta")}
-                  disabled={updateChecking || updateInstalling}
-                >
-                  测试版
-                </button>
-              </div>
-            </div>
             <div className="update-version-row">
               <div className="update-version">
                 <span>当前版本 · {updateChannel === "beta" ? "测试版渠道" : "正式版渠道"}</span>
@@ -1829,9 +1815,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <GithubMirrorField
               label="GitHub 镜像加速"
               ariaLabel="客户端 GitHub 镜像加速地址"
-              description="检查桌面端更新和下载发布包时优先使用镜像，失败自动回退 GitHub 直连。"
               value={githubMirrorDraft}
-              effectiveValue={githubMirrorEffective || "GitHub 直连"}
               dirty={clientMirrorDirty}
               saving={githubMirrorSaving}
               error={githubMirrorError}
@@ -1841,16 +1825,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               }}
               onSave={(value) => void saveGithubMirror(value)}
               onClear={() => void saveGithubMirror("")}
-              scopeNote="只影响当前设备的桌面端更新，保存在本机，不下发服务器。"
             />
-            <p className="form-hint">
-              更新安装需要网络连接。Windows 会在安装完成后自动退出并重新启动；服务器 Web 界面随服务端镜像更新，不在此处处理。
-            </p>
           </section>
         ) : null}
 
         <section className="settings-card span-2">
-          <header><h2>日程识别模型</h2><span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span><span>动态文字和图片分别结构化，OpenAI-Compatible 接口。</span></header>
+          <header>
+            <h2>日程识别模型</h2>
+            <span className="setting-scope server">{serverMode ? "服务端同步" : "本机"}</span>
+            <div className="card-header-toggle">
+              <Toggle
+                checked={draft.autoAnalyzeImages}
+                onChange={(value) => setDraft((current) => ({ ...current, autoAnalyzeImages: value }))}
+                label=""
+                ariaLabel="自动分析动态文字和日程图片"
+              />
+            </div>
+          </header>
           <div className="form-grid">
             <label>
               <span>Base URL</span>
@@ -1912,35 +1903,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 />
               </label>
             ) : null}
-            <div className="secret-state">
-              <ShieldCheck size={17} />
-              <span>
-                {serverMode
-                  ? secrets.llmConfigured
-                    ? "模型密钥已由服务端加密保存，不会明文回显，并同步到已授权设备"
-                    : "服务端尚未配置模型密钥"
-                  : secrets.llmConfigured
-                    ? "模型密钥已安全保存"
-                    : "尚未配置模型密钥"}
-              </span>
-            </div>
-            <div className="span-2 stacked-field">
+            <div className="stacked-field">
               <span>思考程度</span>
-              <div className="segmented" role="group" aria-label="思考程度">
+              <select
+                value={llmReasoningEffort}
+                onChange={(event) => changeReasoningEffort(event.target.value as LlmReasoningEffort)}
+                aria-label="思考程度"
+              >
                 {LLM_REASONING_OPTIONS.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={llmReasoningEffort === option.value ? "active" : ""}
-                    onClick={() => changeReasoningEffort(option.value)}
-                  >
-                    {option.label}
-                  </button>
+                  <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
-              </div>
-              <p className="form-hint">
-                自动不发送该参数；高思考对日程提取提升有限，延迟会从约 6 秒升到 8 秒以上、token 消耗约 3 倍。
-              </p>
+              </select>
             </div>
             <label>
               <span>并行个数</span>
@@ -1956,14 +1929,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 />
                 <em>路</em>
               </div>
-              <p className="form-hint">
-                同时分析几条动态；同一时间最多发起这么多次模型请求，数值越大刷新越快，但更容易触发模型服务的限流。
-              </p>
             </label>
-            <div className="settings-stack span-2">
-              <Toggle checked={draft.autoAnalyzeImages} onChange={(value) => setDraft((current) => ({ ...current, autoAnalyzeImages: value }))} label="自动分析动态文字和日程图片" />
-              <p className="form-hint">动态自由文本与带预约卡片的动态都交给大模型分析，卡片标题/描述会和正文一起送进模型；未配置模型或模型调用失败时，才回退到预约卡片里的结构化时间。</p>
-            </div>
             <div className="llm-test-panel span-2">
               <div className="inline-actions">
                 <button className="button secondary" onClick={() => void testLlm()} disabled={llmTesting}>
@@ -2011,11 +1977,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <span className={`setting-scope ${serverMode ? "server" : "local"}`}>
                 {serverMode ? "服务器" : "仅本设备"}
               </span>
-              <span>
-                {serverMode
-                  ? "二维码由服务器生成，Cookie 只加密保存在服务器。"
-                  : "登录后自动保存到 Windows 凭据管理器。"}
-              </span>
+              {serverMode ? (
+                <span className={`server-login-pill ${biliConfigured ? "is-online" : "is-offline"}`}>
+                  {biliConfigured ? "服务端已登录" : "服务端未登录"}
+                </span>
+              ) : (
+                <span>登录后自动保存到 Windows 凭据管理器。</span>
+              )}
             </header>
             <div className="bili-login-actions">
               {!serverMode && tauri ? (
@@ -2033,11 +2001,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </button>
             </div>
             {browserLoginHint ? <p className="form-hint login-hint">{browserLoginHint}</p> : null}
-            {serverMode ? (
-              <p className="form-hint">
-                手机扫码后由服务器直接接收 Cookie；客户端不会收到或保存服务器 Cookie。
-              </p>
-            ) : (
+            {serverMode ? null : (
               <div className="form-grid">
                 <label>
                   <span>手动填写 SESSDATA / Cookie（可选）</span>

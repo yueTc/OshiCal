@@ -35,6 +35,7 @@ import type {
 import { addDays, eventDayKey, inputDateTime, localDateKey, rangeAroundDays, rollingDays, timeLabel } from "../lib/dates";
 import { explainError, openExternalUrl } from "../lib/api";
 import { matchLiveSchedules } from "../lib/live-schedule";
+import { useStickyHeader } from "../lib/sticky-header";
 import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
 import { Avatar, EmptyState, ErrorBanner, Modal, SubscriptionSelect } from "./ui";
 
@@ -281,6 +282,7 @@ export default function ScheduleView({
   const suppressClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gridWheelTimerRef = useRef<number | null>(null);
   const pageRef = useRef<HTMLElement>(null);
+  const { stickyRef: scheduleStickyRef, stickyPinned: scheduleStickyPinned } = useStickyHeader<HTMLDivElement>();
   const gridRef = useRef<HTMLDivElement>(null);
   const timelineViewportRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -1395,94 +1397,121 @@ export default function ScheduleView({
 
   return (
     <section ref={pageRef} className="page schedule-page" aria-label="直播日程">
-      <header className="page-header schedule-toolbar">
-        <div>
-          <h1 className="schedule-title">直播日程</h1>
-          <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右拖动浏览` : `${Math.max(1, timelineVisibleDays.length)} 天 · 上下拖动浏览`}</p>
-        </div>
-        <div className="toolbar-actions">
-          {viewMode === "timeline" ? (
-            <div className="calendar-width-control" role="group" aria-label="调整每行日程数量">
-              <span className="calendar-width-label timeline-columns-label">每行</span>
+      <div
+        ref={scheduleStickyRef}
+        className={`sticky-page-header schedule-sticky ${scheduleStickyPinned ? "is-pinned" : ""}`}
+      >
+        <header className="page-header schedule-toolbar">
+          <div>
+            <h1 className="schedule-title">直播日程</h1>
+            <p className="page-subtitle" aria-live="polite">{rangeText} · {viewMode === "grid" ? `${visibleDays.length} 天 · 左右拖动浏览` : `${Math.max(1, timelineVisibleDays.length)} 天 · 上下拖动浏览`}</p>
+          </div>
+          <div className="toolbar-actions">
+            {viewMode === "timeline" ? (
+              <div className="calendar-width-control" role="group" aria-label="调整每行日程数量">
+                <span className="calendar-width-label timeline-columns-label">每行</span>
+                <button
+                  type="button"
+                  onClick={() => changeTimelineColumns(-1)}
+                  disabled={effectiveTimelineColumns <= TIMELINE_COLUMNS_MIN}
+                  title="减少每行日程"
+                  aria-label="减少每行日程数量"
+                >
+                  <Minus size={14} />
+                </button>
+                <strong className="calendar-control-value">{effectiveTimelineColumns}</strong>
+                <button
+                  type="button"
+                  onClick={() => changeTimelineColumns(1)}
+                  disabled={effectiveTimelineColumns >= timelineColumnsMax}
+                  title="增加每行日程"
+                  aria-label="增加每行日程数量"
+                >
+                  <Plus size={14} />
+                </button>
+              </div>
+            ) : (
+              <div className="calendar-width-control" role="group" aria-label="调整日历栏宽">
+                <span className="calendar-width-label">栏宽</span>
+                <button
+                  type="button"
+                  onClick={() => changeGridDayWidth(-GRID_DAY_WIDTH_STEP)}
+                  disabled={gridDayWidth <= GRID_DAY_WIDTH_MIN}
+                  title="缩窄栏宽"
+                  aria-label="缩窄栏宽"
+                >
+                  <Minus size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeGridDayWidth(GRID_DAY_WIDTH_STEP)}
+                  disabled={gridDayWidth >= GRID_DAY_WIDTH_MAX}
+                  title="加宽栏宽"
+                  aria-label="加宽栏宽"
+                >
+                  <Plus size={14} />
+                </button>
+              </div>
+            )}
+            <div className="segmented" aria-label="视图模式">
               <button
                 type="button"
-                onClick={() => changeTimelineColumns(-1)}
-                disabled={effectiveTimelineColumns <= TIMELINE_COLUMNS_MIN}
-                title="减少每行日程"
-                aria-label="减少每行日程数量"
+                className={viewMode === "timeline" ? "active" : ""}
+                onClick={() => changeViewMode("timeline")}
+                aria-label="切换到时间线"
+                aria-pressed={viewMode === "timeline"}
+                title="时间线"
               >
-                <Minus size={14} />
+                <List size={17} />
               </button>
-              <strong className="calendar-control-value">{effectiveTimelineColumns}</strong>
               <button
                 type="button"
-                onClick={() => changeTimelineColumns(1)}
-                disabled={effectiveTimelineColumns >= timelineColumnsMax}
-                title="增加每行日程"
-                aria-label="增加每行日程数量"
+                className={viewMode === "grid" ? "active" : ""}
+                onClick={() => changeViewMode("grid")}
+                aria-label="切换到日历网格"
+                aria-pressed={viewMode === "grid"}
+                title="日历网格"
               >
-                <Plus size={14} />
+                <Grid3X3 size={17} />
               </button>
             </div>
-          ) : (
-            <div className="calendar-width-control" role="group" aria-label="调整日历栏宽">
-              <span className="calendar-width-label">栏宽</span>
-              <button
-                type="button"
-                onClick={() => changeGridDayWidth(-GRID_DAY_WIDTH_STEP)}
-                disabled={gridDayWidth <= GRID_DAY_WIDTH_MIN}
-                title="缩窄栏宽"
-                aria-label="缩窄栏宽"
-              >
-                <Minus size={14} />
-              </button>
-              <button
-                type="button"
-                onClick={() => changeGridDayWidth(GRID_DAY_WIDTH_STEP)}
-                disabled={gridDayWidth >= GRID_DAY_WIDTH_MAX}
-                title="加宽栏宽"
-                aria-label="加宽栏宽"
-              >
-                <Plus size={14} />
-              </button>
-            </div>
-          )}
-          <div className="segmented" aria-label="视图模式">
-            <button
-              type="button"
-              className={viewMode === "timeline" ? "active" : ""}
-              onClick={() => changeViewMode("timeline")}
-              aria-label="切换到时间线"
-              aria-pressed={viewMode === "timeline"}
-              title="时间线"
-            >
-              <List size={17} />
+            <button className="button secondary" onClick={() => navigateToDate(new Date())}>
+              <RotateCcw size={16} />
+              回到今天
             </button>
-            <button
-              type="button"
-              className={viewMode === "grid" ? "active" : ""}
-              onClick={() => changeViewMode("grid")}
-              aria-label="切换到日历网格"
-              aria-pressed={viewMode === "grid"}
-              title="日历网格"
-            >
-              <Grid3X3 size={17} />
+            <button className="button secondary" onClick={() => void refresh()} disabled={refreshing}>
+              <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+              刷新
+            </button>
+            <button className="button primary" onClick={openCreate} disabled={!subscriptions.length}>
+              <Plus size={17} />
+              新增日程
             </button>
           </div>
-          <button className="button secondary" onClick={() => navigateToDate(new Date())}>
-            <RotateCcw size={16} />
-            回到今天
+        </header>
+
+        <div className="day-navigator">
+          <button className="icon-button" onClick={() => shiftAnchor(-1)} aria-label="前移一天">
+            <ChevronLeft size={19} />
           </button>
-          <button className="button secondary" onClick={() => void refresh()} disabled={refreshing}>
-            <RefreshCw size={16} className={refreshing ? "spin" : ""} />
-            刷新
-          </button>
-          <button className="button primary" onClick={openCreate} disabled={!subscriptions.length}>
-            <Plus size={17} />
-            新增日程
+          <div className="day-strip" style={{ gridTemplateColumns: `repeat(${stripDays.length}, minmax(56px, 1fr))` }}>
+            {stripDays.map((day, index) => (
+              <button
+                key={localDateKey(day)}
+                className={`day-pill ${index === 0 ? "active" : ""}`}
+                aria-current={index === 0 ? "date" : undefined}
+                onClick={() => navigateToDate(day)}
+              >
+                <span>{["日", "一", "二", "三", "四", "五", "六"][day.getDay()]}</span>
+                <strong>{day.getDate()}</strong>
+              </button>
+            ))}
+          </div>
+          <button className="icon-button" onClick={() => shiftAnchor(1)} aria-label="后移一天">
+            <ChevronRight size={19} />
           </button>
         </div>
-      </header>
+      </div>
 
       <div
         key={viewMode}
@@ -1491,28 +1520,6 @@ export default function ScheduleView({
           if (event.target === event.currentTarget) setViewEnterAnimation(false);
         }}
       >
-      <div className="day-navigator">
-        <button className="icon-button" onClick={() => shiftAnchor(-1)} aria-label="前移一天">
-          <ChevronLeft size={19} />
-        </button>
-        <div className="day-strip" style={{ gridTemplateColumns: `repeat(${stripDays.length}, minmax(56px, 1fr))` }}>
-          {stripDays.map((day, index) => (
-            <button
-              key={localDateKey(day)}
-              className={`day-pill ${index === 0 ? "active" : ""}`}
-              aria-current={index === 0 ? "date" : undefined}
-              onClick={() => navigateToDate(day)}
-            >
-              <span>{["日", "一", "二", "三", "四", "五", "六"][day.getDay()]}</span>
-              <strong>{day.getDate()}</strong>
-            </button>
-          ))}
-        </div>
-        <button className="icon-button" onClick={() => shiftAnchor(1)} aria-label="后移一天">
-          <ChevronRight size={19} />
-        </button>
-      </div>
-
       {error ? <ErrorBanner message={error} onRetry={() => void load(true)} /> : null}
 
       {loading ? (

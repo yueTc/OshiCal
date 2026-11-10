@@ -36,6 +36,7 @@ import type {
 import { explainError, openExternalUrl } from "../lib/api";
 import { aggregateFanHistory } from "../lib/fan-history";
 import type { FanBucket, FanGranularity } from "../lib/fan-history";
+import { useStickyHeader } from "../lib/sticky-header";
 import {
   fertilityCompactLabel,
   fertilitySourceLabel,
@@ -343,39 +344,7 @@ export default function CreatorsView({
   const draggingIdRef = useRef<number | null>(null);
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const [optimisticOrder, setOptimisticOrder] = useState<number[] | null>(null);
-  // 标题+搜索吸附条是否已经贴住窗口顶部：只有贴住时才铺磨砂底色，
-  // 否则未滚动时那层底色会盖住页面顶部（连接异常横幅就在那里）。
-  const stickyRef = useRef<HTMLDivElement>(null);
-  const [stickyPinned, setStickyPinned] = useState(false);
-
-  useEffect(() => {
-    const element = stickyRef.current;
-    if (!element) {
-      return;
-    }
-    let frame = 0;
-    const measure = () => {
-      frame = 0;
-      // position: sticky 命中时元素顶边正好停在 0，据此判断吸附状态。
-      const pinned = element.getBoundingClientRect().top <= 0.5;
-      setStickyPinned((current) => (current === pinned ? current : pinned));
-    };
-    const schedule = () => {
-      if (!frame) {
-        frame = window.requestAnimationFrame(measure);
-      }
-    };
-    measure();
-    window.addEventListener("scroll", schedule, { passive: true });
-    window.addEventListener("resize", schedule);
-    return () => {
-      window.removeEventListener("scroll", schedule);
-      window.removeEventListener("resize", schedule);
-      if (frame) {
-        window.cancelAnimationFrame(frame);
-      }
-    };
-  }, []);
+  const { stickyRef, stickyPinned } = useStickyHeader<HTMLDivElement>();
 
   useEffect(() => {
     setOptimisticOrder(null);
@@ -1247,11 +1216,10 @@ export default function CreatorsView({
 
   return (
     <section className="page creators-page">
-      <div ref={stickyRef} className={`creators-sticky ${stickyPinned ? "is-pinned" : ""}`}>
+      <div ref={stickyRef} className={`sticky-page-header creators-sticky ${stickyPinned ? "is-pinned" : ""}`}>
         <header className="page-header">
           <div>
             <h1 className="schedule-title">主播库</h1>
-            <p className="page-subtitle">管理日程订阅、开播通知、直播数据和官号来源。</p>
           </div>
           <div className="stat-chip" role="status">
             <UsersRound size={17} />{reorderBusy ? "正在保存顺序…" : `${subscriptions.length} 位主播`}
@@ -1393,6 +1361,78 @@ export default function CreatorsView({
                   <span>UID {streamer.mid}</span>
                   {streamer.isLive ? <span className="live-label">直播中</span> : null}
                 </div>
+                <div className="creator-actions">
+                  {fertilityEnabled ? (
+                    (() => {
+                      const status = findFertilityStatus(fertilitySnapshot, streamer);
+                      const meta = status ? fertilityStatusMeta(status.status) : null;
+                      // 开关关闭时整块不渲染：没有数据就没有展示价值，也不该占位。
+                      return (
+                        <button
+                          type="button"
+                          className={`creator-fertility-button ${meta?.className ?? "is-missing"}`}
+                          title={
+                            status
+                              ? `${meta?.label ?? "月相"}${status.dayInCycle ? ` · 周期第 ${status.dayInCycle} 天` : ""} · 下次 ${formatNextPeriod(status.nextPeriod)} · 点击查看详情`
+                              : "LAPLACE 暂未收录这位主播，点击查看说明"
+                          }
+                          aria-label={`${streamer.name} 的月相参考`}
+                          onClick={() => openFertilityDetail(streamer)}
+                        >
+                          {status ? (
+                            <>
+                              <strong>{fertilityCompactLabel(status)}</strong>
+                              <em>{formatNextPeriod(status.nextPeriod)}</em>
+                            </>
+                          ) : (
+                            <strong>{fertilityLoading ? "读取中…" : "· 未收录"}</strong>
+                          )}
+                        </button>
+                      );
+                    })()
+                  ) : null}
+                  <button
+                    type="button"
+                    className="creator-fan-button"
+                    title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
+                    onClick={() => openFanHistory(streamer)}
+                  >
+                    <TrendingUp size={14} />
+                    <strong>{formatFanCount(streamer.fans)}</strong>
+                    <span>粉丝</span>
+                    <em>查看趋势</em>
+                  </button>
+                  <button
+                    className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
+                    title={streamer.liveUrl || streamer.roomId
+                      ? `进入 ${streamer.name} 的直播间`
+                      : `${streamer.name} 暂未配置直播间地址`}
+                    aria-label={`进入 ${streamer.name} 的直播间`}
+                    onClick={() => void onOpenLiveRoom(streamer)}
+                    disabled={!streamer.liveUrl && !streamer.roomId}
+                  >
+                    <ExternalLink size={17} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title={`设置 ${streamer.name} 的固定周表`}
+                    aria-label={`设置 ${streamer.name} 的固定周表`}
+                    onClick={() => void openWeeklyRules(streamer)}
+                  >
+                    <CalendarClock size={17} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title={`重新拉取 ${streamer.name} 的日程`}
+                    aria-label={`重新拉取 ${streamer.name} 的日程`}
+                    onClick={() => void refreshStreamer(streamer)}
+                    disabled={refreshBusy !== null}
+                  >
+                    <RefreshCw className={refreshBusy === streamer.id ? "spin" : ""} size={17} />
+                  </button>
+                  <button className="icon-button" title="编辑别名" onClick={() => openAlias(streamer)}><Settings2 size={17} /></button>
+                  <button className="icon-button danger" title="删除主播" onClick={() => void removeStreamer(streamer)}><Trash2 size={17} /></button>
+                </div>
                 {streamer.lastError ? <p className="inline-error">{streamer.lastError}</p> : null}
                 <div className="creator-toggles">
                   <Toggle
@@ -1453,78 +1493,6 @@ export default function CreatorsView({
                     <Plus size={13} />关联官号
                   </button>
                 </div>
-              </div>
-              <div className="creator-actions">
-                {fertilityEnabled ? (
-                  (() => {
-                    const status = findFertilityStatus(fertilitySnapshot, streamer);
-                    const meta = status ? fertilityStatusMeta(status.status) : null;
-                    // 开关关闭时整块不渲染：没有数据就没有展示价值，也不该占位。
-                    return (
-                      <button
-                        type="button"
-                        className={`creator-fertility-button ${meta?.className ?? "is-missing"}`}
-                        title={
-                          status
-                            ? `${meta?.label ?? "月相"}${status.dayInCycle ? ` · 周期第 ${status.dayInCycle} 天` : ""} · 下次 ${formatNextPeriod(status.nextPeriod)} · 点击查看详情`
-                            : "LAPLACE 暂未收录这位主播，点击查看说明"
-                        }
-                        aria-label={`${streamer.name} 的月相参考`}
-                        onClick={() => openFertilityDetail(streamer)}
-                      >
-                        {status ? (
-                          <>
-                            <strong>{fertilityCompactLabel(status)}</strong>
-                            <em>{formatNextPeriod(status.nextPeriod)}</em>
-                          </>
-                        ) : (
-                          <strong>{fertilityLoading ? "读取中…" : "· 未收录"}</strong>
-                        )}
-                      </button>
-                    );
-                  })()
-                ) : null}
-                <button
-                  type="button"
-                  className="creator-fan-button"
-                  title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
-                  onClick={() => openFanHistory(streamer)}
-                >
-                  <TrendingUp size={14} />
-                  <strong>{formatFanCount(streamer.fans)}</strong>
-                  <span>粉丝</span>
-                  <em>查看趋势</em>
-                </button>
-                <button
-                  className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
-                  title={streamer.liveUrl || streamer.roomId
-                    ? `进入 ${streamer.name} 的直播间`
-                    : `${streamer.name} 暂未配置直播间地址`}
-                  aria-label={`进入 ${streamer.name} 的直播间`}
-                  onClick={() => void onOpenLiveRoom(streamer)}
-                  disabled={!streamer.liveUrl && !streamer.roomId}
-                >
-                  <ExternalLink size={17} />
-                </button>
-                <button
-                  className="icon-button"
-                  title={`设置 ${streamer.name} 的固定周表`}
-                  aria-label={`设置 ${streamer.name} 的固定周表`}
-                  onClick={() => void openWeeklyRules(streamer)}
-                >
-                  <CalendarClock size={17} />
-                </button>
-                <button
-                  className="icon-button"
-                  title={`重新拉取 ${streamer.name} 的日程`}
-                  aria-label={`重新拉取 ${streamer.name} 的日程`}
-                  onClick={() => void refreshStreamer(streamer)}
-                  disabled={refreshBusy !== null}
-                >
-                  <RefreshCw className={refreshBusy === streamer.id ? "spin" : ""} size={17} />
-                </button>
-                <button className="icon-button" title="编辑别名" onClick={() => openAlias(streamer)}><Settings2 size={17} /></button>
-                <button className="icon-button danger" title="删除主播" onClick={() => void removeStreamer(streamer)}><Trash2 size={17} /></button>
               </div>
             </article>
           ))}

@@ -120,7 +120,6 @@ export default function DeviceSyncPanel({
       <header className="device-sync-header">
         <div>
           <h2>多设备同步</h2>
-          <span>服务器是唯一数据源；本机只保存缓存、游标和设备设置。</span>
         </div>
         <div className={`device-sync-status ${sync.status}`}>
           {sync.status === "connected" ? (
