@@ -465,11 +465,13 @@ fn app_update_is_available(
     candidate: &semver::Version,
     channel: AppUpdateChannel,
 ) -> bool {
-    candidate > current
-        || (channel == AppUpdateChannel::Stable
-            && !current.pre.is_empty()
-            && candidate.pre.is_empty()
-            && candidate < current)
+    match channel {
+        AppUpdateChannel::Beta => candidate > current,
+        AppUpdateChannel::Stable => {
+            candidate.pre.is_empty()
+                && (candidate > current || (!current.pre.is_empty() && candidate < current))
+        }
+    }
 }
 
 async fn resolve_app_update_endpoints(
