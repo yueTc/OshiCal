@@ -64,7 +64,7 @@ pub struct AppSettings {
     /// 思考程度，默认 `Auto`（请求体不带 `reasoning_effort`）。
     #[serde(default)]
     pub llm_reasoning_effort: ReasoningEffort,
-    /// 并行个数：同时向模型端点发起的最大请求数，合法 1..=8。
+    /// 并行个数：同时处理的独立主播任务上限，同主播动态串行；模型请求同样受限，合法1..=8。
     /// 裸 `#[serde(default)]` 对 u8 会给 0（不合法），所以缺字段时必须回落到 1。
     #[serde(default = "default_llm_parallelism")]
     pub llm_parallelism: u8,

@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -43,6 +44,8 @@ const GROUP_DUPLICATE_TOLERANCE_MINUTES: i64 = 5;
 /// 每轮都重问会把一次全量刷新拖成几十分钟。
 const EMPTY_ANALYSIS_RETRY_HOURS: i64 = 12;
 const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
+// Space Bilibili request starts without holding a database or model permit.
+const SOURCE_FETCH_START_INTERVAL_MS: u64 = 70;
 /// 「立即刷新」最多等待的秒数：超过就回落到缓存，避免界面长时间停在「读取中」。
 const FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS: u64 = 15;
 
@@ -1268,38 +1271,23 @@ impl AppService {
         let mut attempted_streamer_ids = HashSet::new();
         let mut successfully_analyzed_streamer_ids = HashSet::new();
         let mut streamer_errors: HashMap<i64, String> = HashMap::new();
-        for (index, (source_mid, targets)) in sources.iter().enumerate() {
-            if index > 0 && index % 5 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-            }
-            if let Some(target) = progress {
-                emit_progress(
-                    target,
-                    &format!("拉取动态 {}/{}", index + 1, sources.len()),
-                    index,
-                    sources.len(),
-                    5 + (index * 80 / sources.len().max(1)) as u8,
-                    false,
-                    false,
-                    on_progress,
-                );
-            }
-            match fetch(source_mid.clone()).await {
-                Ok(posts) => {
-                    let stats = self
-                        .process_source_posts_with_progress(
-                            source_mid,
-                            targets,
-                            &posts,
-                            settings,
-                            llm,
-                            &mut event_state,
-                            progress,
-                            on_progress,
-                            index,
-                            sources.len(),
-                        )
-                        .await?;
+        let outcomes = self
+            .process_sources_concurrently(
+                sources,
+                settings,
+                llm,
+                &mut event_state,
+                progress,
+                on_progress,
+                fetch,
+            )
+            .await?;
+        // Aggregate in original source order, not completion order. Error
+        // attribution and deferred cancellations retain their existing semantics.
+        for (index, outcome) in outcomes {
+            let (source_mid, targets) = &sources[index];
+            match outcome {
+                SourceRefreshResult::Processed(stats) => {
                     report.new_schedules += stats.new_schedules;
                     report.cancelled_schedules += stats.cancelled_schedules;
                     report.llm_calls += stats.llm_calls;
@@ -1347,25 +1335,13 @@ impl AppService {
                         }
                     }
                 }
-                Err(error) => {
+                SourceRefreshResult::FetchFailed(error) => {
                     let message = error.to_string();
                     for target in targets {
                         attempted_streamer_ids.insert(target.id);
                         streamer_errors
                             .entry(target.id)
                             .or_insert_with(|| message.clone());
-                    }
-                    if let Some(target) = progress {
-                        emit_progress(
-                            target,
-                            "拉取动态失败",
-                            index,
-                            sources.len(),
-                            5 + ((index + 1) * 80 / sources.len().max(1)) as u8,
-                            false,
-                            true,
-                            on_progress,
-                        );
                     }
                     report
                         .failed_streamers
@@ -1430,6 +1406,145 @@ impl AppService {
                 .await?;
         }
         Ok(report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_sources_concurrently<Fetch, FetchFuture>(
+        &self,
+        sources: &[(String, Vec<Streamer>)],
+        settings: &AppSettings,
+        llm: Option<&PostAnalyzer>,
+        event_state: &mut RefreshEventState,
+        progress: Option<&ProgressTarget>,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+        fetch: &Fetch,
+    ) -> AppResult<Vec<(usize, SourceRefreshResult)>>
+    where
+        Fetch: Fn(String) -> FetchFuture + Sync,
+        FetchFuture: std::future::Future<Output = AppResult<Vec<DynamicPost>>> + Send,
+    {
+        let limit = usize::from(settings.llm_parallelism.clamp(1, 8));
+        let mut pending: Vec<usize> = (0..sources.len()).collect();
+        let mut active_targets = HashSet::new();
+        let mut running = FuturesUnordered::new();
+        let mut outcomes: Vec<Option<SourceRefreshResult>> =
+            (0..sources.len()).map(|_| None).collect();
+        let mut cancellations: Vec<Vec<PendingCancellation>> =
+            (0..sources.len()).map(|_| Vec::new()).collect();
+        let source_progress = StdMutex::new(vec![0u8; sources.len()]);
+        let next_fetch_start = Mutex::new(tokio::time::Instant::now());
+        while !pending.is_empty() || !running.is_empty() {
+            while running.len() < limit {
+                let Some(position) = next_ready_source(sources, &pending, &active_targets) else {
+                    break;
+                };
+                let index = pending.remove(position);
+                let (source_mid, targets) = &sources[index];
+                active_targets.extend(targets.iter().map(|target| target.id));
+                let mut local_state = RefreshEventState {
+                    cancellations: Vec::new(),
+                    written_identities: event_state.written_identities.clone(),
+                };
+                let source_progress = &source_progress;
+                let next_fetch_start = &next_fetch_start;
+                running.push(async move {
+                    let label = targets
+                        .iter()
+                        .map(|target| target.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    let report = |mut update: RefreshProgress| {
+                        let mut fractions = source_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        fractions[index] = fractions[index].max(update.percent.min(100));
+                        update.percent = (5 + fractions
+                            .iter()
+                            .map(|fraction| usize::from(*fraction))
+                            .sum::<usize>()
+                            * 80
+                            / (sources.len().max(1) * 100))
+                            as u8;
+                        update.completed = fractions
+                            .iter()
+                            .filter(|fraction| **fraction == 100)
+                            .count();
+                        update.total = sources.len();
+                        update.stage = format!("{label}：{}", update.stage);
+                        // All callbacks for this coordinator are emitted in poll order.
+                        drop(fractions);
+                        on_progress(update);
+                    };
+                    if let Some(target) = progress {
+                        emit_progress(target, "准备拉取动态", 0, 1, 0, false, false, &report);
+                    }
+                    {
+                        let mut next = next_fetch_start.lock().await;
+                        tokio::time::sleep_until(*next).await;
+                        *next = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(SOURCE_FETCH_START_INTERVAL_MS);
+                    }
+                    let result = match fetch(source_mid.clone()).await {
+                        Ok(posts) => self
+                            .process_source_posts_with_progress(
+                                source_mid,
+                                targets,
+                                &posts,
+                                settings,
+                                llm,
+                                &mut local_state,
+                                progress,
+                                &report,
+                                0,
+                                1,
+                            )
+                            .await
+                            .map(SourceRefreshResult::Processed),
+                        Err(error) => Ok(SourceRefreshResult::FetchFailed(error)),
+                    };
+                    if let (Some(target), Ok(outcome)) = (progress, &result) {
+                        let failed = matches!(outcome, SourceRefreshResult::FetchFailed(_));
+                        let stage = if failed {
+                            "拉取动态失败"
+                        } else {
+                            "动态处理完成"
+                        };
+                        emit_progress(target, stage, 1, 1, 100, false, failed, &report);
+                    }
+                    (index, local_state, result)
+                });
+            }
+            let Some((index, local_state, result)) = running.next().await else {
+                break;
+            };
+            let outcome = result?;
+            for target in &sources[index].1 {
+                active_targets.remove(&target.id);
+            }
+            for (post_id, identities) in local_state.written_identities {
+                event_state
+                    .written_identities
+                    .entry(post_id)
+                    .or_default()
+                    .extend(identities);
+            }
+            cancellations[index] = local_state.cancellations;
+            outcomes[index] = Some(outcome);
+        }
+        // A late cancellation must see all schedules, even if another streamer
+        // took longer to analyse. Preserve the original source traversal order.
+        for pending in cancellations {
+            event_state.cancellations.extend(pending);
+        }
+        outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome
+                    .map(|outcome| (index, outcome))
+                    .ok_or_else(|| AppError::validation("动态刷新任务未完成"))
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -2465,8 +2580,8 @@ impl ProgressTarget {
     }
 }
 
-/// 一轮刷新共用的模型通道：固定配置 + `llm_parallelism` 控制并发上限。
-/// 只有一个模型端点、一份密钥；并行只体现在同时发出多少个请求。
+/// 一轮刷新共用的模型通道。主播级调度按 `llm_parallelism` 限制活跃任务，
+/// 同一主播内部逐条分析；本许可池同时限制共享端点的模型请求数量。
 struct PostAnalyzer {
     config: LlmConfig,
     pool: LlmPool,
@@ -2512,6 +2627,33 @@ struct RefreshEventState {
     /// 同一条动态可能走多遍分析（主播本人 + 官号），清理 stale source 时
     /// 要用整轮的并集，不能用单遍的结果。
     written_identities: HashMap<String, HashSet<String>>,
+}
+
+enum SourceRefreshResult {
+    Processed(ProcessStats),
+    FetchFailed(AppError),
+}
+
+// Earlier pending sources reserve their targets too: an official source must
+// not be overtaken by a later personal/linked source for the same streamer.
+// Unrelated targets can still run, rather than occupying a worker waiting for A.
+fn next_ready_source(
+    sources: &[(String, Vec<Streamer>)],
+    pending: &[usize],
+    active_targets: &HashSet<i64>,
+) -> Option<usize> {
+    let mut unavailable = active_targets.clone();
+    for (position, index) in pending.iter().enumerate() {
+        let targets = &sources[*index].1;
+        if targets
+            .iter()
+            .all(|target| !unavailable.contains(&target.id))
+        {
+            return Some(position);
+        }
+        unavailable.extend(targets.iter().map(|target| target.id));
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -7594,6 +7736,156 @@ mod tests {
         let high_call = analyzer.last_call();
         assert_eq!(high_call.reasoning_effort, ReasoningEffort::High);
         assert_eq!(high_call.reasoning_effort.as_request_value(), Some("high"));
+    }
+
+    #[test]
+    fn shared_sources_preserve_target_order_without_blocking_unrelated_streamers() {
+        let a = streamer_stub(1, "1", "甲");
+        let b = streamer_stub(2, "2", "乙");
+        let c = streamer_stub(3, "3", "丙");
+        let sources = vec![
+            ("a-main".to_owned(), vec![a.clone()]),
+            ("shared".to_owned(), vec![a.clone(), b.clone()]),
+            ("b-main".to_owned(), vec![b]),
+            ("a-linked".to_owned(), vec![a]),
+            ("c-main".to_owned(), vec![c]),
+        ];
+        // Shared(A,B) waits for A; later B must not overtake it. C can start.
+        assert_eq!(
+            next_ready_source(&sources, &[1, 2, 3, 4], &HashSet::from([1])),
+            Some(3)
+        );
+        assert_eq!(
+            next_ready_source(&sources, &[1, 2, 3], &HashSet::new()),
+            Some(0)
+        );
+        assert_eq!(
+            next_ready_source(&sources, &[2, 3], &HashSet::from([1, 2])),
+            None
+        );
+        assert_eq!(
+            next_ready_source(&sources, &[2, 3], &HashSet::new()),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_source_runs_once_and_linked_sources_do_not_overtake_it() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let a = store
+            .add_subscription(&subscription("991", "甲"))
+            .await
+            .unwrap();
+        let b = store
+            .add_subscription(&subscription("992", "乙"))
+            .await
+            .unwrap();
+        let c = store
+            .add_subscription(&subscription("993", "丙"))
+            .await
+            .unwrap();
+        let sources = vec![
+            ("a-main".to_owned(), vec![a.clone()]),
+            ("shared".to_owned(), vec![a.clone(), b.clone()]),
+            ("b-main".to_owned(), vec![b]),
+            ("a-linked".to_owned(), vec![a]),
+            ("c-main".to_owned(), vec![c]),
+        ];
+        let analyzer = Arc::new(StreamerConcurrencyAnalyzer::new(false));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let fetched = StdMutex::new(Vec::new());
+        let now = Utc::now();
+        let fetch = |mid: String| {
+            fetched.lock().unwrap().push(mid.clone());
+            let post = dynamic_post(&format!("{mid}-post"), &mid, &mid, now, &mid, Vec::new());
+            async move { Ok(vec![post]) }
+        };
+        let settings = AppSettings {
+            llm_parallelism: 2,
+            ..AppSettings::default()
+        };
+        let pool = PostAnalyzer {
+            config: test_pool("fixture-model").config,
+            pool: LlmPool::new(2),
+        };
+        let report = service
+            .refresh_sources_with_fetcher(&sources, &settings, Some(&pool), None, &|_| {}, &fetch)
+            .await
+            .unwrap();
+        assert!(report.failed_streamers.is_empty());
+        assert_eq!(report.refreshed_streamers, 3);
+        assert_eq!(report.llm_calls, 5);
+        let fetched = fetched.lock().unwrap();
+        let position = |mid: &str| fetched.iter().position(|value| value == mid).unwrap();
+        assert_eq!(fetched.iter().filter(|mid| *mid == "shared").count(), 1);
+        assert!(position("a-main") < position("shared"));
+        assert!(position("shared") < position("b-main"));
+        assert!(position("shared") < position("a-linked"));
+    }
+
+    #[tokio::test]
+    async fn failed_source_does_not_discard_other_streamers_results() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut sources = Vec::new();
+        for index in 0..3 {
+            let mid = format!("998{index}");
+            sources.push((
+                mid.clone(),
+                vec![store
+                    .add_subscription(&subscription(&mid, &mid))
+                    .await
+                    .unwrap()],
+            ));
+        }
+        let analyzer = Arc::new(StreamerConcurrencyAnalyzer::new(false));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer).unwrap();
+        let now = Utc::now();
+        let fetch = |mid: String| async move {
+            if mid == "9981" {
+                return Err(AppError::validation("fixture fetch failed"));
+            }
+            Ok(vec![dynamic_post(
+                &format!("{mid}-post"),
+                &mid,
+                &mid,
+                now,
+                "first",
+                Vec::new(),
+            )])
+        };
+        let settings = AppSettings {
+            llm_parallelism: 2,
+            ..AppSettings::default()
+        };
+        let pool = PostAnalyzer {
+            config: test_pool("fixture-model").config,
+            pool: LlmPool::new(2),
+        };
+        let report = service
+            .refresh_sources_with_fetcher(&sources, &settings, Some(&pool), None, &|_| {}, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(report.refreshed_streamers, 2);
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 2);
+        assert!(report
+            .failed_streamers
+            .iter()
+            .any(|error| error.contains("fixture fetch failed")));
+        assert!(store
+            .get_streamer(sources[1].1[0].id)
+            .await
+            .unwrap()
+            .last_error
+            .is_some());
+        assert!(store
+            .get_streamer(sources[0].1[0].id)
+            .await
+            .unwrap()
+            .last_error
+            .is_none());
     }
 
     struct StreamerConcurrencyAnalyzer {
