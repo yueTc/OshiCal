@@ -2286,7 +2286,7 @@ mod regression_tests {
         };
         let input = PostAnalysisInput {
             author: "测试主播".to_owned(),
-            published_at: now(),
+            published_at: Utc::now(),
             text: "周表".to_owned(),
             reserve: None,
             image_urls: (0..9)
