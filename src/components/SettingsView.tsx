@@ -1097,8 +1097,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
     setServerUpdateError(null);
     const submittedDraft = serverUpdateDraftRef.current;
+    const previousChannel = serverUpdateRef.current?.channel;
+    let savedValue: ServerUpdateInfo | null = null;
     try {
       const value = await actions.saveServerUpdateSettings(submittedDraft);
+      savedValue = value;
       const latestDraft = serverUpdateDraftRef.current;
       const nextDraft = serverUpdateSettingsEqual(latestDraft, submittedDraft)
         ? serverUpdateSettingsFromInfo(value)
@@ -1111,13 +1114,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       );
       setServerUpdate(value);
       setServerUpdateDraft(nextDraft);
-      return true;
     } catch (updateError) {
       setServerUpdateError(explainError(updateError));
-      return false;
     } finally {
       finishServerUpdateAction();
     }
+    if (
+      savedValue
+      && previousChannel === "beta"
+      && submittedDraft.channel === "stable"
+      && savedValue.updateAvailable
+    ) {
+      const confirmed = window.confirm(
+        `已切换到正式版渠道，并获取到最新正式版 v${savedValue.latestVersion}（当前 v${savedValue.currentVersion}）。是否立即更新服务器？更新期间服务会短暂中断，系统会先备份数据，失败时自动回滚。如果正式版版本低于当前测试版，这一步会执行显式降级。`,
+      );
+      if (confirmed) {
+        await installServerUpdate(true);
+      }
+    }
+    return savedValue !== null;
   }
 
   async function checkServerUpdate() {
@@ -1134,8 +1149,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
-  async function installServerUpdate() {
-    if (!window.confirm("确定立即更新服务器？更新期间服务会短暂中断，系统会先备份数据，失败时自动回滚。")) {
+  async function installServerUpdate(alreadyConfirmed = false) {
+    if (
+      !alreadyConfirmed
+      && !window.confirm("确定立即更新服务器？更新期间服务会短暂中断，系统会先备份数据，失败时自动回滚。")
+    ) {
       return;
     }
     if (!beginServerUpdateAction("install")) {
@@ -1151,18 +1169,22 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
-  async function checkUpdates() {
+  async function checkUpdates(
+    channel: UpdateChannel = updateChannel,
+    promptForUpdate = false,
+  ): Promise<AvailableUpdate | null> {
     if (updateActionRef.current !== null) {
-      return;
+      return null;
     }
     updateActionRef.current = "check";
     setUpdateChecking(true);
-    setUpdateStatus(null);
+    setUpdateStatus(channel === "stable" && promptForUpdate ? "正在获取最新正式版…" : null);
     setUpdateInfo(null);
     setUpdateInstalled(false);
     setUpdateProgress({ downloaded: 0, total: null });
+    let update: AvailableUpdate | null = null;
     try {
-      const update = await checkForUpdate(updateChannel);
+      update = await checkForUpdate(channel);
       setUpdateInfo(update);
       setUpdateStatus(update ? `发现新版本 v${update.version}` : "当前已是最新版本");
     } catch (updateError) {
@@ -1171,10 +1193,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       updateActionRef.current = null;
       setUpdateChecking(false);
     }
+    if (
+      update
+      && promptForUpdate
+      && window.confirm(
+        `已切换到正式版渠道，并获取到最新正式版 v${update.version}（当前 v${update.currentVersion}）。是否立即安装？如果正式版版本低于当前测试版，这一步会执行显式降级。`,
+      )
+    ) {
+      await installUpdate(update, channel);
+    }
+    return update;
   }
 
-  async function installUpdate() {
-    if (!updateInfo || updateActionRef.current !== null) {
+  async function installUpdate(
+    update: AvailableUpdate | null = updateInfo,
+    channel: UpdateChannel = updateChannel,
+  ) {
+    if (!update || updateActionRef.current !== null) {
       return;
     }
     updateActionRef.current = "install";
@@ -1190,7 +1225,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             ? `正在下载 ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
             : `已下载 ${formatBytes(progress.downloaded)}`,
         );
-      }, updateChannel);
+      }, channel);
       setUpdateInstalled(true);
       setUpdateStatus("更新已安装，应用即将重启。");
     } catch (updateError) {
@@ -1201,14 +1236,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
-  function switchUpdateChannel(channel: UpdateChannel) {
+  async function switchUpdateChannel(channel: UpdateChannel) {
     if (updateChecking || updateInstalling || channel === updateChannel) {
       return;
     }
+    const previousChannel = updateChannel;
     setUpdateChannel(saveUpdateChannel(channel));
     setUpdateInfo(null);
     setUpdateInstalled(false);
     setUpdateProgress({ downloaded: 0, total: null });
+    if (channel === "stable" && previousChannel === "beta") {
+      await checkUpdates(channel, true);
+      return;
+    }
     setUpdateStatus(
       channel === "beta"
         ? "已切换到测试版渠道，将同时检查测试版和正式版中更高的版本。"
@@ -1359,7 +1399,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <div>
                 <strong>服务器更新渠道</strong>
                 <span>
-                  测试版会同时比较服务器测试版和正式版清单；切换后点“保存更新设置”生效。
+                  测试版会同时比较服务器测试版和正式版清单；从测试版切回正式版后会立即检查最新正式版，并询问是否安装。
                 </span>
               </div>
               <div className="segmented" role="group" aria-label="服务器更新渠道">
@@ -1718,7 +1758,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <div>
                 <strong>更新渠道</strong>
                 <span>
-                  正式版只读取正式清单；测试版会同时比较测试版与正式版，并仅升级到更高版本。
+                  切回正式版会立即检查最新正式版；正式版低于当前测试版时，只有二次确认后才会显式降级。测试版会同时比较两个渠道并优先选择更高版本。
                 </span>
               </div>
               <div className="segmented" role="group" aria-label="桌面端更新渠道">

@@ -561,6 +561,14 @@ raise SystemExit(0 if candidate > current else 1)
 PY
 }
 
+version_is_stable() {
+  [[ "$1" != *-* ]]
+}
+
+version_is_prerelease() {
+  [[ "$1" == *-* ]]
+}
+
 health_url="${OSHICAL_HEALTH_URL:-http://127.0.0.1:${OSHICAL_PORT:-8787}/api/health}"
 if ! python3 - "$health_url" <<'PY'
 import ipaddress
@@ -712,6 +720,15 @@ if [[ -n "$installed_version" && "$current_version" != "$installed_version" ]]; 
       exit 1
     fi
     installed_version="$current_version"
+  elif [[ "$force" == "true" ]] \
+    && version_is_stable "$target_version" \
+    && version_is_prerelease "$current_version"; then
+    if ! record_installed_version "$current_version"; then
+      write_status "failed" "failed" "无法持久化显式降级后的已安装版本状态" "failed to write installed-version state after explicit downgrade" "$target_version"
+      safe_remove_file "$request_file" || true
+      exit 1
+    fi
+    installed_version="$current_version"
   else
     write_status "failed" "validation" "检测到版本低于 root 记录的已安装版本，拒绝静默降级" "running $current_version is below recorded $installed_version" "$target_version"
     safe_remove_file "$request_file" || true
@@ -735,9 +752,15 @@ if [[ "$effective_current_version" == "$target_version" ]]; then
   exit 0
 fi
 if ! version_is_newer "$target_version" "$effective_current_version"; then
-  write_status "failed" "validation" "目标版本低于已安装版本，拒绝降级" "downgrade rejected: $effective_current_version -> $target_version" "$target_version"
-  safe_remove_file "$request_file" || true
-  exit 1
+  if [[ "$force" == "true" ]] \
+    && version_is_stable "$target_version" \
+    && version_is_prerelease "$effective_current_version"; then
+    :
+  else
+    write_status "failed" "validation" "目标版本低于已安装版本，拒绝未授权的降级" "downgrade rejected: $effective_current_version -> $target_version" "$target_version"
+    safe_remove_file "$request_file" || true
+    exit 1
+  fi
 fi
 
 if [[ "$force" != "true" ]] && ! in_window; then
@@ -761,6 +784,7 @@ heartbeat_pid=$!
 
 if OSHICAL_IMAGE="$server_image" \
   OSHICAL_TARGET_VERSION="$target_version" \
+  OSHICAL_ALLOW_DOWNGRADE="$force" \
   /bin/bash ./scripts/update-server.sh 2>&1 | safe_append_file "$update_dir/updater.log"; then
   if ! refreshed_version="$(health_version 2>/dev/null)"; then
     write_status "failed" "failed" "更新后无法读取服务器版本，已按失败处理" "server health request failed after update" "$target_version"

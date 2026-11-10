@@ -124,6 +124,7 @@ if [[ "$(stat -c '%d' -- "$backup_dir")" != "$(stat -c '%d' -- "${data_dir%/}/..
 fi
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
+ALLOW_DOWNGRADE="${OSHICAL_ALLOW_DOWNGRADE:-false}"
 backup_file="$backup_dir/oshical-data-$timestamp-$$.tar.gz"
 
 health_version() {
@@ -187,14 +188,32 @@ raise SystemExit(0 if candidate > current else 1)
 PY
 }
 
+version_is_stable() {
+  [[ "$1" != *-* ]]
+}
+
+version_is_prerelease() {
+  [[ "$1" == *-* ]]
+}
+
 previous_version_hint="$(health_version 2>/dev/null || true)"
 if [[ ! "$previous_version_hint" =~ $semver_regex ]]; then
   echo "无法读取当前服务器版本，拒绝在未知状态下更新。" >&2
   exit 1
 fi
-if [[ -n "${OSHICAL_TARGET_VERSION:-}" ]] && ! version_is_newer "$OSHICAL_TARGET_VERSION" "$previous_version_hint"; then
-  echo "目标版本必须严格高于当前版本: $previous_version_hint -> $OSHICAL_TARGET_VERSION" >&2
+if [[ "$ALLOW_DOWNGRADE" != "true" && "$ALLOW_DOWNGRADE" != "false" ]]; then
+  echo "OSHICAL_ALLOW_DOWNGRADE 必须是 true 或 false。" >&2
   exit 1
+fi
+if [[ -n "${OSHICAL_TARGET_VERSION:-}" ]] && ! version_is_newer "$OSHICAL_TARGET_VERSION" "$previous_version_hint"; then
+  if [[ "$ALLOW_DOWNGRADE" == "true" ]] \
+    && version_is_stable "$OSHICAL_TARGET_VERSION" \
+    && version_is_prerelease "$previous_version_hint"; then
+    :
+  else
+    echo "目标版本必须更高；只有显式切回正式版时才允许安装较低的稳定版: $previous_version_hint -> $OSHICAL_TARGET_VERSION" >&2
+    exit 1
+  fi
 fi
 
 previous_image="$(docker compose images -q oshical 2>/dev/null | sed -n '1p' || true)"

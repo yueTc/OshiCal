@@ -229,6 +229,24 @@ impl ServerUpdateManager {
             let _ = fs::remove_file(self.latest_path()).await;
             let _ = fs::remove_file(self.status_path()).await;
         }
+        if previous.channel == ServerUpdateChannel::Beta
+            && settings.channel == ServerUpdateChannel::Stable
+        {
+            if let Err(error) = self
+                .check_release(settings.channel, &settings.github_mirror_url)
+                .await
+            {
+                let status = UpdateStatus {
+                    status: "failed".to_owned(),
+                    phase: "check".to_owned(),
+                    message: format!("已切换到正式版渠道，但检查最新正式版失败：{error}"),
+                    target_version: None,
+                    updated_at: Some(Utc::now()),
+                    error: Some(error.to_string()),
+                };
+                let _ = write_json(&self.status_path(), &status).await;
+            }
+        }
         self.view().await
     }
 
@@ -254,7 +272,9 @@ impl ServerUpdateManager {
             None
         };
         let latest_channel = latest.release_channel.filter(|_| latest_valid);
-        let update_available = latest_version
+        let update_available = latest_valid
+            && update_is_available(&latest, env!("CARGO_PKG_VERSION"), settings.channel);
+        let auto_update_available = latest_version
             .as_deref()
             .is_some_and(|value| is_newer_version(value, env!("CARGO_PKG_VERSION")));
         let request_pending = fs::try_exists(self.request_path()).await?;
@@ -264,7 +284,7 @@ impl ServerUpdateManager {
             status.message = "等待宿主机更新代理处理".to_owned();
         }
         let agent_online = self.agent_online().await;
-        let message = effective_message(&status, &settings, update_available, agent_online);
+        let message = effective_message(&status, &settings, auto_update_available, agent_online);
         Ok(ServerUpdateView {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
             channel: settings.channel,
@@ -301,9 +321,9 @@ impl ServerUpdateManager {
         let latest = self
             .check_release(settings.channel, &settings.github_mirror_url)
             .await?;
-        if !is_newer_version(&latest.version, env!("CARGO_PKG_VERSION")) {
+        if !update_is_available(&latest, env!("CARGO_PKG_VERSION"), settings.channel) {
             return Err(AppError::validation(
-                "服务器已经是最新版本，拒绝重复安装或降级",
+                "服务器已经是最新版本，当前渠道没有可安装的版本",
             ));
         }
         self.write_request(
@@ -560,8 +580,11 @@ impl ServerUpdateManager {
         validate_hhmm(&settings.update_window_end)?;
         Version::parse(target_version)
             .map_err(|error| AppError::validation(format!("目标版本号无效: {error}")))?;
-        if !is_newer_version(target_version, env!("CARGO_PKG_VERSION")) {
-            return Err(AppError::validation("目标版本必须严格高于当前服务器版本"));
+        let downgrade = is_stable_downgrade(target_version, env!("CARGO_PKG_VERSION"));
+        if !is_newer_version(target_version, env!("CARGO_PKG_VERSION")) && !(force && downgrade) {
+            return Err(AppError::validation(
+                "目标版本必须更高；只有显式切回正式版时才允许安装较低的稳定版",
+            ));
         }
         let image_digest =
             image_digest.ok_or_else(|| AppError::validation("更新请求缺少不可变镜像摘要"))?;
@@ -887,6 +910,26 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
+fn is_stable_downgrade(target: &str, current: &str) -> bool {
+    match (Version::parse(target), Version::parse(current)) {
+        (Ok(target), Ok(current)) => {
+            target < current && target.pre.is_empty() && !current.pre.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn update_is_available(
+    release: &ReleaseInfo,
+    current: &str,
+    requested_channel: ServerUpdateChannel,
+) -> bool {
+    is_newer_version(&release.version, current)
+        || (requested_channel == ServerUpdateChannel::Stable
+            && release.release_channel == Some(ServerUpdateChannel::Stable)
+            && is_stable_downgrade(&release.version, current))
+}
+
 fn now_hhmm() -> u32 {
     let offset = FixedOffset::east_opt(8 * 60 * 60).expect("valid Asia/Shanghai offset");
     let now = Utc::now().with_timezone(&offset);
@@ -946,10 +989,10 @@ fn effective_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_message, is_newer_version, mirror_manifest_url, parse_hhmm,
-        release_from_manifest, select_newer_release, validate_image_digest, validate_mirror_url,
-        validate_update_signature, window_contains, ReleaseInfo, ServerUpdateChannel,
-        ServerUpdateManager, ServerUpdateSettings, UpdateStatus,
+        effective_message, is_newer_version, is_stable_downgrade, mirror_manifest_url, parse_hhmm,
+        release_from_manifest, select_newer_release, update_is_available, validate_image_digest,
+        validate_mirror_url, validate_update_signature, window_contains, ReleaseInfo,
+        ServerUpdateChannel, ServerUpdateManager, ServerUpdateSettings, UpdateStatus,
     };
 
     #[test]
@@ -1070,6 +1113,40 @@ mod tests {
         assert!(!is_newer_version("0.2.4", "0.2.4"));
         assert!(!is_newer_version("0.2.3", "0.2.4"));
         assert!(!is_newer_version("invalid", "0.2.4"));
+    }
+
+    #[test]
+    fn stable_channel_can_offer_explicit_beta_rollback() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let signature = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let stable = ReleaseInfo {
+            channel: "server".to_owned(),
+            requested_channel: Some(ServerUpdateChannel::Stable),
+            release_channel: Some(ServerUpdateChannel::Stable),
+            version: "0.3.28".to_owned(),
+            image_digest: Some(digest.to_owned()),
+            signature: Some(signature.to_owned()),
+            checked_at: None,
+            release_url: None,
+        };
+        let beta = ReleaseInfo {
+            release_channel: Some(ServerUpdateChannel::Beta),
+            version: "0.3.29-beta.1".to_owned(),
+            ..stable.clone()
+        };
+
+        assert!(is_stable_downgrade("0.3.28", "0.3.29-beta.2"));
+        assert!(update_is_available(
+            &stable,
+            "0.3.29-beta.2",
+            ServerUpdateChannel::Stable
+        ));
+        assert!(!update_is_available(
+            &beta,
+            "0.3.29-beta.2",
+            ServerUpdateChannel::Stable
+        ));
+        assert!(!is_stable_downgrade("0.3.30-beta.1", "0.3.29-beta.2"));
     }
 
     #[test]

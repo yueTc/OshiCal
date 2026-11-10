@@ -460,12 +460,28 @@ fn app_update_version_is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
+fn app_update_is_available(
+    current: &semver::Version,
+    candidate: &semver::Version,
+    channel: AppUpdateChannel,
+) -> bool {
+    candidate > current
+        || (channel == AppUpdateChannel::Stable
+            && !current.pre.is_empty()
+            && candidate.pre.is_empty()
+            && candidate < current)
+}
+
 async fn resolve_app_update_endpoints(
     app: &AppHandle,
     endpoints: Vec<url::Url>,
+    channel: AppUpdateChannel,
 ) -> Result<Option<tauri_plugin_updater::Update>, String> {
     let updater = app
         .updater_builder()
+        .version_comparator(move |current, release| {
+            app_update_is_available(&current, &release.version, channel)
+        })
         .endpoints(endpoints)
         .map_err(|error| format!("配置更新端点失败: {error}"))?
         .timeout(APP_UPDATE_CHECK_TIMEOUT)
@@ -487,7 +503,7 @@ async fn resolve_app_update(
     let mut failures = Vec::new();
     for manifest_endpoint in channel.manifest_urls() {
         let endpoints = app_update_endpoints(manifest_endpoint, mirror_url)?;
-        match resolve_app_update_endpoints(app, endpoints).await {
+        match resolve_app_update_endpoints(app, endpoints, channel).await {
             Ok(Some(candidate)) => {
                 successful_checks += 1;
                 let should_replace = best.as_ref().is_none_or(|current| {
@@ -2994,10 +3010,11 @@ async fn export_client_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_endpoints, app_update_version_is_newer, batch_is_fully_applied, build_ws_url,
-        changes_after_cursor, cookie_header_from_webview, empty_changes_page_requires_rebuild,
-        normalize_mirror_base, prepare_forwarded_event, validate_external_url, AppUpdateChannel,
-        RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
+        app_update_endpoints, app_update_is_available, app_update_version_is_newer,
+        batch_is_fully_applied, build_ws_url, changes_after_cursor, cookie_header_from_webview,
+        empty_changes_page_requires_rebuild, normalize_mirror_base, prepare_forwarded_event,
+        validate_external_url, AppUpdateChannel, RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT,
+        APP_UPDATE_STABLE_ENDPOINT,
     };
     use crate::sync_client::SyncChange;
     use serde_json::json;
@@ -3071,6 +3088,29 @@ mod tests {
         assert!(app_update_version_is_newer("0.3.21", "0.3.21-beta.1"));
         assert!(!app_update_version_is_newer("0.3.21-beta.1", "0.3.21"));
         assert!(!app_update_version_is_newer("0.3.20", "0.3.20"));
+    }
+
+    #[test]
+    fn stable_channel_can_offer_explicit_beta_rollback() {
+        let current = semver::Version::parse("0.3.21-beta.3").expect("current");
+        let stable = semver::Version::parse("0.3.20").expect("stable");
+        let beta = semver::Version::parse("0.3.21-beta.4").expect("beta");
+
+        assert!(app_update_is_available(
+            &current,
+            &stable,
+            AppUpdateChannel::Stable
+        ));
+        assert!(!app_update_is_available(
+            &current,
+            &stable,
+            AppUpdateChannel::Beta
+        ));
+        assert!(!app_update_is_available(
+            &current,
+            &beta,
+            AppUpdateChannel::Stable
+        ));
     }
 
     #[test]

@@ -295,7 +295,7 @@ sqlite3 $backup "PRAGMA integrity_check;"
 
 ## 7. 桌面端与服务端双渠道自动更新
 
-桌面端和服务端均支持 `stable` 正式版与 `beta` 测试版渠道。客户端与服务端设置页可自行选择；切换后按 SemVer 只升级到更高版本，不自动降级。
+桌面端和服务端均支持 `stable` 正式版与 `beta` 测试版渠道。测试版渠道同时比较两个清单并优先选择更高版本；用户从测试版主动切回正式版时，会立即检查最新正式版并询问是否安装。若正式版低于当前测试版，界面会明确提示降级风险，只有二次确认后才执行；自动检测和定时更新始终不会降级。
 
 ```text
 桌面正式版：https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
