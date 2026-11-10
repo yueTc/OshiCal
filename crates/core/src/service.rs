@@ -1717,7 +1717,7 @@ impl AppService {
                 keep_identities.insert(identity);
             }
 
-            // 带图动态与纯文字动态走同一条通道：正文（含预约卡）与全部图片
+            // 带图动态与纯文字动态走同一条通道：正文（含预约卡）与前两图
             // 只在这一次请求里送出，任何一侧出现时间点都能被提取。
             let has_images = !post.images.is_empty();
             // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
