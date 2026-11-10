@@ -1848,7 +1848,6 @@ impl AppService {
                         base.revision,
                         duplicate.id,
                         duplicate.revision,
-                        &duplicate_input,
                         merged.as_ref(),
                     )
                     .await?
@@ -2336,7 +2335,6 @@ impl AppService {
                             base.revision,
                             duplicate.id,
                             duplicate.revision,
-                            &duplicate_input,
                             merged.as_ref(),
                         )
                         .await?

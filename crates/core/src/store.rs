@@ -1710,7 +1710,6 @@ impl SqliteStore {
         canonical_revision: i64,
         duplicate_id: i64,
         duplicate_revision: i64,
-        duplicate_input: &NewSchedule,
         merge_input: Option<&NewSchedule>,
     ) -> AppResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1776,21 +1775,45 @@ impl SqliteStore {
             }
             self.emit_schedule_change(&mut tx, canonical_id, "upsert", SyncActor::collector())
                 .await?;
-            self.attach_schedule_source_on(
-                &mut tx,
-                canonical_id,
-                merge_input,
-                SyncActor::collector(),
+        }
+
+        let source_identities: Vec<String> = sqlx::query_scalar(
+            "SELECT source_identity FROM schedule_sources WHERE schedule_id = ? ORDER BY id",
+        )
+        .bind(duplicate_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schedule_sources
+                (schedule_id, source_kind, source_post_id, source_image_url,
+                 source_fingerprint, source_identity, confidence, created_at, revision)
+             SELECT ?, source_kind, source_post_id, source_image_url,
+                    source_fingerprint, source_identity, confidence, created_at, revision
+             FROM schedule_sources WHERE schedule_id = ?
+             ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
+                confidence = MAX(schedule_sources.confidence, excluded.confidence),
+                source_kind = CASE WHEN excluded.confidence > schedule_sources.confidence
+                    THEN excluded.source_kind ELSE schedule_sources.source_kind END,
+                source_post_id = CASE WHEN excluded.confidence > schedule_sources.confidence
+                    THEN excluded.source_post_id ELSE schedule_sources.source_post_id END,
+                source_image_url = COALESCE(excluded.source_image_url, schedule_sources.source_image_url),
+                source_fingerprint = COALESCE(excluded.source_fingerprint, schedule_sources.source_fingerprint),
+                revision = schedule_sources.revision + 1",
+        )
+        .bind(canonical_id)
+        .bind(duplicate_id)
+        .execute(&mut *tx)
+        .await?;
+        for identity in source_identities {
+            let source_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM schedule_sources WHERE schedule_id = ? AND source_identity = ?",
             )
+            .bind(canonical_id)
+            .bind(identity)
+            .fetch_one(&mut *tx)
             .await?;
-        } else {
-            self.attach_schedule_source_on(
-                &mut tx,
-                canonical_id,
-                duplicate_input,
-                SyncActor::collector(),
-            )
-            .await?;
+            self.emit_schedule_source_change(&mut tx, source_id, "upsert", SyncActor::collector())
+                .await?;
         }
 
         if !self
