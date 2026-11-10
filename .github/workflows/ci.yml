@@ -58,7 +58,7 @@ jobs:
           if ($clippyExit -ne 0) {
             $diagnostics = @(
               $clippyOutput |
-                Where-Object { $_ -match '^(error|warning)(\[|:)|^\s*-->' } |
+                Where-Object { $_ -match '(?i)error:|warning:' } |
                 Select-Object -First 25
             )
             if ($diagnostics.Count -eq 0) {
