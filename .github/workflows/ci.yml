@@ -51,16 +51,23 @@ jobs:
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $output = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Tee-Object -Variable clippyOutput
+          $env:CARGO_TERM_COLOR = 'never'
+          $clippyOutput = @(cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1)
           $clippyExit = $LASTEXITCODE
+          $clippyOutput | ForEach-Object { Write-Host $_ }
           if ($clippyExit -ne 0) {
-            $clippyOutput |
-              Where-Object { $_ -match '^(error|warning)(\[|:)|^\s*-->' } |
-              Select-Object -First 25 |
-              ForEach-Object {
-                $message = $_.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-                Write-Host "::error title=Rust clippy::$message"
-              }
+            $diagnostics = @(
+              $clippyOutput |
+                Where-Object { $_ -match '^(error|warning)(\[|:)|^\s*-->' } |
+                Select-Object -First 25
+            )
+            if ($diagnostics.Count -eq 0) {
+              $diagnostics = @($clippyOutput | Select-Object -Last 20)
+            }
+            foreach ($line in $diagnostics) {
+              $message = $line.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Host "::error title=Rust clippy::$message"
+            }
           }
           exit $clippyExit
 
