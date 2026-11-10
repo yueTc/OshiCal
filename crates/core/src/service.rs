@@ -7,6 +7,7 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
+use tracing::Instrument;
 
 use crate::bilibili::{BilibiliClient, QrLoginPoll, QrLoginStart};
 use crate::error::{AppError, AppResult};
@@ -17,6 +18,7 @@ use crate::live_stats::LiveStatsManager;
 use crate::llm::{
     events_from_raw, llm_base_urls_match, ContentAnalyzer, LlmClient, LlmConfig,
     LlmDiscoveryConfig, LlmEvent, LlmEventAction, LlmPool, LlmTestReport, PostAnalysisInput,
+    POST_ANALYSIS_IMAGE_LIMIT,
 };
 use crate::models::{
     AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
@@ -27,6 +29,7 @@ use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::{FertilityCache, SqliteStore};
+use crate::timing::{measure, PhaseTimer};
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
@@ -1064,24 +1067,30 @@ impl AppService {
     where
         P: Fn(RefreshProgress) + Send + Sync,
     {
-        // A manual refresh may arrive while the periodic monitor is running.
-        // Queue it instead of failing and discarding the caller's progress UI.
-        let target = ProgressTarget::all();
-        let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
-        self.repair_reserve_room_urls().await;
-        let settings = load_settings(&self.store).await?;
-        let llm = self.post_analyzer(&settings).await;
-        let streamers = self.store.list_streamers().await?;
-        self.backfill_avatar_captures(&streamers).await;
-        let sources = sources_for_streamers(&streamers);
-        // 全量刷新没有“当前主播”，用合成条目播报整体进度。
-        self.refresh_sources(
-            &sources,
-            &settings,
-            llm.as_ref(),
-            Some(&target),
-            &on_progress,
-        )
+        let refresh_id = uuid::Uuid::new_v4().to_string();
+        let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = "all");
+        measure("refresh_round", async {
+            // A manual refresh may arrive while the periodic monitor is running.
+            // Queue it instead of failing and discarding the caller's progress UI.
+            let target = ProgressTarget::all();
+            let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
+            self.repair_reserve_room_urls().await;
+            let settings = load_settings(&self.store).await?;
+            let llm = self.post_analyzer(&settings).await;
+            let streamers = self.store.list_streamers().await?;
+            self.backfill_avatar_captures(&streamers).await;
+            let sources = sources_for_streamers(&streamers);
+            // 全量刷新没有“当前主播”，用合成条目播报整体进度。
+            self.refresh_sources(
+                &sources,
+                &settings,
+                llm.as_ref(),
+                Some(&target),
+                &on_progress,
+            )
+            .await
+        })
+        .instrument(span)
         .await
     }
 
@@ -1093,11 +1102,15 @@ impl AppService {
         target: &ProgressTarget,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> tokio::sync::MutexGuard<'a, ()> {
+        let queue_timer = PhaseTimer::start("refresh_queue_wait");
         let started = std::time::Instant::now();
         let mut waited_seconds = 0u64;
         loop {
             match self.refresh_lock.try_lock() {
-                Ok(guard) => return guard,
+                Ok(guard) => {
+                    queue_timer.finish(true);
+                    return guard;
+                }
                 Err(_) => {
                     emit_progress(
                         target,
@@ -1141,69 +1154,75 @@ impl AppService {
     where
         P: Fn(RefreshProgress) + Send + Sync,
     {
-        // Keep one refresh in flight, but let a requested refresh wait for the
-        // current background run instead of returning an immediate validation error.
-        let streamer = self.store.get_streamer(streamer_id).await?;
-        let target = ProgressTarget::for_streamer(&streamer);
-        let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
-        self.backfill_avatar_captures(std::slice::from_ref(&streamer))
-            .await;
-        emit_progress(
-            &target,
-            "准备抓取主播与官号动态",
-            0,
-            0,
-            3,
-            false,
-            false,
-            &on_progress,
-        );
-        let result = async {
-            let settings = load_settings(&self.store).await?;
-            let llm = self.post_analyzer(&settings).await;
-            let sources = sources_for_streamers(std::slice::from_ref(&streamer));
-            self.refresh_sources(
-                &sources,
-                &settings,
-                llm.as_ref(),
-                Some(&target),
+        let refresh_id = uuid::Uuid::new_v4().to_string();
+        let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = "streamer", streamer_id);
+        measure("refresh_round", async {
+            // Keep one refresh in flight, but let a requested refresh wait for the
+            // current background run instead of returning an immediate validation error.
+            let streamer = self.store.get_streamer(streamer_id).await?;
+            let target = ProgressTarget::for_streamer(&streamer);
+            let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
+            self.backfill_avatar_captures(std::slice::from_ref(&streamer))
+                .await;
+            emit_progress(
+                &target,
+                "准备抓取主播与官号动态",
+                0,
+                0,
+                3,
+                false,
+                false,
                 &on_progress,
-            )
-            .await
-        }
-        .await;
-        match &result {
-            Ok(report) => {
-                let failed = !report.failed_streamers.is_empty();
-                emit_progress(
-                    &target,
-                    if failed {
-                        "刷新完成，但部分来源失败"
-                    } else {
-                        "刷新完成"
-                    },
-                    1,
-                    1,
-                    100,
-                    true,
-                    failed,
+            );
+            let result = async {
+                let settings = load_settings(&self.store).await?;
+                let llm = self.post_analyzer(&settings).await;
+                let sources = sources_for_streamers(std::slice::from_ref(&streamer));
+                self.refresh_sources(
+                    &sources,
+                    &settings,
+                    llm.as_ref(),
+                    Some(&target),
                     &on_progress,
-                );
+                )
+                .await
             }
-            Err(error) => {
-                emit_progress(
-                    &target,
-                    &format!("刷新失败: {error}"),
-                    1,
-                    1,
-                    100,
-                    true,
-                    true,
-                    &on_progress,
-                );
+            .await;
+            match &result {
+                Ok(report) => {
+                    let failed = !report.failed_streamers.is_empty();
+                    emit_progress(
+                        &target,
+                        if failed {
+                            "刷新完成，但部分来源失败"
+                        } else {
+                            "刷新完成"
+                        },
+                        1,
+                        1,
+                        100,
+                        true,
+                        failed,
+                        &on_progress,
+                    );
+                }
+                Err(error) => {
+                    emit_progress(
+                        &target,
+                        &format!("刷新失败: {error}"),
+                        1,
+                        1,
+                        100,
+                        true,
+                        true,
+                        &on_progress,
+                    );
+                }
             }
-        }
-        result
+            result
+        })
+        .instrument(span)
+        .await
     }
 
     async fn current_llm_config(&self, settings: &AppSettings) -> Option<LlmConfig> {
@@ -1245,8 +1264,28 @@ impl AppService {
             let bili = self.bili_client();
             async move { bili.fetch_dynamics(&mid, 20).await }
         };
-        self.refresh_sources_with_fetcher(sources, settings, llm, progress, on_progress, &fetch)
-            .await
+        measure("source_pipeline", async {
+            let result = self
+                .refresh_sources_with_fetcher(sources, settings, llm, progress, on_progress, &fetch)
+                .await;
+            if let Ok(report) = &result {
+                tracing::info!(
+                    sources = sources.len(),
+                    parallelism = settings.llm_parallelism,
+                    llm_calls = report.llm_calls,
+                    cache_hits = report.llm_cache_hits,
+                    image_limit = POST_ANALYSIS_IMAGE_LIMIT,
+                    model = llm
+                        .map(|analyzer| analyzer.config.model.as_str())
+                        .unwrap_or("disabled"),
+                    new_schedules = report.new_schedules,
+                    failed_streamers = report.failed_streamers.len(),
+                    "刷新耗时统计摘要"
+                );
+            }
+            result
+        })
+        .await
     }
 
     // Private transport seam: fixtures exercise the real refresh pipeline,
@@ -1454,7 +1493,9 @@ impl AppService {
                 };
                 let source_progress = &source_progress;
                 let next_fetch_start = &next_fetch_start;
+                let source_span = tracing::info_span!("refresh_source", source_mid = %source_mid);
                 running.push(async move {
+                    let source_timer = PhaseTimer::start("source_refresh");
                     let label = targets
                         .iter()
                         .map(|target| target.name.as_str())
@@ -1491,7 +1532,7 @@ impl AppService {
                         *next = tokio::time::Instant::now()
                             + std::time::Duration::from_millis(SOURCE_FETCH_START_INTERVAL_MS);
                     }
-                    let result = match fetch(source_mid.clone()).await {
+                    let result = match measure("source_fetch", fetch(source_mid.clone())).await {
                         Ok(posts) => self
                             .process_source_posts_with_progress(
                                 source_mid,
@@ -1518,8 +1559,9 @@ impl AppService {
                         };
                         emit_progress(target, stage, 1, 1, 100, false, failed, &report);
                     }
+                    source_timer.finish(matches!(&result, Ok(SourceRefreshResult::Processed(stats)) if stats.analysis_errors.is_empty()));
                     (index, local_state, result)
-                });
+                }.instrument(source_span));
             }
             let Some((index, local_state, result)) = running.next().await else {
                 break;
@@ -1633,7 +1675,10 @@ impl AppService {
                 total_steps,
                 false,
             );
-            self.store.save_dynamic_post(post).await?;
+            tracing::info!(post_id = %post.id, source_mid, images_total = post.images.len(), images_selected = post.images.len().min(POST_ANALYSIS_IMAGE_LIMIT), "动态识别输入统计");
+            measure("post_store", self.store.save_dynamic_post(post))
+                .instrument(tracing::info_span!("post", post_id = %post.id))
+                .await?;
             let reserve_schedule = post
                 .reserve
                 .as_ref()
@@ -1693,10 +1738,12 @@ impl AppService {
                     .insert(format!("post:{}", post.id), None);
             }
             if let Some(analyzer) = llm.filter(|_| has_content) {
-                // v3 保留历史日程，不能复用旧版按时间过滤后留下的空/不完整缓存。
-                let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
+                // v4 只识别前两图，不复用旧多图结果；历史日程继续保留。
+                let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
+                let slot_timer = PhaseTimer::start("model_slot_wait");
                 let _permit = analyzer.pool.acquire().await;
+                slot_timer.finish(true);
                 let config = LlmConfig {
                     base_url: analyzer.config.base_url.clone(),
                     api_key: analyzer.config.api_key.clone(),
@@ -1713,9 +1760,20 @@ impl AppService {
                     published_at: post.published_at,
                     text: post.text.clone(),
                     reserve,
-                    image_urls: post.images.clone(),
+                    image_urls: post
+                        .images
+                        .iter()
+                        .take(POST_ANALYSIS_IMAGE_LIMIT)
+                        .cloned()
+                        .collect(),
                 };
-                let cached_events = match self.store.load_post_analysis_entry(&cache_key).await? {
+                let cached_events = match measure(
+                    "cache_lookup",
+                    self.store.load_post_analysis_entry(&cache_key),
+                )
+                .instrument(tracing::info_span!("post", post_id = %post.id))
+                .await?
+                {
                     Some((raw, created_at)) => match events_from_raw(&raw, now) {
                         Ok(events) if !events.is_empty() => {
                             stats.llm_cache_hits += 1;
@@ -1746,22 +1804,26 @@ impl AppService {
                     None => match self
                         .llm_analyzer()
                         .analyze_post(&config, &analysis_input)
+                        .instrument(tracing::info_span!("post", post_id = %post.id))
                         .await
                     {
                         Ok(analysis) => {
                             stats.llm_calls += 1;
                             // 成功就入缓存，空结果也一样；空结果的过期重试由
                             // `empty_analysis_is_fresh` 按写入时间判断。
-                            self.store
-                                .save_post_analysis(
+                            measure(
+                                "cache_store",
+                                self.store.save_post_analysis(
                                     &cache_key,
                                     &post.id,
                                     &content_digest,
                                     &config.model,
                                     &prompt_version,
                                     &analysis.raw,
-                                )
-                                .await?;
+                                ),
+                            )
+                            .instrument(tracing::info_span!("post", post_id = %post.id))
+                            .await?;
                             Some(analysis.events)
                         }
                         Err(error) => {
@@ -2417,152 +2479,160 @@ impl AppService {
         room_owner_name: Option<&str>,
         participants: &[String],
     ) -> AppResult<bool> {
-        // Independent streamer jobs may report the same joint event. Keep the
-        // existing lookup-and-merge decision atomic across those jobs, without
-        // serialising their network/model work or holding a SQLite transaction.
-        let _write_guard = self.auto_schedule_write_lock.lock().await;
-        let mut schedule = schedule.clone();
-        schedule.title = self
-            .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
-            .await?;
-        let schedule = &schedule;
-        // 带预约卡片的动态不再在这里按卡片时间拦文字/图片候选：
-        // 卡片那一场现在也由文字模型给出，模型结果就是主来源。
-        // 卡片正则的兜底在 process_source_posts 里按“是否已被模型覆盖”决定，
-        // 不会和模型事件重复落库。
-        if self
-            .store
-            .is_source_suppressed(target.id, &post.id, source_fingerprint)
-            .await?
-        {
-            return Ok(false);
-        }
-        let input = NewSchedule {
-            streamer_id: target.id,
-            participants: participants.to_vec(),
-            title: schedule.title.clone(),
-            start_at: schedule.start_at,
-            end_at: schedule.end_at,
-            room_url: room_url
-                .map(ToOwned::to_owned)
-                .or_else(|| target.live_url.clone()),
-            room_owner_mid: room_owner_mid.map(ToOwned::to_owned),
-            room_owner_name: room_owner_name.map(ToOwned::to_owned),
-            source_kind: source_kind.to_owned(),
-            source_post_id: Some(post.id.clone()),
-            source_image_url: (source_kind == "image").then(|| image_url.to_owned()),
-            source_author_mid: Some(post.author_mid.clone()),
-            source_fingerprint: Some(source_fingerprint.to_owned()),
-            source_identity: Some(source_identity.to_owned()),
-            source_published_at: Some(post.published_at),
-            confidence: schedule.confidence,
-        };
-        if participants.len() > 1 || source_kind == "reserve" {
-            let candidates = self
-                .store
-                .list_schedules_near_all(schedule.start_at, 10)
+        measure("schedule_upsert", async {
+            // Independent streamer jobs may report the same joint event. Keep the
+            // existing lookup-and-merge decision atomic across those jobs, without
+            // serialising their network/model work or holding a SQLite transaction.
+            let _write_guard = self.auto_schedule_write_lock.lock().await;
+            let mut schedule = schedule.clone();
+            schedule.title = self
+                .resolve_auto_schedule_title(target.id, &schedule.title, schedule.start_at)
                 .await?;
-            let mut duplicates = group_duplicates(
-                &candidates,
-                schedule,
-                participants,
-                room_owner_mid,
-                room_url,
-                source_kind,
-            );
-            if !duplicates.is_empty() {
-                duplicates.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
-                let existing = duplicates.remove(0);
-                let mut base = existing.clone();
-                for duplicate in duplicates {
-                    let duplicate_input = schedule_to_new_input(duplicate);
-                    let merged = (!base.manual_locked)
-                        .then(|| merge_group_schedule(&base, &duplicate_input));
-                    if self
-                        .store
-                        .merge_and_delete_schedule_duplicate(
-                            base.id,
-                            base.revision,
-                            duplicate.id,
-                            duplicate.revision,
-                            merged.as_ref(),
-                        )
-                        .await?
-                    {
-                        base = self.store.get_schedule(base.id).await?;
-                    }
-                }
-                self.store.attach_schedule_source(base.id, &input).await?;
-                if !base.manual_locked {
-                    let merged = merge_group_schedule(&base, &input);
-                    self.store.merge_schedule_auto(base.id, &merged).await?;
-                }
-                return Ok(false);
-            }
-        }
-        // 单次分析后图片来源与文字来源等价：带图动态的正文里常写“明天八点改到九点”，
-        // 这类时间变更必须同样能改到预约卡对应的日程上。
-        if is_post_analysis_source(source_kind) && post.reserve.is_none() {
-            if let Some(existing) = self
-                .find_reservation_time_change_candidate(target, schedule.start_at, post)
+            let schedule = &schedule;
+            // 带预约卡片的动态不再在这里按卡片时间拦文字/图片候选：
+            // 卡片那一场现在也由文字模型给出，模型结果就是主来源。
+            // 卡片正则的兜底在 process_source_posts 里按“是否已被模型覆盖”决定，
+            // 不会和模型事件重复落库。
+            if self
+                .store
+                .is_source_suppressed(target.id, &post.id, source_fingerprint)
                 .await?
             {
-                self.store
-                    .attach_schedule_source(existing.id, &input)
-                    .await?;
-                let mut merged = merge_input_for_existing(&existing, &input);
-                merged.source_published_at = Some(post.published_at);
-                merged.confidence = existing.confidence.max(input.confidence);
-                self.store.merge_schedule_auto(existing.id, &merged).await?;
                 return Ok(false);
             }
-        }
-        if let Some(existing) = self
-            .store
-            .find_schedule_near(target.id, schedule.start_at, 10)
-            .await?
-        {
-            if existing.source_identity.as_deref() != Some(source_identity) {
-                // 预约卡与模型事件同槽但标题对不上时默认保留两条；
-                // 只有同一直播间且同槽时，才视为同一场合并。
-                let same_room = room_owner_mid
-                    .is_some_and(|mid| existing.room_owner_mid.as_deref() == Some(mid))
-                    || room_url.is_some_and(|url| existing.room_url.as_deref() == Some(url));
-                // 预约卡与同一直播间的图文识别经常给出不同标题；同房间且同槽
-                // 仍是同一场，不能因为标题措辞不同就再落一条。
-                let incompatible_reservation = (existing.source_kind == "reserve"
-                    || input.source_kind == "reserve")
-                    && !cancellation_titles_match(&existing.title, &input.title)
-                    && !(same_room
-                        && same_schedule_slot(
-                            existing.start_at,
-                            schedule.start_at,
-                            RESERVE_DUPLICATE_TOLERANCE_MINUTES,
-                        ));
-                if !incompatible_reservation {
-                    self.store
-                        .attach_schedule_source(existing.id, &input)
-                        .await?;
-                    if existing.weekly_rule_id.is_some()
-                        && normalize_alias(&existing.title) != normalize_alias(&schedule.title)
-                    {
-                        self.store.mark_schedule_source_changed(existing.id).await?;
+            let input = NewSchedule {
+                streamer_id: target.id,
+                participants: participants.to_vec(),
+                title: schedule.title.clone(),
+                start_at: schedule.start_at,
+                end_at: schedule.end_at,
+                room_url: room_url
+                    .map(ToOwned::to_owned)
+                    .or_else(|| target.live_url.clone()),
+                room_owner_mid: room_owner_mid.map(ToOwned::to_owned),
+                room_owner_name: room_owner_name.map(ToOwned::to_owned),
+                source_kind: source_kind.to_owned(),
+                source_post_id: Some(post.id.clone()),
+                source_image_url: (source_kind == "image").then(|| image_url.to_owned()),
+                source_author_mid: Some(post.author_mid.clone()),
+                source_fingerprint: Some(source_fingerprint.to_owned()),
+                source_identity: Some(source_identity.to_owned()),
+                source_published_at: Some(post.published_at),
+                confidence: schedule.confidence,
+            };
+            if participants.len() > 1 || source_kind == "reserve" {
+                let candidates = self
+                    .store
+                    .list_schedules_near_all(schedule.start_at, 10)
+                    .await?;
+                let mut duplicates = group_duplicates(
+                    &candidates,
+                    schedule,
+                    participants,
+                    room_owner_mid,
+                    room_url,
+                    source_kind,
+                );
+                if !duplicates.is_empty() {
+                    duplicates.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
+                    let existing = duplicates.remove(0);
+                    let mut base = existing.clone();
+                    for duplicate in duplicates {
+                        let duplicate_input = schedule_to_new_input(duplicate);
+                        let merged = (!base.manual_locked)
+                            .then(|| merge_group_schedule(&base, &duplicate_input));
+                        if self
+                            .store
+                            .merge_and_delete_schedule_duplicate(
+                                base.id,
+                                base.revision,
+                                duplicate.id,
+                                duplicate.revision,
+                                merged.as_ref(),
+                            )
+                            .await?
+                        {
+                            base = self.store.get_schedule(base.id).await?;
+                        }
                     }
-                    let incoming_wins = match existing.source_published_at {
-                        Some(existing_published_at) => post.published_at >= existing_published_at,
-                        None => schedule.confidence >= existing.confidence,
-                    };
-                    if !existing.manual_locked && incoming_wins {
-                        let merged = merge_input_for_existing(&existing, &input);
-                        self.store.merge_schedule_auto(existing.id, &merged).await?;
-                        return Ok(false);
+                    self.store.attach_schedule_source(base.id, &input).await?;
+                    if !base.manual_locked {
+                        let merged = merge_group_schedule(&base, &input);
+                        self.store.merge_schedule_auto(base.id, &merged).await?;
                     }
                     return Ok(false);
                 }
             }
-        }
-        let (_, inserted) = self.store.upsert_schedule(&input).await?;
-        Ok(inserted)
+            // 单次分析后图片来源与文字来源等价：带图动态的正文里常写“明天八点改到九点”，
+            // 这类时间变更必须同样能改到预约卡对应的日程上。
+            if is_post_analysis_source(source_kind) && post.reserve.is_none() {
+                if let Some(existing) = self
+                    .find_reservation_time_change_candidate(target, schedule.start_at, post)
+                    .await?
+                {
+                    self.store
+                        .attach_schedule_source(existing.id, &input)
+                        .await?;
+                    let mut merged = merge_input_for_existing(&existing, &input);
+                    merged.source_published_at = Some(post.published_at);
+                    merged.confidence = existing.confidence.max(input.confidence);
+                    self.store.merge_schedule_auto(existing.id, &merged).await?;
+                    return Ok(false);
+                }
+            }
+            if let Some(existing) = self
+                .store
+                .find_schedule_near(target.id, schedule.start_at, 10)
+                .await?
+            {
+                if existing.source_identity.as_deref() != Some(source_identity) {
+                    // 预约卡与模型事件同槽但标题对不上时默认保留两条；
+                    // 只有同一直播间且同槽时，才视为同一场合并。
+                    let same_room = room_owner_mid
+                        .is_some_and(|mid| existing.room_owner_mid.as_deref() == Some(mid))
+                        || room_url.is_some_and(|url| existing.room_url.as_deref() == Some(url));
+                    // 预约卡与同一直播间的图文识别经常给出不同标题；同房间且同槽
+                    // 仍是同一场，不能因为标题措辞不同就再落一条。
+                    let incompatible_reservation = (existing.source_kind == "reserve"
+                        || input.source_kind == "reserve")
+                        && !cancellation_titles_match(&existing.title, &input.title)
+                        && !(same_room
+                            && same_schedule_slot(
+                                existing.start_at,
+                                schedule.start_at,
+                                RESERVE_DUPLICATE_TOLERANCE_MINUTES,
+                            ));
+                    if !incompatible_reservation {
+                        self.store
+                            .attach_schedule_source(existing.id, &input)
+                            .await?;
+                        if existing.weekly_rule_id.is_some()
+                            && normalize_alias(&existing.title) != normalize_alias(&schedule.title)
+                        {
+                            self.store.mark_schedule_source_changed(existing.id).await?;
+                        }
+                        let incoming_wins = match existing.source_published_at {
+                            Some(existing_published_at) => {
+                                post.published_at >= existing_published_at
+                            }
+                            None => schedule.confidence >= existing.confidence,
+                        };
+                        if !existing.manual_locked && incoming_wins {
+                            let merged = merge_input_for_existing(&existing, &input);
+                            self.store.merge_schedule_auto(existing.id, &merged).await?;
+                            return Ok(false);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+            let (_, inserted) = self.store.upsert_schedule(&input).await?;
+            Ok(inserted)
+        })
+        .instrument(
+            tracing::info_span!("schedule_write", post_id = %post.id, streamer_id = target.id),
+        )
+        .await
     }
 }
 
@@ -2747,13 +2817,18 @@ fn text_analysis_context(post: &DynamicPost) -> String {
     .to_owned()
 }
 
-/// 整条动态的内容摘要：正文摘要 + 预约卡摘要 + 全部图片地址。
+/// 动态分析摘要：正文、预约卡及原顺序前两图；未选中的广告尾图不影响缓存。
 /// 任一组成变化都会得到新摘要，缓存条目与图片来源 identity 随之失效。
 fn content_digest_of(text_hash: &str, reserve: Option<&str>, image_urls: &[String]) -> String {
     text_digest(&format!(
         "{text_hash}|{}|{}",
         reserve.unwrap_or_default(),
-        image_urls.join(",")
+        image_urls
+            .iter()
+            .take(POST_ANALYSIS_IMAGE_LIMIT)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
     ))
 }
 
@@ -6895,7 +6970,7 @@ mod tests {
             assert_eq!(analyzer.call_count(), 1);
             assert_eq!(analyzer.last_call().input.published_at, post.published_at);
             let new_key = format!(
-                "{}:{content_digest}:fixture-model:{}-post-v3",
+                "{}:{content_digest}:fixture-model:{}-post-v4",
                 post.id, settings.llm_prompt_version
             );
             assert_eq!(
@@ -6936,7 +7011,7 @@ mod tests {
         let text_hash = text_digest(&text_analysis_context(&post));
         let reserve = reserve_summary(&post);
         let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
-        let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
         let cache_key = format!("{}:{content_digest}:{model}:{prompt_version}", post.id);
         store
             .save_post_analysis(
@@ -7190,9 +7265,43 @@ mod tests {
             serde_json::from_str::<Vec<String>>(&stored).unwrap(),
             images
         );
+        let settings = AppSettings::default();
+        let mut changed = post.clone();
+        changed.images[2] = "https://i0.hdslb.com/bfs/new_dyn/changed-ad.jpg".to_owned();
+        let cached = service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&changed),
+                &settings,
+                Some(&test_pool("fixture")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.llm_calls, 0,
+            "ignored tail changes must not invalidate analysis"
+        );
+        assert_eq!(cached.llm_cache_hits, 1);
+        changed.images[0] = "https://i0.hdslb.com/bfs/new_dyn/changed-schedule.jpg".to_owned();
+        let fresh = service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&changed),
+                &settings,
+                Some(&test_pool("fixture")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.llm_calls, 1,
+            "selected image changes must be analysed"
+        );
+        assert_eq!(analyzer.call_count(), 2);
     }
 
-    /// 9 张图的动态只发一次请求，图片全部随这次请求送出。
+    /// 九图动态只选前两张，仍然只发一次模型请求。
     #[tokio::test]
     async fn nine_images_go_in_one_request() {
         let store = SqliteStore::in_memory().await.expect("db");
@@ -7238,7 +7347,7 @@ mod tests {
         assert_eq!(analyzer.call_count(), 1);
         assert_eq!(analyzer.captured_calls().len(), 1);
         assert_eq!(stats.llm_calls, 1);
-        assert_eq!(analyzer.last_call().input.image_urls, images);
+        assert_eq!(analyzer.last_call().input.image_urls, images[..2]);
         assert_eq!(stats.new_schedules, 1);
     }
 
@@ -7656,7 +7765,7 @@ mod tests {
         let settings = AppSettings::default();
         let text_hash = text_digest(&text_analysis_context(&post));
         let content_digest = content_digest_of(&text_hash, None, &post.images);
-        let prompt_version = format!("{}-post-v3", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
         let cache_key = format!(
             "{}:{content_digest}:fixture-model:{prompt_version}",
             post.id

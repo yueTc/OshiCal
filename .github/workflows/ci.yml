@@ -72,6 +72,12 @@ jobs:
           }
           exit $clippyExit
 
+      - name: Refresh timing summary tests
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONUTF8: "1"
+        run: python -m unittest discover -s scripts -p test_refresh_timing.py -v
+
       - name: Frontend tests
         if: ${{ !cancelled() }}
         run: npm run test:web

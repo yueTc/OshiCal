@@ -19,6 +19,7 @@ use std::io::Cursor;
 use crate::bilibili::normalize_image_url;
 use crate::error::{AppError, AppResult};
 use crate::settings::ReasoningEffort;
+use crate::timing::measure;
 
 const IMAGE_DOWNLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 // Keep the base64 data URL below 10 MiB while leaving room for the prompt JSON.
@@ -46,6 +47,8 @@ const RESIZED_JPEG_QUALITY: u8 = 90;
 /// 一次请求里所有图片加起来的 base64 预算。九宫格动态按 7 MiB/张压出来能到 40 MB，
 /// 网关会直接 413 或者拖到超时；压到这个量级后同一批图能稳定在十几秒内返回。
 const MODEL_REQUEST_IMAGE_BUDGET_BYTES: usize = 3 * 1024 * 1024;
+/// Only these original positions may be downloaded; failed slots are not refilled.
+pub(crate) const POST_ANALYSIS_IMAGE_LIMIT: usize = 2;
 /// 每张图至少留这么大的空间，避免图片特别多时压得看不清。
 const MODEL_MIN_IMAGE_BYTES: usize = 160 * 1024;
 const RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
@@ -80,7 +83,7 @@ pub struct LlmConfig {
     pub reasoning_effort: ReasoningEffort,
 }
 
-/// 一条动态的完整输入：正文、预约卡与全部图片属于同一次模型调用。
+/// 一条动态的分析输入：正文、预约卡与原顺序前两张图片属于同一次模型调用。
 #[derive(Debug, Clone)]
 pub struct PostAnalysisInput {
     pub author: String,
@@ -678,7 +681,7 @@ pub(crate) const TEXT_HEADER: &str = "你是 B 站虚拟主播日程结构化提
 /// 图文通道头部（这条动态带图片），占位符含义同 [`SCHEDULE_RULES`]。
 /// 旧实现把图片通道单独发一次、且不带发布者昵称，导致模型纠结“主播是谁”后返回空数组；
 /// 这里把“图片与正文地位完全对等”写进头部，并要求正文时间点在图片无日期时按发布日解释。
-pub(crate) const MULTIMODAL_HEADER: &str = "你是 B 站虚拟主播日程结构化提取器。本次输入是这条动态的全部图片（可能一张，也可能九张）加上动态正文，走图文通道：一条动态的所有图片与正文一次送来，只输出一次结果。
+pub(crate) const MULTIMODAL_HEADER: &str = "你是 B 站虚拟主播日程结构化提取器。本次输入是这条动态按原顺序选取的前两张图片（最多两张）加上动态正文，走图文通道：一条动态的所有图片与正文一次送来，只输出一次结果。
 图片与正文地位完全对等，任一侧出现明确的时间点都必须提取：正文说“今晚八点”“八点见”“下周六播见”而图片里没有日期信息时，按发布时间所在自然日（或正文明确给的那一天）解释成那个时刻，绝不能因此返回空数组；图片是日程表或长图时按图中的日期逐条解析。
 发布者：{author}
 当前日期：{now}（北京时间）。动态发布时间：{pub}。未标明日期的周表按动态发布时所在自然周 {mon} 至 {sun} 解释；当前日期仅作参考，不用于决定周表归属或过滤历史日程。
@@ -781,8 +784,11 @@ impl LlmClient {
         let load = |url: String, budget: usize| async move {
             self.load_image_payload_with_budget(&url, budget).await
         };
-        self.analyze_post_with_image_loader(config, input, &load)
-            .await
+        measure(
+            "post_analysis",
+            self.analyze_post_with_image_loader(config, input, &load),
+        )
+        .await
     }
 
     async fn analyze_post_with_image_loader<Load, LoadFuture>(
@@ -804,15 +810,22 @@ impl LlmClient {
             return Err(AppError::validation("动态既没有文字也没有图片"));
         }
         let now = Utc::now();
+        let selected = &input.image_urls[..input.image_urls.len().min(POST_ANALYSIS_IMAGE_LIMIT)];
+        tracing::info!(
+            images_total = input.image_urls.len(),
+            images_selected = selected.len(),
+            images_ignored = input.image_urls.len().saturating_sub(selected.len()),
+            "动态识别图片选择"
+        );
         // 图片越多，单张能分到的字节越少；总共不超过 MODEL_REQUEST_IMAGE_BUDGET_BYTES。
-        let image_budget = if input.image_urls.is_empty() {
+        let image_budget = if selected.is_empty() {
             IMAGE_UPLOAD_JPEG_BYTES
         } else {
-            (MODEL_REQUEST_IMAGE_BUDGET_BYTES / input.image_urls.len())
+            (MODEL_REQUEST_IMAGE_BUDGET_BYTES / selected.len())
                 .clamp(MODEL_MIN_IMAGE_BYTES, IMAGE_UPLOAD_JPEG_BYTES)
         };
-        let mut image_data_urls = Vec::with_capacity(input.image_urls.len());
-        for image_url in &input.image_urls {
+        let mut image_data_urls = Vec::with_capacity(selected.len());
+        for image_url in selected {
             // 单张图下载失败或被跳过不拖垮整条动态：剩下的图和正文仍走这一次调用；
             // 失败与空结果都不补发第二次请求。
             match load(image_url.clone(), image_budget).await {
@@ -830,6 +843,12 @@ impl LlmClient {
                 ),
             }
         }
+        tracing::info!(
+            images_selected = selected.len(),
+            images_prepared = image_data_urls.len(),
+            images_skipped = selected.len().saturating_sub(image_data_urls.len()),
+            "动态识别图片准备结果"
+        );
         let kind = if input.image_urls.is_empty() {
             PromptKind::Text
         } else {
@@ -868,11 +887,17 @@ impl LlmClient {
             tracing::warn!(image_url, "skip image with unsupported url");
             return Ok(None);
         };
-        let Some((_content_type, bytes)) = self.download_image(&image_url).await? else {
+        let Some((_content_type, bytes)) =
+            measure("image_download", self.download_image(&image_url)).await?
+        else {
             return Ok(None);
         };
         Ok(Some(
-            Self::encode_image_data_url_with_budget(&bytes, byte_limit).await?,
+            measure(
+                "image_prepare",
+                Self::encode_image_data_url_with_budget(&bytes, byte_limit),
+            )
+            .await?,
         ))
     }
 
@@ -921,98 +946,101 @@ impl LlmClient {
         reserve: Option<&str>,
         image_data_urls: Vec<DataUrl>,
     ) -> AppResult<LlmAnalysis> {
-        config.validate()?;
-        validate_llm_base_url_target(&config.base_url, "日程模型地址").await?;
-        let china = FixedOffset::east_opt(8 * 3600).expect("china offset");
-        let published_cn = published_at.with_timezone(&china);
-        let author = author.trim();
-        let author_label = if author.is_empty() { "未知" } else { author };
-        let system_prompt = build_system_prompt(kind, author, published_at, now);
-        let mut user_text = format!(
-            "发布时间：{}\n发布者：{}\n\n动态正文：\n{}",
-            published_cn.format("%Y-%m-%d %H:%M"),
-            author_label,
-            if text.is_empty() { "（无）" } else { text }
-        );
-        if let Some(reserve) = reserve.map(str::trim).filter(|value| !value.is_empty()) {
-            user_text.push_str("\n\n预约卡：\n");
-            user_text.push_str(reserve);
-        }
-        let mut content = Vec::with_capacity(image_data_urls.len() + 1);
-        content.push(json!({"type": "text", "text": user_text}));
-        for data_url in image_data_urls {
-            content.push(json!({"type": "image_url", "image_url": {"url": data_url}}));
-        }
-        tracing::debug!(
-            model = config.model.as_str(),
-            prompts = ?kind,
-            image_count = content.len().saturating_sub(1),
-            reasoning_effort = config.reasoning_effort.as_request_value().unwrap_or("auto"),
-            "sending single-call post analysis"
-        );
-        let mut request = json!({
-            "model": config.model,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content}
-            ]
-        });
-        if let Some(effort) = config.reasoning_effort.as_request_value() {
-            request["reasoning_effort"] = Value::String(effort.to_owned());
-        }
-        let mut builder = self
-            .http
-            .post(config.endpoint()?)
-            .header(ACCEPT, "application/json")
-            .header("Content-Type", "application/json");
-        if !config.api_key.trim().is_empty() {
-            builder = builder.bearer_auth(config.api_key.trim());
-        }
-        // 网关偶发断连（reqwest 报 error sending request），一次失败就让整条动态白等
-        // 九十秒超时，还会连带整轮刷新被拖长。传输层失败重试两次，HTTP 错误码不重试。
-        let mut attempts = 0;
-        let response = loop {
-            attempts += 1;
-            let sent = builder
-                .try_clone()
-                .expect("request builder is clonable")
-                .json(&request)
-                .send()
-                .await;
-            match sent {
-                Ok(response) => break response,
-                Err(error)
-                    if attempts < LLM_SEND_ATTEMPTS
-                        && !error.is_builder()
-                        && !error.is_timeout() =>
-                {
-                    tracing::warn!(
-                        %error,
-                        attempt = attempts,
-                        max_attempts = LLM_SEND_ATTEMPTS,
-                        "日程模型请求发送失败，稍后重试"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(error) => return Err(error.into()),
+        measure("model_request", async {
+            config.validate()?;
+            validate_llm_base_url_target(&config.base_url, "日程模型地址").await?;
+            let china = FixedOffset::east_opt(8 * 3600).expect("china offset");
+            let published_cn = published_at.with_timezone(&china);
+            let author = author.trim();
+            let author_label = if author.is_empty() { "未知" } else { author };
+            let system_prompt = build_system_prompt(kind, author, published_at, now);
+            let mut user_text = format!(
+                "发布时间：{}\n发布者：{}\n\n动态正文：\n{}",
+                published_cn.format("%Y-%m-%d %H:%M"),
+                author_label,
+                if text.is_empty() { "（无）" } else { text }
+            );
+            if let Some(reserve) = reserve.map(str::trim).filter(|value| !value.is_empty()) {
+                user_text.push_str("\n\n预约卡：\n");
+                user_text.push_str(reserve);
             }
-        };
-        let status = response.status();
-        let body = String::from_utf8(read_bounded_body(response, RESPONSE_LIMIT_BYTES).await?)
-            .map_err(|_| bad_output("日程模型响应不是有效 UTF-8"))?;
-        if !status.is_success() {
-            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
-                "日程模型鉴权失败".to_owned()
-            } else {
-                format!("日程模型返回 HTTP {status}")
-            };
-            return Err(AppError::External {
-                code: format!("LLM_{}", status.as_u16()),
-                message,
+            let mut content = Vec::with_capacity(image_data_urls.len() + 1);
+            content.push(json!({"type": "text", "text": user_text}));
+            for data_url in image_data_urls {
+                content.push(json!({"type": "image_url", "image_url": {"url": data_url}}));
+            }
+            tracing::debug!(
+                model = config.model.as_str(),
+                prompts = ?kind,
+                image_count = content.len().saturating_sub(1),
+                reasoning_effort = config.reasoning_effort.as_request_value().unwrap_or("auto"),
+                "sending single-call post analysis"
+            );
+            let mut request = json!({
+                "model": config.model,
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content}
+                ]
             });
-        }
-        parse_llm_response(&body, now)
+            if let Some(effort) = config.reasoning_effort.as_request_value() {
+                request["reasoning_effort"] = Value::String(effort.to_owned());
+            }
+            let mut builder = self
+                .http
+                .post(config.endpoint()?)
+                .header(ACCEPT, "application/json")
+                .header("Content-Type", "application/json");
+            if !config.api_key.trim().is_empty() {
+                builder = builder.bearer_auth(config.api_key.trim());
+            }
+            // 网关偶发断连（reqwest 报 error sending request），一次失败就让整条动态白等
+            // 九十秒超时，还会连带整轮刷新被拖长。传输层失败重试两次，HTTP 错误码不重试。
+            let mut attempts = 0;
+            let response = loop {
+                attempts += 1;
+                let sent = builder
+                    .try_clone()
+                    .expect("request builder is clonable")
+                    .json(&request)
+                    .send()
+                    .await;
+                match sent {
+                    Ok(response) => break response,
+                    Err(error)
+                        if attempts < LLM_SEND_ATTEMPTS
+                            && !error.is_builder()
+                            && !error.is_timeout() =>
+                    {
+                        tracing::warn!(
+                            %error,
+                            attempt = attempts,
+                            max_attempts = LLM_SEND_ATTEMPTS,
+                            "日程模型请求发送失败，稍后重试"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let status = response.status();
+            let body = String::from_utf8(read_bounded_body(response, RESPONSE_LIMIT_BYTES).await?)
+                .map_err(|_| bad_output("日程模型响应不是有效 UTF-8"))?;
+            if !status.is_success() {
+                let message = if status.as_u16() == 401 || status.as_u16() == 403 {
+                    "日程模型鉴权失败".to_owned()
+                } else {
+                    format!("日程模型返回 HTTP {status}")
+                };
+                return Err(AppError::External {
+                    code: format!("LLM_{}", status.as_u16()),
+                    message,
+                });
+            }
+            parse_llm_response(&body, now)
+        })
+        .await
     }
 
     pub async fn test_calendar_image(&self, config: &LlmConfig) -> AppResult<LlmTestReport> {
@@ -1525,7 +1553,12 @@ fn post_content_digest(text: &str, reserve: Option<&str>, image_urls: &[String])
             "{}|{}|{}",
             sha256_hex(text.as_bytes()),
             reserve.unwrap_or_default(),
-            image_urls.join(",")
+            image_urls
+                .iter()
+                .take(POST_ANALYSIS_IMAGE_LIMIT)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
         )
         .as_bytes(),
     )
@@ -2284,40 +2317,88 @@ mod regression_tests {
             prompt_version: "fixture".to_owned(),
             reasoning_effort: ReasoningEffort::Auto,
         };
-        let input = PostAnalysisInput {
+        let mut input = PostAnalysisInput {
             author: "测试主播".to_owned(),
             published_at: Utc::now(),
             text: "周表".to_owned(),
             reserve: None,
-            image_urls: (0..9)
-                .map(|i| format!("https://i0.hdslb.com/bfs/new_dyn/cap-{i}.jpg"))
-                .collect(),
-        };
-        let loaded = Mutex::new(Vec::new());
-        let load = |url: String, budget: usize| {
-            loaded.lock().unwrap().push((url, budget));
-            async { Ok(Some("data:image/jpeg;base64,AA==".to_owned())) }
+            image_urls: Vec::new(),
         };
         let client = LlmClient::new().unwrap();
+        for count in [0, 1, 2, 9] {
+            input.image_urls = (0..count)
+                .map(|i| format!("https://i0.hdslb.com/bfs/new_dyn/cap-{i}.jpg"))
+                .collect();
+            let loaded = Mutex::new(Vec::new());
+            let load = |url: String, budget: usize| {
+                loaded.lock().unwrap().push((url, budget));
+                async { Ok(Some("data:image/jpeg;base64,AA==".to_owned())) }
+            };
+            let result = client
+                .analyze_post_with_image_loader(&config, &input, &load)
+                .await
+                .unwrap();
+            let loaded = loaded.lock().unwrap();
+            assert_eq!(
+                loaded.len(),
+                count.min(2),
+                "third and later URLs must never reach the loader"
+            );
+            for (index, (url, budget)) in loaded.iter().enumerate() {
+                assert_eq!(*url, input.image_urls[index]);
+                assert_eq!(*budget, MODEL_REQUEST_IMAGE_BUDGET_BYTES / count.min(2));
+            }
+            assert_eq!(
+                result.source_digest,
+                post_content_digest(&input.text, None, &input.image_urls)
+            );
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(
+                bodies.last().unwrap()["messages"][1]["content"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                count.min(2) + 1
+            );
+        }
+        let loaded = Mutex::new(Vec::new());
+        let bad_first = |url: String, _budget: usize| {
+            loaded.lock().unwrap().push(url.clone());
+            async move {
+                if url.ends_with("cap-0.jpg") {
+                    Err(AppError::validation("fixture bad first image"))
+                } else {
+                    Ok(Some("data:image/jpeg;base64,AA==".to_owned()))
+                }
+            }
+        };
         let result = client
-            .analyze_post_with_image_loader(&config, &input, &load)
+            .analyze_post_with_image_loader(&config, &input, &bad_first)
             .await;
         server.abort();
-        assert!(result.is_ok());
-        assert_eq!(
-            loaded.lock().unwrap().len(),
-            2,
-            "third and later URLs must never reach the image loader"
+        assert!(
+            result.is_ok(),
+            "valid second image and text still get one model call"
         );
-        assert_eq!(loaded.lock().unwrap()[0].0, input.image_urls[0]);
-        assert_eq!(loaded.lock().unwrap()[1].0, input.image_urls[1]);
+        assert_eq!(loaded.lock().unwrap().as_slice(), &input.image_urls[..2]);
+        assert_eq!(bodies.lock().unwrap().len(), 5);
         assert_eq!(
-            bodies.lock().unwrap()[0]["messages"][1]["content"]
+            bodies.lock().unwrap()[4]["messages"][1]["content"]
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            2
         );
+    }
+
+    #[test]
+    fn post_digest_ignores_tail_images_but_not_selected_images() {
+        let mut images = vec!["a".to_owned(), "b".to_owned(), "ad".to_owned()];
+        let original = post_content_digest("text", None, &images);
+        images[2] = "new-ad".to_owned();
+        assert_eq!(original, post_content_digest("text", None, &images));
+        images[1] = "new-schedule".to_owned();
+        assert_ne!(original, post_content_digest("text", None, &images));
     }
 
     #[tokio::test]

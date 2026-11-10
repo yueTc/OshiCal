@@ -9,6 +9,7 @@ pub mod schedule;
 pub mod service;
 pub mod settings;
 pub mod store;
+mod timing;
 pub mod weekly;
 
 pub use error::{AppError, AppResult};
