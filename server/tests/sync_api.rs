@@ -849,9 +849,9 @@ async fn llm_secret_round_trip_is_encrypted_and_never_enters_sync_payload() {
     assert_eq!(loaded["data"]["revision"], 1);
     assert!(loaded["data"].get("apiKey").is_none());
 
-    // 密钥按账号分开存，未指定 accountId 时落在 default 账号上。
+    // 密钥存在单密钥槽位里，落库前已加密。
     let raw = store
-        .get_client_sync_state("server:secret:llm_api_key:v1:default")
+        .get_client_sync_state("server:secret:llm_api_key:v1")
         .await
         .unwrap()
         .expect("persisted secret");

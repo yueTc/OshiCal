@@ -14,7 +14,7 @@ use crate::api::{build_router, persist_changed_settings, AppState};
 use crate::config::ServerConfig;
 use crate::jobs::RefreshJobManager;
 use crate::secrets::{
-    load_persisted_bili_secret, load_persisted_llm_secret, seed_llm_secrets_from_env, SecretVault,
+    load_persisted_bili_secret, load_persisted_llm_secret, seed_llm_secret_from_env, SecretVault,
 };
 use crate::sync_api;
 use crate::update_manager::ServerUpdateManager;
@@ -45,28 +45,22 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     settings.llm_reasoning_effort =
         config.effective_llm_reasoning_effort(settings.llm_reasoning_effort);
     settings.llm_parallelism = config.effective_llm_parallelism(settings.llm_parallelism);
-    for env_account in &config.llm_accounts {
-        let account = env_account.account.clone();
-        match settings
-            .llm_accounts
-            .iter_mut()
-            .find(|existing| existing.id == account.id)
-        {
-            Some(existing) => *existing = account,
-            None => settings.llm_accounts.push(account),
-        }
-    }
     persist_changed_settings(&store, &persisted_settings, &settings)
         .await
         .map_err(|error| format!("保存服务端设置失败: {error}"))?;
     let secret_vault = SecretVault::from_env(config.api_token.as_deref(), &config.database_path);
-    // 先把环境变量里的账号密钥写进 vault，再搬走 config.secrets。
-    match seed_llm_secrets_from_env(&store, &secret_vault, &config.env_llm_account_keys()).await {
-        Ok(seeded) if !seeded.is_empty() => {
-            tracing::info!(accounts = %seeded.join(","), "已从环境变量写入模型账号密钥");
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "写入环境变量模型账号密钥失败"),
+    // 先把环境变量里的密钥写进 vault，再搬走 config.secrets。
+    match seed_llm_secret_from_env(
+        &store,
+        &secret_vault,
+        config.secrets.llm_api_key.as_deref(),
+        config.llm_base_url.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => tracing::info!("已从环境变量写入模型密钥"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "写入环境变量模型密钥失败"),
     }
     let mut runtime_secrets = config.secrets;
     let mut persisted_llm_binding = None;

@@ -44,16 +44,6 @@ impl ReasoningEffort {
     }
 }
 
-/// 一个可用的模型账号。同一账号串行、不同账号才并行，所以账号是并行的上限。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LlmAccount {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub model: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -74,13 +64,10 @@ pub struct AppSettings {
     /// 思考程度，默认 `Auto`（请求体不带 `reasoning_effort`）。
     #[serde(default)]
     pub llm_reasoning_effort: ReasoningEffort,
-    /// 并行个数，合法 1..=8；有效并行度 = min(llm_parallelism, 账号数)。
+    /// 并行个数：同时向模型端点发起的最大请求数，合法 1..=8。
     /// 裸 `#[serde(default)]` 对 u8 会给 0（不合法），所以缺字段时必须回落到 1。
     #[serde(default = "default_llm_parallelism")]
     pub llm_parallelism: u8,
-    /// 账号池；为空且 `llm_base_url` 非空时由迁移在内存里合成一个 default 账号。
-    #[serde(default)]
-    pub llm_accounts: Vec<LlmAccount>,
     #[serde(default)]
     pub proxy_port: Option<u16>,
 }
@@ -106,7 +93,6 @@ impl Default for AppSettings {
             llm_prompt_version: "schedule-v1".to_owned(),
             llm_reasoning_effort: ReasoningEffort::Auto,
             llm_parallelism: default_llm_parallelism(),
-            llm_accounts: Vec::new(),
             proxy_port: None,
         }
     }
@@ -156,7 +142,7 @@ pub struct RuntimeSecrets {
     pub llm_api_key: Option<String>,
 }
 
-pub const SETTING_KEYS: [&str; 15] = [
+pub const SETTING_KEYS: [&str; 14] = [
     "data_mode",
     "server_url",
     "live_poll_seconds",
@@ -170,22 +156,8 @@ pub const SETTING_KEYS: [&str; 15] = [
     "llm_prompt_version",
     "llm_reasoning_effort",
     "llm_parallelism",
-    "llm_accounts",
     "proxy_port",
 ];
-
-fn parse_json_or_warn<T>(key: &str, raw: &str) -> Option<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    match serde_json::from_str::<T>(raw) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            tracing::warn!(setting = key, %error, "设置项解析失败，保留默认值");
-            None
-        }
-    }
-}
 
 /// 兼容 `"high"`（JSON 字符串）与裸 `high`，大小写不敏感；无法识别时告警并保留默认值。
 fn parse_reasoning_effort_setting(raw: &str) -> Option<ReasoningEffort> {
@@ -245,27 +217,11 @@ pub async fn load_settings(store: &SqliteStore) -> AppResult<AppSettings> {
                     settings.llm_parallelism = parallelism;
                 }
             }
-            "llm_accounts" => {
-                let accounts = parse_json_or_warn::<Vec<LlmAccount>>("llm_accounts", &value);
-                if let Some(accounts) = accounts {
-                    settings.llm_accounts = accounts;
-                }
-            }
             "proxy_port" => settings.proxy_port = serde_json::from_str(&value)?,
             _ => {}
         }
     }
     settings.validate()?;
-    // 老库迁移：还没写过账号池、但已经配过模型地址时，内存里合成一个 default 账号供账号池使用。
-    // 只读不写库，避免把默认值固化进 settings 表。
-    if settings.llm_accounts.is_empty() && !settings.llm_base_url.is_empty() {
-        settings.llm_accounts.push(LlmAccount {
-            id: "default".to_owned(),
-            name: "默认账号".to_owned(),
-            base_url: settings.llm_base_url.clone(),
-            model: settings.llm_model.clone(),
-        });
-    }
     Ok(settings)
 }
 
@@ -314,10 +270,6 @@ pub async fn save_settings(store: &SqliteStore, settings: &AppSettings) -> AppRe
         (
             "llm_parallelism",
             serde_json::to_string(&settings.llm_parallelism)?,
-        ),
-        (
-            "llm_accounts",
-            serde_json::to_string(&settings.llm_accounts)?,
         ),
         ("proxy_port", serde_json::to_string(&settings.proxy_port)?),
     ];

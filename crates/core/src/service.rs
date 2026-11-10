@@ -24,7 +24,7 @@ use crate::models::{
 };
 use crate::network::{test_google, ProxyTestReport};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
-use crate::settings::{load_settings, AppSettings, LlmAccount, RuntimeSecrets};
+use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::{FertilityCache, SqliteStore};
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
@@ -1062,7 +1062,7 @@ impl AppService {
         let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
         self.repair_reserve_room_urls().await;
         let settings = load_settings(&self.store).await?;
-        let llm_pool = self.llm_pool(&settings).await;
+        let llm = self.post_analyzer(&settings).await;
         let streamers = self.store.list_streamers().await?;
         self.backfill_avatar_captures(&streamers).await;
         let sources = sources_for_streamers(&streamers);
@@ -1070,7 +1070,7 @@ impl AppService {
         self.refresh_sources(
             &sources,
             &settings,
-            llm_pool.as_ref(),
+            llm.as_ref(),
             Some(&target),
             &on_progress,
         )
@@ -1152,12 +1152,12 @@ impl AppService {
         );
         let result = async {
             let settings = load_settings(&self.store).await?;
-            let llm_pool = self.llm_pool(&settings).await;
+            let llm = self.post_analyzer(&settings).await;
             let sources = sources_for_streamers(std::slice::from_ref(&streamer));
             self.refresh_sources(
                 &sources,
                 &settings,
-                llm_pool.as_ref(),
+                llm.as_ref(),
                 Some(&target),
                 &on_progress,
             )
@@ -1212,52 +1212,24 @@ impl AppService {
         })
     }
 
-    /// 组装模型账号池：账号来自设置，密钥按账号的 `base_url` 逐个取。
-    /// 没有配置账号时退化成「默认账号」，与单账号时代的配置向后兼容。
-    async fn llm_pool(&self, settings: &AppSettings) -> Option<LlmPool> {
+    /// 组装这次刷新用的模型通道：配置来自设置，并发上限来自 `llm_parallelism`。
+    /// 没有开启图片分析或没配好模型地址时返回 `None`，整轮跳过模型调用。
+    async fn post_analyzer(&self, settings: &AppSettings) -> Option<PostAnalyzer> {
         if !settings.auto_analyze_images {
             return None;
         }
-        let mut accounts = Vec::new();
-        let mut keys = HashMap::new();
-        for account in &settings.llm_accounts {
-            if account.id.trim().is_empty()
-                || account.base_url.trim().is_empty()
-                || account.model.trim().is_empty()
-            {
-                continue;
-            }
-            // 取不到密钥的账号直接跳过：它发不出请求，留在池里只会让
-            // 下一次 acquire 选中一个必然失败的账号。
-            let Some(api_key) = self.llm_key_for_base_url(&account.base_url).await else {
-                continue;
-            };
-            keys.insert(account.id.clone(), api_key);
-            accounts.push(account.clone());
-        }
-        if accounts.is_empty() {
-            let config = self.current_llm_config(settings).await?;
-            let fallback = LlmAccount {
-                id: "default".to_owned(),
-                name: "默认账号".to_owned(),
-                base_url: config.base_url,
-                model: config.model,
-            };
-            keys.insert(fallback.id.clone(), config.api_key);
-            accounts.push(fallback);
-        }
-        Some(LlmPool::new(
-            settings.llm_parallelism.max(1),
-            accounts,
-            keys,
-        ))
+        let config = self.current_llm_config(settings).await?;
+        Some(PostAnalyzer {
+            config,
+            pool: LlmPool::new(settings.llm_parallelism),
+        })
     }
 
     async fn refresh_sources(
         &self,
         sources: &[(String, Vec<Streamer>)],
         settings: &AppSettings,
-        llm_pool: Option<&LlmPool>,
+        llm: Option<&PostAnalyzer>,
         progress: Option<&ProgressTarget>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> AppResult<RefreshReport> {
@@ -1297,7 +1269,7 @@ impl AppService {
                             targets,
                             &posts,
                             settings,
-                            llm_pool,
+                            llm,
                             &mut event_state,
                             progress,
                             on_progress,
@@ -1444,7 +1416,7 @@ impl AppService {
         targets: &[Streamer],
         posts: &[DynamicPost],
         settings: &AppSettings,
-        llm_pool: Option<&LlmPool>,
+        llm: Option<&PostAnalyzer>,
     ) -> AppResult<ProcessStats> {
         let mut event_state = RefreshEventState::default();
         let mut stats = self
@@ -1453,7 +1425,7 @@ impl AppService {
                 targets,
                 posts,
                 settings,
-                llm_pool,
+                llm,
                 &mut event_state,
                 None,
                 &|_| {},
@@ -1472,7 +1444,7 @@ impl AppService {
         targets: &[Streamer],
         posts: &[DynamicPost],
         settings: &AppSettings,
-        llm_pool: Option<&LlmPool>,
+        llm: Option<&PostAnalyzer>,
         event_state: &mut RefreshEventState,
         progress: Option<&ProgressTarget>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
@@ -1554,13 +1526,13 @@ impl AppService {
             // 既没有正文也没有图片的动态没有东西可送模型：不占一次调用，
             // 但仍然算“分析成功”，让上一版提示词留下的旧来源照常清理。
             let has_content = !post.text.trim().is_empty() || !post.images.is_empty();
-            if llm_pool.is_some() && !has_content {
+            if llm.is_some() && !has_content {
                 analysis_succeeded = true;
                 stats
                     .analysis_outcomes
                     .insert(format!("post:{}", post.id), None);
             }
-            if let Some(pool) = llm_pool.filter(|_| has_content) {
+            if let Some(analyzer) = llm.filter(|_| has_content) {
                 // 纯文字动态的 identity 仍沿用「发布者 + 正文 + 预约卡」的旧摘要，
                 // 升级后历史日程才能原地更新，而不是再造一条。
                 let text_hash = text_digest(&text_analysis_context(post));
@@ -1568,12 +1540,12 @@ impl AppService {
                 let content_digest =
                     content_digest_of(&text_hash, reserve.as_deref(), &post.images);
                 let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
-                // 每篇动态取一次号：同一账号串行、不同账号并行。
-                let lease = pool.acquire().await;
+                // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
+                let _permit = analyzer.pool.acquire().await;
                 let config = LlmConfig {
-                    base_url: lease.account.base_url.clone(),
-                    api_key: lease.api_key.clone(),
-                    model: lease.account.model.clone(),
+                    base_url: analyzer.config.base_url.clone(),
+                    api_key: analyzer.config.api_key.clone(),
+                    model: analyzer.config.model.clone(),
                     prompt_version: prompt_version.clone(),
                     reasoning_effort: settings.llm_reasoning_effort,
                 };
@@ -1663,8 +1635,6 @@ impl AppService {
                         .analyzed_streamer_ids
                         .extend(targets.iter().map(|target| target.id));
                 }
-                // 租约覆盖整个事件应用过程，Drop 时才归还账号许可。
-                let _lease = lease;
                 for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                     let event = canonicalize_event_participants(event, targets);
                     if applied_events
@@ -2451,6 +2421,13 @@ impl ProgressTarget {
             name: "全部主播".to_owned(),
         }
     }
+}
+
+/// 一轮刷新共用的模型通道：固定配置 + `llm_parallelism` 控制并发上限。
+/// 只有一个模型端点、一份密钥；并行只体现在同时发出多少个请求。
+struct PostAnalyzer {
+    config: LlmConfig,
+    pool: LlmPool,
 }
 
 // 进度播报的参数本来就多（阶段、步数、百分比、结束/失败标记），
@@ -3531,23 +3508,19 @@ mod tests {
         )
     }
 
-    fn fixture_account(id: &str, model: &str) -> LlmAccount {
-        LlmAccount {
-            id: id.to_owned(),
-            name: format!("账号{id}"),
-            base_url: "https://fixture.invalid/v1".to_owned(),
-            model: model.to_owned(),
+    /// 单并发的模型通道：与 `AppSettings::default()` 的 `llm_parallelism` 一致，
+    /// 只把模型名换成用例关心的值。
+    fn test_pool(model: &str) -> PostAnalyzer {
+        PostAnalyzer {
+            config: LlmConfig {
+                base_url: "https://fixture.invalid/v1".to_owned(),
+                api_key: String::new(),
+                model: model.to_owned(),
+                prompt_version: "fixture-v1".to_owned(),
+                reasoning_effort: ReasoningEffort::Auto,
+            },
+            pool: LlmPool::new(1),
         }
-    }
-
-    /// 单账号、单并发的池子：与 `AppSettings::default()` 的 `llm_parallelism`
-    /// 一致，只把模型名换成用例关心的值。
-    fn test_pool(model: &str) -> LlmPool {
-        LlmPool::new(
-            1,
-            vec![fixture_account("default", model)],
-            HashMap::from([("default".to_owned(), "fixture-key".to_owned())]),
-        )
     }
 
     fn subscription(mid: &str, name: &str) -> AddSubscription {
@@ -7220,74 +7193,22 @@ mod tests {
         assert_eq!(high_call.reasoning_effort.as_request_value(), Some("high"));
     }
 
-    /// 同一账号在同一时刻只跑一个请求，第二个租约必须排队。
+    /// 并发许可数就是并行个数：许可用尽后新的请求必须排队。
     #[tokio::test]
-    async fn same_account_never_runs_twice_concurrently() {
-        let pool = LlmPool::new(
-            4,
-            vec![fixture_account("only", "model-a")],
-            HashMap::from([("only".to_owned(), "key-a".to_owned())]),
-        );
+    async fn parallelism_permits_bound_the_in_flight_requests() {
+        let pool = LlmPool::new(2);
         let first = pool.acquire().await;
+        let second = pool.acquire().await;
         let blocked =
             tokio::time::timeout(std::time::Duration::from_millis(120), pool.acquire()).await;
-        assert!(blocked.is_err(), "同账号的第二个租约必须等第一个归还");
+        assert!(blocked.is_err(), "并行个数用完时第三个请求必须等待");
         drop(first);
         let after_release =
             tokio::time::timeout(std::time::Duration::from_millis(500), pool.acquire()).await;
-        assert!(after_release.is_ok(), "归还后应立即拿到租约");
-    }
-
-    /// 不同账号可以同时持租约，并行度来自账号数。
-    #[tokio::test]
-    async fn different_accounts_run_in_parallel() {
-        let pool = LlmPool::new(
-            2,
-            vec![
-                fixture_account("a", "model-a"),
-                fixture_account("b", "model-b"),
-            ],
-            HashMap::from([
-                ("a".to_owned(), "key-a".to_owned()),
-                ("b".to_owned(), "key-b".to_owned()),
-            ]),
-        );
-        let first = pool.acquire().await;
-        let second = tokio::time::timeout(std::time::Duration::from_millis(500), pool.acquire())
-            .await
-            .expect("第二个账号无需等待");
-        assert_ne!(first.account.id, second.account.id);
+        assert!(after_release.is_ok(), "归还后应立即拿到许可");
+        drop(second);
         assert_eq!(pool.effective_parallelism(), 2);
-    }
-
-    /// 有效并行度取 `min(并行个数, 账号数)`，没有账号时按 1 算。
-    #[tokio::test]
-    async fn parallelism_clamped_to_account_count() {
-        let accounts = vec![
-            fixture_account("a", "model-a"),
-            fixture_account("b", "model-b"),
-        ];
-        let keys = HashMap::from([
-            ("a".to_owned(), "key-a".to_owned()),
-            ("b".to_owned(), "key-b".to_owned()),
-        ]);
-        assert_eq!(
-            LlmPool::new(8, accounts.clone(), keys.clone()).effective_parallelism(),
-            2
-        );
-        assert_eq!(LlmPool::new(2, accounts, keys).effective_parallelism(), 2);
-        assert_eq!(
-            LlmPool::new(
-                8,
-                vec![fixture_account("a", "model-a")],
-                HashMap::from([("a".to_owned(), "key-a".to_owned())])
-            )
-            .effective_parallelism(),
-            1
-        );
-        assert_eq!(
-            LlmPool::new(5, Vec::new(), HashMap::new()).effective_parallelism(),
-            1
-        );
+        // 0 会让第一个请求永远等下去，构造时兜底成 1。
+        assert_eq!(LlmPool::new(0).effective_parallelism(), 1);
     }
 }

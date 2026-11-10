@@ -556,12 +556,9 @@ pub struct ServerSettings {
     /// 模型思考程度：auto 时不向模型发送该参数。
     #[serde(default)]
     pub llm_reasoning_effort: crate::settings::ReasoningEffort,
-    /// 同时进行的模型调用路数；只有不同账号才能真并行。
+    /// 同时向模型端点发起的最大请求数。
     #[serde(default = "crate::settings::default_llm_parallelism")]
     pub llm_parallelism: u8,
-    /// 参与并行的模型账号列表。
-    #[serde(default)]
-    pub llm_accounts: Vec<crate::settings::LlmAccount>,
     pub proxy_port: Option<u16>,
     #[serde(default)]
     pub revision: i64,
@@ -580,7 +577,6 @@ impl Default for ServerSettings {
             llm_prompt_version: "schedule-v1".to_owned(),
             llm_reasoning_effort: crate::settings::ReasoningEffort::Auto,
             llm_parallelism: crate::settings::default_llm_parallelism(),
-            llm_accounts: Vec::new(),
             proxy_port: None,
             revision: 1,
         }

@@ -3523,7 +3523,7 @@ impl SqliteStore {
                         'live_poll_seconds', 'dynamic_poll_seconds', 'auto_analyze_images',
                         'live_stats_enabled', 'fertility_enabled', 'llm_base_url',
                         'llm_model', 'llm_prompt_version', 'llm_reasoning_effort',
-                        'llm_parallelism', 'llm_accounts', 'proxy_port'
+                        'llm_parallelism', 'proxy_port'
                      )",
                 )
                 .fetch_one(&mut *tx)
@@ -3983,7 +3983,6 @@ fn is_server_setting_key(key: &str) -> bool {
             | "llm_prompt_version"
             | "llm_reasoning_effort"
             | "llm_parallelism"
-            | "llm_accounts"
             | "proxy_port"
     )
 }
@@ -4007,9 +4006,7 @@ fn ensure_setting_key_allowed(key: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{
-        load_settings, save_settings, AppSettings, DataMode, LlmAccount, ReasoningEffort,
-    };
+    use crate::settings::{load_settings, save_settings, AppSettings, DataMode, ReasoningEffort};
     use chrono::Duration;
 
     fn add_input(mid: &str, name: &str) -> AddSubscription {
@@ -4458,13 +4455,6 @@ mod tests {
             proxy_port: Some(7890),
             llm_reasoning_effort: ReasoningEffort::High,
             llm_parallelism: 3,
-            // 账号池非空时不会触发「合成 default 账号」的迁移，往返比较才有意义。
-            llm_accounts: vec![LlmAccount {
-                id: "primary".to_owned(),
-                name: "主账号".to_owned(),
-                base_url: "https://api.example.com/v1".to_owned(),
-                model: "cn:test".to_owned(),
-            }],
             ..Default::default()
         };
         save_settings(&store, &settings).await.expect("save");
@@ -4477,38 +4467,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_settings_synthesize_default_llm_account_in_memory() {
-        let store = SqliteStore::in_memory().await.expect("db");
-        store
-            .set_settings(&[
-                ("llm_base_url", "\"https://api.example.com/v1\"".to_owned()),
-                ("llm_model", "\"cn:test\"".to_owned()),
-            ])
-            .await
-            .expect("seed legacy settings");
-        let loaded = load_settings(&store).await.expect("load");
-        assert_eq!(loaded.llm_reasoning_effort, ReasoningEffort::Auto);
-        assert_eq!(loaded.llm_parallelism, 1);
-        assert_eq!(
-            loaded.llm_accounts,
-            vec![LlmAccount {
-                id: "default".to_owned(),
-                name: "默认账号".to_owned(),
-                base_url: "https://api.example.com/v1".to_owned(),
-                model: "cn:test".to_owned(),
-            }]
-        );
-        // 迁移只在内存里合成，不回写 settings 表。
-        assert!(store
-            .get_setting("llm_accounts")
-            .await
-            .expect("raw accounts")
-            .is_none());
-        let reloaded = load_settings(&store).await.expect("reload");
-        assert_eq!(reloaded.llm_accounts.len(), 1);
-    }
-
-    #[tokio::test]
     async fn dirty_llm_settings_fall_back_to_defaults() {
         let store = SqliteStore::in_memory().await.expect("db");
         // 直接写库模拟「历史遗留 / 手工改坏」的脏值：set_settings 会校验并
@@ -4516,7 +4474,6 @@ mod tests {
         for (key, value) in [
             ("llm_parallelism", "0"),
             ("llm_reasoning_effort", "\"turbo\""),
-            ("llm_accounts", "{"),
         ] {
             sqlx::query(
                 "INSERT INTO settings (key, value, updated_at, revision) VALUES (?, ?, ?, 1)
@@ -4532,8 +4489,6 @@ mod tests {
         let loaded = load_settings(&store).await.expect("load");
         assert_eq!(loaded.llm_parallelism, 1);
         assert_eq!(loaded.llm_reasoning_effort, ReasoningEffort::Auto);
-        assert_eq!(loaded.llm_accounts.len(), 1);
-        assert_eq!(loaded.llm_accounts[0].id, "default");
     }
 
     #[test]
@@ -4552,7 +4507,6 @@ mod tests {
         let settings: AppSettings = serde_json::from_str(raw).expect("deserialize");
         assert_eq!(settings.llm_reasoning_effort, ReasoningEffort::Auto);
         assert_eq!(settings.llm_parallelism, 1);
-        assert!(settings.llm_accounts.is_empty());
         settings.validate().expect("validate");
     }
 

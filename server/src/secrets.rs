@@ -12,80 +12,19 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// 旧版（单密钥时代）的状态键。只作为 `default` 账号的兜底读取来源，
-/// 写入一律走带账号后缀的键。
+/// 模型密钥在 `client_sync_state` 里的状态键与 AAD。
 const LLM_SECRET_STATE_KEY: &str = "server:secret:llm_api_key:v1";
-const BILI_SECRET_STATE_KEY: &str = "server:secret:bilibili_cookie:v1";
-/// 旧版 AAD，与 [`LLM_SECRET_STATE_KEY`] 配套，只用于兜底解 `default` 的旧密文。
 const LLM_AAD: &[u8] = b"oshical:server-secret:llm-api-key:v1";
-/// 账号级 AAD 前缀，完整形态为 `{LLM_AAD_PREFIX}:{account_id}`。
-const LLM_AAD_PREFIX: &str = "oshical:server-secret:llm-api-key:v1";
+/// 0.3.20 ~ 0.3.26 曾把密钥按账号存到 `server:secret:llm_api_key:v1:{account}`，
+/// AAD 也带账号后缀。账号池功能已删除，但线上库里可能还留着这份密文，
+/// 读的时候要能认出来，写入统一落回 [`LLM_SECRET_STATE_KEY`]。
+const LEGACY_ACCOUNT_SCOPED_LLM_STATE_KEY: &str = "server:secret:llm_api_key:v1:default";
+const LEGACY_ACCOUNT_SCOPED_LLM_AAD: &[u8] = b"oshical:server-secret:llm-api-key:v1:default";
+const BILI_SECRET_STATE_KEY: &str = "server:secret:bilibili_cookie:v1";
 const BILI_AAD: &[u8] = b"oshical:server-secret:bilibili-cookie:v1";
 const NONCE_BYTES: usize = 12;
 const LLM_PENDING_URL_BINDING_TTL_SECONDS: i64 = 15 * 60;
-/// 请求里没带 `accountId` 时落到的账号。旧客户端只会碰这个账号。
-pub const DEFAULT_LLM_ACCOUNT_ID: &str = "default";
-/// 账号 id 长度上限，与设置里 `llm_accounts[].id` 的约束对齐。
-pub const LLM_ACCOUNT_ID_MAX_CHARS: usize = 64;
 static SECRET_WRITE_LOCK: Mutex<()> = Mutex::const_new(());
-
-/// 账号 id 归一化：去首尾空白，空值回落 `default`。
-///
-/// 状态键与 AAD 都从这里取值，所以 `" x "` 与 `"x"` 必须落到同一个槽位，
-/// 否则同一个账号会写出两行互不可见的纪录。
-pub fn normalize_llm_account_id(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        DEFAULT_LLM_ACCOUNT_ID.to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-/// 校验并归一化账号 id。
-///
-/// 账号 id 会拼进状态键，所以只放行字母、数字与 `-_.`：否则一个带 `:` 或空白的
-/// id 就能把密文写到命名空间的别处，或与别的账号共用槽位。
-pub fn validate_llm_account_id(raw: &str) -> Result<String, AppError> {
-    let account = normalize_llm_account_id(raw);
-    let legal = account.chars().count() <= LLM_ACCOUNT_ID_MAX_CHARS
-        && account
-            .chars()
-            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'));
-    if !legal {
-        return Err(AppError::validation(format!(
-            "账号 id 只能包含字母、数字、`-`、`_`、`.`，且不能超过 {LLM_ACCOUNT_ID_MAX_CHARS} 个字符"
-        )));
-    }
-    Ok(account)
-}
-
-/// 一个账号的密钥槽位：状态键 + AAD 同时绑定账号 id。
-///
-/// 换账号就换 AAD，即使密文被搬到别的键下也解不开，避免串号。
-#[derive(Debug, Clone)]
-struct LlmSecretSlot {
-    state_key: String,
-    aad: Vec<u8>,
-}
-
-impl LlmSecretSlot {
-    fn for_account(account_id: &str) -> Self {
-        let normalized = normalize_llm_account_id(account_id);
-        Self {
-            state_key: format!("{LLM_SECRET_STATE_KEY}:{normalized}"),
-            aad: format!("{LLM_AAD_PREFIX}:{normalized}").into_bytes(),
-        }
-    }
-
-    /// 0.3.19 及更早版本的单密钥槽位：状态键无后缀，AAD 也不带后缀。
-    fn legacy_default() -> Self {
-        Self {
-            state_key: LLM_SECRET_STATE_KEY.to_owned(),
-            aad: LLM_AAD.to_vec(),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct SecretVault {
@@ -180,23 +119,14 @@ impl SecretVault {
         })
     }
 
-    /// 旧版单密钥加密（AAD 不带账号后缀）。只用于兼容与联调，业务写入走
-    /// [`SecretVault::encrypt_llm_key`]。
+    /// 模型密钥加密（AAD 绑定单密钥槽位）。
     pub fn encrypt(&self, plaintext: &str) -> Result<String, AppError> {
         self.encrypt_with_aad(plaintext, LLM_AAD)
     }
 
-    /// 旧版单密钥解密（AAD 不带账号后缀），与 [`SecretVault::encrypt`] 配套。
+    /// 模型密钥解密，与 [`SecretVault::encrypt`] 配套。
     pub fn decrypt(&self, encoded: &str) -> Result<String, AppError> {
         self.decrypt_with_aad(encoded, LLM_AAD)
-    }
-
-    fn encrypt_llm_key(&self, plaintext: &str, slot: &LlmSecretSlot) -> Result<String, AppError> {
-        self.encrypt_with_aad(plaintext, &slot.aad)
-    }
-
-    fn decrypt_llm_key(&self, encoded: &str, slot: &LlmSecretSlot) -> Result<String, AppError> {
-        self.decrypt_with_aad(encoded, &slot.aad)
     }
 
     fn encrypt_bili_cookie(&self, cookie: &str) -> Result<String, AppError> {
@@ -222,7 +152,6 @@ struct StoredSecret {
 
 #[derive(Debug, Clone)]
 pub struct PersistedLlmSecret {
-    pub account_id: String,
     pub api_key: String,
     pub revision: i64,
     pub changed: bool,
@@ -231,7 +160,7 @@ pub struct PersistedLlmSecret {
     pub requires_url_binding: bool,
 }
 
-/// 「这个账号到底配没配密钥」的状态快照，不含明文。
+/// 「模型密钥到底配没配」的状态快照，不含明文。
 #[derive(Debug, Clone, Default)]
 pub struct LlmSecretStatus {
     pub configured: bool,
@@ -249,31 +178,35 @@ pub struct PersistedBiliSecret {
 
 async fn load_stored_llm_secret(
     store: &SqliteStore,
-    account_id: &str,
-) -> Result<Option<(StoredSecret, LlmSecretSlot)>, AppError> {
-    let account = normalize_llm_account_id(account_id);
-    let slot = LlmSecretSlot::for_account(&account);
-    if let Some(raw) = store.get_client_sync_state(&slot.state_key).await? {
-        return Ok(Some((serde_json::from_str(&raw)?, slot)));
+) -> Result<Option<(StoredSecret, bool)>, AppError> {
+    if let Some(raw) = store.get_client_sync_state(LLM_SECRET_STATE_KEY).await? {
+        return Ok(Some((serde_json::from_str(&raw)?, false)));
     }
-    // `default` 账号还要能读出 0.3.19 之前的单密钥密文（旧键 + 旧 AAD）。
-    // 其它账号没有历史数据，直接返回未配置。
-    if account == DEFAULT_LLM_ACCOUNT_ID {
-        let legacy = LlmSecretSlot::legacy_default();
-        if let Some(raw) = store.get_client_sync_state(&legacy.state_key).await? {
-            return Ok(Some((serde_json::from_str(&raw)?, legacy)));
-        }
+    if let Some(raw) = store
+        .get_client_sync_state(LEGACY_ACCOUNT_SCOPED_LLM_STATE_KEY)
+        .await?
+    {
+        return Ok(Some((serde_json::from_str(&raw)?, true)));
     }
     Ok(None)
 }
 
-async fn store_llm_secret(
-    store: &SqliteStore,
-    slot: &LlmSecretSlot,
+/// `account_scoped` 为真时表示密文来自按账号存的旧槽位，AAD 不同。
+fn decrypt_llm_ciphertext(
+    vault: &SecretVault,
     stored: &StoredSecret,
-) -> Result<(), AppError> {
+    account_scoped: bool,
+) -> Result<String, AppError> {
+    if account_scoped {
+        vault.decrypt_with_aad(&stored.ciphertext, LEGACY_ACCOUNT_SCOPED_LLM_AAD)
+    } else {
+        vault.decrypt(&stored.ciphertext)
+    }
+}
+
+async fn store_llm_secret(store: &SqliteStore, stored: &StoredSecret) -> Result<(), AppError> {
     store
-        .set_client_sync_state(&slot.state_key, &serde_json::to_string(stored)?)
+        .set_client_sync_state(LLM_SECRET_STATE_KEY, &serde_json::to_string(stored)?)
         .await
 }
 
@@ -293,14 +226,12 @@ fn pending_url_binding_is_fresh(stored: &StoredSecret) -> bool {
 
 fn persisted_llm_secret(
     stored: &StoredSecret,
-    slot: &LlmSecretSlot,
     vault: &SecretVault,
-    account_id: &str,
+    account_scoped: bool,
     changed: bool,
 ) -> Result<PersistedLlmSecret, AppError> {
     Ok(PersistedLlmSecret {
-        account_id: normalize_llm_account_id(account_id),
-        api_key: vault.decrypt_llm_key(&stored.ciphertext, slot)?,
+        api_key: decrypt_llm_ciphertext(vault, stored, account_scoped)?,
         revision: stored.revision,
         changed,
         bound_base_url: stored.bound_base_url.clone(),
@@ -309,39 +240,28 @@ fn persisted_llm_secret(
     })
 }
 
-/// 读取默认账号（`default`）的模型密钥，等价于改造前的全局单密钥入口。
 pub async fn load_persisted_llm_secret(
     store: &SqliteStore,
     vault: &SecretVault,
 ) -> Result<Option<PersistedLlmSecret>, AppError> {
-    load_persisted_llm_secret_for_account(store, vault, DEFAULT_LLM_ACCOUNT_ID).await
-}
-
-/// 按账号读取模型密钥。账号不存在时返回 `None`，不报错。
-pub async fn load_persisted_llm_secret_for_account(
-    store: &SqliteStore,
-    vault: &SecretVault,
-    account_id: &str,
-) -> Result<Option<PersistedLlmSecret>, AppError> {
-    let Some((stored, slot)) = load_stored_llm_secret(store, account_id).await? else {
+    let Some((stored, account_scoped)) = load_stored_llm_secret(store).await? else {
         return Ok(None);
     };
-    persisted_llm_secret(&stored, &slot, vault, account_id, false).map(Some)
+    persisted_llm_secret(&stored, vault, account_scoped, false).map(Some)
 }
 
 /// 只回报「是否已配置」，不解出明文。
 ///
 /// 解密仍然做一次：密文损坏（例如换了 `OSHICAL_SECRETS_KEY`）时必须报错，
 /// 否则界面会显示「已配置」而实际调不通。
-pub async fn llm_secret_status_for_account(
+pub async fn llm_secret_status(
     store: &SqliteStore,
     vault: &SecretVault,
-    account_id: &str,
 ) -> Result<LlmSecretStatus, AppError> {
-    let Some((stored, slot)) = load_stored_llm_secret(store, account_id).await? else {
+    let Some((stored, account_scoped)) = load_stored_llm_secret(store).await? else {
         return Ok(LlmSecretStatus::default());
     };
-    vault.decrypt_llm_key(&stored.ciphertext, &slot)?;
+    decrypt_llm_ciphertext(vault, &stored, account_scoped)?;
     Ok(LlmSecretStatus {
         configured: true,
         revision: stored.revision,
@@ -350,39 +270,25 @@ pub async fn llm_secret_status_for_account(
     })
 }
 
-/// 写入默认账号（`default`）的模型密钥，保留改造前签名供 `runtime` 等旧调用点使用。
+/// 写入模型密钥。同值重写不涨 `revision`，只更新绑定状态。
 pub async fn save_persisted_llm_secret(
     store: &SqliteStore,
     vault: &SecretVault,
     api_key: &str,
     base_url: Option<&str>,
 ) -> Result<PersistedLlmSecret, AppError> {
-    save_persisted_llm_secret_for_account(store, vault, DEFAULT_LLM_ACCOUNT_ID, api_key, base_url)
-        .await
-}
-
-/// 按账号写入模型密钥。同值重写不涨 `revision`，只更新绑定状态。
-pub async fn save_persisted_llm_secret_for_account(
-    store: &SqliteStore,
-    vault: &SecretVault,
-    account_id: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-) -> Result<PersistedLlmSecret, AppError> {
-    let account = normalize_llm_account_id(account_id);
-    let slot = LlmSecretSlot::for_account(&account);
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    let previous = load_stored_llm_secret(store, &account).await?;
+    let previous = load_stored_llm_secret(store).await?;
     let previous_key = match previous.as_ref() {
-        Some((stored, previous_slot)) => {
-            Some(vault.decrypt_llm_key(&stored.ciphertext, previous_slot)?)
+        Some((stored, account_scoped)) => {
+            Some(decrypt_llm_ciphertext(vault, stored, *account_scoped)?)
         }
         None => None,
     };
     let now = Utc::now().to_rfc3339();
 
     if previous_key.as_deref() == Some(api_key) {
-        let (stored, previous_slot) = previous.as_ref().ok_or_else(|| AppError::External {
+        let (stored, _) = previous.as_ref().ok_or_else(|| AppError::External {
             code: "SECRET_CACHE_INCONSISTENT".to_owned(),
             message: "模型密钥缓存状态不一致".to_owned(),
         })?;
@@ -395,90 +301,67 @@ pub async fn save_persisted_llm_secret_for_account(
             }
             None => stored.pending_url_binding = true,
         }
-        // 命中的是旧版单密钥槽位时，趁这次「值没变」的写入把密文迁到账号槽位：
-        // AAD 变了必须重新加密，但语义上没换密钥，`revision` 保持不变。
-        let target_slot = if previous_slot.state_key == slot.state_key {
-            previous_slot.clone()
-        } else {
-            stored.ciphertext = vault.encrypt_llm_key(api_key, &slot)?;
-            slot.clone()
-        };
-        store_llm_secret(store, &target_slot, &stored).await?;
-        return persisted_llm_secret(&stored, &target_slot, vault, &account, false);
+        // 值没变，但密文可能还躺在旧的按账号槽位里：趁这次写入搬回单密钥槽位。
+        // AAD 变了必须重新加密，语义上没换密钥，所以 `revision` 保持不变。
+        stored.ciphertext = vault.encrypt(api_key)?;
+        store_llm_secret(store, &stored).await?;
+        return persisted_llm_secret(&stored, vault, false, false);
     }
 
     let revision = previous
         .as_ref()
         .map_or(1, |(stored, _)| stored.revision.saturating_add(1));
     let stored = StoredSecret {
-        ciphertext: vault.encrypt_llm_key(api_key, &slot)?,
+        ciphertext: vault.encrypt(api_key)?,
         revision,
         updated_at: now,
         bound_base_url: base_url.map(ToOwned::to_owned),
         pending_url_binding: base_url.is_none(),
     };
-    store_llm_secret(store, &slot, &stored).await?;
-    persisted_llm_secret(&stored, &slot, vault, &account, true)
+    store_llm_secret(store, &stored).await?;
+    persisted_llm_secret(&stored, vault, false, true)
 }
 
-/// 绑定默认账号（`default`）的密钥到某个 base URL，保留改造前签名。
+/// 把已保存的密钥绑定到 `base_url`（首次成功探测后调用）。
 pub async fn bind_persisted_llm_secret_url(
     store: &SqliteStore,
     vault: &SecretVault,
     base_url: &str,
 ) -> Result<PersistedLlmSecret, AppError> {
-    bind_persisted_llm_secret_url_for_account(store, vault, DEFAULT_LLM_ACCOUNT_ID, base_url).await
-}
-
-/// 按账号把已保存的密钥绑定到 `base_url`（首次成功探测后调用）。
-pub async fn bind_persisted_llm_secret_url_for_account(
-    store: &SqliteStore,
-    vault: &SecretVault,
-    account_id: &str,
-    base_url: &str,
-) -> Result<PersistedLlmSecret, AppError> {
-    let account = normalize_llm_account_id(account_id);
-    let slot = LlmSecretSlot::for_account(&account);
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    let (stored, previous_slot) = load_stored_llm_secret(store, &account)
+    let (stored, account_scoped) = load_stored_llm_secret(store)
         .await?
         .ok_or_else(|| AppError::NotFound("模型密钥".to_owned()))?;
     let mut stored = stored;
-    if previous_slot.state_key != slot.state_key {
-        // 旧槽位的密文换了 AAD 就解不开，必须先解再按账号 AAD 重新加密。
-        let plaintext = vault.decrypt_llm_key(&stored.ciphertext, &previous_slot)?;
-        stored.ciphertext = vault.encrypt_llm_key(&plaintext, &slot)?;
+    if account_scoped {
+        // 旧槽位的密文换了 AAD 就解不开，先解再按单密钥 AAD 重新加密。
+        let plaintext = decrypt_llm_ciphertext(vault, &stored, true)?;
+        stored.ciphertext = vault.encrypt(&plaintext)?;
     }
     stored.bound_base_url = Some(base_url.to_owned());
     stored.pending_url_binding = false;
     stored.updated_at = Utc::now().to_rfc3339();
-    store_llm_secret(store, &slot, &stored).await?;
-    persisted_llm_secret(&stored, &slot, vault, &account, false)
+    store_llm_secret(store, &stored).await?;
+    persisted_llm_secret(&stored, vault, false, false)
 }
 
-/// 把部署配置（例如 `OSHICAL_LLM_ACCOUNTS`）里的账号密钥写进持久化槽位。
+/// 把部署配置（`OSHICAL_LLM_API_KEY`）里的密钥写进持久化槽位。
 ///
-/// 传 `(account_id, api_key, base_url)` 三元组：策略上环境变量优先，
-/// 写进去以后所有读路径（`/api/secrets/llm`、`/api/llm/*`、分析循环）
-/// 都只看持久化槽位，不需要第二套「从 env 取 key」的分支。
-/// 值没变的账号不会涨 `revision`，见 [`save_persisted_llm_secret_for_account`]。
-pub async fn seed_llm_secrets_from_env(
+/// 策略上环境变量优先：写进去以后所有读路径（`/api/secrets/llm`、
+/// `/api/llm/*`、分析循环）都只看持久化槽位，不需要第二套「从 env 取 key」的分支。
+/// 值没变时不会涨 `revision`。
+pub async fn seed_llm_secret_from_env(
     store: &SqliteStore,
     vault: &SecretVault,
-    accounts: &[(&str, &str, Option<&str>)],
-) -> Result<Vec<String>, AppError> {
-    let mut seeded = Vec::with_capacity(accounts.len());
-    for &(account_id, api_key, base_url) in accounts {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            continue;
-        }
-        let account = validate_llm_account_id(account_id)?;
-        let base_url = base_url.map(str::trim).filter(|value| !value.is_empty());
-        save_persisted_llm_secret_for_account(store, vault, &account, api_key, base_url).await?;
-        seeded.push(account);
-    }
-    Ok(seeded)
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<bool, AppError> {
+    let Some(api_key) = api_key.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    let base_url = base_url.map(str::trim).filter(|value| !value.is_empty());
+    save_persisted_llm_secret(store, vault, api_key, base_url).await?;
+    Ok(true)
 }
 
 pub async fn load_persisted_bili_secret(
@@ -643,119 +526,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_secrets_are_isolated_per_account() {
+    async fn llm_secret_round_trips_with_a_single_slot() {
         let store = SqliteStore::in_memory().await.unwrap();
         let vault = SecretVault::from_material("fixture-master-key");
-        let first = save_persisted_llm_secret_for_account(&store, &vault, "acct-a", "sk-a", None)
+        assert!(load_persisted_llm_secret(&store, &vault)
+            .await
+            .unwrap()
+            .is_none());
+        let status = llm_secret_status(&store, &vault).await.unwrap();
+        assert!(!status.configured);
+
+        let first = save_persisted_llm_secret(&store, &vault, "sk-a", None)
             .await
             .unwrap();
-        assert_eq!(first.account_id, "acct-a");
-        let second = save_persisted_llm_secret_for_account(&store, &vault, "acct-b", "sk-b", None)
-            .await
-            .unwrap();
-        assert_eq!(second.account_id, "acct-b");
         assert_eq!(first.revision, 1);
-        assert_eq!(second.revision, 1);
-
-        let loaded_a = load_persisted_llm_secret_for_account(&store, &vault, "acct-a")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded_a.api_key, "sk-a");
-        let loaded_b = load_persisted_llm_secret_for_account(&store, &vault, "acct-b")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded_b.api_key, "sk-b");
-
-        // 版本号各自递增，互不影响。
-        let bumped_a =
-            save_persisted_llm_secret_for_account(&store, &vault, "acct-a", "sk-a2", None)
-                .await
-                .unwrap();
-        assert_eq!(bumped_a.revision, 2);
-        let reloaded_b = load_persisted_llm_secret_for_account(&store, &vault, "acct-b")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded_b.revision, 1);
-
-        // 账号 id 归一化：去空白，空值落到 default。
-        assert_eq!(normalize_llm_account_id("  acct-a  "), "acct-a");
-        assert_eq!(normalize_llm_account_id("   "), DEFAULT_LLM_ACCOUNT_ID);
-        let blank = save_persisted_llm_secret_for_account(&store, &vault, "  ", "sk-default", None)
-            .await
-            .unwrap();
-        assert_eq!(blank.account_id, DEFAULT_LLM_ACCOUNT_ID);
-    }
-
-    #[tokio::test]
-    async fn default_account_reads_legacy_single_key_and_migrates_on_write() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let vault = SecretVault::from_material("fixture-master-key");
-        // 模拟 0.3.19 的落库形态：旧键 + 旧 AAD。
-        let legacy = StoredSecret {
-            ciphertext: vault.encrypt("sk-legacy").unwrap(),
-            revision: 7,
-            updated_at: Utc::now().to_rfc3339(),
-            bound_base_url: Some("https://legacy.example.com".to_owned()),
-            pending_url_binding: false,
-        };
-        store
-            .set_client_sync_state(
-                LLM_SECRET_STATE_KEY,
-                &serde_json::to_string(&legacy).unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = llm_secret_status_for_account(&store, &vault, DEFAULT_LLM_ACCOUNT_ID)
-            .await
-            .unwrap();
-        assert!(status.configured);
-        assert_eq!(status.revision, 7);
+        assert!(first.changed);
+        assert!(first.pending_url_binding);
+        assert_eq!(first.api_key, "sk-a");
 
         let loaded = load_persisted_llm_secret(&store, &vault)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.api_key, "sk-legacy");
-        assert_eq!(
-            loaded.bound_base_url.as_deref(),
-            Some("https://legacy.example.com")
-        );
+        assert_eq!(loaded.api_key, "sk-a");
         assert!(!loaded.changed);
 
-        // 同值写入：密文迁到账号槽位（AAD 变了必须重新加密），revision 不涨。
-        let migrated = save_persisted_llm_secret(&store, &vault, "sk-legacy", None)
+        // 同值重写只刷新时间与绑定状态，不涨 revision。
+        let refreshed =
+            save_persisted_llm_secret(&store, &vault, "sk-a", Some("https://m.example/v1"))
+                .await
+                .unwrap();
+        assert_eq!(refreshed.revision, 1);
+        assert!(!refreshed.changed);
+        assert!(!refreshed.pending_url_binding);
+
+        let bumped = save_persisted_llm_secret(&store, &vault, "sk-b", None)
             .await
             .unwrap();
-        assert_eq!(migrated.revision, 7);
-        assert!(!migrated.changed);
-
-        let account_key = format!("{LLM_SECRET_STATE_KEY}:{DEFAULT_LLM_ACCOUNT_ID}");
-        let account_raw = store
-            .get_client_sync_state(&account_key)
-            .await
-            .unwrap()
-            .expect("账号槽位应已写入");
-        let account_stored: StoredSecret = serde_json::from_str(&account_raw).unwrap();
-        let account_slot = LlmSecretSlot::for_account(DEFAULT_LLM_ACCOUNT_ID);
+        assert_eq!(bumped.revision, 2);
         assert_eq!(
-            vault
-                .decrypt_llm_key(&account_stored.ciphertext, &account_slot)
-                .unwrap(),
-            "sk-legacy"
-        );
-        // 旧 AAD 解不开账号槽位的密文。
-        assert!(vault.decrypt(&account_stored.ciphertext).is_err());
-
-        // 其它账号读不到 default 的密钥。
-        assert!(
-            load_persisted_llm_secret_for_account(&store, &vault, "acct-a")
+            load_persisted_llm_secret(&store, &vault)
                 .await
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .api_key,
+            "sk-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_scoped_ciphertext_is_still_readable_and_migrates_on_write() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let vault = SecretVault::from_material("fixture-master-key");
+        // 模拟 0.3.20 ~ 0.3.26 的落库形态：按账号键 + 带后缀的 AAD。
+        let stored = StoredSecret {
+            ciphertext: vault
+                .encrypt_with_aad("sk-scoped", LEGACY_ACCOUNT_SCOPED_LLM_AAD)
+                .unwrap(),
+            revision: 3,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: Some("https://scoped.example.com/v1".to_owned()),
+            pending_url_binding: false,
+        };
+        store
+            .set_client_sync_state(
+                LEGACY_ACCOUNT_SCOPED_LLM_STATE_KEY,
+                &serde_json::to_string(&stored).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = llm_secret_status(&store, &vault).await.unwrap();
+        assert!(status.configured);
+        assert_eq!(status.revision, 3);
+        let loaded = load_persisted_llm_secret(&store, &vault)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.api_key, "sk-scoped");
+
+        // 同值写入：密文按单密钥 AAD 重新加密到旧键，revision 不涨。
+        let migrated = save_persisted_llm_secret(&store, &vault, "sk-scoped", None)
+            .await
+            .unwrap();
+        assert_eq!(migrated.revision, 3);
+        assert!(!migrated.changed);
+        let raw = store
+            .get_client_sync_state(LLM_SECRET_STATE_KEY)
+            .await
+            .unwrap()
+            .expect("单密钥槽位应已写入");
+        let migrated_stored: StoredSecret = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            vault.decrypt(&migrated_stored.ciphertext).unwrap(),
+            "sk-scoped"
         );
     }
 }

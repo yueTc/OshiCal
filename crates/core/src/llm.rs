@@ -8,9 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -20,7 +18,7 @@ use std::io::Cursor;
 
 use crate::bilibili::normalize_image_url;
 use crate::error::{AppError, AppResult};
-use crate::settings::{LlmAccount, ReasoningEffort};
+use crate::settings::ReasoningEffort;
 
 const IMAGE_DOWNLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 // Keep the base64 data URL below 10 MiB while leaving room for the prompt JSON.
@@ -1521,121 +1519,35 @@ fn post_content_digest(text: &str, reserve: Option<&str>, image_urls: &[String])
     )
 }
 
-/// 账号池：全局并发闸门（`llm_parallelism`）+ 每个账号一把串行锁。
-/// 同一账号同一时刻只有一个调用在跑，不同账号可以并行；调用方先
-/// [`LlmPool::acquire`] 拿到租约，再调 `analyze_post`。账号池自己不发请求，
-/// 也不重试：失败或空结果由调用方决定是否缓存，不补发。
+/// 并发闸门：`llm_parallelism` 限制同一时刻最多有多少个模型请求在跑。
+/// 池自己不发请求，也不重试：失败或空结果由调用方决定是否缓存，不补发。
 pub struct LlmPool {
-    global: Arc<Semaphore>,
-    per_account: HashMap<String, Arc<Semaphore>>,
-    fallback: Arc<Semaphore>,
-    accounts: Vec<LlmAccount>,
-    keys: HashMap<String, String>,
-    cursor: AtomicUsize,
+    permits: Arc<Semaphore>,
     parallelism: usize,
 }
 
-/// 账号租约：`account` + `api_key` 供本次调用使用，内部 permit 在 drop 时归还。
-pub struct LlmAccountLease {
-    pub account: LlmAccount,
-    pub api_key: String,
-    _global: OwnedSemaphorePermit,
-    _account: OwnedSemaphorePermit,
-}
-
 impl LlmPool {
-    /// `keys` 是账号 id 到 API key 的映射；`accounts` 为空时退化成单账号默认通道。
-    pub fn new(parallelism: u8, accounts: Vec<LlmAccount>, keys: HashMap<String, String>) -> Self {
+    /// 并行度至少为 1：0 个许可会让第一次 `acquire` 永远等下去。
+    pub fn new(parallelism: u8) -> Self {
         let parallelism = usize::from(parallelism.max(1));
-        let mut per_account = HashMap::with_capacity(accounts.len());
-        for account in &accounts {
-            per_account.insert(account.id.clone(), Arc::new(Semaphore::new(1)));
-        }
         Self {
-            global: Arc::new(Semaphore::new(parallelism)),
-            per_account,
-            fallback: Arc::new(Semaphore::new(1)),
-            accounts,
-            keys,
-            cursor: AtomicUsize::new(0),
+            permits: Arc::new(Semaphore::new(parallelism)),
             parallelism,
         }
     }
 
-    /// 有效并行度：`min(llm_parallelism, 账号数)`，没有账号时按 1 算。
+    /// 有效并行度，至少 1。
     pub fn effective_parallelism(&self) -> usize {
-        self.parallelism.min(self.accounts.len().max(1))
+        self.parallelism
     }
 
-    /// 取一个空闲账号的租约：先拿全局许可，再在所有账号间轮询挑一个空闲的；
-    /// 全部被占用时等待轮询命中的第一个账号（同账号串行）。
-    pub async fn acquire(&self) -> LlmAccountLease {
-        let global = self
-            .global
+    /// 取一个许可，请求结束（`Drop`）时归还。
+    pub async fn acquire(&self) -> OwnedSemaphorePermit {
+        self.permits
             .clone()
             .acquire_owned()
             .await
-            .expect("日程模型全局并发信号量不会在池存活期间关闭");
-        if self.accounts.is_empty() {
-            let account = LlmAccount {
-                id: "default".to_owned(),
-                name: "默认账号".to_owned(),
-                base_url: String::new(),
-                model: String::new(),
-            };
-            let api_key = self.keys.get(&account.id).cloned().unwrap_or_default();
-            let permit = self
-                .fallback
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("日程模型兜底并发信号量不会在池存活期间关闭");
-            return LlmAccountLease {
-                account,
-                api_key,
-                _global: global,
-                _account: permit,
-            };
-        }
-        let start = self.cursor.fetch_add(1, AtomicOrdering::Relaxed) % self.accounts.len();
-        let mut blocked: Option<&LlmAccount> = None;
-        for offset in 0..self.accounts.len() {
-            let account = &self.accounts[(start + offset) % self.accounts.len()];
-            let Some(semaphore) = self.per_account.get(&account.id) else {
-                continue;
-            };
-            match semaphore.clone().try_acquire_owned() {
-                Ok(permit) => return self.lease(account, permit, global),
-                Err(_) => {
-                    blocked.get_or_insert(account);
-                }
-            }
-        }
-        let account = blocked.expect("账号列表非空时至少能轮询到一个账号");
-        let semaphore = self
-            .per_account
-            .get(&account.id)
-            .cloned()
-            .expect("per_account 与 accounts 同步创建");
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .expect("日程模型账号信号量不会在池存活期间关闭");
-        self.lease(account, permit, global)
-    }
-
-    fn lease(
-        &self,
-        account: &LlmAccount,
-        permit: OwnedSemaphorePermit,
-        global: OwnedSemaphorePermit,
-    ) -> LlmAccountLease {
-        LlmAccountLease {
-            account: account.clone(),
-            api_key: self.keys.get(&account.id).cloned().unwrap_or_default(),
-            _global: global,
-            _account: permit,
-        }
+            .expect("日程模型并发信号量不会在池存活期间关闭")
     }
 }
 
@@ -2345,19 +2257,11 @@ mod regression_tests {
     }
 
     #[test]
-    fn pool_effective_parallelism_is_bounded_by_accounts() {
-        let account = |id: &str| LlmAccount {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            base_url: "https://api.example.com/v1".to_owned(),
-            model: "model".to_owned(),
-        };
-        let pool = LlmPool::new(8, vec![account("a"), account("b")], HashMap::new());
-        assert_eq!(pool.effective_parallelism(), 2);
-        let pool = LlmPool::new(3, vec![account("a")], HashMap::new());
-        assert_eq!(pool.effective_parallelism(), 1);
-        let pool = LlmPool::new(0, Vec::new(), HashMap::new());
-        assert_eq!(pool.effective_parallelism(), 1);
+    fn pool_effective_parallelism_is_at_least_one() {
+        assert_eq!(LlmPool::new(8).effective_parallelism(), 8);
+        assert_eq!(LlmPool::new(3).effective_parallelism(), 3);
+        // 0 个许可会让第一次 acquire 永久阻塞，构造时必须兜底成 1。
+        assert_eq!(LlmPool::new(0).effective_parallelism(), 1);
     }
 
     #[tokio::test]
