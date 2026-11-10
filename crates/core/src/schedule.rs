@@ -539,6 +539,35 @@ mod tests {
     }
 
     #[test]
+    fn historical_text_and_live_reservations_keep_original_dates() {
+        let published = "2026-11-02T19:01:22+08:00".parse().unwrap();
+        let later = "2026-11-10T20:00:00+08:00".parse().unwrap();
+        for (text, expected) in [
+            ("今天 18:00 歌回", "2026-11-02T10:00:00+00:00"),
+            ("明天 20:00 歌回", "2026-11-03T12:00:00+00:00"),
+            ("11月1日 20:00 歌回", "2026-11-01T12:00:00+00:00"),
+            ("2025-11-01 20:00 歌回", "2025-11-01T12:00:00+00:00"),
+            ("周三 20:00 歌回", "2026-11-04T12:00:00+00:00"),
+            ("11.1 20:00 歌回", "2026-11-01T12:00:00+00:00"),
+            ("18:00 歌回", "2026-11-02T10:00:00+00:00"),
+        ] {
+            let value = parse_text_schedule(text, published, later, "直播").expect(text);
+            assert_eq!(value.start_at.to_rfc3339(), expected, "{text}");
+        }
+        let reserve = ReserveCard {
+            title: "直播预约：歌回".to_owned(),
+            description: "明天 20:00 直播".to_owned(),
+            room_id: None,
+            jump_url: None,
+            stype: Some(2),
+        };
+        let value =
+            parse_reserve_schedule(&reserve, published, later).expect("historical reservation");
+        assert_eq!(value.start_at.to_rfc3339(), "2026-11-03T12:00:00+00:00");
+        assert_eq!(value.title, "歌回");
+    }
+
+    #[test]
     fn rejects_past_or_missing_time() {
         assert!(
             parse_text_schedule("上周一 20:00 直播", published(), china_now(), "直播").is_none()

@@ -6569,6 +6569,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_schedule_reanalysis_ignores_v2_cache_and_is_idempotent() {
+        for images in [
+            Vec::new(),
+            vec!["https://i0.hdslb.com/bfs/new_dyn/history.png"],
+        ] {
+            let store = SqliteStore::in_memory().await.expect("db");
+            let streamer = store
+                .add_subscription(&subscription("1203217682", "泽音Melody"))
+                .await
+                .unwrap();
+            let now = Utc::now();
+            let start = now - Duration::days(7);
+            let post = dynamic_post(
+                "historical-post",
+                &streamer.mid,
+                &streamer.name,
+                now - Duration::days(8),
+                "周表",
+                images,
+            );
+            let settings = AppSettings {
+                llm_prompt_version: "custom-history".to_owned(),
+                ..AppSettings::default()
+            };
+            let digest = content_digest_of(
+                &text_digest(&text_analysis_context(&post)),
+                None,
+                &post.images,
+            );
+            let old_version = format!("{}-post-v2", settings.llm_prompt_version);
+            store
+                .save_post_analysis(
+                    &format!("{}:{digest}:fixture-model:{old_version}", post.id),
+                    &post.id,
+                    &digest,
+                    "fixture-model",
+                    &old_version,
+                    &json!([]),
+                )
+                .await
+                .unwrap();
+            let analyzer = Arc::new(CountingAnalyzer::new(
+                vec![schedule_event("历史歌回", Some(start), &streamer.name)],
+                Vec::new(),
+            ));
+            let service = AppService::with_analyzer(
+                store.clone(),
+                RuntimeSecrets::default(),
+                analyzer.clone(),
+            )
+            .unwrap();
+            let pool = test_pool("fixture-model");
+            for expected_calls in [1, 0] {
+                let stats = service
+                    .process_source_posts(
+                        &streamer.mid,
+                        std::slice::from_ref(&streamer),
+                        std::slice::from_ref(&post),
+                        &settings,
+                        Some(&pool),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(stats.llm_calls, expected_calls);
+                assert_eq!(stats.llm_cache_hits, 1 - expected_calls);
+                let schedules = store.list_all_schedules().await.unwrap();
+                assert_eq!(schedules.len(), 1);
+                assert_eq!(schedules[0].start_at.timestamp(), start.timestamp());
+                assert_eq!(schedules[0].source_published_at, Some(post.published_at));
+            }
+            assert_eq!(analyzer.call_count(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn publication_week_revision_ignores_old_post_cache_in_both_channels() {
         for images in [
             Vec::new(),

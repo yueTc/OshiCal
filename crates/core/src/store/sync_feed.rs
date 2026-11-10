@@ -2025,6 +2025,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pruning_without_candidates_does_not_wait_for_the_writer() {
+        let directory =
+            std::env::temp_dir().join(format!("oshical-prune-lock-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .expect("directory");
+        let store = SqliteStore::connect(directory.join("sync.db"))
+            .await
+            .expect("store");
+        store
+            .append_sync_change("test", "fresh", "upsert", 1, Some(json!({})))
+            .await
+            .expect("append");
+        let writer = store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold writer");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            store.prune_sync_changes(SyncPrunePolicy::Before(Utc::now() - Duration::days(30))),
+        )
+        .await;
+        writer.rollback().await.expect("release writer");
+        store.pool.close().await;
+        tokio::fs::remove_dir_all(directory).await.expect("cleanup");
+        assert_eq!(
+            result
+                .expect("read-only boundary lookup must not acquire a write lock")
+                .expect("prune"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_commits_small_prefixes_with_matching_cursor_metadata() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 530)
+             INSERT INTO sync_changes(entity_type,entity_id,operation,entity_revision,payload_json,actor_type,created_at)
+             SELECT 'test', CAST(x AS TEXT), 'upsert', 1, '{}', 'system', '2026-11-01T00:00:00+00:00' FROM n",
+        ).execute(&store.pool).await.expect("seed changes");
+        sqlx::query("INSERT INTO sync_feed_meta(key,value,updated_at) VALUES('min_retained_seq',0,'test') ON CONFLICT(key) DO UPDATE SET value=0")
+            .execute(&store.pool).await.expect("seed metadata");
+        sqlx::raw_sql(
+            "CREATE TABLE prune_audit(remaining INTEGER, boundary INTEGER);
+             CREATE TRIGGER audit_prune AFTER UPDATE OF value ON sync_feed_meta
+             WHEN NEW.key = 'min_retained_seq'
+             BEGIN
+                 INSERT INTO prune_audit SELECT COUNT(*), NEW.value FROM sync_changes;
+             END;",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("audit commits");
+        let latest = store.latest_sync_seq().await.unwrap();
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepLatest(7))
+                .await
+                .unwrap(),
+            523
+        );
+        let audit: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT remaining,boundary FROM prune_audit ORDER BY rowid")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert!(
+            audit.len() >= 3,
+            "deletion must be split into bounded transactions: {audit:?}"
+        );
+        let mut previous = 530;
+        for (remaining, boundary) in audit {
+            assert!((1..=256).contains(&(previous - remaining)));
+            assert_eq!(
+                boundary,
+                latest - remaining + 1,
+                "cursor and deleted prefix must commit together"
+            );
+            previous = remaining;
+        }
+        assert_eq!(previous, 7);
+        assert_eq!(store.latest_sync_seq().await.unwrap(), latest);
+        assert_eq!(store.min_retained_sync_seq().await.unwrap(), latest - 6);
+        assert!(
+            store
+                .sync_changes_after(0, 100)
+                .await
+                .unwrap()
+                .reset_required
+        );
+        let retained = store.sync_changes_after(latest - 7, 100).await.unwrap();
+        assert!(!retained.reset_required);
+        assert_eq!(retained.changes.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn pruning_before_preserves_timezone_comparison_and_uses_covering_index() {
+        let store = SqliteStore::in_memory().await.expect("store");
+        for (index, timestamp) in ["2026-11-02T00:00:00+08:00", "2026-11-01T17:00:00+00:00"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_sync_change("test", &index.to_string(), "upsert", 1, Some(json!({})))
+                .await
+                .unwrap();
+            sqlx::query("UPDATE sync_changes SET created_at=? WHERE entity_id=?")
+                .bind(timestamp)
+                .bind(index.to_string())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let before = "2026-11-01T16:30:00Z".parse().unwrap();
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::Before(before))
+                .await
+                .unwrap(),
+            1
+        );
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT entity_id FROM sync_changes ORDER BY seq")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["1"]);
+    }
+
+    #[tokio::test]
     async fn pruning_advances_the_retained_cursor_boundary() {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = add_streamer(&store, "105", "清理主播").await;

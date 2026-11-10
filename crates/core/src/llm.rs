@@ -1846,6 +1846,32 @@ mod tests {
     }
 
     #[test]
+    fn historical_model_events_are_retained_including_cancellations() {
+        let raw = json!([
+            {"action":"schedule","performer":"泽音Melody","title":"上周歌回","start_at":"2026-11-03T20:00:00+08:00","confidence":0.95},
+            {"action":"cancel","performer":"泽音Melody","title":"上周歌回","start_at":"2026-11-04T20:00:00+08:00","confidence":0.95}
+        ]);
+        let later = "2026-11-10T20:00:00+08:00".parse().unwrap();
+        let events = events_from_raw(&raw, later).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].start_at.unwrap().to_rfc3339(),
+            "2026-11-03T12:00:00+00:00"
+        );
+        assert_eq!(events[1].action, LlmEventAction::Cancel);
+        for kind in [PromptKind::Text, PromptKind::Multimodal] {
+            let prompt = build_system_prompt(
+                kind,
+                "泽音Melody",
+                "2026-11-02T19:01:22+08:00".parse().unwrap(),
+                later,
+            );
+            assert!(prompt.contains("即使开始时间早于当前时刻也必须输出"));
+            assert!(!prompt.contains("过去的日期不要输出"));
+        }
+    }
+
+    #[test]
     fn parses_json_and_discards_invalid_events() {
         let text = r#"
 ```json
