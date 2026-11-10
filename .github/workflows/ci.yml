@@ -5,7 +5,6 @@ on:
     branches:
       - main
       - master
-      - codex/streamer-parallel
   pull_request:
   workflow_dispatch:
 
