@@ -2748,6 +2748,77 @@ impl SqliteStore {
         Ok(removed)
     }
 
+    /// 只清理「当前分析里已经不存在的来源」：来源编号尾号是事件序号。
+    ///
+    /// - 尾号 `>= event_count`：这一版结果里没有第 N 条事件了（旧提示词、
+    ///   旧的逐图缓存、被合并掉的重复场次留下的编号），清掉。
+    /// - 尾号在范围内、且 `replaced` 里这个序号已经换了新编号：同一条事件
+    ///   被新一轮结果重新覆盖了（摘要变了），旧编号属于同一场，清掉不会丢
+    ///   日程——新编号已经挂在这条日程上。
+    /// - 其它一律保留。摘要变了但这一轮没重新写到的，不许删：那正是同一场
+    ///   直播时有时无的根源（删了来源会连带触发 `delete_orphan_schedules`）。
+    ///
+    /// 与 [`Self::delete_schedule_sources_except`] 的区别：那个按「本轮写没写」
+    /// 判断，摘要一变就把上一轮写入的来源全删掉；这个按事件序号判断。
+    ///
+    /// `keep` 里的编号无论尾号如何都保留；`event_count == 0`（一条事件都
+    /// 没识别出来）时一条都不动——模型偶尔看走眼，不能因此删掉还能用的场次。
+    pub async fn prune_schedule_sources_beyond(
+        &self,
+        post_id: &str,
+        event_count: usize,
+        keep: &[String],
+        replaced: &std::collections::HashMap<usize, String>,
+    ) -> AppResult<Vec<(String, i64)>> {
+        if event_count == 0 {
+            return Ok(Vec::new());
+        }
+        let keep_set: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // 只看这条动态的 text/image 来源：预约卡来源（`reserve:{post}`）尾号是
+        // 动态 id，按序号解析会把它误判成过期。
+        let rows = sqlx::query(
+            "SELECT id, source_identity, schedule_id FROM schedule_sources
+             WHERE source_post_id = ? AND source_kind IN ('text', 'image')
+             ORDER BY id",
+        )
+        .bind(post_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut removed = Vec::new();
+        for row in rows {
+            let source_id: i64 = row.try_get("id")?;
+            let identity: String = row.try_get("source_identity")?;
+            if keep_set.contains(identity.as_str()) {
+                continue;
+            }
+            let Some(event_index) = identity
+                .rsplit(':')
+                .next()
+                .and_then(|tail| tail.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let stale = event_index >= event_count
+                || replaced
+                    .get(&event_index)
+                    .is_some_and(|fresh| fresh != &identity);
+            if !stale {
+                continue;
+            }
+            let schedule_id: i64 = row.try_get("schedule_id")?;
+            self.emit_schedule_source_change(&mut tx, source_id, "delete", SyncActor::system())
+                .await?;
+            sqlx::query("DELETE FROM schedule_sources WHERE id = ?")
+                .bind(source_id)
+                .execute(&mut *tx)
+                .await?;
+            removed.push((identity, schedule_id));
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     pub async fn add_source_suppression(
         &self,
         streamer_id: i64,

@@ -1504,14 +1504,27 @@ impl AppService {
                     self.remove_stale_non_live_reserve_schedule(post).await?;
             }
 
-            // 本次真正写入日程的 source_identity。stale 清理只保留这些：
-            // 被去重或跳过的身份不算“写入”，否则会把旧来源误删。
-            let mut written_identities: Vec<String> = Vec::new();
+            // 本轮这条动态涉及的全部 source_identity。清理只删「当前分析里已经没有
+            // 第 N 条事件」的来源，这里登记过的无论尾号如何都不动：被去重、被跳过、
+            // 或者换了个摘要的场次都还存在，只是这一轮没有重新写到而已。
+            let mut keep_identities: HashSet<String> = event_state
+                .written_identities
+                .entry(post.id.clone())
+                .or_default()
+                .clone();
+            // 这一轮每条事件对应的编号。数组序号即事件序号：清理时用它判断
+            // 「第 N 条事件这一轮是不是被新编号重新覆盖了」。
+            let mut slot_identities: HashMap<usize, String> = HashMap::new();
+            // 纯文字动态的 identity 仍沿用「发布者 + 正文 + 预约卡」的旧摘要，
+            // 升级后历史日程才能原地更新，而不是再造一条。
+            let text_hash = text_digest(&text_analysis_context(post));
+            let reserve = reserve_summary(post);
+            let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
             if let Some(identity) = self
                 .apply_deterministic_reservation_time_change(source_mid, targets, post)
                 .await?
             {
-                written_identities.push(identity);
+                keep_identities.insert(identity);
             }
 
             // 带图动态与纯文字动态走同一条通道：正文（含预约卡）与全部图片
@@ -1523,6 +1536,8 @@ impl AppService {
             // 模型偶尔把同一场说两遍（正文一次、图片一次），按时间槽去重。
             let mut applied_events: Vec<LlmEvent> = Vec::new();
             let mut analysis_succeeded = false;
+            // 这一轮模型给出的有效事件条数，清理来源时按序号判断哪些已经不存在。
+            let mut event_count = 0usize;
             // 既没有正文也没有图片的动态没有东西可送模型：不占一次调用，
             // 但仍然算“分析成功”，让上一版提示词留下的旧来源照常清理。
             let has_content = !post.text.trim().is_empty() || !post.images.is_empty();
@@ -1533,12 +1548,6 @@ impl AppService {
                     .insert(format!("post:{}", post.id), None);
             }
             if let Some(analyzer) = llm.filter(|_| has_content) {
-                // 纯文字动态的 identity 仍沿用「发布者 + 正文 + 预约卡」的旧摘要，
-                // 升级后历史日程才能原地更新，而不是再造一条。
-                let text_hash = text_digest(&text_analysis_context(post));
-                let reserve = reserve_summary(post);
-                let content_digest =
-                    content_digest_of(&text_hash, reserve.as_deref(), &post.images);
                 let prompt_version = format!("{}-post-v1", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
                 let _permit = analyzer.pool.acquire().await;
@@ -1626,6 +1635,7 @@ impl AppService {
                         }
                     },
                 };
+                event_count = events.as_ref().map_or(0, Vec::len);
                 analysis_succeeded = events.is_some();
                 if analysis_succeeded {
                     stats
@@ -1637,6 +1647,15 @@ impl AppService {
                 }
                 for (event_index, event) in events.unwrap_or_default().iter().enumerate() {
                     let event = canonicalize_event_participants(event, targets);
+                    // 先把 identity 算出来：这一轮即使因为去重、或者找不到对应
+                    // 主播而没写进库里，也不代表它已经不存在了，清理时不能删。
+                    let identity = event_source_identity(
+                        &post.id,
+                        has_images,
+                        &text_hash,
+                        &content_digest,
+                        event_index,
+                    );
                     if applied_events
                         .iter()
                         .any(|seen| llm_events_equivalent(seen, &event))
@@ -1670,14 +1689,7 @@ impl AppService {
                         });
                         continue;
                     }
-                    // 纯文字动态保持 `text:{post_id}:{digest}:{idx}`（历史日程原地更新）；
-                    // 带图动态改用整条动态的 content_digest，图片增减或换图都会换 identity。
                     let source_kind = if has_images { "image" } else { "text" };
-                    let identity = if has_images {
-                        format!("image:{}:{content_digest}:{event_index}", post.id)
-                    } else {
-                        format!("text:{}:{text_hash}:{event_index}", post.id)
-                    };
                     let fingerprint = format!(
                         "{}:{}:{}:{}",
                         source_fingerprint(post, &event.title, source_kind),
@@ -1699,7 +1711,10 @@ impl AppService {
                             &fingerprint,
                         )
                         .await?;
-                    written_identities.push(identity);
+                    // 真写进去了才算「这一序号已被新编号覆盖」，也才是绝不会被
+                    // 清理的保留来源。没写进去的序号不登记，旧来源原样留着。
+                    slot_identities.insert(event_index, identity.clone());
+                    keep_identities.insert(identity);
                     if inserted {
                         stats.new_schedules += 1;
                     }
@@ -1744,36 +1759,32 @@ impl AppService {
                         )
                         .await?;
                     // 兜底卡片也是本轮真实写入的来源，不能被随后的清理删掉。
-                    written_identities.push(identity);
+                    keep_identities.insert(identity);
                     if inserted {
                         stats.new_schedules += 1;
                     }
                 }
             }
 
-            // 应用完本轮结果后清理这条动态的历史来源：上一版提示词、旧的逐图缓存、
-            // 已被合并掉的重复场次留下的 identity 都不再挂着，避免同一场直播
-            // 被旧来源反复救活。分析失败、或这一轮一条事件都没识别出来时不动
-            // source：模型偶尔看走眼，不该把还能用的场次一起删掉。
+            // 清理这条动态的历史来源：只删「当前分析里已经没有第 N 条事件」的来源
+            // 清理这条动态的历史来源，只认「事件序号」不认「这一轮写没写」：
+            // 尾号超出当前事件条数、或者同一序号已经被本轮新编号覆盖的来源才清掉。
             //
-            // 同一条动态可能同时出现在主播本人和官号两个来源里，两条路径各自
-            // 写入自己的 identity。清理必须按「本轮全部来源的并集」判断，否则
-            // 后一条路径会把前一条刚写进去的来源当成历史脏数据删掉，下一轮再
-            // 反过来删，来回抖动。
-            let mut keep_identities: HashSet<String> = event_state
-                .written_identities
-                .entry(post.id.clone())
-                .or_default()
-                .clone();
-            keep_identities.extend(written_identities.iter().cloned());
-            if analysis_succeeded && !keep_identities.is_empty() {
+            // 摘要一变就把旧编号当脏数据删掉是错误的：那会连带触发
+            // `delete_orphan_schedules` 把整条日程删了，这正是同一场直播时有时无
+            // 的原因（周表里思诺的单人场次就是这么丢的）。分析失败、或者一条事件
+            // 都没识别出来时同样一条都不动。
+            //
+            // 同一条动态可能同时出现在主播本人和官号两个来源里，两条路径各自写入
+            // 自己的 identity；保留集合按整轮并集维护，避免互相把对方删掉。
+            if analysis_succeeded && event_count > 0 {
                 event_state
                     .written_identities
                     .insert(post.id.clone(), keep_identities.clone());
-                let keep: Vec<String> = keep_identities.into_iter().collect();
+                let keep: Vec<String> = keep_identities.iter().cloned().collect();
                 let removed = self
                     .store
-                    .delete_schedule_sources_except(&post.id, &keep)
+                    .prune_schedule_sources_beyond(&post.id, event_count, &keep, &slot_identities)
                     .await?;
                 if !removed.is_empty() {
                     // 来源被清空的日程如果一条来源都不剩，就从库里删掉；
@@ -2941,6 +2952,26 @@ impl ResolvedRoom {
             owner_mid: Some(target.mid),
             owner_name: Some(target.name),
         }
+    }
+}
+
+/// 一条动态里第 `event_index` 条事件对应的来源编号。
+///
+/// 纯文字动态保持 `text:{post_id}:{text_hash}:{idx}`，历史日程能原地更新；
+/// 带图动态用整条动态的 `content_digest`（正文 + 预约卡 + 图片地址），
+/// 换图或改正文都会换编号。编号尾号就是事件序号，清理来源时按它判断
+/// 「这条事件在最新一轮分析里还在不在」。
+fn event_source_identity(
+    post_id: &str,
+    has_images: bool,
+    text_hash: &str,
+    content_digest: &str,
+    event_index: usize,
+) -> String {
+    if has_images {
+        format!("image:{post_id}:{content_digest}:{event_index}")
+    } else {
+        format!("text:{post_id}:{text_hash}:{event_index}")
     }
 }
 
@@ -7210,5 +7241,243 @@ mod tests {
         assert_eq!(pool.effective_parallelism(), 2);
         // 0 会让第一个请求永远等下去，构造时兜底成 1。
         assert_eq!(LlmPool::new(0).effective_parallelism(), 1);
+    }
+
+    /// 只清「当前分析里已经没有第 N 条事件」的来源，序号还在的一条都不动。
+    #[tokio::test]
+    async fn pruning_only_drops_events_beyond_the_current_analysis() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("701", "甲"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let first_at = now + Duration::days(1);
+        let second_at = now + Duration::days(2);
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            vec![
+                schedule_event("第一场", Some(first_at), "甲"),
+                schedule_event("第二场", Some(second_at), "甲"),
+            ],
+            Vec::new(),
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let post = dynamic_post(
+            "prune-post",
+            "701",
+            "甲",
+            now,
+            "明天八点第一场，后天八点第二场",
+            vec!["https://i0.hdslb.com/bfs/new_dyn/prune.jpg"],
+        );
+        let pool = test_pool("fixture-model");
+        service
+            .process_source_posts(
+                "701",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("first process");
+        let identities = source_identities(&store, "prune-post").await;
+        assert_eq!(identities.len(), 2, "两条事件各挂一条来源: {identities:?}");
+        let kept_identity = identities[0].clone();
+        // 造一条上一版提示词留下的第 7 条事件来源，指向第一场的日程。
+        let schedule_id: i64 = sqlx::query_scalar(
+            "SELECT schedule_id FROM schedule_sources WHERE source_identity = ?",
+        )
+        .bind(&kept_identity)
+        .fetch_one(store.pool())
+        .await
+        .expect("schedule id");
+        sqlx::query(
+            "INSERT INTO schedule_sources
+                 (schedule_id, source_kind, source_post_id, source_fingerprint,
+                  source_identity, confidence, created_at, revision)
+             VALUES (?, 'image', 'prune-post', 'legacy', ?, 0.9, ?, 1)",
+        )
+        .bind(schedule_id)
+        .bind("image:prune-post:legacy:7".to_owned())
+        .bind(now.to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("insert legacy source");
+
+        // 第二轮命中缓存，结果仍是两条事件：第 7 条要清掉，前两条必须留着。
+        service
+            .process_source_posts(
+                "701",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("second process");
+        let identities = source_identities(&store, "prune-post").await;
+        assert!(
+            !identities.iter().any(|identity| identity.ends_with(":7")),
+            "第 7 条事件已经不存在，来源要清掉: {identities:?}"
+        );
+        assert!(
+            identities.contains(&kept_identity),
+            "第 0 条事件还在，来源不能删: {identities:?}"
+        );
+        assert_eq!(
+            store.list_all_schedules().await.expect("schedules").len(),
+            2,
+            "清理来源不该连带删掉日程"
+        );
+    }
+
+    /// 摘要变化会换掉全部 identity：同一序号被新编号覆盖时，旧编号可以清掉，
+    /// 但日程必须原地存活（线上思诺周表就是在这里被连带删掉的）。
+    #[tokio::test]
+    async fn digest_change_keeps_the_schedule_and_replaces_the_source() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("702", "乙"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let start_at = now + Duration::days(1);
+        let analyzer = Arc::new(CountingAnalyzer::new(
+            vec![schedule_event("电台", Some(start_at), "乙")],
+            Vec::new(),
+        ));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let pool = test_pool("fixture-model");
+        let before = dynamic_post(
+            "digest-post",
+            "702",
+            "乙",
+            now,
+            "明天八点电台",
+            vec!["https://i0.hdslb.com/bfs/new_dyn/digest-a.jpg"],
+        );
+        service
+            .process_source_posts(
+                "702",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&before),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("first process");
+        let old_identities = source_identities(&store, "digest-post").await;
+        assert_eq!(old_identities.len(), 1);
+
+        // 同一条动态多挂了一张图：content_digest 变了，identity 全换新。
+        let mut after = before.clone();
+        after
+            .images
+            .push("https://i0.hdslb.com/bfs/new_dyn/digest-b.jpg".to_owned());
+        service
+            .process_source_posts(
+                "702",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&after),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("second process");
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1, "同槽不该因为换摘要变成两条日程");
+        let identities = source_identities(&store, "digest-post").await;
+        assert_eq!(
+            identities.len(),
+            1,
+            "旧摘要那条已被新编号覆盖，只留一条来源: {identities:?}"
+        );
+        assert_ne!(identities[0], old_identities[0], "留下的必须是新摘要的编号");
+    }
+
+    /// 分析失败时一条来源都不许动：模型偶尔看走眼，不能把还能用的场次删掉。
+    #[tokio::test]
+    async fn pruning_skips_everything_when_analysis_failed() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("703", "丙"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let start_at = now + Duration::days(1);
+        let ok_analyzer = Arc::new(CountingAnalyzer::new(
+            vec![schedule_event("电台", Some(start_at), "丙")],
+            Vec::new(),
+        ));
+        let service = AppService::with_analyzer(
+            store.clone(),
+            RuntimeSecrets::default(),
+            ok_analyzer.clone(),
+        )
+        .expect("service");
+        let pool = test_pool("fixture-model");
+        let post = dynamic_post("fail-post", "703", "丙", now, "明天八点电台", Vec::new());
+        service
+            .process_source_posts(
+                "703",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("first process");
+        let before = source_identities(&store, "fail-post").await;
+        assert_eq!(before.len(), 1);
+
+        // 第二轮换成会报错的模型：清理必须整体跳过。
+        let failing = Arc::new(FailingAnalyzer);
+        let failing_service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), failing)
+                .expect("failing service");
+        let mut changed = post.clone();
+        changed.text = "明天八点电台，别错过".to_owned();
+        failing_service
+            .process_source_posts(
+                "703",
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&changed),
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("failing process");
+
+        assert_eq!(
+            source_identities(&store, "fail-post").await,
+            before,
+            "分析失败时来源必须原样保留"
+        );
+        assert_eq!(
+            store.list_all_schedules().await.expect("schedules").len(),
+            1
+        );
+    }
+
+    struct FailingAnalyzer;
+
+    #[async_trait]
+    impl ContentAnalyzer for FailingAnalyzer {
+        async fn analyze_post(
+            &self,
+            _config: &LlmConfig,
+            _input: &PostAnalysisInput,
+        ) -> AppResult<LlmAnalysis> {
+            Err(AppError::External {
+                code: "LLM_TEST".to_owned(),
+                message: "日程模型调用失败".to_owned(),
+            })
+        }
     }
 }
