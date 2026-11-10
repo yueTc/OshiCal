@@ -1431,13 +1431,15 @@ impl AppService {
         let limit = usize::from(settings.llm_parallelism.clamp(1, 8));
         let mut pending: Vec<usize> = (0..sources.len()).collect();
         let mut active_targets = HashSet::new();
+        // Declare shared state before the future set so cancellation drops all
+        // borrowing futures before destroying their progress/pacing state.
+        let source_progress = StdMutex::new(vec![0u8; sources.len()]);
+        let next_fetch_start = Mutex::new(tokio::time::Instant::now());
         let mut running = FuturesUnordered::new();
         let mut outcomes: Vec<Option<SourceRefreshResult>> =
             (0..sources.len()).map(|_| None).collect();
         let mut cancellations: Vec<Vec<PendingCancellation>> =
             (0..sources.len()).map(|_| Vec::new()).collect();
-        let source_progress = StdMutex::new(vec![0u8; sources.len()]);
-        let next_fetch_start = Mutex::new(tokio::time::Instant::now());
         while !pending.is_empty() || !running.is_empty() {
             while running.len() < limit {
                 let Some(position) = next_ready_source(sources, &pending, &active_targets) else {
