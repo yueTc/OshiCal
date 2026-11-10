@@ -1386,12 +1386,12 @@ impl AppService {
             }
         }
         report.cancelled_schedules += self.apply_pending_cancellations(&mut event_state).await?;
-        match self.dedupe_group_schedules().await {
+        match self.dedupe_schedule_duplicates().await {
             Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "merged duplicate group schedules");
+                tracing::info!(removed, "merged duplicate schedules");
             }
             Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "deduplicate group schedules failed"),
+            Err(error) => tracing::warn!(%error, "deduplicate schedules failed"),
         }
         report.refreshed_streamers = refreshed_streamer_ids.len();
         if report.new_schedules > 0 || report.cancelled_schedules > 0 {
@@ -1821,22 +1821,20 @@ impl AppService {
         Ok(stats)
     }
 
-    async fn dedupe_group_schedules(&self) -> AppResult<usize> {
+    async fn dedupe_schedule_duplicates(&self) -> AppResult<usize> {
         let mut schedules = self.store.list_all_schedules().await?;
         schedules.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
         let mut removed_ids = HashSet::new();
         let mut removed = 0;
         for index in 0..schedules.len() {
-            if removed_ids.contains(&schedules[index].id) || schedules[index].participants.len() < 2
-            {
+            if removed_ids.contains(&schedules[index].id) {
                 continue;
             }
             let mut base = schedules[index].clone();
             for duplicate in schedules.iter().skip(index + 1) {
                 if removed_ids.contains(&duplicate.id)
-                    || duplicate.participants.len() < 2
                     || (base.manual_locked && duplicate.manual_locked)
-                    || !group_schedules_equivalent(&base, duplicate)
+                    || !schedules_equivalent(&base, duplicate)
                 {
                     continue;
                 }
@@ -2377,11 +2375,22 @@ impl AppService {
             .await?
         {
             if existing.source_identity.as_deref() != Some(source_identity) {
-                // 卡片场次与模型事件撞在同一个槽位时，标题对不上就各留一条：
-                // 卡片是官方文案，模型说的是另一场，别硬合并。
+                // 预约卡与模型事件同槽但标题对不上时默认保留两条；
+                // 只有同一直播间且同槽时，才视为同一场合并。
+                let same_room = room_owner_mid
+                    .is_some_and(|mid| existing.room_owner_mid.as_deref() == Some(mid))
+                    || room_url.is_some_and(|url| existing.room_url.as_deref() == Some(url));
+                // 预约卡与同一直播间的图文识别经常给出不同标题；同房间且同槽
+                // 仍是同一场，不能因为标题措辞不同就再落一条。
                 let incompatible_reservation = (existing.source_kind == "reserve"
                     || input.source_kind == "reserve")
-                    && !cancellation_titles_match(&existing.title, &input.title);
+                    && !cancellation_titles_match(&existing.title, &input.title)
+                    && !(same_room
+                        && same_schedule_slot(
+                            existing.start_at,
+                            schedule.start_at,
+                            RESERVE_DUPLICATE_TOLERANCE_MINUTES,
+                        ));
                 if !incompatible_reservation {
                     self.store
                         .attach_schedule_source(existing.id, &input)
@@ -3012,7 +3021,9 @@ fn llm_events_equivalent(left: &LlmEvent, right: &LlmEvent) -> bool {
     shared >= 1 && shared * 2 >= min_participants
 }
 
-fn group_schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
+/// 同一场直播在重试或多来源抓取后可能以不同标题落成多条。
+/// 同槽且参与者有强重合，或同一直播间且至少一人重合时，视为同一场。
+fn schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
     let minutes = (left.start_at - right.start_at).num_minutes().abs();
     if minutes > 10 {
         return false;
@@ -4845,7 +4856,10 @@ mod tests {
             .await
             .expect("automatic schedule");
 
-        assert_eq!(service.dedupe_group_schedules().await.expect("dedupe"), 1);
+        assert_eq!(
+            service.dedupe_schedule_duplicates().await.expect("dedupe"),
+            1
+        );
         assert!(
             store
                 .get_schedule(manual.id)
@@ -4854,6 +4868,181 @@ mod tests {
                 .manual_locked
         );
         assert!(store.get_schedule(automatic.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn single_participant_duplicate_sources_dedupe_by_room_and_slot() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("401315430", "星瞳_Official"))
+            .await
+            .expect("streamer");
+        let now = Utc::now();
+        let start = now + Duration::days(2);
+        let end = start + Duration::hours(2) + Duration::minutes(30);
+        let room_url = Some("https://live.bilibili.com/22886883".to_owned());
+        let participants = vec![streamer.name.clone()];
+        let variants = [
+            (
+                "reserve",
+                "星瞳2026年生日会",
+                None,
+                "reserve:post-reserve",
+                "post-reserve",
+            ),
+            (
+                "image",
+                "2026年生日会直播",
+                Some(end),
+                "image:post-image-1:digest:0",
+                "post-image-1",
+            ),
+            (
+                "image",
+                "2026年生日会·偷星大盗",
+                None,
+                "image:post-image-2:digest:0",
+                "post-image-2",
+            ),
+            (
+                "image",
+                "偷星大盗·2026生日会",
+                None,
+                "image:post-image-3:digest:0",
+                "post-image-3",
+            ),
+        ];
+        let mut canonical_id = 0;
+        for (index, (kind, title, end_at, identity, post_id)) in variants.into_iter().enumerate() {
+            let (schedule, _) = store
+                .upsert_schedule(&NewSchedule {
+                    streamer_id: streamer.id,
+                    participants: participants.clone(),
+                    title: title.to_owned(),
+                    start_at: start,
+                    end_at,
+                    room_url: room_url.clone(),
+                    room_owner_mid: Some(streamer.mid.clone()),
+                    room_owner_name: Some(streamer.name.clone()),
+                    source_kind: kind.to_owned(),
+                    source_post_id: Some(post_id.to_owned()),
+                    source_image_url: (kind == "image")
+                        .then(|| format!("https://example.com/{index}.png")),
+                    source_author_mid: Some(streamer.mid.clone()),
+                    source_fingerprint: Some(format!("fingerprint-{index}")),
+                    source_identity: Some(identity.to_owned()),
+                    source_published_at: Some(now + Duration::minutes(index as i64)),
+                    confidence: 0.95,
+                })
+                .await
+                .expect("schedule");
+            if index == 0 {
+                canonical_id = schedule.id;
+            }
+        }
+
+        let service = AppService::new(store.clone(), RuntimeSecrets::default()).expect("service");
+        assert_eq!(
+            service.dedupe_schedule_duplicates().await.expect("dedupe"),
+            3
+        );
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].id, canonical_id);
+        assert_eq!(schedules[0].title, "星瞳2026年生日会");
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(schedules[0].end_at, Some(end));
+        let source_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schedule_sources WHERE schedule_id = ?")
+                .bind(canonical_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("source count");
+        assert_eq!(source_count, 4);
+    }
+
+    #[tokio::test]
+    async fn reservation_and_image_same_room_slot_merge_across_title_wording() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let streamer = store
+            .add_subscription(&subscription("401315430", "星瞳_Official"))
+            .await
+            .expect("streamer");
+        let service = AppService::new(store.clone(), RuntimeSecrets::default()).expect("service");
+        let now = Utc::now();
+        let start = now + Duration::days(2);
+        let room_url = "https://live.bilibili.com/22886883";
+        let (reserved, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: streamer.id,
+                participants: vec![streamer.name.clone()],
+                title: "星瞳2026年生日会".to_owned(),
+                start_at: start,
+                end_at: None,
+                room_url: Some(room_url.to_owned()),
+                room_owner_mid: Some(streamer.mid.clone()),
+                room_owner_name: Some(streamer.name.clone()),
+                source_kind: "reserve".to_owned(),
+                source_post_id: Some("reserve-post".to_owned()),
+                source_image_url: None,
+                source_author_mid: Some(streamer.mid.clone()),
+                source_fingerprint: Some("reserve-fingerprint".to_owned()),
+                source_identity: Some("reserve:reserve-post".to_owned()),
+                source_published_at: Some(now),
+                confidence: 0.95,
+            })
+            .await
+            .expect("reserved schedule");
+        let post = DynamicPost {
+            id: "image-post".to_owned(),
+            author_mid: streamer.mid.clone(),
+            author_name: streamer.name.clone(),
+            published_at: now + Duration::minutes(1),
+            text: "生日会海报".to_owned(),
+            images: vec!["https://example.com/birthday.png".to_owned()],
+            source_url: "https://t.bilibili.com/image-post".to_owned(),
+            raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
+            reserve: None,
+        };
+        let candidate = ParsedSchedule {
+            title: "偷星大盗·2026生日会".to_owned(),
+            start_at: start,
+            end_at: None,
+            confidence: 0.98,
+        };
+        let participants = vec![streamer.name.clone()];
+        let inserted = service
+            .upsert_candidate(
+                &streamer,
+                &candidate,
+                "image",
+                &post,
+                "https://example.com/birthday.png",
+                "image:image-post:digest:0",
+                "image-fingerprint",
+                Some(room_url),
+                Some(streamer.mid.as_str()),
+                Some(streamer.name.as_str()),
+                &participants,
+            )
+            .await
+            .expect("upsert candidate");
+
+        assert!(!inserted);
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].id, reserved.id);
+        assert_eq!(schedules[0].title, "星瞳2026年生日会");
+        let image_source_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedule_sources
+             WHERE schedule_id = ? AND source_identity = ?",
+        )
+        .bind(reserved.id)
+        .bind("image:image-post:digest:0")
+        .fetch_one(store.pool())
+        .await
+        .expect("image source");
+        assert_eq!(image_source_count, 1);
     }
 
     #[test]

@@ -177,11 +177,31 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
           path: packages
           merge-multiple: true
+
+      - name: Locate server release notes
+        id: release_notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t notes < <(find docs -maxdepth 1 -type f -name "*-release-server-${VERSION}.md" -print)
+          if (( ${#notes[@]} != 1 )); then
+            echo "版本 $VERSION 必须恰好有一份 docs/*-release-server-$VERSION.md，实际 ${#notes[@]} 份" >&2
+            exit 1
+          fi
+          test -s "${notes[0]}"
+          printf 'path=%s\n' "${notes[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Checksums
         shell: bash
@@ -206,6 +226,7 @@ jobs:
           TAG: ${{ needs.meta.outputs.tag }}
           VERSION: ${{ needs.meta.outputs.version }}
           CHANNEL: ${{ needs.meta.outputs.channel }}
+          RELEASE_NOTES: ${{ steps.release_notes.outputs.path }}
         run: |
           set -euo pipefail
           for attempt in $(seq 1 60); do
@@ -227,7 +248,7 @@ jobs:
           gh release create "$TAG" --repo "$REPOSITORY" \
             --target "$GITHUB_SHA" "${release_flags[@]}" \
             --title "OshiCal Server v$VERSION" \
-            --notes "服务端 $VERSION（$CHANNEL）。编译产物：linux-x86_64.tar.gz、windows-x86_64.zip；镜像清单见 $manifest_tag。"
+            --notes-file "$RELEASE_NOTES"
 
       - name: Upload binaries
         shell: bash

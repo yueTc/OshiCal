@@ -3110,13 +3110,14 @@ dependencies = [
 
 [[package]]
 name = "oshical-desktop"
-version = "0.3.21-beta.1"
+version = "0.3.21-beta.2"
 dependencies = [
  "chrono",
  "futures-util",
  "keyring",
  "oshical-core",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -3136,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-server"
-version = "0.3.29-beta.1"
+version = "0.3.29-beta.2"
 dependencies = [
  "aes-gcm",
  "axum",

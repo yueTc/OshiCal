@@ -46,7 +46,23 @@ jobs:
 
       - name: Rust format and lint
         if: ${{ !cancelled() }}
-        run: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $output = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Tee-Object -Variable clippyOutput
+          $clippyExit = $LASTEXITCODE
+          if ($clippyExit -ne 0) {
+            $clippyOutput |
+              Where-Object { $_ -match '^(error|warning)(\[|:)|^\s*-->' } |
+              Select-Object -First 25 |
+              ForEach-Object {
+                $message = $_.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                Write-Host "::error title=Rust clippy::$message"
+              }
+          }
+          exit $clippyExit
 
       - name: Frontend tests
         if: ${{ !cancelled() }}

@@ -142,6 +142,25 @@ jobs:
             }
           }
 
+      - name: Load desktop release notes
+        id: release_notes
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = @(Get-ChildItem -Path 'docs' -File -Filter "*-release-desktop-$env:VERSION.md")
+          if ($notes.Count -ne 1) {
+            throw "版本 $env:VERSION 必须恰好有一份 docs/*-release-desktop-$env:VERSION.md，实际 $($notes.Count) 份"
+          }
+          $body = Get-Content -Raw -LiteralPath $notes[0].FullName
+          if ([string]::IsNullOrWhiteSpace($body)) {
+            throw "发布说明为空：$($notes[0].FullName)"
+          }
+          $delimiter = "OSHICAL_RELEASE_NOTES_$([guid]::NewGuid().ToString('N'))"
+          "body<<$delimiter" >> $env:GITHUB_OUTPUT
+          $body >> $env:GITHUB_OUTPUT
+          $delimiter >> $env:GITHUB_OUTPUT
+
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -181,12 +200,7 @@ jobs:
         with:
           tagName: desktop-v__VERSION__
           releaseName: "OshiCal Desktop v__VERSION__"
-          releaseBody: |
-            Windows 安装包与自动更新清单由 GitHub Actions 自动生成。
-
-            - 普通用户请下载 NSIS 安装包。
-            - 已安装 OshiCal 的用户可在“设置 → 软件更新”中检查更新。
-            - 更新包使用 Tauri 签名校验；Windows Authenticode 代码签名需另行配置。
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           uploadUpdaterJson: true

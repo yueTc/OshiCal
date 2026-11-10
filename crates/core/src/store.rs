@@ -1772,7 +1772,7 @@ impl SqliteStore {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() != 1 {
-                return Err(AppError::validation("团播日程在合并期间已被修改"));
+                return Err(AppError::validation("日程在合并期间已被修改"));
             }
             self.emit_schedule_change(&mut tx, canonical_id, "upsert", SyncActor::collector())
                 .await?;
@@ -1803,7 +1803,7 @@ impl SqliteStore {
             )
             .await?
         {
-            return Err(AppError::validation("团播日程在删除期间已被修改"));
+            return Err(AppError::validation("日程在删除期间已被修改"));
         }
         tx.commit().await?;
         Ok(true)

@@ -27,6 +27,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
       digest: ${{ steps.build.outputs.digest }}
+      release_notes: ${{ steps.release_notes.outputs.path }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -133,6 +134,21 @@ jobs:
             exit 1
           fi
 
+      - name: Validate server release notes
+        id: release_notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t notes < <(find docs -maxdepth 1 -type f -name "*-release-server-${VERSION}.md" -print)
+          if (( ${#notes[@]} != 1 )); then
+            echo "版本 $VERSION 必须恰好有一份 docs/*-release-server-$VERSION.md，实际 ${#notes[@]} 份" >&2
+            exit 1
+          fi
+          test -s "${notes[0]}"
+          printf 'path=%s\n' "${notes[0]}" >> "$GITHUB_OUTPUT"
+
       - name: Verify server tag matches version
         if: startsWith(github.ref, 'refs/tags/server-v')
         shell: bash
@@ -189,12 +205,24 @@ jobs:
       CHANNEL: ${{ needs.build.outputs.channel }}
       DIGEST: ${{ needs.build.outputs.digest }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Publish fixed and signed server updater manifest
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPDATE_SIGNING_KEY: ${{ secrets.OSHICAL_SERVER_UPDATE_HMAC_KEY }}
+          RELEASE_NOTES: ${{ needs.build.outputs.release_notes }}
         run: |
+          set -euo pipefail
+          release_notes_file="$RUNNER_TEMP/oshical-server-release-notes.md"
+          {
+            cat "$RELEASE_NOTES"
+            printf '\n\n---\n\n发布版本：`%s`；渠道：`%s`；镜像摘要：`%s`。\n' "$VERSION" "$CHANNEL" "$DIGEST"
+          } > "$release_notes_file"
           manifest_dir="$RUNNER_TEMP/server-updater"
           manifest="$manifest_dir/latest-server.json"
           if [[ "$CHANNEL" == "beta" ]]; then
@@ -299,7 +327,7 @@ jobs:
           gh release create "$version_tag" "$manifest" "$legacy_manifest" \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" "${release_flags[@]}" \
             --title "OshiCal Server v$VERSION" \
-            --notes "服务端 $VERSION（$CHANNEL）。镜像：$IMAGE_REPOSITORY@$DIGEST。宿主更新代理升级前须配置 /etc/oshical/updater-hmac.key。"
+            --notes-file "$release_notes_file"
 
           if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$release_tag" --repo "$GITHUB_REPOSITORY" \
@@ -314,5 +342,5 @@ jobs:
           gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" \
             --latest=false \
             --title "$release_title" \
-            --notes "$release_note $GITHUB_REF_NAME 发布版本：$VERSION；渠道：$CHANNEL；镜像摘要：$DIGEST。"
+            --notes "$release_note"
           echo "Published signed server manifest version=$VERSION imageDigest=$DIGEST"
