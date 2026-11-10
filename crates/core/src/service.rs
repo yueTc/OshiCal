@@ -1233,6 +1233,29 @@ impl AppService {
         progress: Option<&ProgressTarget>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> AppResult<RefreshReport> {
+        let fetch = |mid: String| {
+            let bili = self.bili_client();
+            async move { bili.fetch_dynamics(&mid, 20).await }
+        };
+        self.refresh_sources_with_fetcher(sources, settings, llm, progress, on_progress, &fetch)
+            .await
+    }
+
+    // Private transport seam: fixtures exercise the real refresh pipeline,
+    // while production always uses BilibiliClient above.
+    async fn refresh_sources_with_fetcher<Fetch, FetchFuture>(
+        &self,
+        sources: &[(String, Vec<Streamer>)],
+        settings: &AppSettings,
+        llm: Option<&PostAnalyzer>,
+        progress: Option<&ProgressTarget>,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+        fetch: &Fetch,
+    ) -> AppResult<RefreshReport>
+    where
+        Fetch: Fn(String) -> FetchFuture + Sync,
+        FetchFuture: std::future::Future<Output = AppResult<Vec<DynamicPost>>> + Send,
+    {
         let mut report = RefreshReport {
             refreshed_streamers: 0,
             failed_streamers: Vec::new(),
@@ -1261,7 +1284,7 @@ impl AppService {
                     on_progress,
                 );
             }
-            match self.bili_client().fetch_dynamics(source_mid, 20).await {
+            match fetch(source_mid.clone()).await {
                 Ok(posts) => {
                     let stats = self
                         .process_source_posts_with_progress(
@@ -7571,6 +7594,175 @@ mod tests {
         let high_call = analyzer.last_call();
         assert_eq!(high_call.reasoning_effort, ReasoningEffort::High);
         assert_eq!(high_call.reasoning_effort.as_request_value(), Some("high"));
+    }
+
+    struct StreamerConcurrencyAnalyzer {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        active_by_author: std::sync::Mutex<HashSet<String>>,
+        order: std::sync::Mutex<HashMap<String, Vec<String>>>,
+        barrier: Option<tokio::sync::Barrier>,
+    }
+
+    impl StreamerConcurrencyAnalyzer {
+        fn new(parallel: bool) -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                active_by_author: std::sync::Mutex::new(HashSet::new()),
+                order: std::sync::Mutex::new(HashMap::new()),
+                barrier: parallel.then(|| tokio::sync::Barrier::new(2)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContentAnalyzer for StreamerConcurrencyAnalyzer {
+        async fn analyze_post(
+            &self,
+            _config: &LlmConfig,
+            input: &PostAnalysisInput,
+        ) -> AppResult<LlmAnalysis> {
+            assert!(
+                self.active_by_author
+                    .lock()
+                    .unwrap()
+                    .insert(input.author.clone()),
+                "same streamer must never overlap"
+            );
+            self.order
+                .lock()
+                .unwrap()
+                .entry(input.author.clone())
+                .or_default()
+                .push(input.text.clone());
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let paired = match &self.barrier {
+                Some(barrier) => {
+                    tokio::time::timeout(std::time::Duration::from_millis(900), barrier.wait())
+                        .await
+                        .is_ok()
+                }
+                None => true,
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.active_by_author.lock().unwrap().remove(&input.author);
+            if !paired {
+                return Err(AppError::validation(
+                    "fixture: another streamer never started",
+                ));
+            }
+            let offset = if input.text == "second" { 2 } else { 1 };
+            let events = vec![schedule_event(
+                &input.text,
+                Some(input.published_at + Duration::days(2) + Duration::hours(offset)),
+                &input.author,
+            )];
+            Ok(LlmAnalysis {
+                raw: events_to_model_json(&events),
+                events,
+                source_digest: "fixture".to_owned(),
+            })
+        }
+    }
+
+    async fn assert_streamer_refresh_parallelism(parallelism: u8) {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let analyzer = Arc::new(StreamerConcurrencyAnalyzer::new(parallelism > 1));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let mut sources = Vec::new();
+        let mut posts_by_mid = HashMap::new();
+        let now = Utc::now();
+        for index in 0..4 {
+            let mid = format!("900{index}");
+            let name = format!("主播{index}");
+            let streamer = store
+                .add_subscription(&subscription(&mid, &name))
+                .await
+                .unwrap();
+            // Reverse API order: each streamer's processing must still be oldest-first.
+            posts_by_mid.insert(
+                mid.clone(),
+                vec![
+                    dynamic_post(
+                        &format!("{mid}-second"),
+                        &mid,
+                        &name,
+                        now + Duration::minutes(1),
+                        "second",
+                        Vec::new(),
+                    ),
+                    dynamic_post(
+                        &format!("{mid}-first"),
+                        &mid,
+                        &name,
+                        now,
+                        "first",
+                        Vec::new(),
+                    ),
+                ],
+            );
+            sources.push((mid, vec![streamer]));
+        }
+        let fetch = |mid: String| {
+            let posts = posts_by_mid[&mid].clone();
+            async move { Ok(posts) }
+        };
+        let settings = AppSettings {
+            llm_parallelism: parallelism,
+            ..AppSettings::default()
+        };
+        let pool = PostAnalyzer {
+            config: test_pool("fixture-model").config,
+            pool: LlmPool::new(parallelism),
+        };
+        let reports = std::sync::Mutex::new(Vec::new());
+        let report = service
+            .refresh_sources_with_fetcher(
+                &sources,
+                &settings,
+                Some(&pool),
+                Some(&ProgressTarget::all()),
+                &|p| reports.lock().unwrap().push(p),
+                &fetch,
+            )
+            .await
+            .unwrap();
+        assert!(
+            report.failed_streamers.is_empty(),
+            "{:?}",
+            report.failed_streamers
+        );
+        assert_eq!(report.refreshed_streamers, 4);
+        assert_eq!(report.llm_calls, 8);
+        assert_eq!(
+            analyzer.peak.load(Ordering::SeqCst),
+            usize::from(parallelism)
+        );
+        for order in analyzer.order.lock().unwrap().values() {
+            assert_eq!(order, &["first", "second"]);
+        }
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 8);
+        let reports = reports.lock().unwrap();
+        assert!(
+            reports
+                .windows(2)
+                .all(|pair| pair[0].percent <= pair[1].percent),
+            "global progress must not go backwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_streamers_actually_refresh_in_parallel() {
+        assert_streamer_refresh_parallelism(2).await;
+    }
+
+    #[tokio::test]
+    async fn one_streamer_at_a_time_when_parallelism_is_one() {
+        assert_streamer_refresh_parallelism(1).await;
     }
 
     /// 并发许可数就是并行个数：许可用尽后新的请求必须排队。
