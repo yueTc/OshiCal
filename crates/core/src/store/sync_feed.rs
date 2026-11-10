@@ -2121,8 +2121,6 @@ mod tests {
         )
         .await;
         writer.rollback().await.expect("release writer");
-        store.pool.close().await;
-        tokio::fs::remove_dir_all(directory).await.expect("cleanup");
         assert_eq!(
             count_result
                 .expect("count lookup must not acquire a writer")
@@ -2138,6 +2136,25 @@ mod tests {
                 .expect("prune"),
             0
         );
+        store.pool.close().await;
+        drop(store);
+        // SQLx's SQLite worker may release the last OS file handle shortly
+        // after pool closure. Windows refuses directory removal until then.
+        // Retry ONLY that teardown race; never relax the lock assertions above.
+        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::fs::remove_dir_all(&directory).await {
+                Ok(()) => break,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32))
+                        && tokio::time::Instant::now() < cleanup_deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("cleanup after SQLite worker shutdown: {error}"),
+            }
+        }
     }
 
     #[tokio::test]
