@@ -72,7 +72,7 @@ docs/                 设计与发布文档
 
 首次启动需要配置 OpenAI 兼容的模型接口，未配置时文字与图片解析不会运行。B 站动态接口存在风控，必要时在设置中填写可选的 SESSDATA。
 
-应用内更新位于「设置 → 软件更新」，使用 Tauri Updater 校验签名；GitHub 访问受限时可在同一卡片填写镜像地址（例如 `https://gh-proxy.com/`）。
+应用内更新位于「设置 → 软件更新」，可选择正式版或测试版渠道，并使用 Tauri Updater 校验签名；GitHub 访问受限时可在同一卡片填写镜像地址（例如 `https://gh-proxy.com/`）。
 
 安装包未做 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。
 
@@ -97,7 +97,7 @@ docker compose up -d --no-deps oshical
 Invoke-RestMethod http://127.0.0.1:8787/api/health
 ```
 
-镜像：`ghcr.io/yuetc/oshical-server:<版本>` / `:latest`。Web 界面在 `http://<host>:8787`，使用 Bearer Token 登录，数据持久化在 `./data`。
+镜像：`ghcr.io/yuetc/oshical-server:<版本>`；正式通道为 `:latest`，测试通道为 `:beta`。Web 界面在 `http://<host>:8787`，使用 Bearer Token 登录，数据持久化在 `./data`。
 
 ### 二进制压缩包
 
@@ -196,26 +196,46 @@ npx tauri build --bundles nsis
 
 ## 发布
 
-桌面端与服务端使用独立版本号与独立标签：
+桌面端与服务端使用独立版本号、独立标签和 `stable / beta` 双更新渠道。默认发布节奏是：
+
+1. 有改动时只前进一个 PATCH 版本，例如 `0.3.20 -> 0.3.21`。
+2. 先生成测试版 `0.3.21-beta.1` 并发布；同一 PATCH 的后续测试版只递增 `beta.N`，不再次前进 PATCH。
+3. 测试通过后询问是否发布正式版；确认后把同一核心版本提升为 `0.3.21`。
+4. 正式版发布前不再前进新的 PATCH。只有用户明确要求时才允许 MINOR / MAJOR 升级。
 
 ```powershell
-node scripts/set-version.mjs desktop 0.3.20
-git tag desktop-v0.3.20
+# 默认：桌面端下一个测试版；服务端同理使用 server
+npm run version:next-beta -- desktop
+git tag desktop-v0.3.21-beta.1
+git push origin desktop-v0.3.21-beta.1
 
-node scripts/set-version.mjs server 0.3.28
-git tag server-v0.3.28
+# 仅当用户确认发布正式版后：同核心版本去掉 -beta.N，不再加 PATCH
+npm run version:promote-stable -- desktop
+git tag desktop-v0.3.21
+git push origin desktop-v0.3.21
+
+npm run version:next-beta -- server
+git tag server-v0.3.29-beta.1
+git push origin server-v0.3.29-beta.1
 ```
 
-- `desktop-v*`：构建 NSIS 安装包、更新签名与 `latest.json`。
-- `server-v*`：构建 GHCR 镜像与 Linux / Windows 二进制，并更新 `server-latest` 清单（prerelease，不覆盖桌面端的 latest）。
+- `desktop-v*`：构建 NSIS 安装包、更新签名与 `latest.json`。带 `-beta.N` 的版本标记为 prerelease，并同步到固定 `desktop-beta` 清单。
+- `server-v*`：构建 GHCR 镜像与 Linux / Windows 二进制。正式版更新 `server-latest`；测试版更新 `server-beta`，不移动 Docker `latest`。
 - 仓库需配置 `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；服务端更新代理另用 `OSHICAL_SERVER_UPDATE_HMAC_KEY` 签发清单。
 
 更新地址：
 
 ```text
+# 桌面正式版 / 服务端正式版
 https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
 https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.json
+
+# 桌面测试版 / 服务端测试版
+https://github.com/yueTc/OshiCal/releases/download/desktop-beta/latest-beta.json
+https://github.com/yueTc/OshiCal/releases/download/server-beta/latest-server.json
 ```
+
+客户端和服务端设置页均可选择正式版或测试版渠道。测试版渠道会同时比较正式版与测试版清单，并按 SemVer 选择更高版本，因此支持正式版升测试版，也支持测试版在正式版更高时切回正式版；不会自动降级。
 
 设计与回滚流程见 [docs/11-github-release-and-updater-plan.md](docs/11-github-release-and-updater-plan.md)。
 

@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { nextBetaVersion, promoteStableVersion } from "./versioning.mjs";
 
 const rawTarget = process.argv[2];
-const version = process.argv[3];
+const lifecycleMode = process.env.npm_lifecycle_event === "version:next-beta"
+  ? "next-beta"
+  : process.env.npm_lifecycle_event === "version:promote-stable"
+    ? "promote-stable"
+    : undefined;
+const requestedVersion = process.argv[3] ?? lifecycleMode;
 const target = rawTarget === "client" ? "desktop" : rawTarget;
 const targets = new Set(["desktop", "server", "core"]);
+const versionModes = new Set(["next-beta", "promote-stable"]);
 
-if (!targets.has(target) || !version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-  console.error("用法: node scripts/set-version.mjs <desktop|server|core> <semver>");
+if (!targets.has(target) || !requestedVersion) {
+  console.error("用法: node scripts/set-version.mjs <desktop|server|core> <semver|next-beta|promote-stable>");
+  console.error("或: npm run version:next-beta|version:promote-stable -- <desktop|server>");
   process.exit(1);
 }
 
@@ -40,6 +48,56 @@ function updateCargoPackageVersion(path) {
     throw new Error("未在 [package] 中找到版本字段: " + path);
   }
   fs.writeFileSync(path, lines.join("\n"), "utf8");
+}
+
+function readJsonVersion(path) {
+  return JSON.parse(fs.readFileSync(path, "utf8")).version;
+}
+
+function readCargoPackageVersion(path) {
+  const lines = fs.readFileSync(path, "utf8").split(/\r?\n/);
+  let inPackage = false;
+  for (const line of lines) {
+    if (line.trim() === "[package]") {
+      inPackage = true;
+      continue;
+    }
+    if (inPackage && line.startsWith("[")) {
+      break;
+    }
+    if (inPackage && line.startsWith("version = ")) {
+      return line.match(/^version = "([^"]+)"$/)?.[1];
+    }
+  }
+  throw new Error("未在 [package] 中找到版本字段: " + path);
+}
+
+function readWorkspaceVersion(path) {
+  const lines = fs.readFileSync(path, "utf8").split(/\r?\n/);
+  let inWorkspacePackage = false;
+  for (const line of lines) {
+    if (line.trim() === "[workspace.package]") {
+      inWorkspacePackage = true;
+      continue;
+    }
+    if (inWorkspacePackage && line.startsWith("[")) {
+      break;
+    }
+    if (inWorkspacePackage && line.startsWith("version = ")) {
+      return line.match(/^version = "([^"]+)"$/)?.[1];
+    }
+  }
+  throw new Error("未在 [workspace.package] 中找到版本字段");
+}
+
+function currentVersion() {
+  if (target === "desktop") {
+    return readJsonVersion("package.json");
+  }
+  if (target === "server") {
+    return readCargoPackageVersion("server/Cargo.toml");
+  }
+  return readWorkspaceVersion("Cargo.toml");
 }
 
 function updateWorkspaceVersion(path) {
@@ -84,6 +142,27 @@ function updateLockPackageVersion(names) {
     throw new Error("Cargo.lock 包版本更新不完整: " + updated + "/" + names.size);
   }
   fs.writeFileSync(lockPath, blocks.join(""), "utf8");
+}
+
+let version = requestedVersion;
+if (versionModes.has(requestedVersion)) {
+  if (target === "core") {
+    console.error("版本节奏命令只适用于 desktop / server");
+    process.exit(1);
+  }
+  const current = currentVersion();
+  try {
+    version = requestedVersion === "next-beta"
+      ? nextBetaVersion(current)
+      : promoteStableVersion(current);
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+  console.log(`版本节奏: ${current} -> ${version}`);
+} else if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+  console.error("版本号必须是 SemVer，例如 0.3.21 或 0.3.21-beta.1");
+  process.exit(1);
 }
 
 if (target === "desktop") {

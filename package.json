@@ -1,7 +1,7 @@
 {
   "name": "oshical",
   "private": true,
-  "version": "0.3.20",
+  "version": "0.3.21-beta.1",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -16,9 +16,11 @@
     "dev:desktop": "tauri dev",
     "dev:server": "cargo run -p oshical-server",
     "test": "cargo test --workspace",
-    "test:web": "node --experimental-strip-types --test scripts/live-schedule.test.ts scripts/server-url.test.ts scripts/github-mirror.test.ts scripts/fan-history.test.ts scripts/timeline-layout.test.ts scripts/fertility.test.ts scripts/updater-agent.test.ts",
+    "test:web": "node --experimental-strip-types --test scripts/live-schedule.test.ts scripts/server-url.test.ts scripts/github-mirror.test.ts scripts/fan-history.test.ts scripts/timeline-layout.test.ts scripts/fertility.test.ts scripts/updater-agent.test.ts scripts/versioning.test.ts",
     "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && tsc -b --pretty false",
-    "version:set": "node scripts/set-version.mjs"
+    "version:set": "node scripts/set-version.mjs",
+    "version:next-beta": "node scripts/set-version.mjs",
+    "version:promote-stable": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

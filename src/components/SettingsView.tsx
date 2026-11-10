@@ -34,6 +34,7 @@ import type {
   ServerUpdateInfo,
   ServerUpdateSettings,
   DataMode,
+  UpdateChannel,
 } from "../types";
 import { LLM_PARALLELISM_MAX, LLM_PARALLELISM_MIN } from "../types";
 import type { SecretInput } from "../lib/secret-types";
@@ -53,7 +54,9 @@ import {
   currentAppVersion,
   downloadAndInstallUpdate,
   formatBytes,
+  readUpdateChannel,
   relaunchApplication,
+  saveUpdateChannel,
   type AvailableUpdate,
   type UpdateProgress,
 } from "../lib/updater";
@@ -111,6 +114,7 @@ const LLM_REASONING_OPTIONS: ReadonlyArray<{ value: LlmReasoningEffort; label: s
 
 function serverUpdateSettingsFromInfo(info: ServerUpdateInfo): ServerUpdateSettings {
   return {
+    channel: info.channel,
     autoCheckEnabled: info.autoCheckEnabled,
     autoUpdateEnabled: info.autoUpdateEnabled,
     updateWindowStart: info.updateWindowStart,
@@ -127,7 +131,8 @@ function serverUpdateAutoSettingsEqual(left: ServerUpdateSettings, right: Server
 }
 
 function serverUpdateSettingsEqual(left: ServerUpdateSettings, right: ServerUpdateSettings): boolean {
-  return serverUpdateAutoSettingsEqual(left, right)
+  return left.channel === right.channel
+    && serverUpdateAutoSettingsEqual(left, right)
     && left.githubMirrorUrl === right.githubMirrorUrl;
 }
 
@@ -285,6 +290,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [leavePromptOpen, setLeavePromptOpen] = useState(false);
   const [leaveSaving, setLeaveSaving] = useState(false);
   const [appVersion, setAppVersion] = useState("");
+  const [updateChannel, setUpdateChannel] = useState<UpdateChannel>(readUpdateChannel);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<AvailableUpdate | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -293,6 +299,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress>({ downloaded: 0, total: null });
   const [serverUpdate, setServerUpdate] = useState<ServerUpdateInfo | null>(null);
   const [serverUpdateDraft, setServerUpdateDraft] = useState<ServerUpdateSettings>({
+    channel: "stable",
     autoCheckEnabled: true,
     autoUpdateEnabled: false,
     updateWindowStart: "03:00",
@@ -1155,7 +1162,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     setUpdateInstalled(false);
     setUpdateProgress({ downloaded: 0, total: null });
     try {
-      const update = await checkForUpdate();
+      const update = await checkForUpdate(updateChannel);
       setUpdateInfo(update);
       setUpdateStatus(update ? `发现新版本 v${update.version}` : "当前已是最新版本");
     } catch (updateError) {
@@ -1183,7 +1190,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             ? `正在下载 ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
             : `已下载 ${formatBytes(progress.downloaded)}`,
         );
-      });
+      }, updateChannel);
       setUpdateInstalled(true);
       setUpdateStatus("更新已安装，应用即将重启。");
     } catch (updateError) {
@@ -1192,6 +1199,21 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       updateActionRef.current = null;
       setUpdateInstalling(false);
     }
+  }
+
+  function switchUpdateChannel(channel: UpdateChannel) {
+    if (updateChecking || updateInstalling || channel === updateChannel) {
+      return;
+    }
+    setUpdateChannel(saveUpdateChannel(channel));
+    setUpdateInfo(null);
+    setUpdateInstalled(false);
+    setUpdateProgress({ downloaded: 0, total: null });
+    setUpdateStatus(
+      channel === "beta"
+        ? "已切换到测试版渠道，将同时检查测试版和正式版中更高的版本。"
+        : "已切换到正式版渠道，仅检查正式版更新。",
+    );
   }
 
   async function restartForUpdate() {
@@ -1333,6 +1355,32 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </span>
               <span>由宿主机 systemd 更新代理执行镜像拉取、备份、重启和失败回滚。</span>
             </header>
+            <div className="update-channel-row server-update-channel">
+              <div>
+                <strong>服务器更新渠道</strong>
+                <span>
+                  测试版会同时比较服务器测试版和正式版清单；切换后点“保存更新设置”生效。
+                </span>
+              </div>
+              <div className="segmented" role="group" aria-label="服务器更新渠道">
+                <button
+                  type="button"
+                  className={serverUpdateDraft.channel === "stable" ? "active" : undefined}
+                  onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "stable" }))}
+                  disabled={serverUpdateLoading !== null || serverUpdateActive}
+                >
+                  正式版
+                </button>
+                <button
+                  type="button"
+                  className={serverUpdateDraft.channel === "beta" ? "active" : undefined}
+                  onClick={() => updateServerUpdateDraft((current) => ({ ...current, channel: "beta" }))}
+                  disabled={serverUpdateLoading !== null || serverUpdateActive}
+                >
+                  测试版
+                </button>
+              </div>
+            </div>
             <div className="server-update-metrics">
               <div>
                 <span>当前版本</span>
@@ -1341,6 +1389,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <div>
                 <span>最新版本</span>
                 <strong>{serverUpdate?.latestVersion ? `v${serverUpdate.latestVersion}` : "尚未检查"}</strong>
+                {serverUpdate?.latestVersion && serverUpdate.latestChannel ? (
+                  <small>{serverUpdate.latestChannel === "beta" ? "测试版" : "正式版"}</small>
+                ) : null}
               </div>
               <div>
                 <span>更新状态</span>
@@ -1663,9 +1714,35 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <span className="setting-scope local">仅桌面端</span>
               <span>从 GitHub Releases 检查并安装经过 Tauri 签名校验的更新。</span>
             </header>
+            <div className="update-channel-row">
+              <div>
+                <strong>更新渠道</strong>
+                <span>
+                  正式版只读取正式清单；测试版会同时比较测试版与正式版，并仅升级到更高版本。
+                </span>
+              </div>
+              <div className="segmented" role="group" aria-label="桌面端更新渠道">
+                <button
+                  type="button"
+                  className={updateChannel === "stable" ? "active" : undefined}
+                  onClick={() => switchUpdateChannel("stable")}
+                  disabled={updateChecking || updateInstalling}
+                >
+                  正式版
+                </button>
+                <button
+                  type="button"
+                  className={updateChannel === "beta" ? "active" : undefined}
+                  onClick={() => switchUpdateChannel("beta")}
+                  disabled={updateChecking || updateInstalling}
+                >
+                  测试版
+                </button>
+              </div>
+            </div>
             <div className="update-version-row">
               <div className="update-version">
-                <span>当前版本</span>
+                <span>当前版本 · {updateChannel === "beta" ? "测试版渠道" : "正式版渠道"}</span>
                 <strong>{appVersion ? `v${appVersion}` : "读取中…"}</strong>
               </div>
               <button className="button secondary" onClick={() => void checkUpdates()} disabled={updateChecking || updateInstalling}>

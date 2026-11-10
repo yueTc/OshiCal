@@ -627,7 +627,10 @@ export interface SyncAckResult {
   seq: number;
 }
 
+export type UpdateChannel = "stable" | "beta";
+
 export interface ServerUpdateSettings {
+  channel: UpdateChannel;
   autoCheckEnabled: boolean;
   autoUpdateEnabled: boolean;
   updateWindowStart: string;
@@ -638,6 +641,7 @@ export interface ServerUpdateSettings {
 export interface ServerUpdateInfo extends ServerUpdateSettings {
   currentVersion: string;
   latestVersion: string | null;
+  latestChannel: UpdateChannel | null;
   updateAvailable: boolean;
   status: string;
   phase: string;

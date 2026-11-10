@@ -461,7 +461,7 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 
 ## 15. 服务端镜像更新
 
-- GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetc/oshical-server:<版本号>` 和 `latest` 镜像。
+- GitHub Actions 在版本标签发布时构建 `ghcr.io/yuetc/oshical-server:<版本号>`；正式版同时更新 `latest`，测试版同时更新 `beta`，测试版不得覆盖 `latest`。
 - `scripts/update-server.sh` 负责镜像比较、数据备份、更新、健康检查和失败回滚。
 - 默认不挂载 Docker Socket；自动更新由宿主机 cron 调度更新脚本。
 
@@ -477,3 +477,62 @@ GitHub 静态 `latest.json` 不适合自动降级，建议：
 - 客户端 GitHub 镜像保存在当前设备 localStorage，只影响桌面端更新检查和下载。
 - 服务端 GitHub 镜像保存在服务端更新设置文件中，只影响服务器版本检查。
 - 两端优先走镜像，失败自动回退 GitHub 直连。
+
+## 18. 正式版 / 测试版双渠道
+
+### 18.1 目标
+
+- 桌面客户端与服务端均支持 `stable` 和 `beta` 更新渠道。
+- 正式版用户可以切换到测试版；测试版用户在正式版版本更高时可以切回正式版。
+- 测试版发布不能移动正式版 `latest` 清单，也不能覆盖 Docker `latest` 标签。
+- 双渠道仍保留 Tauri 更新签名或服务端 HMAC 清单校验，不降低现有安全边界。
+
+### 18.2 清单地址
+
+```text
+桌面正式版：https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
+桌面测试版：https://github.com/yueTc/OshiCal/releases/download/desktop-beta/latest-beta.json
+服务端正式版：https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.json
+服务端测试版：https://github.com/yueTc/OshiCal/releases/download/server-beta/latest-server.json
+```
+
+- 正式版 Release 使用 `desktop-vX.Y.Z` / `server-vX.Y.Z`，不能带预发布后缀。
+- 测试版 Release 使用 `desktop-vX.Y.Z-beta.N` / `server-vX.Y.Z-beta.N`，并标记为 prerelease。
+- 固定 `desktop-beta` / `server-beta` Release 只承载测试版清单，使用 `--latest=false`。
+- 测试版渠道会同时检查正式版与测试版清单，选择 SemVer 更高的版本；正式版渠道只检查正式版清单。
+
+### 18.3 版本节奏
+
+1. 有改动时只前进一个 PATCH：`X.Y.Z -> X.Y.(Z+1)`。
+2. 先发布 `X.Y.(Z+1)-beta.1`。
+3. 同一 PATCH 的后续测试版只递增 `beta.N`，不再次前进 PATCH。
+4. 测试完成后询问用户是否发布正式版。
+5. 用户确认后发布同核心版本 `X.Y.(Z+1)`，不再额外增加 PATCH。
+6. 正式版发布前，不得开始下一 PATCH。MINOR / MAJOR 升级必须由用户当次明确要求。
+
+发布流水线会读取已发布的正式版和测试版清单，并由 `scripts/check-release-version.py` 拒绝非递增版本，防止旧测试版覆盖固定清单。
+
+命令：
+
+```powershell
+npm run version:next-beta -- desktop
+npm run version:next-beta -- server
+
+# 用户确认发布正式版后
+npm run version:promote-stable -- desktop
+npm run version:promote-stable -- server
+```
+
+### 18.4 渠道切换规则
+
+- 只允许升级到严格更高的 SemVer；不执行静默降级。
+- 正式版 `0.3.21` 高于测试版 `0.3.21-beta.1`，所以测试版用户可在正式版发布后切回正式版。
+- 测试版 `0.3.22-beta.1` 高于正式版 `0.3.21`，所以正式版用户可主动切换到测试版。
+- 若当前安装版本已经高于目标渠道最新版本，设置页显示“已是最新”，不会安装低版本。
+- 服务端更新执行中禁止切换渠道；切换成功后清空旧渠道检查结果，下一次检查重新读取对应清单。
+
+### 18.5 回滚
+
+- 测试版问题：停止继续发布测试版，修复后递增 `beta.N`；正式版渠道不受影响。
+- 正式版问题：优先发布更高 PATCH 的 Hotfix，保留上一版本安装包与服务端镜像。
+- 不通过回写 `latest` 指向低版本实现自动降级，避免与签名清单和已安装版本状态冲突。

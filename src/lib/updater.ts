@@ -2,7 +2,10 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
+import type { UpdateChannel } from "../types";
 import { readClientGithubMirror } from "./github-mirror";
+
+const CLIENT_UPDATE_CHANNEL_KEY = "oshical.updateChannel";
 
 export interface AvailableUpdate {
   currentVersion: string;
@@ -24,14 +27,35 @@ export async function currentAppVersion(): Promise<string> {
   return getVersion();
 }
 
-export async function checkForUpdate(): Promise<AvailableUpdate | null> {
+export function readUpdateChannel(): UpdateChannel {
+  try {
+    return localStorage.getItem(CLIENT_UPDATE_CHANNEL_KEY) === "beta" ? "beta" : "stable";
+  } catch {
+    return "stable";
+  }
+}
+
+export function saveUpdateChannel(channel: UpdateChannel): UpdateChannel {
+  try {
+    localStorage.setItem(CLIENT_UPDATE_CHANNEL_KEY, channel);
+  } catch {
+    // The in-memory setting remains active for this page session.
+  }
+  return channel;
+}
+
+export async function checkForUpdate(
+  channel: UpdateChannel = readUpdateChannel(),
+): Promise<AvailableUpdate | null> {
   return invoke<AvailableUpdate | null>("check_app_update", {
     mirrorUrl: readClientGithubMirror() || null,
+    channel,
   });
 }
 
 export async function downloadAndInstallUpdate(
   onProgress: (progress: UpdateProgress) => void,
+  channel: UpdateChannel = readUpdateChannel(),
 ): Promise<void> {
   const unlisten = await listen<UpdateProgressEvent>("app-update-progress", (event) => {
     onProgress({ downloaded: event.payload.downloaded, total: event.payload.total });
@@ -39,6 +63,7 @@ export async function downloadAndInstallUpdate(
   try {
     await invoke("install_app_update", {
       mirrorUrl: readClientGithubMirror() || null,
+      channel,
     });
   } finally {
     unlisten();

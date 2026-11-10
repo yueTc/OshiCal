@@ -58,6 +58,7 @@ jobs:
           }
 
       - name: Validate app version and tag
+        id: version
         shell: pwsh
         env:
           RELEASE_REF: ${{ github.ref }}
@@ -70,6 +71,13 @@ jobs:
           if ($env:RELEASE_REF.StartsWith("refs/tags/") -and "desktop-v$version" -ne $env:RELEASE_REF_NAME) {
             throw "标签 $env:RELEASE_REF_NAME 与 tauri.conf.json 版本 v$version 不一致"
           }
+          $isBeta = $version.Contains("-")
+          if ($isBeta -and $version -notmatch '-beta\.[1-9][0-9]*$') {
+            throw "测试版版本号必须使用 X.Y.Z-beta.N，实际为 $version"
+          }
+          $channel = if ($isBeta) { "beta" } else { "stable" }
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "prerelease=$($isBeta.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
       - name: Reject an existing release tag
         shell: pwsh
@@ -87,6 +95,51 @@ jobs:
           $tagCommit = gh api "repos/$($env:REPOSITORY)/commits/$tag" --jq .sha 2> $null
           if ($LASTEXITCODE -eq 0 -and $tagCommit -ne $env:RELEASE_SHA) {
             throw "标签 $tag 已指向其它提交，拒绝发布"
+          }
+
+      - name: Reject non-increasing app version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $repo = $env:REPOSITORY
+          $dir = Join-Path $env:RUNNER_TEMP "oshical-app-version-check"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $manifests = @()
+
+          $releaseJson = gh release list --repo $repo --limit 100 --json tagName,isPrerelease
+          if ($LASTEXITCODE -ne 0) { throw "无法读取 Release 列表" }
+          $releases = @($releaseJson | ConvertFrom-Json)
+          $stableReleases = @(
+            $releases | Where-Object {
+              $_.tagName -like "desktop-v*" -and -not $_.isPrerelease
+            }
+          )
+          if ($stableReleases.Count -gt 0) {
+            $stableTag = $stableReleases[0].tagName
+            $stableDir = Join-Path $dir "stable"
+            New-Item -ItemType Directory -Force -Path $stableDir | Out-Null
+            gh release download $stableTag --repo $repo --pattern latest.json --dir $stableDir --clobber
+            if ($LASTEXITCODE -ne 0) { throw "无法读取正式版 latest.json：$stableTag" }
+            $manifests += Join-Path $stableDir "latest.json"
+          }
+
+          $betaRelease = @($releases | Where-Object { $_.tagName -eq "desktop-beta" }) | Select-Object -First 1
+          if ($betaRelease) {
+            $betaDir = Join-Path $dir "beta"
+            New-Item -ItemType Directory -Force -Path $betaDir | Out-Null
+            gh release download desktop-beta --repo $repo --pattern latest-beta.json --dir $betaDir --clobber
+            if ($LASTEXITCODE -ne 0) { throw "无法读取测试版 latest-beta.json" }
+            $manifests += Join-Path $betaDir "latest-beta.json"
+          }
+
+          if ($manifests.Count -gt 0) {
+            python scripts/check-release-version.py $version @manifests
+            if ($LASTEXITCODE -ne 0) {
+              throw "桌面端版本 $version 未严格高于已发布正式版/测试版清单"
+            }
           }
 
       - name: Setup Node.js
@@ -135,7 +188,7 @@ jobs:
             - 已安装 OshiCal 的用户可在“设置 → 软件更新”中检查更新。
             - 更新包使用 Tauri 签名校验；Windows Authenticode 代码签名需另行配置。
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
           uploadUpdaterSignatures: true
@@ -185,3 +238,32 @@ jobs:
           $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
           gh release upload $tag $manifestPath --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw "无法更新 latest.json" }
+
+      - name: Publish fixed beta updater manifest
+        if: steps.version.outputs.channel == 'beta'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $tag = "desktop-v$version"
+          $betaTag = "desktop-beta"
+          $repo = $env:REPOSITORY
+          $dir = Join-Path $env:RUNNER_TEMP "oshical-beta-updater"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $source = Join-Path $dir "latest.json"
+          $betaManifest = Join-Path $dir "latest-beta.json"
+          gh release download $tag --repo $repo --pattern latest.json --dir $dir --clobber
+          if ($LASTEXITCODE -ne 0) { throw "无法下载测试版 latest.json" }
+          Copy-Item -LiteralPath $source -Destination $betaManifest -Force
+          gh release view $betaTag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $betaTag --repo $repo --latest=false --target $env:RELEASE_SHA `
+              --title "OshiCal Desktop Beta" `
+              --notes "桌面端测试版自动更新清单。仅由 Release 工作流维护，不占用 latest。"
+            if ($LASTEXITCODE -ne 0) { throw "无法创建 $betaTag 更新清单 Release" }
+          }
+          gh release upload $betaTag $betaManifest --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "无法更新测试版 latest-beta.json" }

@@ -12,18 +12,46 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::sync::Mutex;
 
-const SERVER_RELEASE_TAG: &str = "server-latest";
 const SERVER_MANIFEST_CHANNEL: &str = "server";
-const DIRECT_MANIFEST_URL: &str =
+const STABLE_RELEASE_TAG: &str = "server-latest";
+const BETA_RELEASE_TAG: &str = "server-beta";
+const STABLE_MANIFEST_URL: &str =
     "https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.json";
+const BETA_MANIFEST_URL: &str =
+    "https://github.com/yueTc/OshiCal/releases/download/server-beta/latest-server.json";
 const CHECK_INTERVAL_MINUTES: i64 = 30;
 const FAILED_RETRY_MINUTES: i64 = 30;
 const AGENT_ONLINE_SECONDS: u64 = 90;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerUpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+impl ServerUpdateChannel {
+    fn release_tag(self) -> &'static str {
+        match self {
+            Self::Stable => STABLE_RELEASE_TAG,
+            Self::Beta => BETA_RELEASE_TAG,
+        }
+    }
+
+    fn manifest_url(self) -> &'static str {
+        match self {
+            Self::Stable => STABLE_MANIFEST_URL,
+            Self::Beta => BETA_MANIFEST_URL,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServerUpdateSettings {
+    pub channel: ServerUpdateChannel,
     pub auto_check_enabled: bool,
     pub auto_update_enabled: bool,
     pub update_window_start: String,
@@ -34,6 +62,7 @@ pub struct ServerUpdateSettings {
 impl Default for ServerUpdateSettings {
     fn default() -> Self {
         Self {
+            channel: ServerUpdateChannel::Stable,
             auto_check_enabled: true,
             auto_update_enabled: false,
             update_window_start: "03:00".to_owned(),
@@ -47,6 +76,8 @@ impl Default for ServerUpdateSettings {
 #[serde(rename_all = "camelCase", default)]
 struct ReleaseInfo {
     channel: String,
+    requested_channel: Option<ServerUpdateChannel>,
+    release_channel: Option<ServerUpdateChannel>,
     version: String,
     image_digest: Option<String>,
     signature: Option<String>,
@@ -82,7 +113,9 @@ impl Default for UpdateStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ServerUpdateView {
     pub current_version: String,
+    pub channel: ServerUpdateChannel,
     pub latest_version: Option<String>,
+    pub latest_channel: Option<ServerUpdateChannel>,
     pub update_available: bool,
     pub status: String,
     pub phase: String,
@@ -178,11 +211,24 @@ impl ServerUpdateManager {
         validate_hhmm(&settings.update_window_start)?;
         validate_hhmm(&settings.update_window_end)?;
         validate_mirror_url(&settings.github_mirror_url)?;
+        let previous = self.settings().await?;
         let mut settings = settings;
         if settings.auto_update_enabled {
             settings.auto_check_enabled = true;
         }
+        if previous.channel != settings.channel {
+            let status = self.load_status().await?;
+            if is_active_status(&status.status) {
+                return Err(AppError::validation("服务器更新执行中，不能切换更新渠道"));
+            }
+        }
         write_json(&self.settings_path(), &settings).await?;
+        if previous.channel != settings.channel {
+            // The manifest and last result from the previous channel must not
+            // remain visible as if they belonged to the newly selected channel.
+            let _ = fs::remove_file(self.latest_path()).await;
+            let _ = fs::remove_file(self.status_path()).await;
+        }
         self.view().await
     }
 
@@ -190,18 +236,20 @@ impl ServerUpdateManager {
         let settings = self.settings().await?;
         let latest = self.load_latest().await?;
         let mut status = self.load_status().await?;
-        let latest_version = Some(latest.version.clone()).filter(|value| {
-            latest.channel == SERVER_MANIFEST_CHANNEL
-                && !value.is_empty()
-                && latest
-                    .image_digest
-                    .as_deref()
-                    .is_some_and(|digest| validate_image_digest(digest).is_ok())
-                && latest
-                    .signature
-                    .as_deref()
-                    .is_some_and(is_valid_update_signature)
-        });
+        let latest_valid = latest.channel == SERVER_MANIFEST_CHANNEL
+            && latest.requested_channel == Some(settings.channel)
+            && latest.release_channel.is_some()
+            && !latest.version.is_empty()
+            && latest
+                .image_digest
+                .as_deref()
+                .is_some_and(|digest| validate_image_digest(digest).is_ok())
+            && latest
+                .signature
+                .as_deref()
+                .is_some_and(is_valid_update_signature);
+        let latest_version = Some(latest.version.clone()).filter(|_| latest_valid);
+        let latest_channel = latest.release_channel.filter(|_| latest_valid);
         let update_available = latest_version
             .as_deref()
             .is_some_and(|value| is_newer_version(value, env!("CARGO_PKG_VERSION")));
@@ -215,7 +263,9 @@ impl ServerUpdateManager {
         let message = effective_message(&status, &settings, update_available, agent_online);
         Ok(ServerUpdateView {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
+            channel: settings.channel,
             latest_version,
+            latest_channel,
             update_available,
             status: status.status,
             phase: status.phase,
@@ -236,14 +286,17 @@ impl ServerUpdateManager {
     pub async fn check_now(&self) -> AppResult<ServerUpdateView> {
         let _guard = self.operation_lock.lock().await;
         let settings = self.settings().await?;
-        self.check_release(&settings.github_mirror_url).await?;
+        self.check_release(settings.channel, &settings.github_mirror_url)
+            .await?;
         self.view().await
     }
 
     pub async fn install_now(&self) -> AppResult<ServerUpdateView> {
         let _guard = self.operation_lock.lock().await;
         let settings = self.settings().await?;
-        let latest = self.check_release(&settings.github_mirror_url).await?;
+        let latest = self
+            .check_release(settings.channel, &settings.github_mirror_url)
+            .await?;
         if !is_newer_version(&latest.version, env!("CARGO_PKG_VERSION")) {
             return Err(AppError::validation(
                 "服务器已经是最新版本，拒绝重复安装或降级",
@@ -268,14 +321,19 @@ impl ServerUpdateManager {
             .checked_at
             .map(|checked_at| (Utc::now() - checked_at).num_minutes() >= CHECK_INTERVAL_MINUTES)
             .unwrap_or(true);
-        if settings.auto_check_enabled && stale {
-            self.check_release(&settings.github_mirror_url).await?;
+        if settings.auto_check_enabled
+            && (stale || latest.requested_channel != Some(settings.channel))
+        {
+            self.check_release(settings.channel, &settings.github_mirror_url)
+                .await?;
         }
         if !settings.auto_update_enabled {
             return Ok(());
         }
         let latest = self.load_latest().await?;
         if latest.channel != SERVER_MANIFEST_CHANNEL
+            || latest.requested_channel != Some(settings.channel)
+            || latest.release_channel.is_none()
             || !is_newer_version(&latest.version, env!("CARGO_PKG_VERSION"))
             || latest
                 .image_digest
@@ -318,69 +376,68 @@ impl ServerUpdateManager {
         .await
     }
 
-    async fn check_release(&self, github_mirror_url: &str) -> AppResult<ReleaseInfo> {
-        let body = self.fetch_manifest(github_mirror_url).await?;
-        let channel = body
-            .get("channel")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::validation("服务器更新清单缺少 channel"))?;
-        if channel != SERVER_MANIFEST_CHANNEL {
-            return Err(AppError::validation(format!(
-                "更新清单 channel 无效: {channel}，服务器只接受 {SERVER_MANIFEST_CHANNEL}"
-            )));
-        }
-        let version = body
-            .get("version")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::validation("更新清单缺少 version"))?
-            .trim_start_matches('v');
-        Version::parse(version)
-            .map_err(|error| AppError::validation(format!("服务器版本号无效: {error}")))?;
-        let image_digest = match body.get("imageDigest") {
-            Some(Value::String(value)) if !value.trim().is_empty() => {
-                let value = value.trim();
-                validate_image_digest(value)?;
-                value.to_owned()
-            }
-            None | Some(Value::Null) | Some(Value::String(_)) => {
-                return Err(AppError::validation(
-                    "服务器更新清单缺少 imageDigest，拒绝使用可变版本标签更新",
-                ));
-            }
-            Some(_) => {
-                return Err(AppError::validation(
-                    "服务器更新清单 imageDigest 必须是字符串",
-                ));
-            }
+    async fn check_release(
+        &self,
+        requested_channel: ServerUpdateChannel,
+        github_mirror_url: &str,
+    ) -> AppResult<ReleaseInfo> {
+        let beta_result = if requested_channel == ServerUpdateChannel::Beta {
+            Some(
+                self.fetch_release(ServerUpdateChannel::Beta, github_mirror_url)
+                    .await,
+            )
+        } else {
+            None
         };
-        let signature = body
-            .get("signature")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::validation("服务器更新清单缺少 signature，拒绝未签名更新"))?
-            .trim();
-        // The HMAC key intentionally lives only on the host updater. This
-        // process validates the shape and forwards the signature; the root
-        // agent is the trust boundary that verifies it before pulling an image.
-        validate_update_signature(signature)?;
-        let release = ReleaseInfo {
-            channel: SERVER_MANIFEST_CHANNEL.to_owned(),
-            version: version.to_owned(),
-            image_digest: Some(image_digest),
-            signature: Some(signature.to_owned()),
-            checked_at: Some(Utc::now()),
-            release_url: Some(format!(
-                "https://github.com/yueTc/OshiCal/releases/tag/{SERVER_RELEASE_TAG}"
-            )),
+        let stable_result = self
+            .fetch_release(ServerUpdateChannel::Stable, github_mirror_url)
+            .await;
+        let mut release = match (beta_result, stable_result) {
+            (Some(Ok(beta)), Ok(stable)) => select_newer_release(beta, stable),
+            (Some(Ok(beta)), Err(error)) => {
+                tracing::warn!(%error, "正式版服务器清单读取失败，使用测试版清单");
+                beta
+            }
+            (Some(Err(error)), Ok(stable)) => {
+                tracing::warn!(%error, "测试版服务器清单读取失败，使用正式版清单");
+                stable
+            }
+            (None, Ok(stable)) => stable,
+            (Some(Err(beta_error)), Err(stable_error)) => {
+                return Err(AppError::External {
+                    code: "SERVER_RELEASE_CHANNELS_UNAVAILABLE".to_owned(),
+                    message: format!(
+                        "测试版与正式版服务器清单均不可用：测试版 {beta_error}；正式版 {stable_error}"
+                    ),
+                });
+            }
+            (None, Err(error)) => return Err(error),
         };
+        release.requested_channel = Some(requested_channel);
         write_json(&self.latest_path(), &release).await?;
         Ok(release)
     }
 
-    async fn fetch_manifest(&self, github_mirror_url: &str) -> AppResult<Value> {
+    async fn fetch_release(
+        &self,
+        release_channel: ServerUpdateChannel,
+        github_mirror_url: &str,
+    ) -> AppResult<ReleaseInfo> {
+        let body = self
+            .fetch_manifest(release_channel, github_mirror_url)
+            .await?;
+        release_from_manifest(&body, release_channel)
+    }
+
+    async fn fetch_manifest(
+        &self,
+        release_channel: ServerUpdateChannel,
+        github_mirror_url: &str,
+    ) -> AppResult<Value> {
         // Revalidate persisted settings too: an older version may have stored a
         // plaintext HTTP mirror before this policy was enforced.
         validate_mirror_url(github_mirror_url)?;
-        if let Some(mirror) = mirror_manifest_url(github_mirror_url) {
+        if let Some(mirror) = mirror_manifest_url(release_channel, github_mirror_url) {
             match self.fetch_mirror_json(&mirror).await {
                 Ok(value) => return Ok(value),
                 Err(error) => {
@@ -388,7 +445,8 @@ impl ServerUpdateManager {
                 }
             }
         }
-        self.fetch_json(&self.client, DIRECT_MANIFEST_URL).await
+        self.fetch_json(&self.client, release_channel.manifest_url())
+            .await
     }
 
     async fn fetch_mirror_json(&self, url: &str) -> AppResult<Value> {
@@ -575,6 +633,75 @@ requested_at={}
     }
 }
 
+fn release_from_manifest(
+    body: &Value,
+    release_channel: ServerUpdateChannel,
+) -> AppResult<ReleaseInfo> {
+    let channel = body
+        .get("channel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::validation("服务器更新清单缺少 channel"))?;
+    if channel != SERVER_MANIFEST_CHANNEL {
+        return Err(AppError::validation(format!(
+            "更新清单 channel 无效: {channel}，服务器只接受 {SERVER_MANIFEST_CHANNEL}"
+        )));
+    }
+    let version = body
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::validation("更新清单缺少 version"))?
+        .trim_start_matches('v');
+    Version::parse(version)
+        .map_err(|error| AppError::validation(format!("服务器版本号无效: {error}")))?;
+    let image_digest = match body.get("imageDigest") {
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            let value = value.trim();
+            validate_image_digest(value)?;
+            value.to_owned()
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => {
+            return Err(AppError::validation(
+                "服务器更新清单缺少 imageDigest，拒绝使用可变版本标签更新",
+            ));
+        }
+        Some(_) => {
+            return Err(AppError::validation(
+                "服务器更新清单 imageDigest 必须是字符串",
+            ));
+        }
+    };
+    let signature = body
+        .get("signature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::validation("服务器更新清单缺少 signature，拒绝未签名更新"))?
+        .trim();
+    validate_update_signature(signature)?;
+    Ok(ReleaseInfo {
+        channel: SERVER_MANIFEST_CHANNEL.to_owned(),
+        requested_channel: None,
+        release_channel: Some(release_channel),
+        version: version.to_owned(),
+        image_digest: Some(image_digest),
+        signature: Some(signature.to_owned()),
+        checked_at: Some(Utc::now()),
+        release_url: Some(format!(
+            "https://github.com/yueTc/OshiCal/releases/tag/{}",
+            release_channel.release_tag()
+        )),
+    })
+}
+
+fn select_newer_release(left: ReleaseInfo, right: ReleaseInfo) -> ReleaseInfo {
+    let left_version = Version::parse(&left.version).ok();
+    let right_version = Version::parse(&right.version).ok();
+    match (left_version, right_version) {
+        (Some(left_version), Some(right_version)) if left_version > right_version => left,
+        (Some(left_version), Some(right_version)) if right_version > left_version => right,
+        _ if left.release_channel == Some(ServerUpdateChannel::Stable) => left,
+        _ => right,
+    }
+}
+
 async fn write_json<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
     let data = serde_json::to_vec_pretty(value)?;
     write_bytes(path, &data).await
@@ -599,7 +726,10 @@ async fn write_bytes(path: &Path, value: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-fn mirror_manifest_url(github_mirror_url: &str) -> Option<String> {
+fn mirror_manifest_url(
+    release_channel: ServerUpdateChannel,
+    github_mirror_url: &str,
+) -> Option<String> {
     let base = github_mirror_url.trim();
     if base.is_empty() {
         return None;
@@ -609,7 +739,7 @@ fn mirror_manifest_url(github_mirror_url: &str) -> Option<String> {
     } else {
         format!("{base}/")
     };
-    Some(format!("{base}{DIRECT_MANIFEST_URL}"))
+    Some(format!("{base}{}", release_channel.manifest_url()))
 }
 
 fn validate_mirror_url(value: &str) -> AppResult<()> {
@@ -813,17 +943,25 @@ fn effective_message(
 mod tests {
     use super::{
         effective_message, is_newer_version, mirror_manifest_url, parse_hhmm,
-        validate_image_digest, validate_mirror_url, validate_update_signature, window_contains,
+        release_from_manifest, select_newer_release, validate_image_digest, validate_mirror_url,
+        validate_update_signature, window_contains, ReleaseInfo, ServerUpdateChannel,
         ServerUpdateManager, ServerUpdateSettings, UpdateStatus,
     };
 
     #[test]
     fn mirror_url_is_normalized_and_validated() {
-        assert_eq!(mirror_manifest_url(""), None);
+        assert_eq!(mirror_manifest_url(ServerUpdateChannel::Stable, ""), None);
         assert_eq!(
-            mirror_manifest_url("https://gh-proxy.com"),
+            mirror_manifest_url(ServerUpdateChannel::Stable, "https://gh-proxy.com"),
             Some(
                 "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.json"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            mirror_manifest_url(ServerUpdateChannel::Beta, "https://gh-proxy.com"),
+            Some(
+                "https://gh-proxy.com/https://github.com/yueTc/OshiCal/releases/download/server-beta/latest-server.json"
                     .to_owned()
             )
         );
@@ -854,6 +992,7 @@ mod tests {
             std::env::temp_dir().join(format!("oshical-update-manager-{}", uuid::Uuid::new_v4()));
         let manager = ServerUpdateManager::new(dir.clone()).expect("manager");
         let settings = ServerUpdateSettings {
+            channel: ServerUpdateChannel::Beta,
             auto_check_enabled: true,
             auto_update_enabled: true,
             update_window_start: "23:30".to_owned(),
@@ -866,6 +1005,7 @@ mod tests {
             .expect("settings");
         assert!(view.auto_check_enabled);
         assert!(view.auto_update_enabled);
+        assert_eq!(view.channel, ServerUpdateChannel::Beta);
         assert_eq!(view.update_window_start, "23:30");
 
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -926,6 +1066,42 @@ mod tests {
         assert!(!is_newer_version("0.2.4", "0.2.4"));
         assert!(!is_newer_version("0.2.3", "0.2.4"));
         assert!(!is_newer_version("invalid", "0.2.4"));
+    }
+
+    #[test]
+    fn beta_channel_can_resolve_stable_and_beta_releases() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let signature = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let release = |channel, version: &str| ReleaseInfo {
+            channel: "server".to_owned(),
+            requested_channel: None,
+            release_channel: Some(channel),
+            version: version.to_owned(),
+            image_digest: Some(digest.to_owned()),
+            signature: Some(signature.to_owned()),
+            checked_at: None,
+            release_url: None,
+        };
+        let beta = release(ServerUpdateChannel::Beta, "0.3.29-beta.1");
+        let stable = release(ServerUpdateChannel::Stable, "0.3.29");
+        assert_eq!(
+            select_newer_release(beta.clone(), stable.clone()).version,
+            "0.3.29"
+        );
+        assert_eq!(
+            select_newer_release(release(ServerUpdateChannel::Beta, "0.3.30-beta.1"), stable)
+                .version,
+            "0.3.30-beta.1"
+        );
+        let manifest = serde_json::json!({
+            "channel": "server",
+            "version": "0.3.29-beta.1",
+            "imageDigest": digest,
+            "signature": signature,
+        });
+        let parsed = release_from_manifest(&manifest, ServerUpdateChannel::Beta).expect("manifest");
+        assert_eq!(parsed.release_channel, Some(ServerUpdateChannel::Beta));
+        assert_eq!(parsed.version, "0.3.29-beta.1");
     }
 
     #[test]

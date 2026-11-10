@@ -93,6 +93,8 @@ async fn server_update_routes_require_auth_and_validate_settings() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["data"]["currentVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(value["data"]["channel"], "stable");
+    assert_eq!(value["data"]["latestChannel"], Value::Null);
     assert_eq!(value["data"]["autoCheckEnabled"], true);
     assert_eq!(value["data"]["autoUpdateEnabled"], false);
 
@@ -106,6 +108,7 @@ async fn server_update_routes_require_auth_and_validate_settings() {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
+                        "channel": "beta",
                         "autoCheckEnabled": false,
                         "autoUpdateEnabled": true,
                         "updateWindowStart": "23:30",
@@ -121,6 +124,7 @@ async fn server_update_routes_require_auth_and_validate_settings() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["channel"], "beta");
     assert_eq!(value["data"]["autoCheckEnabled"], true);
     assert_eq!(value["data"]["autoUpdateEnabled"], true);
     assert_eq!(value["data"]["githubMirrorUrl"], "https://gh-proxy.com/");

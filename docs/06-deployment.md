@@ -48,7 +48,8 @@ docker compose up -d --no-deps oshical
 
 ```text
 ghcr.io/yuetc/oshical-server:<版本号>
-ghcr.io/yuetc/oshical-server:latest
+ghcr.io/yuetc/oshical-server:latest   # 正式版通道
+ghcr.io/yuetc/oshical-server:beta     # 测试版通道
 ```
 
 检查：
@@ -292,31 +293,50 @@ sqlite3 $backup "PRAGMA integrity_check;"
 - 检查订阅源 `lastError`。
 - 检查模型费用和调用量。
 
-## 7. Windows 桌面端自动更新
+## 7. 桌面端与服务端双渠道自动更新
 
-桌面端通过 Tauri 官方 Updater 读取 GitHub Releases 的 `latest.json`：
+桌面端和服务端均支持 `stable` 正式版与 `beta` 测试版渠道。客户端与服务端设置页可自行选择；切换后按 SemVer 只升级到更高版本，不自动降级。
 
 ```text
-https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
+桌面正式版：https://github.com/yueTc/OshiCal/releases/latest/download/latest.json
+桌面测试版：https://github.com/yueTc/OshiCal/releases/download/desktop-beta/latest-beta.json
+服务端正式版：https://github.com/yueTc/OshiCal/releases/download/server-latest/latest-server.json
+服务端测试版：https://github.com/yueTc/OshiCal/releases/download/server-beta/latest-server.json
 ```
 
-发布流程：
+### 7.1 默认发布节奏
 
-1. 使用 `node scripts/set-version.mjs desktop <版本号>` 更新桌面端版本。
-2. 提交改动并推送 `desktop-v<版本号>` 标签。
-3. GitHub Actions 构建 NSIS 安装包，生成 `.sig` 与 `latest.json`。
-4. 检查正式 Release 资产与更新清单。
-5. 安装旧版本，确认客户端能检测、下载、校验、安装并重启到新版本。
-
-服务端使用独立版本与标签：
+有改动时默认只前进一个 PATCH：
 
 ```powershell
-node scripts/set-version.mjs server <服务端版本号>
-git tag server-v<服务端版本号>
-git push origin server-v<服务端版本号>
+npm run version:next-beta -- desktop
+git tag desktop-v<桌面测试版>
+git push origin desktop-v<桌面测试版>
+
+npm run version:next-beta -- server
+git tag server-v<服务端测试版>
+git push origin server-v<服务端测试版>
 ```
 
-`server-v*` 只更新 GHCR 镜像和固定标签 `server-latest` 下的服务端更新清单，不会触发桌面端发布。
+- 首次测试版示例：`0.3.21-beta.1`。
+- 同一 PATCH 的后续测试版只递增 `beta.N`，不再次前进 PATCH。
+- 测试完成后必须询问是否发布正式版；确认后执行：
+
+```powershell
+npm run version:promote-stable -- desktop
+npm run version:promote-stable -- server
+```
+
+- 正式版与测试版共享核心版本，例如 `0.3.21-beta.1` 提升为 `0.3.21`，不再额外增加 PATCH。
+- 正式版发布前，不得开始下一 PATCH。MINOR / MAJOR 升级必须由用户当次明确要求。
+
+### 7.2 发布检查
+
+1. GitHub Actions 构建 NSIS 安装包、生成 `.sig` 与 `latest.json`。
+2. 测试版 Release 必须标记 prerelease，并更新固定 `desktop-beta` 清单。
+3. `server-v*` 测试版更新 `server-beta`，不得移动 Docker `latest`；正式版才更新 `server-latest`。
+4. 安装旧版本，分别验证正式版与测试版渠道的检测、下载、签名校验、安装和重启。
+5. 验证正式版与测试版之间的切换升级；确认不会静默安装低版本。
 
 签名 Secrets：
 

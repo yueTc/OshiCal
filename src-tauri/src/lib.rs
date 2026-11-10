@@ -28,8 +28,10 @@ const KEYRING_SERVICE: &str = "com.oshical.app";
 const KEY_LLM_API_KEY: &str = "llm_api_key";
 const KEY_BILI_COOKIE: &str = "bili_cookie";
 const KEY_SERVER_TOKEN: &str = "server_api_token";
-const APP_UPDATE_DIRECT_ENDPOINT: &str =
+const APP_UPDATE_STABLE_ENDPOINT: &str =
     "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json";
+const APP_UPDATE_BETA_ENDPOINT: &str =
+    "https://github.com/yueTc/OshiCal/releases/download/desktop-beta/latest-beta.json";
 const APP_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const APP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -373,6 +375,32 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AppUpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl AppUpdateChannel {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "stable" => Ok(Self::Stable),
+            "beta" => Ok(Self::Beta),
+            _ => Err("更新渠道必须是 stable 或 beta".to_owned()),
+        }
+    }
+
+    fn manifest_urls(self) -> Vec<&'static str> {
+        match self {
+            Self::Stable => vec![APP_UPDATE_STABLE_ENDPOINT],
+            // A beta client can move back to stable as soon as the stable
+            // release becomes the higher SemVer version.
+            Self::Beta => vec![APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT],
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppUpdateInfo {
@@ -407,23 +435,35 @@ fn normalize_mirror_base(mirror_url: Option<&str>) -> Result<Option<String>, Str
     }))
 }
 
-fn app_update_endpoints(mirror_url: Option<&str>) -> Result<Vec<url::Url>, String> {
-    let direct = url::Url::parse(APP_UPDATE_DIRECT_ENDPOINT)
-        .map_err(|error| format!("更新地址无效: {error}"))?;
+fn app_update_endpoints(
+    manifest_endpoint: &str,
+    mirror_url: Option<&str>,
+) -> Result<Vec<url::Url>, String> {
+    let direct =
+        url::Url::parse(manifest_endpoint).map_err(|error| format!("更新地址无效: {error}"))?;
     // Invalid mirror configuration must not disable the built-in direct path.
     let Some(base) = normalize_mirror_base(mirror_url).ok().flatten() else {
         return Ok(vec![direct]);
     };
-    let mirror = url::Url::parse(&format!("{base}{APP_UPDATE_DIRECT_ENDPOINT}"))
+    let mirror = url::Url::parse(&format!("{base}{manifest_endpoint}"))
         .map_err(|error| format!("镜像更新地址无效: {error}"))?;
     Ok(vec![mirror, direct])
 }
 
-async fn resolve_app_update(
+fn app_update_version_is_newer(candidate: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(candidate.trim_start_matches('v')),
+        semver::Version::parse(current.trim_start_matches('v')),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+async fn resolve_app_update_endpoints(
     app: &AppHandle,
-    mirror_url: Option<&str>,
+    endpoints: Vec<url::Url>,
 ) -> Result<Option<tauri_plugin_updater::Update>, String> {
-    let endpoints = app_update_endpoints(mirror_url)?;
     let updater = app
         .updater_builder()
         .endpoints(endpoints)
@@ -431,25 +471,62 @@ async fn resolve_app_update(
         .timeout(APP_UPDATE_CHECK_TIMEOUT)
         .build()
         .map_err(|error| format!("初始化更新检查失败: {error}"))?;
-    let mut update = updater
+    updater
         .check()
         .await
-        .map_err(|error| format!("检查更新失败: {error}"))?;
-    let mirror_base = normalize_mirror_base(mirror_url).ok().flatten();
-    if let Some(update) = update.as_mut() {
-        if let Some(base) = mirror_base.as_deref() {
-            if update.download_url.scheme() == "https"
-                && !update.download_url.as_str().starts_with(base)
-            {
-                update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
-                    .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+        .map_err(|error| format!("检查更新失败: {error}"))
+}
+
+async fn resolve_app_update(
+    app: &AppHandle,
+    mirror_url: Option<&str>,
+    channel: AppUpdateChannel,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    let mut best: Option<tauri_plugin_updater::Update> = None;
+    let mut successful_checks = 0usize;
+    let mut failures = Vec::new();
+    for manifest_endpoint in channel.manifest_urls() {
+        let endpoints = app_update_endpoints(manifest_endpoint, mirror_url)?;
+        match resolve_app_update_endpoints(app, endpoints).await {
+            Ok(Some(candidate)) => {
+                successful_checks += 1;
+                let should_replace = best.as_ref().is_none_or(|current| {
+                    app_update_version_is_newer(&candidate.version, &current.version)
+                });
+                if should_replace {
+                    best = Some(candidate);
+                }
             }
+            Ok(None) => {
+                successful_checks += 1;
+            }
+            Err(error) => failures.push(error),
         }
-        // The updater check timeout also applies to the entire package download. A slow
-        // GitHub mirror can take several minutes to transfer a release installer.
-        update.timeout = Some(APP_UPDATE_DOWNLOAD_TIMEOUT);
     }
-    Ok(update)
+
+    let Some(mut update) = best else {
+        if successful_checks > 0 {
+            return Ok(None);
+        }
+        return Err(if failures.is_empty() {
+            "检查更新失败：没有可用的更新清单".to_owned()
+        } else {
+            failures.join("；")
+        });
+    };
+    let mirror_base = normalize_mirror_base(mirror_url).ok().flatten();
+    if let Some(base) = mirror_base.as_deref() {
+        if update.download_url.scheme() == "https"
+            && !update.download_url.as_str().starts_with(base)
+        {
+            update.download_url = url::Url::parse(&format!("{base}{}", update.download_url))
+                .map_err(|error| format!("镜像下载地址无效: {error}"))?;
+        }
+    }
+    // The updater check timeout also applies to the entire package download. A slow
+    // GitHub mirror can take several minutes to transfer a release installer.
+    update.timeout = Some(APP_UPDATE_DOWNLOAD_TIMEOUT);
+    Ok(Some(update))
 }
 
 async fn install_resolved_update(
@@ -496,8 +573,10 @@ async fn install_resolved_update(
 async fn check_app_update(
     app: AppHandle,
     mirror_url: Option<String>,
+    channel: String,
 ) -> Result<Option<AppUpdateInfo>, String> {
-    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+    let channel = AppUpdateChannel::parse(&channel)?;
+    let update = resolve_app_update(&app, mirror_url.as_deref(), channel).await?;
     Ok(update.as_ref().map(|update| AppUpdateInfo {
         current_version: update.current_version.clone(),
         version: update.version.clone(),
@@ -507,8 +586,13 @@ async fn check_app_update(
 }
 
 #[tauri::command]
-async fn install_app_update(app: AppHandle, mirror_url: Option<String>) -> Result<(), String> {
-    let update = resolve_app_update(&app, mirror_url.as_deref()).await?;
+async fn install_app_update(
+    app: AppHandle,
+    mirror_url: Option<String>,
+    channel: String,
+) -> Result<(), String> {
+    let channel = AppUpdateChannel::parse(&channel)?;
+    let update = resolve_app_update(&app, mirror_url.as_deref(), channel).await?;
     let Some(update) = update else {
         return Err("当前已是最新版本".to_owned());
     };
@@ -522,7 +606,7 @@ async fn install_app_update(app: AppHandle, mirror_url: Option<String>) -> Resul
             if !configured_mirror {
                 return Err(first_error);
             }
-            let direct_update = resolve_app_update(&app, None).await?;
+            let direct_update = resolve_app_update(&app, None, channel).await?;
             let Some(direct_update) = direct_update else {
                 return Err(first_error);
             };
@@ -2910,9 +2994,10 @@ async fn export_client_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_endpoints, batch_is_fully_applied, build_ws_url, changes_after_cursor,
-        cookie_header_from_webview, empty_changes_page_requires_rebuild, normalize_mirror_base,
-        prepare_forwarded_event, validate_external_url, RemoteMonitorState,
+        app_update_endpoints, app_update_version_is_newer, batch_is_fully_applied, build_ws_url,
+        changes_after_cursor, cookie_header_from_webview, empty_changes_page_requires_rebuild,
+        normalize_mirror_base, prepare_forwarded_event, validate_external_url, AppUpdateChannel,
+        RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
     };
     use crate::sync_client::SyncChange;
     use serde_json::json;
@@ -2943,7 +3028,9 @@ mod tests {
 
     #[test]
     fn app_update_endpoints_prefer_mirror_then_direct() {
-        let endpoints = app_update_endpoints(Some("https://gh-proxy.com")).expect("endpoints");
+        let endpoints =
+            app_update_endpoints(APP_UPDATE_STABLE_ENDPOINT, Some("https://gh-proxy.com"))
+                .expect("endpoints");
         assert_eq!(endpoints.len(), 2);
         assert_eq!(
             endpoints[0].as_str(),
@@ -2952,6 +3039,10 @@ mod tests {
         assert_eq!(
             endpoints[1].as_str(),
             "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
+        );
+        assert_eq!(
+            AppUpdateChannel::Beta.manifest_urls(),
+            vec![APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT]
         );
         assert_eq!(normalize_mirror_base(Some("")).unwrap(), None);
         assert_eq!(
@@ -2965,12 +3056,21 @@ mod tests {
         assert!(normalize_mirror_base(Some("https://gh-proxy.com#fragment")).is_err());
 
         let direct_only =
-            app_update_endpoints(Some("http://gh-proxy.com")).expect("direct fallback");
+            app_update_endpoints(APP_UPDATE_STABLE_ENDPOINT, Some("http://gh-proxy.com"))
+                .expect("direct fallback");
         assert_eq!(direct_only.len(), 1);
         assert_eq!(
             direct_only[0].as_str(),
             "https://github.com/yueTc/OshiCal/releases/latest/download/latest.json"
         );
+    }
+
+    #[test]
+    fn beta_update_channel_allows_both_directions() {
+        assert!(app_update_version_is_newer("0.3.21-beta.1", "0.3.20"));
+        assert!(app_update_version_is_newer("0.3.21", "0.3.21-beta.1"));
+        assert!(!app_update_version_is_newer("0.3.21-beta.1", "0.3.21"));
+        assert!(!app_update_version_is_newer("0.3.20", "0.3.20"));
     }
 
     #[test]
