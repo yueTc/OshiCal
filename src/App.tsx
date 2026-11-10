@@ -215,75 +215,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   llmPromptVersion: "schedule-v1",
   llmReasoningEffort: "auto",
   llmParallelism: 1,
-  llmAccounts: [],
   proxyPort: null,
 };
 
 function maskLlmApiKey(apiKey: string): string {
   const value = apiKey.trim();
   return value ? "••••••••" + value.slice(-4) : "";
-}
-
-interface LlmSecretEnvelope {
-  configured?: boolean;
-  revision?: number;
-}
-
-interface LlmSecretResponseEnvelope {
-  ok?: boolean;
-  data?: LlmSecretEnvelope;
-  error?: { code?: string; message?: string };
-}
-
-/**
- * `/api/secrets/llm` 支持按账号读写密钥（GET 走查询串，PUT 走 body 的 accountId），
- * 客户端 SDK 尚未带该参数，这里沿用同一鉴权与信封约定直连，密钥只回传 configured。
- */
-async function requestLlmAccountSecret(
-  api: ServerApi,
-  accountId: string,
-  init: { method?: "GET" | "PUT"; apiKey?: string } = {},
-): Promise<{ configured: boolean; revision: number }> {
-  const base = resolveHttpBase(api);
-  const search = accountId ? `?accountId=${encodeURIComponent(accountId)}` : "";
-  const method = init.method ?? "GET";
-  let response: Response;
-  try {
-    response = await fetch(`${base}/api/secrets/llm${search}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${api.eventToken()}`,
-        "Content-Type": "application/json",
-      },
-      ...(method === "PUT"
-        ? { body: JSON.stringify({ apiKey: init.apiKey ?? "", accountId }) }
-        : {}),
-    });
-  } catch (error) {
-    throw new ApiFailure(
-      error instanceof Error ? error.message : "服务器连接失败",
-      "REMOTE_OFFLINE",
-    );
-  }
-  const text = await response.text();
-  let payload: LlmSecretResponseEnvelope | null = null;
-  try {
-    payload = text ? (JSON.parse(text) as LlmSecretResponseEnvelope) : null;
-  } catch {
-    payload = null;
-  }
-  if (!response.ok || payload?.ok === false) {
-    const action = method === "PUT" ? "保存" : "读取";
-    throw new ApiFailure(
-      payload?.error?.message ?? `${action}账号密钥失败（HTTP ${response.status}）`,
-      payload?.error?.code ?? "REQUEST_FAILED",
-      response.status,
-    );
-  }
-  return {
-    configured: payload?.data?.configured === true,
-    revision: typeof payload?.data?.revision === "number" ? payload.data.revision : 0,
-  };
 }
 
 function isRemoteUncertain(error: unknown): error is ApiFailure {
@@ -2954,31 +2891,6 @@ export default function App() {
               testProxy,
               testLlm,
               listLlmModels,
-              loadLlmAccountSecrets: async (accountIds: string[]) => {
-                const api = serverApiRef.current;
-                if (!api) {
-                  throw new Error("服务器未连接");
-                }
-                const statuses: Record<string, boolean> = {};
-                await Promise.all(
-                  accountIds.map(async (accountId) => {
-                    const status = await requestLlmAccountSecret(api, accountId);
-                    statuses[accountId] = status.configured;
-                  }),
-                );
-                return statuses;
-              },
-              saveLlmAccountSecret: async (accountId: string, apiKey: string) => {
-                const api = serverApiRef.current;
-                if (!api) {
-                  throw new Error("服务器未连接");
-                }
-                const saved = await requestLlmAccountSecret(api, accountId, {
-                  method: "PUT",
-                  apiKey,
-                });
-                return saved.configured;
-              },
               testNotification: sendTestNotification,
               openBiliBrowserLogin: async () => {
                 if (!localApi) {

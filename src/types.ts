@@ -11,14 +11,6 @@ export const LLM_PARALLELISM_MIN = 1;
 
 export const LLM_PARALLELISM_MAX = 8;
 
-/** 服务端 `llm_accounts` 的元素，字段名与后端 camelCase 一致。 */
-export interface LlmAccount {
-  id: string;
-  name: string;
-  baseUrl: string;
-  model: string;
-}
-
 export interface AppSettings {
   dataMode: DataMode;
   serverUrl: string;
@@ -33,10 +25,8 @@ export interface AppSettings {
   llmPromptVersion: string;
   /** 缺省 `"auto"`：不向模型发送 `reasoning_effort`。 */
   llmReasoningEffort?: LlmReasoningEffort;
-  /** 并行个数，合法区间 1..8；有效并行度 = min(该值, 账号数)。 */
+  /** 并行个数，合法区间 1..8；表示同时向同一个模型端点发起的请求数。 */
   llmParallelism?: number;
-  /** 账号池；为空时后端按 `llmBaseUrl` / `llmModel` 合成 `default` 账号。 */
-  llmAccounts?: LlmAccount[];
   proxyPort: number | null;
 }
 
@@ -327,8 +317,6 @@ export interface LlmTestInput {
   apiKey?: string;
   model: string;
   promptVersion: string;
-  /** 走哪个账号的密钥；缺省 `default`。 */
-  accountId?: string;
   /** `auto` 时后端不发送 `reasoning_effort`。 */
   reasoningEffort?: LlmReasoningEffort;
 }
@@ -543,7 +531,6 @@ export interface ServerSettings {
   llmPromptVersion?: string;
   llmReasoningEffort?: LlmReasoningEffort;
   llmParallelism?: number;
-  llmAccounts?: LlmAccount[];
   proxyPort?: number | null;
   revision?: number;
 }

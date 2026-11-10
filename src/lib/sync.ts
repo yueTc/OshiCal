@@ -14,7 +14,6 @@ import type {
   DeviceInfo,
   LiveSession,
   LiveStatus,
-  LlmAccount,
   LlmReasoningEffort,
   Schedule,
   Streamer,
@@ -633,32 +632,6 @@ export function normalizeLlmParallelism(
   return Math.min(LLM_PARALLELISM_MAX, Math.max(LLM_PARALLELISM_MIN, rounded));
 }
 
-/** 只保留结构完整的账号条目，并按 id 去重（服务端与本地共用同一份数据）。 */
-export function normalizeLlmAccounts(value: unknown): LlmAccount[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const accounts: LlmAccount[] = [];
-  const seen = new Set<string>();
-  for (const entry of value) {
-    if (!isRecord(entry)) {
-      continue;
-    }
-    const id = typeof entry.id === "string" ? entry.id.trim() : "";
-    if (!id || seen.has(id)) {
-      continue;
-    }
-    seen.add(id);
-    accounts.push({
-      id,
-      name: typeof entry.name === "string" ? entry.name : "",
-      baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
-      model: typeof entry.model === "string" ? entry.model : "",
-    });
-  }
-  return accounts;
-}
-
 export function mergeServerSettings(local: AppSettings, value: unknown): AppSettings {
   const remote = serverSettingsRecord(value);
   const numberOr = (key: string, fallback: number) =>
@@ -680,10 +653,9 @@ export function mergeServerSettings(local: AppSettings, value: unknown): AppSett
     llmBaseUrl: stringOr("llmBaseUrl", local.llmBaseUrl),
     llmModel: stringOr("llmModel", local.llmModel),
     llmPromptVersion: stringOr("llmPromptVersion", local.llmPromptVersion),
-    // 思考程度 / 并行度 / 账号池：服务端字段缺失时按契约回落 auto / 1 / []。
+    // 思考程度 / 并行度：服务端字段缺失时按契约回落 auto / 1。
     llmReasoningEffort: normalizeLlmReasoningEffort(remote.llmReasoningEffort),
     llmParallelism: normalizeLlmParallelism(remote.llmParallelism),
-    llmAccounts: normalizeLlmAccounts(remote.llmAccounts),
     proxyPort:
       proxyValue === null
         ? null
@@ -706,7 +678,6 @@ export function serverSettingsForSave(local: AppSettings, remote: AppSettings): 
     llmPromptVersion: local.llmPromptVersion,
     llmReasoningEffort: normalizeLlmReasoningEffort(local.llmReasoningEffort),
     llmParallelism: normalizeLlmParallelism(local.llmParallelism),
-    llmAccounts: normalizeLlmAccounts(local.llmAccounts),
     proxyPort: local.proxyPort,
     dataMode: "server",
     serverUrl: remote.serverUrl || local.serverUrl,

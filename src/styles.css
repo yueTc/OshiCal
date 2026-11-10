@@ -587,8 +587,11 @@ h3 {
 .segmented button {
   display: grid;
   place-items: center;
-  width: 36px;
+  /* 固定 width 会让「自动」这类中文两字按钮换行溢出，改用 min-width + 左右内边距。 */
+  min-width: 36px;
   height: 32px;
+  padding: 0 9px;
+  white-space: nowrap;
   color: var(--muted);
   background: transparent;
   border: 0;
