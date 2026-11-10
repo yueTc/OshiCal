@@ -248,7 +248,11 @@ impl ServerUpdateManager {
                 .signature
                 .as_deref()
                 .is_some_and(is_valid_update_signature);
-        let latest_version = Some(latest.version.clone()).filter(|_| latest_valid);
+        let latest_version = if latest_valid {
+            Some(latest.version.clone())
+        } else {
+            None
+        };
         let latest_channel = latest.release_channel.filter(|_| latest_valid);
         let update_available = latest_version
             .as_deref()
