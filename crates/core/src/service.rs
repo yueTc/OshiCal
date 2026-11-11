@@ -5057,12 +5057,28 @@ mod tests {
             .await
             .expect("streamer");
         let published_at = Utc::now();
+        let reserve = ReserveCard {
+            title: "直播预约：【突击】电台电台！".to_owned(),
+            description: "明天 19:00 直播".to_owned(),
+            room_id: Some("22637261".to_owned()),
+            jump_url: None,
+            stype: Some(2),
+        };
+        let card_start = parse_reserve_schedule(&reserve, published_at, published_at)
+            .expect("reservation schedule")
+            .start_at;
+        // Keep the cancelled shows distinct from the new reservation at every
+        // wall-clock time. now+1day+1hour overlaps the 19:00 card around 18:00
+        // Beijing time and exercises the unrelated 10-minute merge path.
+        let old_start = card_start - Duration::hours(4);
+        let song_start = card_start - Duration::hours(3);
+        assert!(card_start.signed_duration_since(song_start) > Duration::minutes(10));
         let (old_schedule, _) = store
             .upsert_schedule(&NewSchedule {
                 streamer_id: streamer.id,
                 participants: Vec::new(),
                 title: "【突击】旧场".to_owned(),
-                start_at: published_at + Duration::days(1),
+                start_at: old_start,
                 end_at: None,
                 room_url: streamer.live_url.clone(),
                 room_owner_mid: Some(streamer.mid.clone()),
@@ -5083,7 +5099,7 @@ mod tests {
                 streamer_id: streamer.id,
                 participants: Vec::new(),
                 title: "歌回".to_owned(),
-                start_at: published_at + Duration::days(1) + Duration::hours(1),
+                start_at: song_start,
                 end_at: None,
                 room_url: streamer.live_url.clone(),
                 room_owner_mid: Some(streamer.mid.clone()),
@@ -5129,13 +5145,7 @@ mod tests {
             images: Vec::new(),
             source_url: "https://t.bilibili.com/current-post".to_owned(),
             raw_kind: "DYNAMIC_TYPE_DRAW".to_owned(),
-            reserve: Some(ReserveCard {
-                title: "直播预约：【突击】电台电台！".to_owned(),
-                description: "明天 19:00 直播".to_owned(),
-                room_id: Some("22637261".to_owned()),
-                jump_url: None,
-                stype: Some(2),
-            }),
+            reserve: Some(reserve),
         };
         let pool = test_pool("fixture-model");
         let stats = service
