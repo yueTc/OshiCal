@@ -2527,6 +2527,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuilding_after_retention_expiry_keeps_pending_local_mutations() {
+        let store = store().await;
+        let server = "https://retention-reset.example.com";
+        let mut bootstrap = SyncBootstrap {
+            schema_version: SYNC_SCHEMA_VERSION,
+            feed_id: "feed-a".to_owned(),
+            snapshot_revision: 5,
+            min_retained_seq: 0,
+            server_time: None,
+            subscriptions: Vec::new(),
+            schedules: Vec::new(),
+            weekly_rules: Vec::new(),
+            weekly_exceptions: Vec::new(),
+            schedule_sources: Vec::new(),
+            source_suppressions: Vec::new(),
+            server_settings: Value::Null,
+            live_statuses: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+        apply_bootstrap(&store, server, &bootstrap).await.unwrap();
+        let mutation = oshical_core::SyncMutation {
+            mutation_id: "offline-draft".to_owned(),
+            operation: "create".to_owned(),
+            entity: "schedule".to_owned(),
+            payload: json!({"title": "离线编辑"}),
+            base_updated_at: None,
+            device_id: None,
+            base_revision: None,
+            status: "pending".to_owned(),
+            last_error: None,
+            created_at: Utc::now(),
+            applied_at: None,
+            result_json: None,
+        };
+        store.enqueue_mutation(&mutation).await.unwrap();
+        bootstrap.snapshot_revision = 100;
+        bootstrap.min_retained_seq = 80;
+        apply_bootstrap(&store, server, &bootstrap).await.unwrap();
+        assert_eq!(get_sync_meta(&store, server).await.unwrap().cursor_seq, 100);
+        let pending = store.list_pending_mutations(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].mutation_id, mutation.mutation_id);
+        assert_eq!(pending[0].payload, mutation.payload);
+        assert_eq!(pending[0].status, "pending");
+    }
+
+    #[tokio::test]
     async fn device_id_is_stable() {
         let store = store().await;
         let first = device_id(&store).await.unwrap();
