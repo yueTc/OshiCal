@@ -504,8 +504,16 @@ async fn refresh_job_progress_is_broadcast_on_creation() {
 async fn refresh_endpoints_reuse_active_jobs() {
     let state = state().await;
     let streamer_id = add_streamer(&state, "880099").await;
-    let all_job = state.jobs.create_all();
-    let streamer_job = state.jobs.create_streamer(streamer_id, "主播880099");
+    let all_key = state.service.refresh_request_key(None).await.unwrap();
+    let single_key = state
+        .service
+        .refresh_request_key(Some(streamer_id))
+        .await
+        .unwrap();
+    let all_job = state.jobs.create_all_with_key(all_key);
+    let streamer_job = state
+        .jobs
+        .create_streamer_with_key(streamer_id, "主播880099", single_key);
     let app = build_router(state);
 
     let (status, accepted) = call_json(&app, Method::POST, "/api/jobs/refresh", None, true).await;
@@ -524,6 +532,20 @@ async fn refresh_endpoints_reuse_active_jobs() {
     assert_eq!(status, StatusCode::OK, "{accepted}");
     assert_eq!(accepted["data"]["jobId"], streamer_job.job.job_id);
     assert_eq!(accepted["data"]["deduplicated"], true);
+}
+
+#[tokio::test]
+async fn refresh_endpoint_does_not_reuse_a_job_after_subscription_snapshot_changes() {
+    let state = state().await;
+    add_streamer(&state, "880101").await;
+    let key = state.service.refresh_request_key(None).await.unwrap();
+    let original = state.jobs.create_all_with_key(key);
+    add_streamer(&state, "880102").await;
+    let app = build_router(state);
+    let (status, accepted) = call_json(&app, Method::POST, "/api/jobs/refresh", None, true).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["data"]["deduplicated"], false);
+    assert_ne!(accepted["data"]["jobId"], original.job.job_id);
 }
 
 #[tokio::test]
