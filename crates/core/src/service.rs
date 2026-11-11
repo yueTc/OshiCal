@@ -8527,6 +8527,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_analysis_failure_is_deferred_but_content_changes_retry() {
+        struct CountFailures(AtomicUsize);
+        #[async_trait]
+        impl ContentAnalyzer for CountFailures {
+            async fn analyze_post(
+                &self,
+                _config: &LlmConfig,
+                _input: &PostAnalysisInput,
+            ) -> AppResult<LlmAnalysis> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(AppError::External {
+                    code: "LLM_503".to_owned(),
+                    message: "fixture unavailable".to_owned(),
+                })
+            }
+        }
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&subscription("retry-fixture", "测试主播"))
+            .await
+            .unwrap();
+        let analyzer = Arc::new(CountFailures(AtomicUsize::new(0)));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let mut post = dynamic_post(
+            "retry-post",
+            &streamer.mid,
+            &streamer.name,
+            Utc::now(),
+            "明晚歌回",
+            Vec::new(),
+        );
+        let pool = test_pool("retry-model");
+        let settings = AppSettings::default();
+        for _ in 0..2 {
+            let stats = service
+                .process_source_posts(
+                    &streamer.mid,
+                    std::slice::from_ref(&streamer),
+                    std::slice::from_ref(&post),
+                    &settings,
+                    Some(&pool),
+                )
+                .await
+                .unwrap();
+            assert!(!stats.analysis_errors.is_empty());
+            assert_eq!(
+                stats.llm_cache_hits, 0,
+                "failure is not successful cached emptiness"
+            );
+        }
+        assert_eq!(
+            analyzer.0.load(Ordering::SeqCst),
+            1,
+            "same failure must not call the model every refresh"
+        );
+        post.text.push_str("改为九点");
+        service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            analyzer.0.load(Ordering::SeqCst),
+            2,
+            "changed content bypasses backoff"
+        );
+        assert!(store.list_all_schedules().await.unwrap().is_empty());
+        let successes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM post_analyses")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(successes, 0);
+    }
+
     struct FailingAnalyzer;
 
     #[async_trait]
