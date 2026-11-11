@@ -37,6 +37,7 @@ import { addDays, eventDayKey, inputDateTime, localDateKey, rangeAroundDays, rol
 import { explainError, openExternalUrl } from "../lib/api";
 import { matchLiveSchedules } from "../lib/live-schedule";
 import { useStickyHeader } from "../lib/sticky-header";
+import { captureMenuScroll } from "../lib/menu-scroll";
 import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
 import { Avatar, EmptyState, ErrorBanner, Modal, SubscriptionSelect } from "./ui";
 
@@ -198,6 +199,7 @@ export default function ScheduleView({
   const [draft, setDraft] = useState<Draft | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
   const [menu, setMenu] = useState<{ schedule: Schedule; x: number; y: number } | null>(null);
+  const menuScrollChangedRef = useRef<() => boolean>(() => false);
   const [liveModal, setLiveModal] = useState<{
     schedule: Schedule;
     session: LiveSession | null;
@@ -686,11 +688,14 @@ export default function ScheduleView({
 
   useEffect(() => {
     const close = () => setMenu(null);
+    const closeOnScroll = () => {
+      if (menuScrollChangedRef.current()) setMenu(null);
+    };
     window.addEventListener("click", close);
-    window.addEventListener("scroll", close, true);
+    window.addEventListener("scroll", closeOnScroll, true);
     return () => {
       window.removeEventListener("click", close);
-      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("scroll", closeOnScroll, true);
     };
   }, []);
 
@@ -981,6 +986,7 @@ export default function ScheduleView({
     }
   }
   function showMenu(schedule: Schedule, x: number, y: number) {
+    menuScrollChangedRef.current = captureMenuScroll(document.elementFromPoint(x, y) ?? pageRef.current);
     setMenu({ schedule, x, y });
   }
 

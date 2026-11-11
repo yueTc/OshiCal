@@ -39,6 +39,7 @@ import { explainError, openExternalUrl } from "../lib/api";
 import { aggregateFanHistory } from "../lib/fan-history";
 import type { FanBucket, FanGranularity } from "../lib/fan-history";
 import { useStickyHeader } from "../lib/sticky-header";
+import { captureMenuScroll } from "../lib/menu-scroll";
 import {
   fertilityCompactLabel,
   fertilitySourceLabel,
@@ -312,6 +313,7 @@ export default function CreatorsView({
   const [moreMenu, setMoreMenu] = useState<{ streamer: Streamer; x: number; y: number } | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const moreScrollChangedRef = useRef<() => boolean>(() => false);
   const [recentTarget, setRecentTarget] = useState<Streamer | null>(null);
   const [aliasTarget, setAliasTarget] = useState<Streamer | null>(null);
   const [aliasText, setAliasText] = useState("");
@@ -415,15 +417,18 @@ export default function CreatorsView({
       }
     };
     const dismissOnMove = () => setMoreMenu(null);
+    const dismissOnScroll = () => {
+      if (moreScrollChangedRef.current()) setMoreMenu(null);
+    };
     window.addEventListener("pointerdown", dismiss);
     window.addEventListener("keydown", escape);
     window.addEventListener("resize", dismissOnMove);
-    window.addEventListener("scroll", dismissOnMove, true);
+    window.addEventListener("scroll", dismissOnScroll, true);
     return () => {
       window.removeEventListener("pointerdown", dismiss);
       window.removeEventListener("keydown", escape);
       window.removeEventListener("resize", dismissOnMove);
-      window.removeEventListener("scroll", dismissOnMove, true);
+      window.removeEventListener("scroll", dismissOnScroll, true);
     };
   }, [moreMenu]);
 
@@ -1523,6 +1528,7 @@ export default function CreatorsView({
                       }
                       const bounds = event.currentTarget.getBoundingClientRect();
                       moreTriggerRef.current = event.currentTarget;
+                      moreScrollChangedRef.current = captureMenuScroll(event.currentTarget);
                       setMoreMenu({ streamer, x: bounds.right - 200, y: bounds.bottom + 6 });
                     }}
                   ><MoreHorizontal size={17} /></button>
