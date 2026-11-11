@@ -552,6 +552,9 @@ pub struct FanRefreshReport {
 pub struct LiveStatus {
     #[serde(default)]
     pub schedule_id: Option<i64>,
+    /// Whether schedule_id came from a server that owns live-card matching.
+    #[serde(default)]
+    pub schedule_known: bool,
     pub streamer_id: i64,
     pub mid: String,
     pub streamer_name: String,

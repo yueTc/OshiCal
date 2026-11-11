@@ -1603,7 +1603,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
 async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveStatus>> {
     let rows = sqlx::query(
         "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_schedule_id, live_notify_enabled, live_revision
+                live_checked_at, live_started_at, live_schedule_id, live_schedule_known, live_notify_enabled, live_revision
          FROM streamers ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&mut *conn)
@@ -1614,7 +1614,7 @@ async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSt
 async fn load_live_status(conn: &mut SqliteConnection, streamer_id: i64) -> AppResult<LiveStatus> {
     let row = sqlx::query(
         "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_schedule_id, live_notify_enabled, live_revision
+                live_checked_at, live_started_at, live_schedule_id, live_schedule_known, live_notify_enabled, live_revision
          FROM streamers WHERE id = ?",
     )
     .bind(streamer_id)
@@ -1627,6 +1627,7 @@ async fn load_live_status(conn: &mut SqliteConnection, streamer_id: i64) -> AppR
 fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
     Ok(LiveStatus {
         schedule_id: row.try_get("live_schedule_id")?,
+        schedule_known: row.try_get::<i64, _>("live_schedule_known")? != 0,
         streamer_id: row.try_get("id")?,
         mid: row.try_get("mid")?,
         streamer_name: row.try_get("name")?,

@@ -256,6 +256,7 @@ export interface FanHistory {
 
 export interface LiveStatus {
   scheduleId?: number | null;
+  scheduleKnown?: boolean;
   streamerId: number;
   mid: string;
   streamerName: string;

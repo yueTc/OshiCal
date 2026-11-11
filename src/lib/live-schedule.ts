@@ -1,7 +1,7 @@
 import type { LiveStatus, Schedule } from "../types";
 
 type LiveScheduleCandidate = Pick<Schedule, "id" | "streamerId" | "startAt" | "cancelled">;
-type ActiveLiveStatus = Pick<LiveStatus, "streamerId" | "isLive" | "startedAt" | "checkedAt" | "scheduleId">;
+type ActiveLiveStatus = Pick<LiveStatus, "streamerId" | "isLive" | "startedAt" | "checkedAt" | "scheduleId" | "scheduleKnown">;
 
 function parseTime(value: string | null | undefined): number | null {
   if (!value) return null;
@@ -49,8 +49,9 @@ export function matchLiveSchedules(
   for (const [streamerId, candidates] of schedulesByStreamer) {
     const live = activeByStreamer.get(streamerId);
     if (!live) continue;
-    // Null means the upgraded server deliberately has no binding. Missing is legacy.
-    if (live.scheduleId !== undefined) {
+    // Null plus scheduleKnown means the upgraded server deliberately has no
+    // binding. Legacy payloads omit both and keep bounded time matching.
+    if (live.scheduleKnown === true || live.scheduleId !== undefined) {
       const bound = candidates.find((schedule) => schedule.id === live.scheduleId);
       if (bound) matchedScheduleIds.add(bound.id);
       continue;

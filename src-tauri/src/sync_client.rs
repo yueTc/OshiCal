@@ -1695,7 +1695,7 @@ async fn apply_live_status(
         .map_err(|error| format!("live_status payload 无效: {error}"))?;
     sqlx::query(
         "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
-            live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?
+            live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?, live_schedule_known = ?
          WHERE id = ?",
     )
     .bind(value.is_live)
@@ -1705,6 +1705,7 @@ async fn apply_live_status(
     .bind(value.started_at.map(|time| time.to_rfc3339()))
     .bind(value.checked_at.to_rfc3339())
     .bind(value.schedule_id)
+    .bind(value.schedule_known)
     .bind(value.streamer_id)
     .execute(&mut **tx)
     .await

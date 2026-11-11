@@ -935,6 +935,7 @@ async fn migration_state_digest_on(
                 "live_started_at",
                 "live_checked_at",
                 "live_schedule_id",
+                "live_schedule_known",
                 "sort_order",
                 "created_at",
                 "updated_at",

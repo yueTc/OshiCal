@@ -618,6 +618,7 @@ mod tests {
             assert_eq!(status(&store).await.schedule_id, Some(first));
         }
         assert_eq!(store.get_schedule(first).await.unwrap().start_at, start);
+        assert_eq!(status(&store).await.started_at, Some(start));
         assert_eq!(store.list_live_broadcasts().await.unwrap().len(), 1);
     }
 

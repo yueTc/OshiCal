@@ -7,10 +7,11 @@ const start = Date.parse("2026-11-11T12:00:00Z");
 const card = (id: number, offset = 0, cancelled = false, streamerId = 1) => ({
   id, streamerId, startAt: new Date(start + offset).toISOString(), cancelled,
 });
-const live = (binding: number | null | undefined = undefined) => ({
+const live = (binding: number | null | undefined = undefined, known?: boolean) => ({
   streamerId: 1, isLive: true, startedAt: new Date(start).toISOString(),
   checkedAt: new Date(start + 30_000).toISOString(),
   ...(binding === undefined ? {} : { scheduleId: binding }),
+  ...(known === undefined ? {} : { scheduleKnown: known }),
 });
 
 test("legacy yesterday-only cards must not be marked live", () => {
@@ -25,8 +26,11 @@ test("legacy two-hour boundary is inclusive, but one millisecond outside is excl
 test("explicit binding survives cross-midnight and ignores a closer unrelated card", () => {
   assert.deepEqual([...matchLiveSchedules([card(1, -86400_000), card(2)], [live(1)])], [1]);
 });
-test("explicit null must not fall back to nearest schedule", () => {
-  assert.deepEqual([...matchLiveSchedules([card(1)], [live(null)])], []);
+test("explicit null on a known-owner server must not fall back to nearest schedule", () => {
+  assert.deepEqual([...matchLiveSchedules([card(1)], [live(null, true)])], []);
+});
+test("legacy payload with missing ownership still uses bounded matching", () => {
+  assert.deepEqual([...matchLiveSchedules([card(1)], [live()])], [1]);
 });
 test("an unloaded bound card must not highlight another card", () => {
   assert.deepEqual([...matchLiveSchedules([card(1)], [live(2)])], []);

@@ -445,6 +445,7 @@ struct WeeklyScheduleRuleRow {
 #[derive(Debug, sqlx::FromRow)]
 struct LiveStatusRow {
     live_schedule_id: Option<i64>,
+    live_schedule_known: i64,
     streamer_id: i64,
     mid: String,
     streamer_name: String,
@@ -553,6 +554,11 @@ impl SqliteStore {
         sync_feed::initialize_sync_feed(&mut tx).await?;
         for (table, column, definition) in [
             ("streamers", "live_schedule_id", "ALTER TABLE streamers ADD COLUMN live_schedule_id INTEGER"),
+            (
+                "streamers",
+                "live_schedule_known",
+                "ALTER TABLE streamers ADD COLUMN live_schedule_known INTEGER NOT NULL DEFAULT 0",
+            ),
             ("live_sessions", "schedule_id", "ALTER TABLE live_sessions ADD COLUMN schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL"),
         ] {
             let columns = sqlx::query(&format!("PRAGMA table_info({table})")).fetch_all(&mut *tx).await?;
@@ -3019,7 +3025,7 @@ impl SqliteStore {
     ) -> AppResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous = sqlx::query(
-            "SELECT live_is_live, live_title, live_cover, live_url, live_started_at, live_checked_at, live_schedule_id
+            "SELECT live_is_live, live_title, live_cover, live_url, live_started_at, live_checked_at, live_schedule_id, live_schedule_known
              FROM streamers WHERE id = ?",
         )
         .bind(streamer_id)
@@ -3051,7 +3057,20 @@ impl SqliteStore {
             None
         };
         let previous_schedule_id: Option<i64> = previous.try_get("live_schedule_id")?;
-        let snapshot_started_at = snapshot.started_at.map(|value| value.to_rfc3339());
+        let previous_schedule_known: i64 = previous.try_get("live_schedule_known")?;
+        // The broadcast state owns the first start timestamp. A platform live_time
+        // reset is a new segment, not a new card or a new display start.
+        let snapshot_started_at = if snapshot.is_live {
+            broadcast
+                .as_ref()
+                .map(|value| value.started_at.clone())
+                .or_else(|| snapshot.started_at.map(|value| value.to_rfc3339()))
+        } else {
+            broadcast
+                .as_ref()
+                .map(|value| value.started_at.clone())
+                .or(previous_started_at.clone())
+        };
         let changed = previous_is_live != (snapshot.is_live as i64)
             || previous_title.as_deref().unwrap_or_default() != snapshot.title
             || previous_cover.as_deref() != snapshot.cover_url.as_deref()
@@ -3060,10 +3079,11 @@ impl SqliteStore {
                 .as_deref()
                 .is_some_and(|url| previous_live_url.as_deref() != Some(url))
             || previous_started_at.as_deref() != snapshot_started_at.as_deref()
-            || previous_schedule_id != schedule_id;
+            || previous_schedule_id != schedule_id
+            || previous_schedule_known == 0;
         sqlx::query(
             "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
-                    live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?,
+                    live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?, live_schedule_known = 1,
                     updated_at = ?, live_revision = live_revision + ? WHERE id = ?",
         )
         .bind(snapshot.is_live)
@@ -3171,7 +3191,7 @@ impl SqliteStore {
     pub async fn list_live_statuses(&self) -> AppResult<Vec<LiveStatus>> {
         let rows = sqlx::query_as::<_, LiveStatusRow>(
             "SELECT id AS streamer_id, mid, name AS streamer_name, avatar_url, live_is_live,
-                    live_title, live_cover, live_url, live_checked_at, live_started_at, live_schedule_id,
+                    live_title, live_cover, live_url, live_checked_at, live_started_at, live_schedule_id, live_schedule_known,
                     live_notify_enabled, live_revision AS revision
              FROM streamers ORDER BY name COLLATE NOCASE",
         )
@@ -3181,6 +3201,7 @@ impl SqliteStore {
             .map(|row| {
                 Ok(LiveStatus {
                     schedule_id: row.live_schedule_id,
+                    schedule_known: row.live_schedule_known != 0,
                     streamer_id: row.streamer_id,
                     mid: row.mid,
                     streamer_name: row.streamer_name,
