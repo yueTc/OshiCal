@@ -98,6 +98,24 @@ export async function refreshStreamerJob(
   if (!Number.isSafeInteger(streamerId) || streamerId <= 0) {
     throw new Error("刷新主播 ID 无效");
   }
+  return followRefreshJob(api, streamerId, streamerName, onProgress, options);
+}
+
+export async function refreshAllJob(
+  api: RefreshJobApi,
+  onProgress: (progress: RefreshProgress) => void,
+  options: RefreshJobOptions = {},
+): Promise<RefreshReport> {
+  return followRefreshJob(api, undefined, "全部主播", onProgress, options);
+}
+
+async function followRefreshJob(
+  api: RefreshJobApi,
+  streamerId: number | undefined,
+  streamerName: string,
+  onProgress: (progress: RefreshProgress) => void,
+  options: RefreshJobOptions,
+): Promise<RefreshReport> {
   const pollMs = options.pollMs ?? 1000;
   if (!Number.isSafeInteger(pollMs) || pollMs <= 0 || pollMs > 2_147_483_647) {
     throw new Error("刷新任务轮询间隔无效");
@@ -122,7 +140,7 @@ export async function refreshStreamerJob(
     // A full job can report streamerId=0/null; keep the user's original target.
     const progress: RefreshProgress = {
       ...job.progress,
-      streamerId,
+      streamerId: streamerId ?? 0,
       streamerName,
       done: job.status === "completed" || job.status === "failed",
     };
@@ -138,7 +156,7 @@ export async function refreshStreamerJob(
         onProgress({ ...progress, stage: withStage(progress.stage, message), failed: true });
         throw new Error(message);
       }
-      const completion = refreshCompletionProgress(job.report, streamerId, streamerName);
+      const completion = refreshCompletionProgress(job.report, streamerId ?? 0, streamerName);
       onProgress({
         ...progress,
         stage: completion.failed

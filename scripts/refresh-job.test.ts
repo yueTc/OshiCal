@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { refreshCompletionProgress, refreshStreamerJob } from "../src/lib/refresh-job.ts";
+import { refreshAllJob, refreshCompletionProgress, refreshStreamerJob } from "../src/lib/refresh-job.ts";
 import type { RefreshJob, RefreshJobAccepted, RefreshProgress, RefreshReport } from "../src/types.ts";
 
 const STREAMER_ID = 42;
@@ -287,4 +287,38 @@ test("a server failed progress flag cannot be overwritten by a successful report
   await h.run();
   assert.equal(h.progress.at(-1)!.failed, true);
   assert.equal(h.progress.at(-1)!.stage, "刷新部分失败");
+});
+
+
+test("full refresh submits once without a streamer id and retains shared progress", async () => {
+  const submissions: Array<number | undefined> = [];
+  const progress: RefreshProgress[] = [];
+  const complete = job("completed", {
+    kind: "refresh_all", streamerId: null, streamerName: null,
+    progress: { stage: "已加入全量刷新（共享全量结果）", completed: 3, total: 3, percent: 100, done: true, failed: false },
+    report: report({ refreshedStreamers: 3 }),
+  });
+  const api = {
+    refreshJob: async (id?: number): Promise<RefreshJobAccepted> => {
+      submissions.push(id); return { jobId: "job-1", status: "running", deduplicated: true };
+    },
+    refreshJobStatus: async (): Promise<RefreshJob> => complete,
+  };
+  const result = await refreshAllJob(api, (value) => progress.push(value));
+  assert.equal(result.refreshedStreamers, 3);
+  assert.deepEqual(submissions, [undefined]);
+  assert.equal(progress[0].streamerId, 0);
+  assert.equal(progress[0].streamerName, "全部主播");
+  assert.match(progress[0].stage, /共享全量结果/);
+});
+
+test("full refresh partial report stays failed instead of becoming an empty success", async () => {
+  const progress: RefreshProgress[] = [];
+  const result = await refreshAllJob({
+    refreshJob: async () => ({ jobId: "job-1", status: "queued" }),
+    refreshJobStatus: async () => job("completed", { report: report({ failedStreamers: ["甲：暂缓重试"] }) }),
+  }, (value) => progress.push(value));
+  assert.deepEqual(result.failedStreamers, ["甲：暂缓重试"]);
+  assert.equal(progress.at(-1)?.failed, true);
+  assert.match(progress.at(-1)?.stage ?? "", /暂缓重试/);
 });

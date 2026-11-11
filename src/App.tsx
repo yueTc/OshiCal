@@ -43,7 +43,7 @@ import {
   openExternalUrl,
 } from "./lib/api";
 import { applyAutostart, readAutostart } from "./lib/autostart";
-import { refreshCompletionProgress, refreshStreamerJob } from "./lib/refresh-job";
+import { refreshAllJob, refreshCompletionProgress, refreshStreamerJob } from "./lib/refresh-job";
 import {
   ensureNotificationPermission,
   installNotificationActionHandler,
@@ -2183,12 +2183,17 @@ export default function App() {
         return localApi.liveSessionForSchedule(scheduleId);
       },
       refresh: async () => {
-        if (serverMode && serverApi) {
-          await serverApi.refresh();
+        let report: RefreshReport | undefined;
+        if (serverMode) {
+          if (!serverApi) throw new Error("服务器未连接");
+          report = await refreshAllJob(serverApi, applyRefreshProgress);
         } else if (localApi) {
-          await localApi.refresh();
+          report = await localApi.refresh();
         }
         await refreshActiveData();
+        if (report?.failedStreamers.length) {
+          throw new Error(`刷新完成，但部分来源失败：${report.failedStreamers.join("；")}`);
+        }
       },
     };
   }, [refreshActiveData, serverApi, settings.dataMode, settings.serverUrl, showToast]);
