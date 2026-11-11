@@ -641,6 +641,21 @@ impl SqliteStore {
                 sqlx::query(definition).execute(&mut *tx).await?;
             }
         }
+        // Intermediate beta builds could already have nullable platform columns.
+        // Backfill only missing values; explicit bilibili/youtube values are preserved.
+        for table in [
+            "streamers",
+            "linked_accounts",
+            "schedule_sources",
+            "source_suppressions",
+        ] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET platform = 'bilibili'
+                 WHERE platform IS NULL OR TRIM(platform) = ''"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
         let columns = sqlx::query("PRAGMA table_info(sync_queue)")
             .fetch_all(&mut *tx)
             .await?;
@@ -1353,6 +1368,15 @@ impl SqliteStore {
             .filter(|value| !value.is_empty());
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let streamer_platform: String =
+            sqlx::query_scalar("SELECT platform FROM streamers WHERE id = ?")
+                .bind(streamer_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| AppError::not_found(format!("主播 {streamer_id}")))?;
+        if parse_platform(&streamer_platform)? != platform {
+            return Err(AppError::validation("关联账号必须与主播使用同一平台"));
+        }
         sqlx::query(
             "INSERT INTO linked_accounts
                 (streamer_id, platform, mid, name, avatar_url, handle, profile_url, created_at)
@@ -4596,6 +4620,27 @@ async fn needs_youtube_schema_migration(pool: &SqlitePool) -> AppResult<bool> {
             return Ok(true);
         }
     }
+
+    // An intermediate beta may already have every column but still contain
+    // legacy NULL/blank platform values. That data backfill also needs a backup.
+    for table in [
+        "streamers",
+        "linked_accounts",
+        "schedule_sources",
+        "source_suppressions",
+    ] {
+        let needs_backfill: i64 = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM {table}
+                WHERE platform IS NULL OR TRIM(platform) = ''
+            )"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if needs_backfill != 0 {
+            return Ok(true);
+        }
+    }
     Ok(false)
 }
 
@@ -4768,6 +4813,19 @@ mod tests {
                 .await
                 .expect("current schema");
         }
+        sqlx::query("INSERT INTO streamers(platform) VALUES (NULL)")
+            .execute(&pool)
+            .await
+            .expect("nullable platform row");
+        assert!(
+            needs_youtube_schema_migration(&pool)
+                .await
+                .expect("legacy platform value needs a backup")
+        );
+        sqlx::query("UPDATE streamers SET platform = 'bilibili'")
+            .execute(&pool)
+            .await
+            .expect("backfilled platform row");
         assert!(
             !needs_youtube_schema_migration(&pool)
                 .await

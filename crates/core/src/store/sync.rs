@@ -477,8 +477,8 @@ impl SqliteStore {
         let actor = sync_actor_for_mutation(mutation);
         let result = match mutation.operation.as_str() {
             "create" => {
-                let streamer_name: String =
-                    sqlx::query_scalar("SELECT name FROM streamers WHERE id = ?")
+                let (streamer_name, streamer_platform): (String, String) =
+                    sqlx::query_as("SELECT name, platform FROM streamers WHERE id = ?")
                         .bind(streamer_id)
                         .fetch_optional(&mut *tx)
                         .await?
@@ -520,6 +520,9 @@ impl SqliteStore {
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 validate_platform_mid(platform, mid)?;
+                if parse_platform(&streamer_platform)? != platform {
+                    return Err(AppError::validation("关联账号必须与主播使用同一平台"));
+                }
                 sqlx::query(
                     "INSERT INTO linked_accounts
                         (streamer_id, platform, mid, name, avatar_url, handle, profile_url, created_at)

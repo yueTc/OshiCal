@@ -20,9 +20,9 @@ use uuid::Uuid;
 use crate::api::{sync_runtime_secrets_from_vault, AppState};
 use crate::config::{validate_oauth_redirect_uri, YouTubeConfig};
 use crate::secrets::{
-    clear_persisted_youtube_oauth, load_persisted_youtube_api_key,
-    load_persisted_youtube_oauth, save_persisted_youtube_oauth, SecretVault,
-    YoutubeOAuthToken,
+    clear_persisted_youtube_oauth, is_recoverable_youtube_secret_read_error,
+    load_persisted_youtube_api_key, load_persisted_youtube_oauth, save_persisted_youtube_oauth,
+    SecretVault, YoutubeOAuthToken,
 };
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -190,6 +190,75 @@ struct OAuthTokenResponse {
     token_type: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    error: Option<String>,
+}
+
+fn has_required_youtube_scope(scopes: &[String]) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope.trim() == YOUTUBE_READONLY_SCOPE)
+}
+
+fn required_oauth_scopes(scope: Option<&str>) -> Result<Vec<String>, YouTubeError> {
+    let scope = scope.ok_or_else(oauth_scope_missing)?;
+    let scopes = scope
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if has_required_youtube_scope(&scopes) {
+        Ok(scopes)
+    } else {
+        Err(oauth_scope_missing())
+    }
+}
+
+fn stored_access_token(token: &YoutubeOAuthToken) -> Option<String> {
+    token
+        .access_token
+        .clone()
+        .map(|value| value.replace(['\r', '\n'], "").trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn oauth_access_token_is_fresh(token: &YoutubeOAuthToken) -> bool {
+    has_required_youtube_scope(&token.scopes)
+        && stored_access_token(token).is_some()
+        && token.access_token_expires_at.is_none_or(|expires_at| {
+            expires_at > Utc::now() + ChronoDuration::seconds(OAUTH_REFRESH_SKEW_SECONDS)
+        })
+}
+
+pub(crate) fn runtime_youtube_access_token(token: &YoutubeOAuthToken) -> Option<String> {
+    if !has_required_youtube_scope(&token.scopes) {
+        return None;
+    }
+    if token
+        .access_token_expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        return None;
+    }
+    stored_access_token(token)
+}
+
+fn oauth_scope_missing() -> YouTubeError {
+    YouTubeError {
+        code: "YOUTUBE_UNAUTHORIZED".to_owned(),
+        message: "YouTube OAuth 缺少读取权限，请重新授权".to_owned(),
+        status: StatusCode::UNAUTHORIZED,
+    }
+}
+
+fn youtube_feature_disabled() -> YouTubeError {
+    YouTubeError {
+        code: "YOUTUBE_FEATURE_DISABLED".to_owned(),
+        message: "YouTube 功能未开启".to_owned(),
+        status: StatusCode::FORBIDDEN,
+    }
+}
+
 pub(crate) fn init_youtube_runtime(
     config: YouTubeConfig,
 ) -> Result<Arc<YouTubeServer>, String> {
@@ -304,6 +373,9 @@ impl YouTubeServer {
     }
 
     pub async fn start_oauth(&self) -> Result<YouTubeOAuthStart, YouTubeError> {
+        // Serialize state creation with logout so request ordering is clear:
+        // logout invalidates states created before it and later starts remain valid.
+        let _guard = OAUTH_REFRESH_LOCK.lock().await;
         let (client_id, _, redirect_uri) = self.oauth_parts()?;
         self.clean_pending_oauth().await;
         let state = random_url_token(32);
@@ -356,9 +428,15 @@ impl YouTubeServer {
         code: &str,
         state: &str,
     ) -> Result<YouTubeOAuthStatus, YouTubeError> {
+        // Serialize completion with refresh and logout so a callback cannot
+        // restore credentials after the user has logged out.
+        let _guard = OAUTH_REFRESH_LOCK.lock().await;
         let pending = self.take_pending_oauth(state).await?;
         if pending.expires_at < Utc::now() {
             return Err(invalid_oauth_state());
+        }
+        if !youtube_feature_enabled(store).await? {
+            return Err(youtube_feature_disabled());
         }
         let (client_id, client_secret, _) = self.oauth_parts()?;
         let token = self
@@ -371,9 +449,17 @@ impl YouTubeServer {
                 ("redirect_uri".to_owned(), pending.redirect_uri),
             ])
             .await?;
-        let previous_refresh = load_persisted_youtube_oauth(store, vault)
-            .await?
-            .map(|value| value.token.refresh_token);
+        if !youtube_feature_enabled(store).await? {
+            return Err(youtube_feature_disabled());
+        }
+        let previous_refresh = match load_persisted_youtube_oauth(store, vault).await {
+            Ok(value) => value.map(|persisted| persisted.token.refresh_token),
+            Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
+                tracing::warn!(code = error.code(), "旧 YouTube OAuth 密文损坏，将用新授权覆盖");
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
         let refresh_token = token
             .refresh_token
             .or(previous_refresh)
@@ -383,17 +469,14 @@ impl YouTubeServer {
                 message: "Google 未返回 refresh token，请撤销授权后重试".to_owned(),
                 status: StatusCode::BAD_GATEWAY,
             })?;
+        let scopes = required_oauth_scopes(token.scope.as_deref())?;
         let saved = YoutubeOAuthToken {
             refresh_token,
             access_token: Some(token.access_token),
             access_token_expires_at: token
                 .expires_in
                 .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds.max(0))),
-            scopes: token
-                .scope
-                .as_deref()
-                .map(|scope| scope.split_whitespace().map(ToOwned::to_owned).collect())
-                .unwrap_or_else(|| vec![YOUTUBE_READONLY_SCOPE.to_owned()]),
+            scopes,
             token_type: token.token_type.unwrap_or_else(|| "Bearer".to_owned()),
         };
         save_persisted_youtube_oauth(store, vault, &saved).await?;
@@ -410,10 +493,15 @@ impl YouTubeServer {
         store: &SqliteStore,
         vault: &SecretVault,
     ) -> Result<YouTubeOAuthStatus, YouTubeError> {
+        let last_error = self.last_oauth_error.lock().await.clone();
         let Some(saved) = load_persisted_youtube_oauth(store, vault).await? else {
-            return Ok(YouTubeOAuthStatus::missing());
+            return Ok(YouTubeOAuthStatus {
+                last_error,
+                ..YouTubeOAuthStatus::missing()
+            });
         };
-        let expired = saved
+        let scope_complete = has_required_youtube_scope(&saved.token.scopes);
+        let access_expired = saved
             .token
             .access_token_expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now());
@@ -423,8 +511,8 @@ impl YouTubeServer {
             updated_at: Some(saved.updated_at),
             expires_at: saved.token.access_token_expires_at,
             scopes: saved.token.scopes,
-            expired,
-            last_error: self.last_oauth_error.lock().await.clone(),
+            expired: access_expired || !scope_complete,
+            last_error,
         })
     }
 
@@ -450,17 +538,24 @@ impl YouTubeServer {
         let Some(saved) = load_persisted_youtube_oauth(store, vault).await? else {
             return Ok(false);
         };
-        if saved.token.access_token.is_some()
-            && saved
-                .token
-                .access_token_expires_at
-                .is_some_and(|expires_at| {
-                    expires_at > Utc::now() + ChronoDuration::seconds(OAUTH_REFRESH_SKEW_SECONDS)
-                })
-        {
+        if !has_required_youtube_scope(&saved.token.scopes) {
+            return Err(oauth_scope_missing());
+        }
+        if oauth_access_token_is_fresh(&saved.token) {
             return Ok(false);
         }
         let _guard = OAUTH_REFRESH_LOCK.lock().await;
+        // Another waiter may have refreshed while this caller was queued. Re-read
+        // under the lock so refresh-token rotation is never consumed twice.
+        let Some(saved) = load_persisted_youtube_oauth(store, vault).await? else {
+            return Ok(false);
+        };
+        if !has_required_youtube_scope(&saved.token.scopes) {
+            return Err(oauth_scope_missing());
+        }
+        if oauth_access_token_is_fresh(&saved.token) {
+            return Ok(false);
+        }
         if let Err(error) = self.refresh_oauth_locked(store, vault).await {
             *self.last_oauth_error.lock().await = Some(error.message.clone());
             return Err(error);
@@ -477,15 +572,45 @@ impl YouTubeServer {
         let saved = load_persisted_youtube_oauth(store, vault)
             .await?
             .ok_or_else(|| YouTubeError::not_configured("YouTube OAuth 尚未授权"))?;
+        if !youtube_feature_enabled(store).await? {
+            return Err(youtube_feature_disabled());
+        }
+        if !has_required_youtube_scope(&saved.token.scopes) {
+            return Err(oauth_scope_missing());
+        }
         let (client_id, client_secret, _) = self.oauth_parts()?;
-        let token = self
+        let token = match self
             .token_request(vec![
                 ("grant_type".to_owned(), "refresh_token".to_owned()),
                 ("refresh_token".to_owned(), saved.token.refresh_token.clone()),
                 ("client_id".to_owned(), client_id.to_owned()),
                 ("client_secret".to_owned(), client_secret.to_owned()),
             ])
-            .await?;
+            .await
+        {
+            Ok(token) => token,
+            Err(error) if error.code == "YOUTUBE_UNAUTHORIZED" => {
+                // Google rejected the refresh token. Remove the dead grant so
+                // runtime callers fail closed until the user authorizes again.
+                clear_persisted_youtube_oauth(store).await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if !youtube_feature_enabled(store).await? {
+            return Err(youtube_feature_disabled());
+        }
+        let scopes = match token.scope.as_deref() {
+            Some(scope) => match required_oauth_scopes(Some(scope)) {
+                Ok(scopes) => scopes,
+                Err(error) => {
+                    clear_persisted_youtube_oauth(store).await?;
+                    return Err(error);
+                }
+            },
+            // Google may omit scope when refresh keeps the originally granted set.
+            None => saved.token.scopes,
+        };
         let next = YoutubeOAuthToken {
             refresh_token: token
                 .refresh_token
@@ -495,11 +620,7 @@ impl YouTubeServer {
             access_token_expires_at: token
                 .expires_in
                 .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds.max(0))),
-            scopes: token
-                .scope
-                .as_deref()
-                .map(|scope| scope.split_whitespace().map(ToOwned::to_owned).collect())
-                .unwrap_or(saved.token.scopes),
+            scopes,
             token_type: token
                 .token_type
                 .unwrap_or_else(|| saved.token.token_type.clone()),
@@ -526,6 +647,16 @@ impl YouTubeServer {
             .await
             .map_err(|_| YouTubeError::upstream("读取 Google OAuth 响应失败"))?;
         if !status.is_success() {
+            let provider_error = serde_json::from_slice::<OAuthErrorResponse>(&bytes)
+                .ok()
+                .and_then(|body| body.error);
+            if provider_error.as_deref() == Some("invalid_grant") {
+                return Err(YouTubeError {
+                    code: "YOUTUBE_UNAUTHORIZED".to_owned(),
+                    message: "Google OAuth 授权已失效，请重新授权".to_owned(),
+                    status: StatusCode::UNAUTHORIZED,
+                });
+            }
             return Err(YouTubeError {
                 code: "YOUTUBE_OAUTH_EXCHANGE_FAILED".to_owned(),
                 message: "Google OAuth 授权失败或已过期，请重新授权".to_owned(),
@@ -544,19 +675,45 @@ impl YouTubeServer {
         store: &SqliteStore,
         vault: &SecretVault,
     ) -> Result<YouTubeOAuthStatus, YouTubeError> {
-        if let Some(saved) = load_persisted_youtube_oauth(store, vault).await? {
-            let token = saved
-                .token
-                .access_token
-                .filter(|value| !value.is_empty())
-                .unwrap_or(saved.token.refresh_token);
-            if !token.is_empty() {
-                let _ = self
+        // Serialize with refresh/completion and invalidate every in-flight state
+        // first. A callback that arrives after logout must not re-authenticate.
+        let _guard = OAUTH_REFRESH_LOCK.lock().await;
+        self.pending_oauth.lock().await.clear();
+        let saved = match load_persisted_youtube_oauth(store, vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                // Clearing the local slot does not require decrypting it. Always
+                // attempt removal so logout also works with a lost master key.
+                tracing::warn!(code = error.code(), "读取 YouTube OAuth 失败；仍尝试清除本地授权槽位");
+                None
+            }
+        };
+        if let Some(saved) = saved {
+            let mut candidates = Vec::new();
+            if let Some(access_token) = stored_access_token(&saved.token) {
+                candidates.push(access_token);
+            }
+            let refresh_token = saved.token.refresh_token.trim();
+            if !refresh_token.is_empty()
+                && candidates
+                    .first()
+                    .is_none_or(|value| value.as_str() != refresh_token)
+            {
+                candidates.push(refresh_token.to_owned());
+            }
+            // Try both grant forms. Google revokes the whole authorization from
+            // either token, but an expired access token can fail first.
+            for token in candidates {
+                let revoked = self
                     .http
                     .post(GOOGLE_REVOKE_URL)
                     .form(&[("token", token.as_str())])
                     .send()
-                    .await;
+                    .await
+                    .is_ok_and(|response| response.status().is_success());
+                if revoked {
+                    break;
+                }
             }
         }
         clear_persisted_youtube_oauth(store).await?;
@@ -573,11 +730,23 @@ impl YouTubeServer {
         let saved = load_persisted_youtube_oauth(store, vault)
             .await?
             .ok_or_else(|| YouTubeError::not_configured("YouTube OAuth 尚未授权"))?;
-        saved
+        if !has_required_youtube_scope(&saved.token.scopes) {
+            return Err(oauth_scope_missing());
+        }
+        if saved
             .token
-            .access_token
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| YouTubeError::not_configured("YouTube OAuth access token 不可用"))
+            .access_token_expires_at
+            .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            return Err(YouTubeError {
+                code: "YOUTUBE_UNAUTHORIZED".to_owned(),
+                message: "YouTube OAuth access token 已过期，请重新授权".to_owned(),
+                status: StatusCode::UNAUTHORIZED,
+            });
+        }
+        stored_access_token(&saved.token).ok_or_else(|| {
+            YouTubeError::not_configured("YouTube OAuth access token 不可用")
+        })
     }
 
     async fn clean_pending_oauth(&self) {
@@ -775,6 +944,132 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
+
+    fn configured_server() -> YouTubeServer {
+        YouTubeServer::new(YouTubeConfig {
+            oauth_client_id: Some("client-id".to_owned()),
+            oauth_client_secret: Some("client-secret".to_owned()),
+            oauth_redirect_uri: Some(
+                "http://127.0.0.1:8787/api/youtube/oauth/callback".to_owned(),
+            ),
+            ..YouTubeConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn required_youtube_scope_is_exact_and_case_sensitive() {
+        assert!(has_required_youtube_scope(&[
+            "openid".to_owned(),
+            YOUTUBE_READONLY_SCOPE.to_owned(),
+        ]));
+        assert!(!has_required_youtube_scope(&[
+            "openid".to_owned(),
+            YOUTUBE_READONLY_SCOPE.to_ascii_uppercase(),
+        ]));
+        assert!(!has_required_youtube_scope(&[]));
+    }
+
+    #[test]
+    fn oauth_token_response_requires_an_explicit_youtube_scope() {
+        let missing = required_oauth_scopes(None).unwrap_err();
+        assert_eq!(missing.code, "YOUTUBE_UNAUTHORIZED");
+        assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
+
+        let wrong = required_oauth_scopes(Some("openid profile")).unwrap_err();
+        assert_eq!(wrong.code, "YOUTUBE_UNAUTHORIZED");
+
+        let case_mismatch =
+            required_oauth_scopes(Some(YOUTUBE_READONLY_SCOPE.to_ascii_uppercase().as_str()))
+                .unwrap_err();
+        assert_eq!(case_mismatch.code, "YOUTUBE_UNAUTHORIZED");
+
+        assert_eq!(
+            required_oauth_scopes(Some(YOUTUBE_READONLY_SCOPE)).unwrap(),
+            vec![YOUTUBE_READONLY_SCOPE.to_owned()]
+        );
+    }
+
+    #[test]
+    fn runtime_access_token_requires_scope_and_remaining_lifetime() {
+        let now = Utc::now();
+        let mut token = YoutubeOAuthToken {
+            refresh_token: "refresh".to_owned(),
+            access_token: Some("access\r\n".to_owned()),
+            access_token_expires_at: Some(now + ChronoDuration::minutes(5)),
+            scopes: vec![YOUTUBE_READONLY_SCOPE.to_owned()],
+            token_type: "Bearer".to_owned(),
+        };
+        assert_eq!(
+            runtime_youtube_access_token(&token).as_deref(),
+            Some("access")
+        );
+
+        token.scopes = vec!["openid".to_owned()];
+        assert!(runtime_youtube_access_token(&token).is_none());
+
+        token.scopes = vec![YOUTUBE_READONLY_SCOPE.to_owned()];
+        token.access_token_expires_at = Some(now - ChronoDuration::seconds(1));
+        assert!(runtime_youtube_access_token(&token).is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_state_is_single_use() {
+        let server = configured_server();
+        let started = server.start_oauth().await.unwrap();
+        assert!(server
+            .take_pending_oauth(&started.state)
+            .await
+            .is_ok());
+        assert!(server
+            .take_pending_oauth(&started.state)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_pending_oauth_states() {
+        let server = configured_server();
+        let store = SqliteStore::in_memory().await.unwrap();
+        let vault = SecretVault::from_material("test-master-key");
+        let started = server.start_oauth().await.unwrap();
+
+        server.logout(&store, &vault).await.unwrap();
+
+        assert!(server
+            .take_pending_oauth(&started.state)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_clears_an_unreadable_oauth_slot() {
+        let server = configured_server();
+        let store = SqliteStore::in_memory().await.unwrap();
+        let vault = SecretVault::from_material("test-master-key");
+        store
+            .set_client_sync_state(
+                "server:secret:youtube_oauth:v1",
+                &json!({
+                    "ciphertext": "not-valid-base64",
+                    "revision": 4,
+                    "updatedAt": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        server.logout(&store, &vault).await.unwrap();
+
+        assert!(store
+            .get_client_sync_state("server:secret:youtube_oauth:v1")
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn oauth_parts_reject_non_loopback_http_even_for_programmatic_config() {

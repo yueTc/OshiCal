@@ -6,6 +6,7 @@ on:
       - main
       - master
       - codex/live-broadcast-card
+      - youtube
   pull_request:
   workflow_dispatch:
 
@@ -87,6 +88,10 @@ jobs:
       - name: Frontend tests
         if: ${{ !cancelled() }}
         run: npm run test:web
+
+      - name: YouTube fixture contracts
+        if: ${{ !cancelled() }}
+        run: node scripts/youtube-fixtures/validate-fixtures.mjs
 
       - name: Rust tests
         if: ${{ !cancelled() }}

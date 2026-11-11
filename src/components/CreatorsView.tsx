@@ -350,6 +350,7 @@ export default function CreatorsView({
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchRequestSeq = useRef(0);
   const searchCache = useRef(new Map<string, { at: number; results: AccountSearchResult[] }>());
+  const searchInFlightKeyRef = useRef<string | null>(null);
   const [linkTarget, setLinkTarget] = useState<Streamer | null>(null);
   const [linkPlatform, setLinkPlatform] = useState<Platform>("bilibili");
   const linkPlatformRef = useRef<Platform>("bilibili");
@@ -358,6 +359,7 @@ export default function CreatorsView({
   const [linkSearching, setLinkSearching] = useState(false);
   const [linkBusyMid, setLinkBusyMid] = useState<string | null>(null);
   const linkSearchSeq = useRef(0);
+  const linkSearchInFlightKeyRef = useRef<string | null>(null);
   const linkTargetIdRef = useRef<number | null>(null);
   const linkQueryRef = useRef("");
   const linkActionBusyRef = useRef(false);
@@ -622,8 +624,13 @@ export default function CreatorsView({
       setHasSearched(true);
       return;
     }
-    const requestId = ++searchRequestSeq.current;
     const cacheKey = `${searchPlatform}:${query.toLocaleLowerCase()}`;
+    // Enter can fire before React renders the disabled button. Block a second
+    // request for the same query so one explicit search never doubles API usage.
+    if (searchInFlightKeyRef.current === cacheKey) {
+      return;
+    }
+    const requestId = ++searchRequestSeq.current;
     const cached = searchCache.current.get(cacheKey);
     if (cached && Date.now() - cached.at < 5 * 60 * 1000) {
       setResults(cached.results);
@@ -632,6 +639,7 @@ export default function CreatorsView({
       setSearching(false);
       return;
     }
+    searchInFlightKeyRef.current = cacheKey;
     setSearching(true);
     setSearchError(null);
     setHasSearched(false);
@@ -652,6 +660,9 @@ export default function CreatorsView({
       setResults([]);
       setHasSearched(true);
     } finally {
+      if (searchInFlightKeyRef.current === cacheKey) {
+        searchInFlightKeyRef.current = null;
+      }
       if (requestId === searchRequestSeq.current) {
         setSearching(false);
       }
@@ -900,12 +911,17 @@ export default function CreatorsView({
     if (!target || !query) {
       return;
     }
-    const requestId = ++linkSearchSeq.current;
     const searchPlatform = linkPlatform;
     if (searchPlatform === "youtube" && !youtubeEnabled) {
       onError("YouTube 功能未开启");
       return;
     }
+    const searchKey = `${searchPlatform}:${query}`;
+    if (linkSearchInFlightKeyRef.current === searchKey) {
+      return;
+    }
+    const requestId = ++linkSearchSeq.current;
+    linkSearchInFlightKeyRef.current = searchKey;
     linkQueryRef.current = query;
     setLinkSearching(true);
     try {
@@ -929,6 +945,9 @@ export default function CreatorsView({
         onError(explainError(error));
       }
     } finally {
+      if (linkSearchInFlightKeyRef.current === searchKey) {
+        linkSearchInFlightKeyRef.current = null;
+      }
       if (
         linkSearchSeq.current === requestId
         && linkTargetIdRef.current === target.id

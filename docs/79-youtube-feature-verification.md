@@ -1,334 +1,411 @@
-# YouTube 功能验证与测试设计
+# YouTube 功能验证、CI 与发布门禁
 
-- 状态：验证资产已设计，未执行
+- 状态：静态审查完成；未执行任何构建、测试、Node fixture 校验或真实环境验收
 - 分支：`youtube`
+- 审查基准：`f93012b`、`3cd76bc`，并以当前工作树中的并行修改作静态参考
 - 对应实施计划：`docs/78-youtube-feature-implementation-plan.md`
-- 禁止事项：当前工作区不得执行 `cargo build`、`cargo test`、`cargo check`、`cargo clippy`、`npm run build`、`npm run check`、`npx tauri build/dev`、`docker build` 或任何会产生编译产物的命令。
-- 执行环境：所有构建、测试、lint、fixture 校验和真实 UI 验收只能通过 GitHub Actions 或用户指定的外部构建机执行。
+- 当前发布结论：**阻断**
+- 阻断解除后的建议：**仅 beta**；在 beta 验收及用户明确确认前，不得发布 stable
 
-## 1. 目标
+> 本文件记录验证设计、静态证据和缺口。它不代表 CI 已通过，也不把源码中存在测试函数视为测试已经执行。
 
-本文件定义 YouTube 功能的可静态审查验证资产和 CI 验收口径，覆盖：
+## 1. 强制边界
 
-- YouTube 频道 ID、handle、频道 URL、视频 URL 解析。
-- YouTube Data API 搜索结果、频道详情、直播/预约/结束状态映射。
-- 公开社区帖、会员可访问社区帖、会员权限不可用时的 `ytInitialData` 解析契约。
-- `/live` 页面直播、未开播、已结束状态。
-- API Key、OAuth、网页会话三类凭据的隔离与不回显。
-- 总开关默认关闭、关闭时路由 fail-closed、不得触发 YouTube 外部请求。
-- 旧 B 站数据默认为 `bilibili`。
-- 同步 schema 升级到 3。
-- 现有 B 站功能回归和发布前真实 UI 验收。
+- 只允许在 `youtube` 分支工作；不得切换分支、提交、推送、发布或合并。
+- 当前主机不得运行 `cargo`、`npm`、`npx`、`docker`、格式化、lint、构建、测试或 Node fixture 校验。
+- 构建、测试、lint、fixture 校验、安装升级、OAuth、真实页面和真实 UI 验收必须在 GitHub Actions 或用户明确指定的外部环境执行。
+- 本文档和 `scripts/youtube-fixtures/validate-fixtures.mjs` 的修改不得被解释为业务代码已通过验证。
+- 发布、版本号、发布说明和回滚必须同时遵守仓库根目录 `AGENTS.md`。
 
-## 2. 新增验证资产
+## 2. 证据分级与缺口类型
 
-| 文件 | 用途 |
+| 等级 | 含义 |
 |---|---|
-| `server/tests/youtube_api.rs` | 服务端 HTTP 契约测试：鉴权、总开关、API Key 加密槽位、OAuth/网页会话不回显、schema 3、B 站默认平台、账号输入 fixture |
-| `scripts/youtube-fixtures/account-inputs.json` | 频道 ID、handle、频道 URL、视频 URL、搜索词和非法输入 fixture |
-| `scripts/youtube-fixtures/data-api.json` | `search.list`、`channels.list`、`videos.list` 响应与预期映射 |
-| `scripts/youtube-fixtures/community.json` | 公开社区帖、会员可访问社区帖、会员权限不可用页面 fixture |
-| `scripts/youtube-fixtures/live-page.json` | `/live` 页面直播、未开播、已结束状态 fixture |
-| `scripts/youtube-fixtures/oauth-contract.json` | API Key 不等于 OAuth、缺 scope、refresh token 失效、state 不匹配、有效授权场景 |
-| `scripts/youtube-fixtures/legacy-bilibili.json` | 旧 B 站 streamer/linked account 行与迁移后的默认平台字段契约 |
-| `scripts/youtube-fixtures/validate-fixtures.mjs` | 只读 fixture 契约校验，不联网、不写文件、不产生构建产物 |
+| 静态实现 | 当前源码中存在对应路径，但未运行 |
+| 测试入口 | 仓库中存在单元/集成测试或 fixture 断言，但未执行 |
+| CI 配置 | 工作流中存在对应命令，但本次审查没有 CI 运行结果 |
+| 真实环境 | 必须连接真实操作系统、浏览器、Google、YouTube 或 SQLite 文件 |
+| 已执行 | 只有拿到可核验的运行链接或日志后才能使用 |
 
-`scripts/youtube-fixtures/validate-fixtures.mjs` 只是 fixture 契约自检，不等价于 Rust 生产解析器测试。生产解析器必须由 `crates/core/src/youtube.rs` 的单元测试或集成测试直接读取同一 fixture 进行验证。
+缺口类型固定为：
 
-## 3. 覆盖矩阵
+- **无入口**：没有测试、脚本、故障注入点或可执行验收步骤。
+- **无数据**：缺少真实旧库、真实页面、真实凭据或真实频道样本。
+- **环境不可达**：当前静态审查环境不能访问 Google、YouTube、Windows WebView 或真实发布清单。
+- **未实测**：已有入口，但本次未执行，不能声明通过。
 
-| ID | 场景 | 验证方式 | 预期结果 |
+## 3. 当前静态结论
+
+### 3.1 当前阻断
+
+1. **账号输入契约已收口，仍需由 CI 复核。**
+   - 生产解析器将显式非 YouTube URL 安全降级为关键词搜索，不访问该 URL，也不把它作为上游请求目标。
+   - `scripts/youtube-fixtures/account-inputs.json`、`scripts/youtube-fixtures/validate-fixtures.mjs` 和 Rust 回归测试已按同一契约对齐。
+   - `server/tests/youtube_api.rs::account_input_fixture_matches_public_parser` 仍需在外部 CI 实际运行后才能证明测试通过；静态审查不能替代执行。
+
+2. **当前桌面版本已有一份与 YouTube 无关的发布说明。**
+   - `package.json` 和 `src-tauri/tauri.conf.json` 当前为 `0.3.23-beta.1`。
+   - `docs/78-release-desktop-0.3.23-beta.1.md` 描述的是“最近直播”功能，并明确写明不包含共享核心数据层改动。
+   - 若直接使用当前版本发布 YouTube，Release 工作流会读取这份错误正文。
+   - 必须生成新的桌面 beta 版本号和全新发布说明；不可复用或覆盖旧的已发布说明。具体版本以实际正式版/测试版清单计算，当前静态建议为 `0.3.23-beta.2` 或下一可用 beta，仍需发布前核对。
+
+### 3.2 P1 beta 阻断
+
+| ID | 缺口 | 类型 | 当前证据 | 关闭条件 |
+|---|---|---|---|---|
+| GAP-MIG-01 | 没有真实旧库经 `SqliteStore::connect_path` 自动迁移的测试 | 无入口/无数据 | 只有备份条件检测单元测试；同步默认值测试不等于 `ALTER TABLE` | 外部环境完成第 6 节迁移演练 |
+| GAP-OAUTH-01 | PKCE、state 一次性、token 轮换、refresh/logout 没有真实 Google 链路 | 无入口/环境不可达/未实测 | 现有服务端测试主要覆盖缺配置 fail-closed、feature gate 和错误码 | 第 7 节真实 OAuth 集成通过 |
+| GAP-ZERO-01 | 总开关关闭后的“全局零外部请求”未验证 | 无入口/未实测 | 路由短路测试和 collector 分页门闩测试不能证明所有后台任务/浏览器路径为零 | 第 8 节代理或请求计数验收通过 |
+| GAP-FIX-01 | 除账号输入外，其余 fixture 未被生产 Rust 测试消费 | 无入口 | 静态 rg 只发现 `account-inputs.json` 被 Rust 读取；Data API、社区、直播、OAuth、legacy 仅由 JS 自检 | 生产解析器读取同一 fixture，或等价的 Rust golden tests 存在并在 CI 执行 |
+| GAP-UI-01 | 没有 YouTube 专用真实 UI 自动化 | 无入口/未实测 | 现有浏览器脚本是既有直播图表和卡片回归，不覆盖 YouTube 设置、凭据和独立卡片全流程 | 第 9 节 UI-001 至 UI-016 在安装包/构建产物上通过 |
+| GAP-CI-01 | `youtube` 分支尚未在远端实际触发 CI | 未实测 | `ci.yml` 已加入 `youtube` push 触发和 fixture 校验步骤，但本地提交不能证明远端运行成功 | 推送后取得该提交对应的 CI 运行链接 |
+| GAP-COOKIE-01 | 会员社区帖只验证合成 fixture | 无数据/环境不可达 | 真实 YouTube 页面结构与会员登录态未测试 | 有权限/无权限账号各完成一次真实会员帖验收 |
+| GAP-API-01 | 真实 Data API 配额、分页、429、Super Chat continuation 未验收 | 无数据/环境不可达 | 现只有解析器测试和本地统计门闩测试 | 使用专用测试项目和配额预算完成第 7、10 节 |
+| GAP-WIN-01 | Windows 主密钥 ACL、系统浏览器回环回调、WebView Cookie 捕获未验收 | 环境不可达 | 仅有源码路径和局部单元测试 | Windows 构建产物上完成凭据与 OAuth smoke test |
+
+### 3.3 P2 已知限制
+
+以下限制可进入 beta 发布说明，但不得被描述成已解决：
+
+- `streamers.mid` 仍是全局唯一，尚未迁移为 `UNIQUE(platform, mid)`。
+- 社区页只解析首屏，不抓取 continuation 多页。
+- 预约直播只检查最近 20 个上传。
+- Super Chat 明细仍以设备本地历史为主，跨设备只同步场次级聚合状态。
+- 尚无统一 YouTube 搜索/频道元数据 TTL 缓存。
+- 桌面、服务端和本地命令仍存在多套搜索/添加路径。
+- 部分测试资产只做 fixture 自检，尚需真实运行。
+- 直播聊天、Super Chat 和会员事件依赖用户自己的 OAuth，不可用时应降级而不是伪造零值。
+- 聊天/Super Chat continuation 与去重水位目前只在进程内恢复；应用进程重启后，普通弹幕和会员事件可能重新扫描首页并重复计数，Super Chat 由数据库唯一键防重。该限制必须写入 beta 说明。
+
+## 4. 用户需求覆盖矩阵
+
+| ID | 用户需求 | 静态实现路径 | 当前验证入口 | 状态/缺口 |
+|---|---|---|---|---|
+| REQ-01 | B 站与 YouTube 独立卡片，不合并人物 | `App.tsx`、`CreatorsView.tsx`、平台字段与筛选 | UI-007 | 静态实现；未真实 UI |
+| REQ-02 | 搜索、URL、`@handle`、Channel ID 添加 | `crates/core/src/youtube.rs`、三套客户端 API | 账号 fixture、Rust parser test | 契约已对齐；待 CI 执行 |
+| REQ-03 | 关联账号 | 服务端/Tauri 路由和模型 | 服务端 feature gate 合约 | 新增成功路径未端到端验证 |
+| REQ-04 | 每用户填写自己的 API Key | SecretVault/本地密钥存储 | 服务端加密和不回显测试 | 有入口；未执行 |
+| REQ-05 | OAuth 读取直播聊天、Super Chat、会员事件 | `youtube.rs`、`youtube_oauth.rs`、`youtube_stats.rs` | 解析器/错误码/缺配置测试 | 真实 OAuth 无入口 |
+| REQ-06 | 网页 Cookie 抓取会员帖 | WebView 捕获、凭据槽位、社区解析 | 合成 fixture | 真实 Cookie/页面未测 |
+| REQ-07 | 公开与会员社区帖生成日程 | 社区解析到 LLM/日程链路 | 解析测试、UI-008/009 | 无端到端自动化 |
+| REQ-08 | 无会员权限时跳过，不报整轮错误 | `skipped=membership_session_unavailable` | 社区 fixture | 有入口；未执行 |
+| REQ-09 | 预约直播、开播/下播、最近直播 | `videos.list`、`/live` probe、场次模型 | 视频映射、直播页状态测试 | 真实页面未测 |
+| REQ-10 | 开播通知与直播 URL | 通知与 Tauri URL 构造 | UI-011 | 无 YouTube 专用 UI 自动化 |
+| REQ-11 | 峰值/平均观看、时长、弹幕、Super Chat、会员数 | 统计 collector、场次聚合、LiveDataModal | store 单测、live-online 前端测试 | 真实聊天/分页未测 |
+| REQ-12 | 新主播 `liveStatsEnabled` 默认关闭 | 模型默认值 | `youtube_subscription_defaults_live_stats_to_false` | 有入口；未执行 |
+| REQ-13 | 设置页最下方总开关，默认关闭 | `SettingsView.tsx`、settings 默认值 | 服务端默认关闭测试、UI-001 | 有入口；未真实 UI |
+| REQ-14 | 关闭后不发起 YouTube 请求 | 路由 gate、collector gate、OAuth 刷新 gate | 路由/分页有限测试 | GAP-ZERO-01 |
+| REQ-15 | 关闭后保留数据和凭据，重新开启可恢复 | settings 切换不删除数据 | 无完整往返测试 | 无入口 |
+| REQ-16 | 数据库自动迁移旧 B 站数据 | `store.rs` 备份与迁移 | 备份条件单测、同步默认值 | GAP-MIG-01 |
+| REQ-17 | 同步 schema 3 和旧客户端升级提示 | `sync_feed.rs`、`sync.ts` | schema 3 服务端测试、前端 schema 检查 | 未执行；无旧客户端矩阵 |
+| REQ-18 | 达到现有 B 站同等核心功能 | 平台分支与共用服务 | CI 全量测试、UI-016 | 未执行 |
+
+## 5. Fixture 与测试资产契约
+
+| 文件 | 用途 | 当前消费方 | 结论 |
 |---|---|---|---|
-| YT-URL-001 | 24 位 `UC...` 频道 ID | fixture + `account_input_fixture_matches_public_parser` | 解析为 `ChannelId` |
-| YT-URL-002 | `@handle` 与 `youtube.com/@handle` | fixture + 公共解析器测试 | 解析为规范化 `Handle` |
-| YT-URL-003 | `m.youtube.com/@handle/videos` | fixture | 忽略路径后缀，保留 handle |
-| YT-URL-004 | `youtube.com/channel/UC...` | fixture | 解析为 `ChannelId` |
-| YT-URL-005 | `youtu.be/{id}`、`watch?v={id}`、`live/{id}` | fixture | 解析为 `VideoId` |
-| YT-URL-006 | 非 YouTube URL、空 handle | fixture + 公共解析器测试 | 非 YouTube URL 作为关键词搜索；空 handle 返回校验错误 |
-| YT-API-001 | `search.list` 频道结果 | fixture 契约 | channelId、标题、头像、主页 URL 正确 |
-| YT-API-002 | `channels.list` 频道详情 | fixture 契约 | handle、uploads playlist、订阅数、隐藏订阅数正确 |
-| YT-API-003 | `videos.list` 直播中 | fixture 契约 | `live`，当前观看人数 321 |
-| YT-API-004 | `videos.list` 预约直播 | fixture 契约 | `upcoming`，保留 `scheduledStartTime` |
-| YT-API-005 | `videos.list` 已结束直播 | fixture 契约 | `ended`，保留开始/结束时间 |
-| YT-API-006 | 普通视频 | fixture 契约 | `none`，不创建直播状态或日程 |
-| YT-COMM-001 | 公开社区帖文本、图片、URL | fixture 契约 | 2 条帖子，图片取最大缩略图 |
-| YT-COMM-002 | 会员可访问社区帖 | fixture 契约 | `membershipOnly = true`，内容正常进入 LLM 分析 |
-| YT-COMM-003 | 会员权限不可用 | fixture 契约 | `skipped = true`、`skipReason = membership_session_unavailable`，不报错、不生成日程 |
-| YT-LIVE-001 | `/live` 重定向到直播视频 | fixture 契约 | `live`，记录 videoId、标题、开播时间 |
-| YT-LIVE-002 | `/live` 退回频道页 | fixture 契约 | `offline`，不生成直播卡片 |
-| YT-LIVE-003 | `/live` 指向已结束直播 | fixture 契约 | `/live` 只能判定 `offline`；结束时间以 `videos.list` 的 `actualEndTime` 为准 |
-| YT-LIVE-004 | 页面有合法 `videoId`，但缺少 `isLive` / `isLiveNow` | `live_page_with_video_id_but_no_live_state_returns_format_error` | 返回 `YOUTUBE_LIVE_FORMAT`，保留未知，不得判离线 |
-| YT-LIVE-005 | 页面明确给出 `isLive = false` 或 `isLiveNow = false` | `live_page_with_explicit_not_live_state_is_offline` | 判定 `offline`，不生成直播卡片 |
-| YT-MON-001 | `superChatEvents.list` 返回 Super Sticker | `super_chat_events_map_super_sticker_details_and_kind` | 保留 `kind = superStickerEvent`、原币种与金额 |
-| YT-OAUTH-001 | 只有 API Key，没有 OAuth | fixture 契约 | 直播聊天、Super Chat、会员事件要求重新授权 |
-| YT-OAUTH-002 | OAuth 缺 `youtube.readonly` scope | fixture 契约 | `reauth_required` |
-| YT-OAUTH-003 | refresh token 过期/撤销 | fixture 契约 | `reauth_required`，停止聊天统计 |
-| YT-OAUTH-004 | callback state 不匹配 | fixture 契约 | 拒绝回调 |
-| YT-OAUTH-005 | OAuth 有效且 scope 完整 | fixture 契约 | 允许读取直播聊天 |
-| YT-SW-001 | 总开关默认关闭 | `youtube_routes_require_auth_and_are_disabled_by_default` | `youtubeEnabled = false` |
-| YT-SW-002 | 关闭时调用搜索、密钥、OAuth、网页会话接口 | `youtube_routes_require_auth_and_are_disabled_by_default` | 返回 `YOUTUBE_FEATURE_DISABLED`，不进入业务处理器 |
-| YT-SEC-001 | 保存 API Key | `youtube_api_key_is_encrypted_and_never_returned_or_synced_in_plaintext` | 响应无明文、SQLite 无明文、同步 payload 无明文 |
-| YT-SEC-002 | 查询 API Key 状态 | 同上 | 只返回 `configured`，不回显 `apiKey` |
-| YT-SEC-003 | OAuth / 网页会话状态 | `youtube_oauth_and_web_session_status_never_expose_credentials` | 不返回 access token、refresh token、cookie、client secret |
-| YT-DB-001 | 旧 B 站记录没有平台字段 | `legacy-bilibili.json` + `sync_schema_is_three_and_legacy_bilibili_rows_default_to_bilibili` | fixture 保持旧列集，预期读出为 `platform = bilibili` |
-| YT-DB-002 | 中间 beta 已有平台列，但缺 `membership_count`、`youtube_stats_available` 或 `live_super_chat_events` | `youtube_schema_backup_detection_covers_intermediate_beta_schema` + 外部 SQLite 迁移演练 | 启动迁移前生成一致快照备份；迁移后二启动幂等 |
-| YT-FE-001 | `LiveSession` 的 YouTube 聚合字段缺失或为 `null` | TypeScript 契约审查 + 后续 API 序列化测试 | `membershipCount` / `youtubeStatsAvailable` 可空；`null` 不等于 0 或 false |
-| YT-SYNC-001 | 同步 bootstrap 和 changes | 同上 | `schemaVersion = 3`，streamer payload 含平台 |
-| YT-REG-001 | 现有 B 站搜索、添加、动态、直播、通知 | CI 全量回归 + 真实 UI | 无行为变化 |
+| `account-inputs.json` | 账号输入解析 | `server/tests/youtube_api.rs` | 唯一被生产 Rust 测试直接读取 |
+| `data-api.json` | Search/Channels/Videos 映射 | `validate-fixtures.mjs` | 需补 Rust production-parser golden test |
+| `community.json` | 公开/会员/无权社区页 | `validate-fixtures.mjs` | 需补 Rust production-parser golden test |
+| `live-page.json` | 直播/离线/已结束/未知态 | `validate-fixtures.mjs` | 需补 Rust production-parser golden test |
+| `oauth-contract.json` | OAuth 能力矩阵 | `validate-fixtures.mjs` | 不是服务端 OAuth 集成测试 |
+| `legacy-bilibili.json` | 旧列集默认平台契约 | `validate-fixtures.mjs` | 不是 SQLite 迁移测试 |
+| `validate-fixtures.mjs` | 只读 fixture 自检 | CI 的 YouTube fixture contracts 步骤 | 本次未运行；不能替代生产测试 |
 
-## 4. 服务端测试设计
+`validate-fixtures.mjs` 本次增强的静态规则：
 
-### 4.1 `youtube_routes_require_auth_and_are_disabled_by_default`
+- 所有 fixture 的 `fixtureVersion` 必须为 1。
+- 频道 ID 必须严格为 24 字符：`UC` 加 22 个合法字符。
+- 账号输入必须与生产解析器的 URL/host/裸视频 ID 优先级一致。
+- 显式非 YouTube URL 只能作为安全关键词搜索，不得被当作可访问 URL 或上游请求目标；fixture 与生产解析器必须一致。
+- 公共社区帖图片按面积选择最大图，而不是依赖数组最后一项。
+- 只有明确的会员提示才可返回 membership skip；普通空页不得被误判。
+- 直播页有 `videoId` 但缺少 `isLive`/`isLiveNow` 明确信号时必须返回 `YOUTUBE_LIVE_FORMAT`。
+- OAuth callback state 不匹配必须优先拒绝，不能因缺少 OAuth 状态而掩盖。
+- Legacy fixture 的源行必须严格符合声明的旧列集，并保留 `mid`。
 
-覆盖接口：
+这些规则仍是自检。生产解析器必须直接读取同一 fixture，或维护与其逐字段等价的 Rust golden tests。
 
-- `GET /api/search?platform=youtube&q=...`
-- `GET /api/youtube/search?q=...`
-- `GET /api/youtube/status`
-- `POST /api/youtube/subscriptions`
-- `GET /api/secrets/youtube`
-- `POST /api/youtube/oauth/start`
-- `POST /api/youtube/oauth/refresh`
-- `POST /api/youtube/oauth/logout`
-- `POST /api/youtube/session/start`
-- `GET /api/youtube/session/status`
-- `DELETE /api/youtube/session`
+## 6. 数据库迁移演练
 
-每个接口先断言无 Token 返回 `401`，再断言总开关关闭时返回 `YOUTUBE_FEATURE_DISABLED`。该测试只能证明路由短路顺序；真正的“零外部请求”必须在 CI 通过拒绝全部出站的 HTTP 代理或请求计数器验证。
+### 6.1 现有静态证据
 
-### 4.2 `youtube_api_key_is_encrypted_and_never_returned_or_synced_in_plaintext`
+- `connect_path` 在 startup 前调用 `backup_before_youtube_schema_migration`。
+- `needs_youtube_schema_migration` 检查平台列、直播统计列、Super Chat 表和索引。
+- `youtube_schema_backup_detection_covers_intermediate_beta_schema` 只检查“是否需要备份”的判断，不执行真实文件迁移。
+- `sync_schema_is_three_and_legacy_bilibili_rows_default_to_bilibili` 验证序列化默认值和同步投影，不验证旧 SQLite 表结构。
 
-测试契约：
+### 6.2 外部演练步骤
 
-- `GET /api/secrets/youtube` 的 `data.apiKey.configured` 默认是 `false`，并同时返回独立的 OAuth 与网页会话状态。
-- `PUT /api/secrets/youtube` 成功后只返回 `configured: true`。
-- `GET /api/secrets/youtube` 不回显 API Key。
-- 专用密文槽位为 `server:secret:youtube_api_key:v1`，原始库内容不包含明文或 `apiKey` 字段。
-- 所有同步 change payload 不包含明文。
-- 删除后槽位和 `configured` 状态都清零。
+必须在外部临时目录执行，保留日志和哈希：
 
-如果实现采用不同的密文键名，必须同步修改测试和文档；不得绕过密文槽位断言。
+1. 准备三份数据库：
+   - v2 旧库：无任何 YouTube 平台字段。
+   - 中间 beta 库：已有部分平台列，缺 `membership_count`、`youtube_stats_available`、Super Chat 表或索引。
+   - 当前 schema 库：作为“不应重复备份”的对照。
+2. 每份库写入代表性数据：B 站 streamer、linked account、schedule source、suppression、live session、设置和 sync change。
+3. 记录迁移前的表清单、列清单、行数、关键行校验和数据库/WAL 路径。
+4. 调用生产入口 `SqliteStore::connect_path`，不得用测试函数替代。
+5. 断言：
+   - 迁移前恰好生成一份 `*.youtube-v3-backup-*.bak`。
+   - 备份可独立打开，表、行数和关键字段与迁移前一致。
+   - 旧 B 站记录全部为 `platform = bilibili`。
+   - 新列、Super Chat 表和索引存在。
+   - `membership_count` 与 `youtube_stats_available` 的旧值为 `NULL`，不是伪造的 0/false。
+   - 新 schema 二次启动幂等，且不重复生成迁移备份。
+   - 全新空库不生成迁移备份。
+6. 故障注入：让迁移中任一 `ALTER TABLE`/建表/索引步骤失败，断言事务回滚、进程 fail-closed、原库仍可打开。当前没有公开 failpoint；如无故障注入入口，必须明确标记为“无入口”，不得用正常迁移冒充回滚通过。
+7. 恢复演练：停服务，保留当前数据库和主密钥文件，再用迁移前备份恢复；用旧版本打开并做搜索、日程、设置和同步读取。
+8. 记录实际 SQL、备份文件名、迁移耗时、日志和操作者。
 
-### 4.3 `youtube_oauth_and_web_session_status_never_expose_credentials`
+### 6.3 升级和回滚注意
 
-测试契约：
+- 备份必须包含数据库以及必要的 WAL/SHM；只导出 JSON 快照不能视为完整统计库备份。
+- 回滚旧服务端前必须备份新的随机主密钥文件。旧版本不读取该密钥文件，已迁移的 YouTube 凭据可能需要重新填写。
+- 不得自动把新密文降级回旧可预测密钥。
+- 回滚旧客户端时同时恢复对应数据库/服务端版本，避免旧客户端误读 schema 3 数据。
 
-- session status 路由存在，不返回 `refreshToken`、`accessToken`、`cookie`、`clientSecret`。
-- 测试进程未配置 OAuth app 凭据时，OAuth start 必须 fail-closed，不能打开浏览器流程或返回 token 材料。
+## 7. OAuth、Data API 与凭据真实验收
 
-完整的 OAuth 成功链路需要可注入的 Google token endpoint。当前服务端若没有测试专用 base URL 注入点，只能放到 CI 沙箱或外部集成环境，不在单元测试中请求真实 Google。
+### 7.1 当前自动测试边界
 
-### 4.4 `sync_schema_is_three_and_legacy_bilibili_rows_default_to_bilibili`
+- 缺少 OAuth app 配置时 fail-closed。
+- feature gate 在 Google error/code 处理之前生效。
+- API Key 加密槽位、响应不回显、同步 payload 不含明文。
+- 动态 `YOUTUBE_HTTP_<status>` 不折叠。
+- 解析器覆盖聊天文本、Super Chat、Super Sticker 和会员事件。
+- 这些测试均未在本轮执行。
 
-测试契约：
+### 7.2 真实 OAuth 验收
 
-- `SYNC_SCHEMA_VERSION == 3`。
-- 通过旧字段 JSON 添加 B 站主播，不显式传 `platform`。
-- bootstrap 中该主播为 `platform = bilibili`。
-- `handle`、`profileUrl`、`uploadsPlaylistId` 为 `null`。
-- changes 中 streamer payload 含 `platform = bilibili`。
+使用专用 Google Cloud 项目和测试账号，凭据只放入外部环境 secret：
 
-该测试验证新字段默认值和同步投影，不验证旧数据库文件的真实 `ALTER TABLE` 迁移。真实迁移测试必须在 `crates/core/src/store.rs` 的测试模块执行，因为服务端集成测试没有直接 SQL 依赖。
+1. 桌面端系统浏览器发起授权，回环 callback 能完成 code exchange。
+2. 授权 URL 使用 PKCE，state 随机且一次性。
+3. 重复 callback、篡改 state、缺失 state 均拒绝，且不交换 token。
+4. 用户取消或 Google 返回 `access_denied` 时显示可操作错误，不保存半成品 token。
+5. refresh token 首次保存后能刷新 access token；轮换后新 refresh token 落盘，旧 token 不被继续使用。
+6. logout/revoke 后被撤销 token 不能读取聊天；应用提示重新授权。
+7. scope 缺少 `https://www.googleapis.com/auth/youtube.readonly` 时不得声称聊天统计可用。
+8. API Key 只能用于公开 Data API，不能替代 OAuth。
+9. 服务端 OAuth 回调地址在非回环环境必须是 HTTPS；localhost/127.0.0.1/[::1] 允许 HTTP。
+10. 日志、HTTP 响应、DOM、localStorage、同步 payload 中均不得出现 API Key、access token、refresh token、Cookie 或 client secret。
 
-### 4.5 `account_input_fixture_matches_public_parser`
+### 7.3 Data API 与聊天验收
 
-直接读取 `scripts/youtube-fixtures/account-inputs.json`，调用生产公开解析器 `parse_youtube_account_input`，逐项断言 channel、handle、video、search 分类。非法域名和空 handle 必须返回错误。
+- 验证 `search.list`、`channels.list`、`videos.list` 的正常、空结果、400、403、404、429、5xx、非 JSON、超大响应和配额耗尽。
+- 验证 upcoming/live/ended/none 映射及 `actualEndTime` 优先级。
+- 验证直播聊天 continuation 轮询、切换视频、下播和 token 过期。
+- 验证 Super Chat/Super Sticker 多页 continuation、重复 token、重复事件 ID、原币种/原金额。
+- 配额预算必须足以覆盖完整分页；失败时保留未知，不写伪造 0/false。
 
-## 5. Fixture 设计说明
+### 7.4 网页会话验收
 
-### 5.1 `account-inputs.json`
+- 有会员权限账号：会员限定帖子内容进入分析并生成日程。
+- 无权限或 Cookie 失效账号：整轮刷新成功，会员帖标记 skipped，不生成错误日程。
+- 清除网页会话只删除应用保存的 YouTube 会话 Cookie，不删除通用 Google 账号 Cookie。
+- 真实页面结构变化时返回 `YOUTUBE_COMMUNITY_FORMAT` 或保留未知，不能把登录页/同意页当成功空结果。
 
-- 固定使用 24 位频道 ID 和 11 位视频 ID。
-- 覆盖裸 ID、裸 handle、完整 URL、移动端 URL、短链接、`watch` URL、`live` URL。
-- 自由文本必须解析为搜索词，不能误判为频道 ID。
-- 非 YouTube URL 按关键词搜索处理，避免把第三方 URL 误判为频道；空 handle 必须拒绝。
+## 8. 总开关“零外部请求”验收
 
-### 5.2 `data-api.json`
+代码级路由测试只能证明请求在业务处理器前返回；不能证明后台任务、OAuth refresh、WebView 登录或分页 continuation 没有出站请求。
 
-- `search.list` 只返回频道结果。
-- `channels.list` 返回 `snippet`、`contentDetails.relatedPlaylists.uploads`、`statistics`。
-- `videos.list` 同时包含 live、upcoming、ended、none 四种状态。
-- 数值字符串必须显式转成整数，不能把订阅数或观看人数当文本写入统计。
-- 已结束直播以 `actualEndTime` 优先判定，不依赖 `liveBroadcastContent = none`。
+至少选择一种可观测机制：
 
-### 5.3 `community.json`
+1. 拒绝全部出站的 HTTP 代理，出现任何 `googleapis.com`、`youtube.com`、`youtu.be` 或 Google OAuth 连接尝试即失败。
+2. 可计数的 fake endpoint，断言关闭场景计数为 0。
+3. 网络命名空间或防火墙规则拦截上述域名，并保留拒绝日志。
 
-- `public`：公开帖文本、两张图片中的最大图、相对 `/post/{id}` URL 转绝对 URL。
-- `membersOnlyAccessible`：存在 `sponsorsOnlyBadge` 时标记 `membershipOnly = true`，但内容仍可分析。
-- `membersOnlyUnavailable`：无帖子且命中会员提示时返回 `skipped`，不得当成解析失败。
-- 解析器必须只读 JSON 节点，不执行页面脚本。
+验收步骤：
 
-### 5.4 `live-page.json`
+1. 先开启 YouTube，保存 API Key、OAuth 和网页 Cookie，保留至少一个 YouTube streamer、日程、场次和统计。
+2. 关闭总开关并等待超过刷新/采样周期。
+3. 分别触发搜索、添加、关联、刷新、OAuth start/refresh、网页会话 start、直播统计和社区抓取入口。
+4. 断言上述入口全部返回 `YOUTUBE_FEATURE_DISABLED` 或在前端被阻止。
+5. 断言代理/请求计数为 0，包括分页后续请求和后台 OAuth 刷新。
+6. 断言主播库隐藏 YouTube 入口和卡片，但数据库、凭据和同步数据仍存在。
+7. 重新开启，断言原有数据、凭据、日程和直播统计仍可读取。
+8. 桌面端和服务器模式各执行一次；开发模式和打包应用模式至少各执行一次。
 
-- `live`：重定向到 `watch?v=...` 且 `isLive = true`。
-- `notLiveChannelPage`：最终 URL 没有视频 ID，且页面可识别为频道页，视为 offline。
-- `endedBroadcastPage`：`isLive = false` 且 `isLiveContent = true`，`/live` 探测器按 offline 处理；`ended` 状态由 `videos.list` 的 `actualEndTime` 判定。
-- `ambiguousVideoId`：存在合法 `videoId` 但缺少 `isLive` / `isLiveNow` 明确状态时必须返回 `YOUTUBE_LIVE_FORMAT` 或保留未知，不能仅凭 `videoId` 判离线。
-- 明确离线只接受布尔值 `false` 等显式信号；字段缺失、页面结构未知或验证页都必须保留未知。
+仅通过 `server/tests/youtube_api.rs` 或 `youtube_stats.rs` 的门闩测试，不得判定零请求通过。
 
-### 5.5 `oauth-contract.json`
+## 9. 真实 UI、通知与 B 站回归
 
-- API Key 只能访问公开 Data API，不能替代 OAuth 读取直播聊天和 Super Chat。
-- 缺 required scope、token 过期、state 不匹配都必须重新授权或拒绝回调。
-- 只有有效 OAuth 且 scope 完整时才允许直播聊天能力。
-
-## 6. 总开关零请求验证
-
-代码级测试只能证明总开关关闭时请求在业务入口前返回。完整的零外部请求验收必须在 CI 增加以下任一机制：
-
-1. 启动拒绝所有出站的 HTTP 代理，执行总开关关闭场景；出现任何连接尝试即失败。
-2. 在 CI 注入可计数的 YouTube fake endpoint，断言请求计数为 0。
-3. 使用网络命名空间或防火墙规则阻断 `googleapis.com`、`youtube.com`、`youtu.be`，再跑关闭场景。
-
-验收标准：
-
-- 关闭开关后搜索、OAuth、网页会话、添加、关联、刷新接口全部返回 `YOUTUBE_FEATURE_DISABLED`。
-- 后台直播探测、社区帖抓取、统计采样任务不启动。
-- 已保存的 API Key、OAuth refresh token、网页 Cookie 和 YouTube 数据不被删除。
-- 重新打开开关后原有数据和凭据仍可用。
-
-## 7. 数据库迁移验证
-
-真实迁移需要验证：
-
-- 旧库启动前自动备份。
-- `streamers` 新增 `platform`、`handle`、`profile_url`、`uploads_playlist_id`、`live_video_id`。
-- `linked_accounts` 新增 `platform`、`handle`、`profile_url`。
-- `schedule_sources` 和 `source_suppressions` 新增 `platform`。
-- `live_sessions` 新增 `membership_count`、`youtube_stats_available`，均允许 `NULL`，表示统计尚未可用或旧数据未知。
-- 新增 `live_super_chat_events` 子表和 `idx_live_super_chat_events_session` 索引，保留原币种 Super Chat / Super Sticker 明细。
-- 启动备份条件必须同时检查上述平台字段、`live_sessions` 新字段和新表/索引；中间 beta schema 也必须在迁移前生成备份。
-- 全新空库不应生成多余备份；已有应用 schema 的数据库只要缺少任一必需项就生成备份。
-- 旧 `streamers` 和 `linked_accounts` 全部为 `platform = bilibili`。
-- 迁移事务失败时回滚，原库仍可打开，进程阻止启动。
-- 二次启动幂等，不重复添加列、不覆盖新数据。
-
-建议在 `crates/core/src/store.rs` 测试模块新增 legacy schema fixture：
-
-1. 在临时目录创建只含旧表结构的 SQLite 文件。
-2. 插入旧 B 站 streamer、linked account、schedule、live session。
-3. 调用 `SqliteStore::connect`。
-4. 检查列、默认值、备份文件和二次启动幂等。
-5. 从“已有平台列、尚无 YouTube 统计列”的中间 beta schema 升级，断言迁移前备份存在且迁移后数据未丢失。
-6. 测试结束清理临时目录。
-
-当前 `server/tests/youtube_api.rs` 不直接依赖 `sqlx`，因此不能安全构造旧表结构；不把默认值测试冒充真实迁移测试。
-
-## 8. 同步 schema 3 验证
-
-至少覆盖：
-
-- `SYNC_SCHEMA_VERSION == 3`。
-- `/api/sync/bootstrap` 返回 `schemaVersion: 3`。
-- `/api/sync/changes` 返回 `schemaVersion: 3`。
-- streamer、linked account、live status、schedule source、suppression 的 payload 都带平台字段。
-- 旧客户端遇到 schema 3 时提示升级，不能静默按 schema 2 解析。
-- 本地缓存 schema 升级后能重建，旧 B 站条目默认 `bilibili`。
-- `LiveSession` 同步投影保留 `membershipCount` 与 `youtubeStatsAvailable`；`null` 表示旧数据或统计未知，不能被前端归一化为 0 / false。
-- 回滚时恢复旧数据库和旧客户端版本。
-
-## 9. 前端与真实 UI 验收
-
-以下场景必须在 CI 产物或外部构建机的真实应用入口操作，不允许只用静态断言代替：
+以下必须在 CI 构建产物或外部 Windows 安装包操作，并同时记录网络请求和截图：
 
 | ID | 操作 | 预期 |
 |---|---|---|
 | UI-001 | 打开设置页 | 最下方存在 YouTube 总开关，默认关闭 |
-| UI-002 | 关闭总开关 | 主播库无 YouTube 入口和卡片，后台无请求 |
-| UI-003 | 开启总开关 | 显示 API Key、OAuth、网页会话三个独立配置区 |
-| UI-004 | 填入 API Key | 状态变为已配置，接口和界面均不回显原文 |
-| UI-005 | 撤销 OAuth | 直播聊天统计停止并提示重新授权 |
-| UI-006 | 清除网页会话 | 会员帖跳过，不导致整轮刷新失败 |
-| UI-007 | 添加 YouTube 频道 | 生成独立 YouTube 卡片，不合并 B 站卡片 |
-| UI-008 | 公开社区帖含日程 | 生成 `youtube_community` 来源日程 |
-| UI-009 | 会员帖无权限 | 跳过且不显示错误日程 |
-| UI-010 | 预约直播 | 生成 `youtube_live` 来源日程 |
-| UI-011 | 直播到开播 | 只触发一次开播通知，点击打开正确 watch URL |
-| UI-012 | 直播结束 | 结束场次，峰值/平均/时长可查看 |
-| UI-013 | B 站现有流程 | 搜索、添加、动态、直播、通知无回归 |
+| UI-002 | 关闭总开关 | 无 YouTube 入口/卡片，等待完整刷新周期后仍零请求 |
+| UI-003 | 开启总开关 | API Key、OAuth、网页会话为三个独立配置区 |
+| UI-004 | 保存 API Key | 只显示已配置，不显示原文，刷新/重启后仍只显示状态 |
+| UI-005 | 启动并完成 OAuth | 显示已授权/过期状态；撤销后聊天统计停止并提示重授权 |
+| UI-006 | 捕获网页会话 | 状态变为已配置；清除后会员帖跳过且不清除通用 Google Cookie |
+| UI-007 | 添加 YouTube 频道 | 生成独立 YouTube 卡片，与 B 站卡片不合并 |
+| UI-008 | 公开社区帖含日程 | 生成 `youtube_community` 日程 |
+| UI-009 | 会员帖无权限 | 跳过，不显示错误日程 |
+| UI-010 | 预约直播 | 生成 `youtube_live` 日程 |
+| UI-011 | 预约到开播 | 只触发一次通知，点击打开正确 watch URL |
+| UI-012 | 直播结束 | 场次结束，峰值/平均/时长/聊天统计可见；未知指标显示未知 |
+| UI-013 | 最近直播与场次 | YouTube 场次可打开数据详情，未采集历史不伪造 |
+| UI-014 | Super Chat/Super Sticker | 显示原币种/原金额，分页不重复 |
+| UI-015 | 会员事件统计 | YouTube 会员数与 B 站舰长数分开显示 |
+| UI-016 | B 站回归 | 搜索、添加、动态、直播、通知、日程和统计无新增失败 |
 
-## 10. CI 执行清单
+现有浏览器 UI 脚本不包含 YouTube 专用场景；不能以通用前端测试代替上表。
 
-以下命令只能由 CI 或用户指定的外部构建机执行：
+## 10. CI 精确执行清单
+
+### 10.1 当前 CI 配置
+
+以当前 `.github/workflows/ci.yml` 为准，实际包含：
 
 ```text
-cargo fmt --check
-cargo check --workspace
-cargo test --workspace --no-fail-fast
-npm run check
+npx tsc -b --pretty false
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+python -m unittest discover -s scripts -p test_refresh_timing.py -v
+node scripts/live-schedule-baseline.mjs
+npm run test:web
+node scripts/youtube-fixtures/validate-fixtures.mjs
+cargo test --workspace --locked --no-fail-fast
+npm run build:web
+```
+
+随后还执行既有 Playwright UI 脚本并上传构建产物。
+
+注意：
+
+- `ci.yml` 已加入 `youtube` push 触发；推送后仍须在结果报告里附上提交 SHA 和实际运行链接。
+- YouTube fixture 步骤必须随工作流修改一起提交；当前未提交的工作树修改不能证明远端 CI 会运行。
+- `cargo check` 没有单独步骤；clippy 会编译，但不能把 `cargo check` 写成“已执行”。
+- `npm run check` 出现在 Release 工作流。它包含 `cargo fmt`、clippy 和 TypeScript，不是 CI 当前步骤名。
+- 所有命令均未在本次静态审查中运行。
+
+### 10.2 外部验收命令
+
+以下命令只能由 CI 或用户指定外部构建机执行：
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+npx tsc -b --pretty false
+npm run test:web
 npm run build:web
 node scripts/youtube-fixtures/validate-fixtures.mjs
 ```
 
-建议 CI 单独增加 Windows 构建和真实应用 smoke test。任何本地命令失败都不能用“静态审查通过”替代。
+需要额外增加但不属于本次可执行范围的门禁：
 
-## 11. 安全审计清单
+- 真实 SQLite 迁移与回滚任务。
+- 真实 OAuth/Data API 集成任务。
+- 零请求代理任务。
+- Windows 安装包 smoke test。
+- YouTube 专用浏览器/原生 UI 测试。
 
-- [ ] API Key 只进加密存储，不进日志、错误、同步 payload、前端状态持久化。
-- [ ] OAuth refresh token 只进加密存储，接口只返回 configured/expired 状态。
-- [ ] PKCE verifier 和 state 一次性使用，回调校验 state。
-- [ ] 网页 Cookie 只进独立加密槽位，不与其他凭据混用。
-- [ ] 三类凭据可独立清除，清除一个不影响另外两个。
-- [ ] 总开关关闭时后端所有 YouTube 路由 fail-closed。
-- [ ] 社区页解析不执行 JavaScript，不把未知 HTML 当成功。
-- [ ] 会员帖无权限返回 skipped，不输出帖子内容或 Cookie。
-- [ ] 多币种 Super Chat 保留原币种和原金额，不伪造人民币收入。
-- [ ] 聊天原文只做短期聚合，不长期写入同步 payload。
+## 11. Beta 发布门禁
 
-## 12. 当前未验证项与已知缺口
+发布 beta 前必须全部满足，且每项有外部运行证据：
 
-本轮只做静态分析和文件编辑，以下项目尚未执行，不能声称通过：
+- [ ] 账号输入 fixture 与生产解析器的契约已静态对齐，并由 CI 证明 Rust 测试和 fixture 校验同时通过。
+- [ ] 当前提交对应 CI 运行全绿，报告链接包含 SHA。
+- [ ] `cargo fmt/clippy/test`、TypeScript、前端测试、Web build 和 fixture 校验通过。
+- [ ] 生产 Rust 解析器读取 Data API/社区/直播 fixture，或等价 golden tests 已加入 CI。
+- [ ] schema 2/中间 beta 到 schema 3 的真实迁移、备份、二次启动、回滚演练通过。
+- [ ] OAuth PKCE/state/refresh/logout 和真实 Google 聊天链路通过。
+- [ ] 总开关关闭零外部请求通过，并证明数据与凭据保留。
+- [ ] 会员帖有权限/无权限真实页面验证通过。
+- [ ] 桌面端和服务器端 Windows/Linux 目标构建产物可启动。
+- [ ] UI-001 至 UI-016 在安装包或构建产物上通过。
+- [ ] B 站完整回归无新增失败。
+- [ ] 所有未验证项和 P2 已知限制写入 beta 发布说明。
 
-- `server/tests/youtube_api.rs` 尚未编译。
-- fixture 校验脚本尚未运行。
-- CI 的 `cargo check`、`cargo test`、`npm run check`、Web 构建尚未运行。
-- 新增的 Super Sticker、`live` 未知状态和中间 beta 备份条件单元测试尚未执行。
-- `youtube_stats.rs` 写入层仍硬编码 `superChatEvent`；解析器已返回 `kind`，后续必须改为使用 `event.kind` 才能完成 Super Sticker 端到端落库。
-- 真实 SQLite 旧库迁移、中间 beta 备份文件和回滚尚未通过外部环境演练。
-- OAuth 真实回调、PKCE、refresh token 轮换尚未通过外部集成测试。
-- 会员社区帖网页会话和真实 YouTube 页面结构尚未验证。
-- 真实 UI 的开关、凭据面板、主播卡片、通知和日程流程尚未验收。
-- `LiveSession` 的 `membershipCount` / `youtubeStatsAvailable` 尚未通过真实 API 序列化与前端归一化测试。
-- 总开关关闭后的外部请求计数尚未通过代理或防火墙验证。
-- B 站完整回归尚未运行。
-
-这些项目必须在 CI 或外部构建机完成并在发布说明中如实披露结果。
-
-## 13. 发布前门禁
-
-发布 beta 前必须满足：
-
-- [ ] 服务端集成测试和 core 单元测试在 CI 全绿。
-- [ ] fixture 校验在 CI 全绿。
-- [ ] schema 3 bootstrap/changes 往返通过。
-- [ ] 总开关关闭零请求通过代理或请求计数验证。
-- [ ] 三类凭据不回显通过接口和日志检查。
-- [ ] 真实 UI 完成 UI-001 至 UI-013。
-- [ ] B 站回归无新增失败。
-- [ ] 未验证项和已知限制写入对应 beta 发布说明。
+## 12. Stable 发布门禁
 
 正式版发布前还必须满足：
 
-- [ ] 同一核心版本的 beta 已验证。
-- [ ] 数据库迁移备份和回滚步骤在外部环境演练。
-- [ ] 旧客户端连接新服务端时的升级提示已验证。
-- [ ] 用户明确确认发布正式版。
+- [ ] 同一核心版本的 beta 已完成外部验收，且 beta 版本号与正式版一致。
+- [ ] 候选版本严格高于当前正式版清单；测试版渠道同时读取 beta/stable 清单并按 SemVer 选择更高版本。
+- [ ] 自动检测和定时更新不会把 beta 降级为较低 stable。
+- [ ] 用户主动从 beta 切回较低 stable 时，界面明确提示显式降级并要求二次确认。
+- [ ] 数据库迁移备份、主密钥文件、凭据重录和旧客户端/旧服务端回滚均演练通过。
+- [ ] 旧客户端连接 schema 3 服务端时显示升级提示，不静默解析。
+- [ ] 发布说明已定稿，Release 正文与标签、渠道、产物完全一致。
+- [ ] 用户明确确认发布 stable。
+- [ ] 发布后不再为下一批改动前进 PATCH，直到本版本正式发布完成。
 
-## 14. 结果报告模板
+## 13. 发布说明与渠道检查
+
+### 13.1 桌面端 beta
+
+必须新建独立的 `docs/<序号>-release-desktop-<version>.md`，至少写明：
+
+- YouTube 总开关默认关闭。
+- 每个用户需自填 API Key；OAuth 和网页会话是可选的独立能力。
+- 独立 YouTube 卡片、社区帖、会员帖、预约直播、通知、最近直播和统计。
+- schema 3 自动迁移、升级前备份、旧 B 站数据默认 `bilibili`。
+- 测试版渠道、NSIS 安装包、Tauri 签名和 Windows Authenticode 实际状态。
+- 总开关关闭后隐藏入口并停止请求但保留数据。
+- 已知限制和回滚方式。
+
+不可复用 `docs/78-release-desktop-0.3.23-beta.1.md`。
+
+### 13.2 服务端 beta
+
+必须新建独立的 `docs/<序号>-release-server-<version>.md`，至少写明：
+
+- 适用的镜像/编译产物、版本号、beta 渠道和固定 `server-beta` 清单。
+- schema 3 迁移、SQLite 备份和实际支持范围。
+- API Key 不再接受服务端环境变量注入，必须由最终用户设置。
+- 随机主密钥文件、旧密钥兼容迁移、ACL/回滚和凭据重录要求。
+- OAuth 回调地址、HTTPS/回环限制和 Google 配置步骤。
+- 升级前数据库、WAL 和主密钥备份。
+- 已知限制和回滚步骤。
+
+### 13.3 渠道与版本
+
+- 桌面候选不能在 `0.3.23-beta.1` 上复用旧说明；以实际发布清单计算新 beta 号。
+- 服务端当前静态版本为 `0.3.30`；候选预计为 `0.3.31-beta.1`，发布前仍须核对正式/测试清单。
+- 测试版 Release 必须标记 prerelease，并更新固定 `desktop-beta`/`server-beta` 清单；不得移动 `latest` 或正式版 `desktop-v*` 清单。
+- beta 发布不自动意味着可以发布 stable；stable 必须等 beta 验证和用户明确确认。
+
+## 14. 回滚检查
+
+- 升级前停止应用/服务端，复制数据库、WAL/SHM、主密钥文件和必要的 OAuth/服务器配置。
+- 保留迁移前备份和相关日志；不要只依赖应用内 JSON 快照。
+- 回滚服务端时恢复数据库和对应版本产物；旧版本可能无法读取新主密钥文件，YouTube 凭据需重新填写。
+- 回滚客户端时恢复旧客户端和对应同步缓存；schema 3 缓存不能强行交给 schema 2 客户端解析。
+- OAuth 可撤销测试账号授权；不得删除生产用户凭据作为普通回滚步骤。
+- 回滚完成后验证 B 站搜索、日程、直播和设置仍可用，并确认没有把 beta 自动降级给其他用户。
+- 任何回滚演练失败都必须阻断 stable；若要发布 beta，必须在 beta 说明中明确写出限制和补救方式。
+
+## 15. 结果报告模板
 
 ```text
 分支：
-提交/工作区状态：
+提交 SHA / 工作树状态：
 CI 运行链接：
-fixture 校验结果：
-服务端测试结果：
-core 迁移测试结果：
-同步 schema 3 结果：
-总开关零请求验证：
-凭据不回显验证：
-真实 UI 验收：
+fixture 校验结果（含是否命中 PRODUCTION_CONTRACT_MISMATCH）：
+cargo fmt / clippy / test：
+TypeScript / 前端测试 / Web build：
+真实 SQLite 迁移与回滚：
+OAuth / Data API / 聊天分页：
+会员 Cookie 页面：
+总开关零请求：
+凭据不回显：
+Windows 安装包与 WebView：
+真实 UI：
 B 站回归：
 未验证项：
 已知限制：
 发布建议：仅 beta / 可 stable / 阻断
 ```
+
+## 16. 当前交付判断
+
+- 测试矩阵已覆盖主要用户需求，但静态覆盖不等于外部验收通过。
+- 静态审查未发现新的 P0；账号输入契约已对齐。仍有迁移、OAuth、零请求、真实 UI 和真实页面等 P1 运行验证缺口。
+- 在 P1 有运行证据、beta 发布说明独立定稿前：**阻断**。
+- P1 关闭后，最多建议先发布 beta；不得直接 stable。
+- 本次没有运行 Node fixture 校验、cargo、npm、npx、docker、构建、测试或格式化，也没有 CI 通过链接。

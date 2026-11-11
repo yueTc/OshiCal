@@ -87,16 +87,25 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
     }
     let mut ids = HashSet::new();
     let mut mids = HashSet::new();
+    let mut streamer_platforms = HashMap::new();
     for streamer in &snapshot.subscriptions {
         validate_platform_mid(streamer.platform, &streamer.mid)?;
         if !ids.insert(streamer.id) || !mids.insert(&streamer.mid) {
             return Err(AppError::validation("快照含重复订阅 ID 或 MID"));
         }
+        streamer_platforms.insert(streamer.id, streamer.platform);
         if streamer.name.trim().is_empty() || streamer.name.chars().count() > 80 {
             return Err(AppError::validation("快照主播名称无效"));
         }
+        let mut linked_mids = HashSet::new();
         for link in &streamer.linked_accounts {
             validate_platform_mid(link.platform, &link.mid)?;
+            if link.platform != streamer.platform {
+                return Err(AppError::validation("快照关联账号与主播平台不一致"));
+            }
+            if !linked_mids.insert(link.mid.as_str()) {
+                return Err(AppError::validation("快照含重复关联账号 MID"));
+            }
         }
     }
 
@@ -219,8 +228,11 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
         {
             return Err(AppError::validation("快照日程来源 ID 或来源键重复"));
         }
-        if !schedule_ids.contains(&source.schedule_id) {
-            return Err(AppError::validation("快照日程来源引用了不存在的日程"));
+        let owner = schedule_owners
+            .get(&source.schedule_id)
+            .ok_or_else(|| AppError::validation("快照日程来源引用了不存在的日程"))?;
+        if streamer_platforms.get(owner) != Some(&source.platform) {
+            return Err(AppError::validation("快照日程来源与主播平台不一致"));
         }
         if source.source_kind.trim().is_empty()
             || source.source_identity.trim().is_empty()
@@ -245,6 +257,9 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
         }
         if !ids.contains(&suppression.streamer_id) {
             return Err(AppError::validation("快照来源抑制引用了不存在的订阅"));
+        }
+        if streamer_platforms.get(&suppression.streamer_id) != Some(&suppression.platform) {
+            return Err(AppError::validation("快照来源抑制与主播平台不一致"));
         }
         if suppression.source_post_id.trim().is_empty()
             || suppression.source_fingerprint.trim().is_empty()

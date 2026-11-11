@@ -336,6 +336,8 @@ export default function App() {
       ),
     [settings.youtubeEnabled, subscriptions],
   );
+  const hiddenStreamerIdsRef = useRef(hiddenStreamerIds);
+  hiddenStreamerIdsRef.current = hiddenStreamerIds;
   const visibleLiveStatuses = useMemo(
     () => settings.youtubeEnabled
       ? liveStatuses
@@ -936,7 +938,8 @@ export default function App() {
         currentSettings.notificationsEnabled &&
         live.isLive &&
         !live.previousIsLive &&
-        live.liveNotifyEnabled
+        live.liveNotifyEnabled &&
+        !hiddenStreamerIdsRef.current.has(live.streamerId)
       ) {
         notifyLive(live);
       }

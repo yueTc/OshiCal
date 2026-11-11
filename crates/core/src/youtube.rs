@@ -43,8 +43,8 @@ impl YouTubeBroadcastState {
         match value.map(str::trim) {
             Some("live") => Self::Live,
             Some("upcoming") => Self::Upcoming,
-            Some("none") | Some("") | None => Self::None,
-            Some(_) => Self::Unknown,
+            Some("none") => Self::None,
+            _ => Self::Unknown,
         }
     }
 
@@ -54,6 +54,10 @@ impl YouTubeBroadcastState {
 
     pub fn is_upcoming(self) -> bool {
         self == Self::Upcoming
+    }
+
+    pub fn is_known_not_live(self) -> bool {
+        self == Self::None
     }
 }
 
@@ -244,6 +248,13 @@ pub struct YouTubeSuperChatPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YouTubeSuperChatBatch {
+    pub events: Vec<YouTubeSuperChatEvent>,
+    pub next_page_token: Option<String>,
+}
+
 pub struct YouTubeClient {
     http: Client,
     api_key: RwLock<Option<String>>,
@@ -349,10 +360,13 @@ impl YouTubeClient {
         if !status.is_success() {
             return Err(youtube_http_error(status, &body));
         }
-        serde_json::from_slice(&body).map_err(|_| AppError::External {
-            code: "YOUTUBE_NON_JSON".to_owned(),
-            message: "YouTube API 返回了非 JSON 内容".to_owned(),
-        })
+        let value =
+            serde_json::from_slice::<Value>(&body).map_err(|_| AppError::External {
+                code: "YOUTUBE_NON_JSON".to_owned(),
+                message: "YouTube API 返回了非 JSON 内容".to_owned(),
+            })?;
+        validate_api_list_response(&value)?;
+        Ok(value)
     }
 
     async fn fetch_page(&self, url: &str, cookie: Option<&str>) -> AppResult<Response> {
@@ -598,9 +612,10 @@ impl YouTubeClient {
         web_cookie: Option<&str>,
     ) -> AppResult<YouTubeCommunityFetch> {
         let url = community_page_url(channel_or_handle)?;
+        let cookie_supplied = web_cookie.and_then(sanitize_secret).is_some();
         let response = self.fetch_page(&url, web_cookie).await?;
         let status = response.status();
-        let final_path = response.url().path().to_owned();
+        let final_url = response.url().clone();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             return Ok(YouTubeCommunityFetch {
                 page_found: false,
@@ -621,9 +636,35 @@ impl YouTubeClient {
             let body = read_response_bytes_limited(response, MAX_PAGE_RESPONSE_BYTES).await?;
             return Err(youtube_http_error(status, &body));
         }
-        if !final_path.contains("/community")
-            && (final_path.starts_with("/@") || final_path.starts_with("/channel/"))
-        {
+        if !is_youtube_host(final_url.host_str().unwrap_or_default()) {
+            if cookie_supplied {
+                return Ok(YouTubeCommunityFetch {
+                    page_found: false,
+                    membership_restricted: true,
+                    skipped_reason: Some("membership_session_unavailable".to_owned()),
+                    posts: Vec::new(),
+                });
+            }
+            return Err(AppError::External {
+                code: "YOUTUBE_COMMUNITY_FORMAT".to_owned(),
+                message: "YouTube 社区页重定向到了非 YouTube 页面".to_owned(),
+            });
+        }
+        if !is_channel_route_url(&final_url) {
+            if cookie_supplied {
+                return Ok(YouTubeCommunityFetch {
+                    page_found: false,
+                    membership_restricted: true,
+                    skipped_reason: Some("membership_session_unavailable".to_owned()),
+                    posts: Vec::new(),
+                });
+            }
+            return Err(AppError::External {
+                code: "YOUTUBE_COMMUNITY_FORMAT".to_owned(),
+                message: "YouTube 社区页重定向到了无法识别的页面".to_owned(),
+            });
+        }
+        if !final_url.path().trim_end_matches('/').ends_with("/community") {
             return Ok(YouTubeCommunityFetch {
                 page_found: false,
                 membership_restricted: false,
@@ -709,6 +750,29 @@ impl YouTubeClient {
         max_results: u32,
         max_pages: u32,
     ) -> AppResult<Vec<YouTubeSuperChatEvent>> {
+        Ok(self
+            .fetch_super_chat_batch(
+                live_chat_id,
+                access_token,
+                initial_page_token,
+                max_results,
+                max_pages,
+            )
+            .await?
+            .events)
+    }
+
+    /// Fetches at most `max_pages` Super Chat pages from the supplied cursor and
+    /// returns the cursor for the next tick. A missing cursor means the current
+    /// traversal is exhausted or encountered a token cycle.
+    pub(crate) async fn fetch_super_chat_batch(
+        &self,
+        live_chat_id: &str,
+        access_token: &str,
+        initial_page_token: Option<&str>,
+        max_results: u32,
+        max_pages: u32,
+    ) -> AppResult<YouTubeSuperChatBatch> {
         let mut page_token = initial_page_token
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -719,7 +783,10 @@ impl YouTubeClient {
         for _ in 0..max_pages.clamp(1, 100) {
             if let Some(token) = page_token.as_deref() {
                 if !seen_page_tokens.insert(token.to_owned()) {
-                    break;
+                    return Ok(YouTubeSuperChatBatch {
+                        events,
+                        next_page_token: None,
+                    });
                 }
             }
             let page = self
@@ -736,11 +803,25 @@ impl YouTubeClient {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
             else {
-                break;
+                return Ok(YouTubeSuperChatBatch {
+                    events,
+                    next_page_token: None,
+                });
             };
+            if page_token.as_deref() == Some(next_token.as_str())
+                || seen_page_tokens.contains(&next_token)
+            {
+                return Ok(YouTubeSuperChatBatch {
+                    events,
+                    next_page_token: None,
+                });
+            }
             page_token = Some(next_token);
         }
-        Ok(events)
+        Ok(YouTubeSuperChatBatch {
+            events,
+            next_page_token: page_token,
+        })
     }
 }
 fn normalize_secret(value: Option<String>) -> Option<String> {
@@ -791,7 +872,9 @@ pub fn parse_youtube_account_input(input: &str) -> AppResult<YouTubeAccountInput
     };
     let url = Url::parse(&normalized)?;
     if !is_youtube_host(url.host_str().unwrap_or_default()) {
-        return Err(AppError::validation("不是受支持的 YouTube 链接"));
+        // A pasted non-YouTube URL is safe to treat as a search phrase. It is never
+        // navigated to or used as an upstream request URL.
+        return Ok(YouTubeAccountInput::Search(input.to_owned()));
     }
     if url.host_str() == Some("youtu.be") {
         return url
@@ -1120,6 +1203,7 @@ fn parse_community_page(
     let lower = html.to_ascii_lowercase();
     let html_membership_restricted = lower.contains("members only")
         || lower.contains("sponsorsonlybadge")
+        || lower.contains("membersonlybadge")
         || html.contains("会员专属");
     let Some(initial) = extract_json_assignment(html, "ytInitialData") else {
         if html_membership_restricted {
@@ -1143,6 +1227,11 @@ fn parse_community_page(
         let Some(post) = parse_community_post(&renderer, channel_hint, &kind, observed_at) else {
             continue;
         };
+        if is_youtube_channel_id(channel_hint) && post.channel_id != channel_hint {
+            // Redirects, shared feeds, or malformed markup must not attribute
+            // another channel's community content to the requested streamer.
+            continue;
+        }
         if post.text.trim().is_empty() && post.images.is_empty() {
             continue;
         }
@@ -1157,6 +1246,7 @@ fn parse_community_page(
         }
     }
     let initial_membership_restricted = contains_key_recursive(&initial, "sponsorsOnlyBadge")
+        || contains_key_recursive(&initial, "membersOnlyBadge")
         || contains_key_recursive(&initial, "membersOnly")
         || contains_key_recursive(&initial, "membershipOnly")
         || contains_true_for_key(&initial, "isMembersOnly");
@@ -1242,6 +1332,7 @@ fn parse_community_post(
 
 fn renderer_is_membership_only(renderer: &Value) -> bool {
     contains_key_recursive(renderer, "sponsorsOnlyBadge")
+        || contains_key_recursive(renderer, "membersOnlyBadge")
         || contains_key_recursive(renderer, "membersOnly")
         || contains_key_recursive(renderer, "membershipOnly")
         || contains_true_for_key(renderer, "isMembersOnly")
@@ -1305,6 +1396,12 @@ fn parse_live_page(
     final_url: &Url,
     checked_at: DateTime<Utc>,
 ) -> AppResult<YouTubeLiveProbe> {
+    if !is_youtube_host(final_url.host_str().unwrap_or_default()) {
+        return Err(AppError::External {
+            code: "YOUTUBE_LIVE_FORMAT".to_owned(),
+            message: "YouTube 直播页重定向到了非 YouTube 页面".to_owned(),
+        });
+    }
     let player = extract_json_assignment(html, "ytInitialPlayerResponse");
     let initial = extract_json_assignment(html, "ytInitialData");
     if player.is_none() && initial.is_none() {
@@ -1314,19 +1411,21 @@ fn parse_live_page(
         });
     }
 
-    let is_live = player
+    let player_video_id = player
         .as_ref()
-        .and_then(|value| value.pointer("/videoDetails/isLive"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || player
+        .and_then(|value| value.pointer("/videoDetails/videoId"))
+        .and_then(Value::as_str)
+        .filter(|value| is_youtube_video_id(value))
+        .map(ToOwned::to_owned);
+    // `ytInitialData` contains recommendations and other unrelated videos. Only
+    // the current player may establish that the target channel is live.
+    let is_live = player_video_id.is_some()
+        && player
             .as_ref()
-            .and_then(|value| value.pointer("/microformat/playerMicroformatRenderer/liveBroadcastDetails/isLiveNow"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || initial
+            .is_some_and(player_has_explicit_live_signal)
+        && !player
             .as_ref()
-            .is_some_and(|value| contains_true_for_key(value, "isLiveNow"));
+            .is_some_and(player_has_explicit_offline_signal);
     if !is_live {
         if live_page_explicitly_offline(player.as_ref(), initial.as_ref(), final_url) {
             return Ok(YouTubeLiveProbe::offline(checked_at));
@@ -1337,14 +1436,7 @@ fn parse_live_page(
         });
     }
 
-    let video_id = video_id_from_page_url(final_url).or_else(|| {
-        player
-            .as_ref()
-            .and_then(|value| value.pointer("/videoDetails/videoId"))
-            .and_then(Value::as_str)
-            .filter(|value| is_youtube_video_id(value))
-            .map(ToOwned::to_owned)
-    });
+    let video_id = player_video_id;
     let title = player
         .as_ref()
         .and_then(|value| value.pointer("/videoDetails/title"))
@@ -1418,11 +1510,21 @@ fn live_page_explicitly_offline(
         .and_then(Value::as_str)
         .is_some_and(is_youtube_video_id);
     player.is_some_and(player_has_explicit_offline_signal)
-        || initial.is_some_and(|value| contains_false_for_key(value, "isLiveNow"))
         || (!player_has_video
             && initial.is_some_and(|value| {
                 is_channel_route_url(final_url) && is_recognizable_channel_page_data(value)
             }))
+}
+
+fn player_has_explicit_live_signal(player: &Value) -> bool {
+    player
+        .pointer("/videoDetails/isLive")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || player
+            .pointer("/microformat/playerMicroformatRenderer/liveBroadcastDetails/isLiveNow")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn player_has_explicit_offline_signal(player: &Value) -> bool {
@@ -1442,23 +1544,6 @@ fn is_recognizable_channel_page_data(initial: &Value) -> bool {
         .any(|key| contains_key_recursive(initial, key))
 }
 
-fn video_id_from_page_url(url: &Url) -> Option<String> {
-    url.query_pairs()
-        .find(|(key, _)| key == "v")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| is_youtube_video_id(value))
-        .or_else(|| {
-            let segments = url.path_segments()?.collect::<Vec<_>>();
-            match segments.as_slice() {
-                [kind, video_id, ..]
-                    if matches!(*kind, "live" | "embed" | "shorts")
-                        && is_youtube_video_id(video_id) => {
-                    Some((*video_id).to_owned())
-                }
-                _ => None,
-            }
-        })
-}
 
 fn is_channel_route_url(url: &Url) -> bool {
     is_youtube_host(url.host_str().unwrap_or_default())
@@ -1494,13 +1579,17 @@ fn parse_live_chat_page(value: &Value) -> YouTubeLiveChatPage {
 
 fn parse_live_chat_message(item: &Value) -> Option<YouTubeLiveChatMessage> {
     let snippet = item.get("snippet")?;
+    let id = item.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
     let kind = snippet
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
     Some(YouTubeLiveChatMessage {
-        id: item.get("id")?.as_str()?.to_owned(),
+        id: id.to_owned(),
         live_chat_id: snippet
             .get("liveChatId")
             .and_then(Value::as_str)
@@ -1579,7 +1668,6 @@ fn parse_chat_membership_event(snippet: &Value, kind: &str) -> Option<YouTubeMem
             "memberMilestoneChatEvent"
                 | "newSponsorEvent"
                 | "membershipGiftingEvent"
-                | "memberChatEvent"
         )
     {
         return None;
@@ -1637,21 +1725,40 @@ fn append_unique_super_chat_events(
 
 fn parse_super_chat_event(item: &Value) -> Option<YouTubeSuperChatEvent> {
     let snippet = item.get("snippet")?;
+    let id = item.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
     let (details, event_kind) = if let Some(details) = snippet.get("superChatDetails") {
         (details, "superChatEvent")
     } else if let Some(details) = snippet.get("superStickerDetails") {
         (details, "superStickerEvent")
     } else {
-        // Compatibility for legacy flattened superChatEvents.list payloads.
+        // Compatibility for legacy flattened superChatEvents.list payloads. Require
+        // a known event type and at least one monetary field so malformed or newly
+        // structured items are skipped instead of becoming zero-value events.
         let event_kind = snippet
             .get("type")
             .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "superChatEvent" | "superStickerEvent"))
-            .unwrap_or("superChatEvent");
+            .filter(|value| matches!(*value, "superChatEvent" | "superStickerEvent"))?;
+        let has_monetary_field = [
+            "amountMicros",
+            "currency",
+            "amountDisplayString",
+            "displayString",
+            "commentText",
+            "userComment",
+            "tier",
+        ]
+        .iter()
+        .any(|key| snippet.get(*key).is_some());
+        if !has_monetary_field {
+            return None;
+        }
         (snippet, event_kind)
     };
     Some(YouTubeSuperChatEvent {
-        id: item.get("id")?.as_str()?.to_owned(),
+        id: id.to_owned(),
         kind: event_kind.to_owned(),
         live_chat_id: snippet
             .get("liveChatId")
@@ -1718,18 +1825,10 @@ fn text_value(value: Option<&Value>) -> String {
 
 fn best_thumbnail(value: &Value) -> Option<String> {
     if let Some(items) = value.as_array() {
-        return items
-            .iter()
-            .rev()
-            .find_map(best_thumbnail)
-            .and_then(|url| normalize_youtube_asset_url(&url));
+        return best_thumbnail_array(items);
     }
     if let Some(items) = value.get("thumbnails").and_then(Value::as_array) {
-        return items
-            .iter()
-            .rev()
-            .filter_map(|item| item.get("url").and_then(Value::as_str))
-            .find_map(normalize_youtube_asset_url);
+        return best_thumbnail_array(items);
     }
     if let Some(url) = value.get("url").and_then(Value::as_str) {
         return normalize_youtube_asset_url(url);
@@ -1743,6 +1842,24 @@ fn best_thumbnail(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn best_thumbnail_array(items: &[Value]) -> Option<String> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(normalize_youtube_asset_url)
+                .or_else(|| item.get("image").and_then(best_thumbnail))?;
+            let width = item.get("width").and_then(json_u64).unwrap_or(0);
+            let height = item.get("height").and_then(json_u64).unwrap_or(0);
+            Some((url, width.saturating_mul(height), index))
+        })
+        .max_by_key(|(_, area, index)| (*area, *index))
+        .map(|(url, _, _)| url)
 }
 
 fn normalize_youtube_asset_url(value: &str) -> Option<String> {
@@ -1797,21 +1914,6 @@ fn contains_true_for_key(value: &Value, key: &str) -> bool {
         Value::Array(items) => items
             .iter()
             .any(|child| contains_true_for_key(child, key)),
-        _ => false,
-    }
-}
-
-fn contains_false_for_key(value: &Value, key: &str) -> bool {
-    match value {
-        Value::Object(object) => {
-            object.get(key).and_then(Value::as_bool) == Some(false)
-                || object
-                    .values()
-                    .any(|child| contains_false_for_key(child, key))
-        }
-        Value::Array(items) => items
-            .iter()
-            .any(|child| contains_false_for_key(child, key)),
         _ => false,
     }
 }
@@ -2043,6 +2145,31 @@ fn parse_json_object_at(html: &str, start: usize) -> Option<Value> {
     None
 }
 
+fn validate_api_list_response(value: &Value) -> AppResult<()> {
+    let Some(object) = value.as_object() else {
+        return Err(AppError::External {
+            code: "YOUTUBE_API_FORMAT".to_owned(),
+            message: "YouTube API 响应顶层不是 JSON 对象".to_owned(),
+        });
+    };
+    if object.get("items").is_some_and(|value| !value.is_array()) {
+        return Err(AppError::External {
+            code: "YOUTUBE_API_FORMAT".to_owned(),
+            message: "YouTube API 响应的 items 不是数组".to_owned(),
+        });
+    }
+    if object
+        .get("nextPageToken")
+        .is_some_and(|value| !value.is_string() && !value.is_null())
+    {
+        return Err(AppError::External {
+            code: "YOUTUBE_API_FORMAT".to_owned(),
+            message: "YouTube API 响应的 nextPageToken 格式无效".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn youtube_http_error(status: StatusCode, body: &[u8]) -> AppError {
     let value = serde_json::from_slice::<Value>(body).ok();
     let error = value.as_ref().and_then(|value| value.get("error"));
@@ -2205,7 +2332,11 @@ mod tests {
             parse_youtube_account_input("some search words").expect("search"),
             YouTubeAccountInput::Search("some search words".to_owned())
         );
-        assert!(parse_youtube_account_input("https://youtube.com.evil.test/@Example").is_err());
+        assert_eq!(
+            parse_youtube_account_input("https://youtube.com.evil.test/@Example")
+                .expect("non-youtube url falls back to search"),
+            YouTubeAccountInput::Search("https://youtube.com.evil.test/@Example".to_owned())
+        );
         assert!(parse_youtube_account_input("@").is_err());
     }
 
@@ -2369,6 +2500,22 @@ mod tests {
     }
 
     #[test]
+    fn live_page_rejects_non_youtube_redirect() {
+        let checked_at = Utc::now();
+        let url = Url::parse("https://example.com/redirected/live").expect("url");
+        let error = parse_live_page(
+            "<script>var ytInitialPlayerResponse = {};</script>",
+            &url,
+            checked_at,
+        )
+        .expect_err("non-YouTube redirect must fail closed");
+        assert!(matches!(
+            error,
+            AppError::External { ref code, .. } if code == "YOUTUBE_LIVE_FORMAT"
+        ));
+    }
+
+    #[test]
     fn live_page_with_video_id_but_no_live_state_returns_format_error() {
         let checked_at = Utc::now();
         let player = json!({
@@ -2383,6 +2530,12 @@ mod tests {
                     "title": "Example Channel",
                     "externalId": CHANNEL_ID
                 }
+            },
+            "recommended": {
+                "videoRenderer": {
+                    "videoId": "RecLive0001",
+                    "isLiveNow": true
+                }
             }
         });
         let html = format!(
@@ -2393,7 +2546,7 @@ mod tests {
         ))
         .expect("url");
         let error = parse_live_page(&html, &url, checked_at)
-            .expect_err("a videoId without an explicit live state must remain unknown");
+            .expect_err("recommendation live state without a target player state must remain unknown");
         assert!(matches!(
             error,
             AppError::External { ref code, .. } if code == "YOUTUBE_LIVE_FORMAT"
@@ -2410,8 +2563,16 @@ mod tests {
                 "isLive": false
             }
         });
+        let initial = json!({
+            "recommended": {
+                "videoRenderer": {
+                    "videoId": "RecLive0001",
+                    "isLiveNow": true
+                }
+            }
+        });
         let html = format!(
-            "<script>var ytInitialPlayerResponse = {player}; var ytInitialData = {{}};</script>"
+            "<script>var ytInitialPlayerResponse = {player}; var ytInitialData = {initial};</script>"
         );
         let url = Url::parse(&format!(
             "https://www.youtube.com/channel/{CHANNEL_ID}/live"
@@ -2518,6 +2679,32 @@ mod tests {
             Some("2026-11-12T09:00:00+00:00".to_owned())
         );
         assert!(!post.published_at_estimated);
+    }
+
+    #[test]
+    fn community_page_drops_posts_from_another_channel() {
+        let initial = json!({
+            "contents": {
+                "gridRenderer": {
+                    "items": [{
+                        "backstagePostRenderer": {
+                            "postId": "Ugk_other_channel",
+                            "authorText": {"simpleText": "Other Channel"},
+                            "authorEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "UC9999999999999999999999"
+                                }
+                            },
+                            "contentText": {"simpleText": "周五 20:00 直播"},
+                            "publishedTimeText": {"simpleText": "2026-11-12"}
+                        }
+                    }]
+                }
+            }
+        });
+        let html = format!("<html><script>var ytInitialData = {initial};</script></html>");
+        let page = parse_community_page(&html, CHANNEL_ID, Utc::now()).expect("community page");
+        assert!(page.posts.is_empty());
     }
 
     #[test]
@@ -2802,6 +2989,24 @@ mod tests {
     }
 
     #[test]
+    fn member_chat_is_not_a_membership_event() {
+        let value = json!({
+            "items": [{
+                "id": "member-chat-1",
+                "snippet": {
+                    "type": "memberChatEvent",
+                    "liveChatId": "chat-id",
+                    "publishedAt": "2026-11-12T12:00:04Z",
+                    "displayMessage": "members-only chat"
+                }
+            }]
+        });
+        let page = parse_live_chat_page(&value);
+        assert_eq!(page.messages.len(), 1);
+        assert!(page.messages[0].membership_event.is_none());
+    }
+
+    #[test]
     fn super_chat_events_map_amount_currency_and_user() {
         let value = json!({
             "items": [{
@@ -2861,6 +3066,15 @@ mod tests {
             Some("$2.50")
         );
         assert_eq!(events[0].user_display_name.as_deref(), Some("Sticker Fan"));
+    }
+
+    #[test]
+    fn youtube_api_list_shape_fails_closed() {
+        assert!(validate_api_list_response(&json!({})).is_ok());
+        assert!(validate_api_list_response(&json!({"items": []})).is_ok());
+        assert!(validate_api_list_response(&json!({"items": {}})).is_err());
+        assert!(validate_api_list_response(&json!({"nextPageToken": 1})).is_err());
+        assert!(validate_api_list_response(&json!([])).is_err());
     }
 
     #[test]

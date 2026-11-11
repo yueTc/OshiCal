@@ -708,7 +708,8 @@ export function mergeServerSettings(local: AppSettings, value: unknown): AppSett
     autoAnalyzeImages: boolOr("autoAnalyzeImages", local.autoAnalyzeImages),
     liveStatsEnabled: boolOr("liveStatsEnabled", local.liveStatsEnabled),
     fertilityEnabled: boolOr("fertilityEnabled", local.fertilityEnabled),
-    youtubeEnabled: boolOr("youtubeEnabled", local.youtubeEnabled ?? false),
+    // Missing remote flags must fail closed instead of resurrecting a stale local enablement.
+    youtubeEnabled: boolOr("youtubeEnabled", false),
     llmBaseUrl: stringOr("llmBaseUrl", local.llmBaseUrl),
     llmModel: stringOr("llmModel", local.llmModel),
     llmPromptVersion: stringOr("llmPromptVersion", local.llmPromptVersion),

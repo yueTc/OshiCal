@@ -11,6 +11,7 @@ use oshical_core::{
     SYNC_SCHEMA_VERSION,
 };
 use oshical_core::youtube::{parse_youtube_account_input, YouTubeAccountInput};
+use oshical_server::secrets::{save_persisted_youtube_oauth, YoutubeOAuthToken};
 use oshical_server::{
     build_router, AppState, RefreshJobManager, SecretVault, ServerConfig, ServerUpdateManager,
 };
@@ -421,6 +422,42 @@ async fn youtube_api_key_is_encrypted_and_never_returned_or_synced_in_plaintext(
 }
 
 #[tokio::test]
+async fn youtube_api_key_can_be_cleared_when_its_ciphertext_is_corrupt() {
+    let state = state().await;
+    let store = state.service.store().clone();
+    let app = build_router(state);
+    enable_youtube(&app).await;
+    store
+        .set_client_sync_state(
+            YOUTUBE_API_KEY_STATE,
+            &json!({
+                "ciphertext": "not-valid-base64",
+                "revision": 7,
+                "updatedAt": "2026-11-12T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = call_json(
+        &app,
+        Method::DELETE,
+        "/api/secrets/youtube",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["configured"], false);
+    assert!(store
+        .get_client_sync_state(YOUTUBE_API_KEY_STATE)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn youtube_subscription_defaults_live_stats_to_false() {
     let state = state().await;
     let input: AddSubscription = serde_json::from_value(json!({
@@ -521,6 +558,54 @@ async fn youtube_oauth_and_web_session_status_never_expose_credentials() {
         assert!(
             !body.to_string().contains(forbidden),
             "OAuth start exposed {forbidden}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn youtube_oauth_missing_required_scope_requires_reauth_without_echoing_tokens() {
+    let state = state().await;
+    let access_token = "ya29.fixture-access-token";
+    let refresh_token = "fixture-refresh-token";
+    save_persisted_youtube_oauth(
+        state.service.store(),
+        &state.secret_vault,
+        &YoutubeOAuthToken {
+            refresh_token: refresh_token.to_owned(),
+            access_token: Some(access_token.to_owned()),
+            access_token_expires_at: None,
+            scopes: vec!["openid".to_owned()],
+            token_type: "Bearer".to_owned(),
+        },
+    )
+    .await
+    .expect("save OAuth fixture");
+    let app = build_router(state);
+    enable_youtube(&app).await;
+
+    let (status, body) = call_json(
+        &app,
+        Method::GET,
+        "/api/secrets/youtube",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["oauth"]["configured"], true);
+    assert_eq!(body["data"]["oauth"]["expired"], true);
+    assert!(
+        !body.to_string().contains(access_token),
+        "OAuth status exposed the access token: {body}"
+    );
+    assert!(
+        !body.to_string().contains(refresh_token),
+        "OAuth status exposed the refresh token: {body}"
+    );
+    for forbidden in ["accessToken", "refreshToken", "clientSecret"] {
+        assert!(
+            !body.to_string().contains(forbidden),
+            "OAuth status exposed {forbidden}: {body}"
         );
     }
 }

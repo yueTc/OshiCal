@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -17,10 +17,132 @@ const LIVE_CHAT_PAGE_SIZE: u32 = 200;
 const MAX_LIVE_CHAT_PAGES_PER_TICK: usize = 20;
 const SUPER_CHAT_PAGE_SIZE: u32 = 50;
 const MAX_SUPER_CHAT_PAGES_PER_TICK: u32 = 10;
+const MAX_TRACKED_EVENT_IDS: usize = 100_000;
+
+type SharedCollectorResume = Arc<StdMutex<CollectorResumeState>>;
+
+#[derive(Default)]
+struct EventIdWindow {
+    ids: HashSet<Arc<str>>,
+    order: VecDeque<Arc<str>>,
+}
+
+impl EventIdWindow {
+    fn remember(&mut self, id: &str) -> bool {
+        let id = Arc::<str>::from(id);
+        if !self.ids.insert(Arc::clone(&id)) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > MAX_TRACKED_EVENT_IDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(oldest.as_ref() as &str);
+            }
+        }
+        true
+    }
+
+    fn forget(&mut self, id: &str) {
+        self.ids.remove(id);
+        self.order
+            .retain(|candidate| candidate.as_ref() != id);
+    }
+}
+
+struct CollectorResumeState {
+    session_id: i64,
+    video_id: Option<String>,
+    chat_id: Option<String>,
+    chat_page_token: Option<String>,
+    super_chat_page_token: Option<String>,
+    seen_chat_message_ids: EventIdWindow,
+    seen_paid_event_ids: EventIdWindow,
+    paid_users: HashSet<String>,
+    interactive_users: HashSet<String>,
+}
+
+impl CollectorResumeState {
+    fn new(session_id: i64, video_id: Option<String>) -> Self {
+        Self {
+            session_id,
+            video_id,
+            chat_id: None,
+            chat_page_token: None,
+            super_chat_page_token: None,
+            seen_chat_message_ids: EventIdWindow::default(),
+            seen_paid_event_ids: EventIdWindow::default(),
+            paid_users: HashSet::new(),
+            interactive_users: HashSet::new(),
+        }
+    }
+}
+
+fn lock_resume(
+    resume: &SharedCollectorResume,
+) -> std::sync::MutexGuard<'_, CollectorResumeState> {
+    resume
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn resume_state_matches(
+    state: &CollectorResumeState,
+    session_id: i64,
+    video_id: Option<&str>,
+) -> bool {
+    state.session_id == session_id && state.video_id.as_deref() == video_id
+}
+
+fn bind_chat_id(resume: &SharedCollectorResume, chat_id: &str) {
+    let mut state = lock_resume(resume);
+    if state.chat_id.as_deref() != Some(chat_id) {
+        state.chat_id = Some(chat_id.to_owned());
+        state.chat_page_token = None;
+        state.super_chat_page_token = None;
+    }
+}
+
+fn set_chat_page_token(
+    resume: &SharedCollectorResume,
+    chat_id: &str,
+    page_token: Option<String>,
+) {
+    let mut state = lock_resume(resume);
+    if state.chat_id.as_deref() == Some(chat_id) {
+        state.chat_page_token = page_token;
+    }
+}
+
+fn set_super_chat_page_token(
+    resume: &SharedCollectorResume,
+    chat_id: &str,
+    page_token: Option<String>,
+) {
+    let mut state = lock_resume(resume);
+    if state.chat_id.as_deref() == Some(chat_id) {
+        state.super_chat_page_token = page_token;
+    }
+}
+
+fn resume_page_tokens(
+    resume: &SharedCollectorResume,
+    chat_id: &str,
+) -> (Option<String>, Option<String>) {
+    let state = lock_resume(resume);
+    if state.chat_id.as_deref() == Some(chat_id) {
+        (
+            state.chat_page_token.clone(),
+            state.super_chat_page_token.clone(),
+        )
+    } else {
+        (None, None)
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct YouTubeStatsManager {
     tasks: Arc<Mutex<HashMap<i64, TaskHandle>>>,
+    resume_states: Arc<Mutex<HashMap<i64, SharedCollectorResume>>>,
 }
 
 struct TaskHandle {
@@ -44,6 +166,30 @@ impl YouTubeStatsManager {
         initial_viewers: u64,
         started_at: DateTime<Utc>,
     ) {
+        let resume = {
+            let mut resume_states = self.resume_states.lock().await;
+            let reusable = resume_states
+                .get(&streamer_id)
+                .filter(|state| {
+                    resume_state_matches(
+                        &lock_resume(*state),
+                        session.id,
+                        video_id.as_deref(),
+                    )
+                })
+                .cloned();
+            match reusable {
+                Some(resume) => resume,
+                None => {
+                    let resume = Arc::new(StdMutex::new(CollectorResumeState::new(
+                        session.id,
+                        video_id.clone(),
+                    )));
+                    resume_states.insert(streamer_id, Arc::clone(&resume));
+                    resume
+                }
+            }
+        };
         let mut tasks = self.tasks.lock().await;
         if let Some(existing) = tasks.get(&streamer_id) {
             if existing.session_id == session.id
@@ -69,6 +215,7 @@ impl YouTubeStatsManager {
             session,
             video_id,
             live_chat_id,
+            resume,
             initial_viewers,
             started_at,
             stop_rx,
@@ -101,7 +248,6 @@ impl YouTubeStatsManager {
     }
 }
 
-#[derive(Default)]
 struct CollectorMetrics {
     peak_online: u64,
     online_total: u64,
@@ -109,10 +255,7 @@ struct CollectorMetrics {
     danmaku_count: u64,
     super_chat_count: u64,
     membership_count: u64,
-    paid_users: HashSet<String>,
-    interactive_users: HashSet<String>,
-    seen_chat_message_ids: HashSet<String>,
-    seen_paid_event_ids: HashSet<String>,
+    resume: SharedCollectorResume,
 }
 
 impl CollectorMetrics {
@@ -122,24 +265,61 @@ impl CollectorMetrics {
         self.online_samples = self.online_samples.saturating_add(1);
     }
 
+    fn remember_chat_message_id(&self, id: &str) -> bool {
+        lock_resume(&self.resume)
+            .seen_chat_message_ids
+            .remember(id)
+    }
+
+    fn remember_paid_event_id(&self, id: &str) -> bool {
+        lock_resume(&self.resume)
+            .seen_paid_event_ids
+            .remember(id)
+    }
+
+    fn forget_chat_message_id(&self, id: &str) {
+        lock_resume(&self.resume)
+            .seen_chat_message_ids
+            .forget(id);
+    }
+
+    fn forget_paid_event_id(&self, id: &str) {
+        lock_resume(&self.resume).seen_paid_event_ids.forget(id);
+    }
+
+    fn remember_interactive_user(&self, user: &str) {
+        let mut state = lock_resume(&self.resume);
+        if state.interactive_users.len() < MAX_TRACKED_EVENT_IDS {
+            state.interactive_users.insert(user.to_owned());
+        }
+    }
+
+    fn remember_paid_user(&self, user: &str) {
+        let mut state = lock_resume(&self.resume);
+        if state.paid_users.len() < MAX_TRACKED_EVENT_IDS {
+            state.paid_users.insert(user.to_owned());
+        }
+    }
+
+    fn paid_user_count(&self) -> u64 {
+        lock_resume(&self.resume).paid_users.len() as u64
+    }
+
+    fn interactive_user_count(&self) -> u64 {
+        lock_resume(&self.resume).interactive_users.len() as u64
+    }
+
+    /// Returns false when a Super Chat contained in the chat message could not
+    /// be persisted. The caller must then retain its previous chat cursor so the
+    /// message can be retried instead of losing the paid event permanently.
     async fn observe_chat_message(
         &mut self,
         store: &SqliteStore,
         session_id: i64,
         message: YouTubeLiveChatMessage,
-    ) {
-        if self.seen_chat_message_ids.len() >= 100_000
-            || !self.seen_chat_message_ids.insert(message.id.clone())
-        {
-            return;
-        }
-        if message.display_message.is_some() {
-            self.danmaku_count = self.danmaku_count.saturating_add(1);
-        }
-        if let Some(author) = message.author_channel_id.as_ref() {
-            if self.interactive_users.len() < 100_000 {
-                self.interactive_users.insert(author.clone());
-            }
+    ) -> bool {
+        if !self.remember_chat_message_id(&message.id) {
+            return true;
         }
         if let Some(event) = message.monetary_event.as_ref() {
             let input = SuperChatEventInput {
@@ -155,23 +335,33 @@ impl CollectorMetrics {
                 amount_display_string: event.amount_display_string.clone(),
                 tier: event.tier,
             };
-            self.observe_super_chat(store, session_id, input).await;
+            if !self.observe_super_chat(store, session_id, input).await {
+                self.forget_chat_message_id(&message.id);
+                return false;
+            }
+        }
+        if message.display_message.is_some() {
+            self.danmaku_count = self.danmaku_count.saturating_add(1);
+        }
+        if let Some(author) = message.author_channel_id.as_ref() {
+            self.remember_interactive_user(author);
         }
         if message.membership_event.is_some() {
             self.membership_count = self.membership_count.saturating_add(1);
         }
+        true
     }
 
+    /// Returns false only when persistence failed, so paginated callers can keep
+    /// their previous cursor and retry the event instead of advancing past it.
     async fn observe_super_chat(
         &mut self,
         store: &SqliteStore,
         session_id: i64,
         event: SuperChatEventInput,
-    ) {
-        if self.seen_paid_event_ids.len() >= 100_000
-            || !self.seen_paid_event_ids.insert(event.id.clone())
-        {
-            return;
+    ) -> bool {
+        if !self.remember_paid_event_id(&event.id) {
+            return true;
         }
         let user = event.user_channel_id.clone();
         match store
@@ -181,14 +371,15 @@ impl CollectorMetrics {
             Ok(true) => {
                 self.super_chat_count = self.super_chat_count.saturating_add(1);
                 if let Some(user) = user {
-                    if self.paid_users.len() < 100_000 {
-                        self.paid_users.insert(user);
-                    }
+                    self.remember_paid_user(&user);
                 }
+                true
             }
-            Ok(false) => {}
+            Ok(false) => true,
             Err(error) => {
+                self.forget_paid_event_id(&event.id);
                 tracing::debug!(%error, session_id, "保存 YouTube Super Chat 事件失败");
+                false
             }
         }
     }
@@ -198,7 +389,7 @@ impl CollectorMetrics {
         store: &SqliteStore,
         session_id: i64,
         event: YouTubeSuperChatEvent,
-    ) {
+    ) -> bool {
         self.observe_super_chat(
             store,
             session_id,
@@ -216,7 +407,7 @@ impl CollectorMetrics {
                 tier: event.tier,
             },
         )
-        .await;
+        .await
     }
 }
 
@@ -283,13 +474,15 @@ async fn stop_collector(
     let token = current_access_token(secrets.as_ref()).await;
     let stats_available =
         effective_stats_available(token.as_deref(), chat_ever_succeeded, chat_degraded);
+    // The store's collector-state contract does not accept "paused"; using
+    // "degraded" keeps the open session and preserves metrics before shutdown.
     persist_metrics(
         store,
         session,
         started_at,
         observed_at,
         stats_available,
-        "paused",
+        "degraded",
         metrics,
     )
     .await;
@@ -331,16 +524,39 @@ async fn run_collector(
     session: LiveSession,
     video_id: Option<String>,
     mut live_chat_id: Option<String>,
+    resume: SharedCollectorResume,
     initial_viewers: u64,
     started_at: DateTime<Utc>,
     mut stop_rx: oneshot::Receiver<DateTime<Utc>>,
 ) {
+    live_chat_id = live_chat_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if let Some(chat_id) = live_chat_id.as_deref() {
+        bind_chat_id(&resume, chat_id);
+    } else {
+        // A collector resumed in the same process can keep the chat identity and
+        // continuation tokens discovered by its previous task.
+        live_chat_id = lock_resume(&resume).chat_id.clone();
+    }
+    let (mut next_chat_page_token, mut next_super_chat_page_token) = live_chat_id
+        .as_deref()
+        .map(|chat_id| resume_page_tokens(&resume, chat_id))
+        .unwrap_or((None, None));
     let mut ticker = interval(Duration::from_secs(SAMPLE_INTERVAL_SECONDS));
-    let mut metrics = CollectorMetrics::default();
-    let mut next_chat_page_token: Option<String> = None;
+    let count_from_db = |value: i64| u64::try_from(value).unwrap_or(0);
+    let mut metrics = CollectorMetrics {
+        peak_online: session.peak_online,
+        online_total: count_from_db(session.online_total),
+        online_samples: count_from_db(session.online_samples),
+        danmaku_count: count_from_db(session.danmaku_count),
+        super_chat_count: count_from_db(session.super_chat_count),
+        membership_count: count_from_db(session.membership_count.unwrap_or(0)),
+        resume: Arc::clone(&resume),
+    };
     let mut observed_initial = false;
     let mut chat_degraded = false;
-    let mut chat_ever_succeeded = false;
+    let mut chat_ever_succeeded = session.youtube_stats_available.unwrap_or(false);
     let mut last_failed_token: Option<String> = None;
 
     loop {
@@ -389,6 +605,9 @@ async fn run_collector(
                     chat_degraded = false;
                     last_failed_token = None;
                     next_chat_page_token = None;
+                    if let Some(chat_id) = live_chat_id.as_deref() {
+                        set_chat_page_token(&resume, chat_id, None);
+                    }
                 }
                 let mut chat_available = chat_is_available(
                     current_token.as_deref(),
@@ -438,8 +657,10 @@ async fn run_collector(
                                 current_viewers = video.concurrent_viewers;
                                 if let Some(chat_id) = video.active_live_chat_id.clone() {
                                     if live_chat_id.as_deref() != Some(chat_id.as_str()) {
+                                        bind_chat_id(&resume, &chat_id);
                                         live_chat_id = Some(chat_id);
                                         next_chat_page_token = None;
+                                        next_super_chat_page_token = None;
                                     }
                                     chat_available = chat_is_available(
                                         current_token.as_deref(),
@@ -448,7 +669,7 @@ async fn run_collector(
                                     );
                                 }
                                 if video.actual_end_at.is_some()
-                                    || (!video.is_live() && !video.is_upcoming())
+                                    || video.live_broadcast_content.is_known_not_live()
                                 {
                                     went_offline = true;
                                 }
@@ -556,21 +777,34 @@ async fn run_collector(
                                     chat_degraded = false;
                                     last_failed_token = None;
                                     let next = page.next_page_token;
+                                    let mut cursor_safe = true;
                                     for message in page.messages {
-                                        metrics
+                                        if !metrics
                                             .observe_chat_message(&store, session.id, message)
-                                            .await;
+                                            .await
+                                        {
+                                            cursor_safe = false;
+                                            break;
+                                        }
+                                    }
+                                    if !cursor_safe {
+                                        break;
                                     }
                                     let Some(next) = next else {
                                         next_chat_page_token = None;
+                                        set_chat_page_token(&resume, &chat_id, None);
                                         break;
                                     };
                                     if page_token.as_deref() == Some(next.as_str())
                                         || seen_page_tokens.contains(&next)
                                     {
-                                        next_chat_page_token = Some(next);
+                                        // Reset on a token cycle instead of retrying the
+                                        // same cursor on every tick.
+                                        next_chat_page_token = None;
+                                        set_chat_page_token(&resume, &chat_id, None);
                                         break;
                                     }
+                                    set_chat_page_token(&resume, &chat_id, Some(next.clone()));
                                     next_chat_page_token = Some(next.clone());
                                     page_token = Some(next);
                                 }
@@ -615,15 +849,16 @@ async fn run_collector(
                     current_access_token(&secrets).await,
                 ) {
                     if !chat_degraded {
-                        // `fetch_all_super_chat_events` follows continuation
-                        // tokens. The surrounding request guard drops this future
-                        // if the global switch turns off, so no later page starts.
-                        let Some(events_result) = super::run_youtube_request(
+                        // Keep the continuation cursor across ticks. Otherwise a
+                        // stream with more than one page budget of paid events
+                        // would rescan the same first pages forever.
+                        let page_token = next_super_chat_page_token.clone();
+                        let Some(batch_result) = super::run_youtube_request(
                             &store,
-                            client.fetch_all_super_chat_events(
+                            client.fetch_super_chat_batch(
                                 chat_id,
                                 &token,
-                                None,
+                                page_token.as_deref(),
                                 SUPER_CHAT_PAGE_SIZE,
                                 MAX_SUPER_CHAT_PAGES_PER_TICK,
                             ),
@@ -643,12 +878,25 @@ async fn run_collector(
                             .await;
                             return;
                         };
-                        match events_result {
-                            Ok(events) => {
-                                for event in events {
-                                    metrics
+                        match batch_result {
+                            Ok(batch) => {
+                                let next_page_token = batch.next_page_token;
+                                let mut cursor_safe = true;
+                                for event in batch.events {
+                                    if !metrics
                                         .observe_super_chat_event(&store, session.id, event)
-                                        .await;
+                                        .await
+                                    {
+                                        cursor_safe = false;
+                                    }
+                                }
+                                if cursor_safe {
+                                    set_super_chat_page_token(
+                                        &resume,
+                                        chat_id,
+                                        next_page_token.clone(),
+                                    );
+                                    next_super_chat_page_token = next_page_token;
                                 }
                             }
                             Err(error) => {
@@ -722,8 +970,8 @@ async fn persist_metrics(
             stats_available.then_some(metrics.danmaku_count),
             stats_available.then_some(metrics.super_chat_count),
             stats_available.then_some(metrics.membership_count),
-            stats_available.then_some(metrics.paid_users.len() as u64),
-            stats_available.then_some(metrics.interactive_users.len() as u64),
+            stats_available.then_some(metrics.paid_user_count()),
+            stats_available.then_some(metrics.interactive_user_count()),
             stats_available,
             "partial",
             collector_state,
@@ -738,6 +986,61 @@ async fn persist_metrics(
 mod tests {
     use super::*;
     use crate::settings::{save_settings, AppSettings};
+
+    fn empty_metrics(resume: SharedCollectorResume) -> CollectorMetrics {
+        CollectorMetrics {
+            peak_online: 0,
+            online_total: 0,
+            online_samples: 0,
+            danmaku_count: 0,
+            super_chat_count: 0,
+            membership_count: 0,
+            resume,
+        }
+    }
+
+    #[test]
+    fn collector_resume_state_keeps_cursors_and_dedup_window() {
+        let resume = Arc::new(StdMutex::new(CollectorResumeState::new(
+            42,
+            Some("video-1".to_owned()),
+        )));
+        bind_chat_id(&resume, "chat-1");
+        set_chat_page_token(&resume, "chat-1", Some("chat-page-2".to_owned()));
+        set_super_chat_page_token(
+            &resume,
+            "chat-1",
+            Some("super-chat-page-3".to_owned()),
+        );
+
+        assert_eq!(
+            resume_page_tokens(&resume, "chat-1"),
+            (
+                Some("chat-page-2".to_owned()),
+                Some("super-chat-page-3".to_owned())
+            )
+        );
+
+        let first = empty_metrics(Arc::clone(&resume));
+        assert!(first.remember_chat_message_id("message-1"));
+        first.remember_interactive_user("viewer-1");
+        first.remember_paid_user("supporter-1");
+        let resumed = empty_metrics(resume);
+        assert!(!resumed.remember_chat_message_id("message-1"));
+        assert_eq!(resumed.interactive_user_count(), 1);
+        assert_eq!(resumed.paid_user_count(), 1);
+
+        first.forget_chat_message_id("message-1");
+        assert!(resumed.remember_chat_message_id("message-1"));
+    }
+
+    #[test]
+    fn collector_resume_state_is_scoped_to_session_and_video() {
+        let state = CollectorResumeState::new(42, Some("video-1".to_owned()));
+        assert!(resume_state_matches(&state, 42, Some("video-1")));
+        assert!(!resume_state_matches(&state, 43, Some("video-1")));
+        assert!(!resume_state_matches(&state, 42, Some("video-2")));
+    }
 
     #[tokio::test]
     async fn youtube_switch_off_blocks_the_next_chat_page_request() {

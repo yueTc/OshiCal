@@ -526,7 +526,7 @@ npm run build:web
 
 版本与发布：
 
-- 桌面端：`0.3.23-beta.1`
+- 桌面端：`0.3.23-beta.2`（`desktop-v0.3.23-beta.1` 已被当前基线占用）
 - 服务端：`0.3.31-beta.1`
 - 两端发布说明分别写入 `docs/`
 - 正式版必须等用户明确确认后发布
@@ -666,6 +666,7 @@ CI: node scripts/youtube-fixtures/validate-fixtures.mjs
 - 社区页只解析当前首屏 `ytInitialData`，未实现 continuation 多页抓取。
 - 预约直播只检查最近 20 个上传，未使用 `search.list?eventType=upcoming` 兜底。
 - Super Chat 明细表仍为设备本地子历史；跨设备同步的是场次级聚合字段和可用性状态，原币种明细在纯镜像端可能缺失。
+- 聊天/Super Chat continuation 与去重水位目前只在进程内恢复；应用进程重启后，普通弹幕和会员事件可能重新扫描首页并重复计数，Super Chat 由数据库唯一键防重。
 - YouTube 搜索和频道元数据尚无统一 TTL 缓存，频繁显式搜索会消耗用户自己的 API 配额。
 - 桌面、服务端和本地命令仍存在三套搜索/添加调用路径，搜索数量与本地结果合并策略尚未完全统一。
 - 真实 Google OAuth、YouTube Data API、会员 Cookie、Windows ACL、SQLite 迁移回滚和真实 UI 关闭零请求仍需在 CI 或外部构建机验收。
@@ -822,3 +823,36 @@ scripts/youtube-fixtures/validate-fixtures.mjs
 - 每个智能体报告：已完成、相关文件、证据、未完成、阻塞、P0/P1/P2。
 - 所有 P0/P1 均有修复 diff 或明确的阻断说明；P2 全部进入 beta 已知限制。
 - 静态检查通过不代表构建通过；CI 结果未返回前，状态只能是“待外部验证”。
+- 发布候选版本按当前标签修正为 desktop `0.3.23-beta.2`、server `0.3.31-beta.1`；未得到用户确认前不得发布 stable。
+
+## 20. Wave 3 并行审查结果（2026-11-12）
+
+### 20.1 已完成
+
+- Agent A（YouTube 解析/统计）：收紧直播页状态判定，避免推荐位和未知状态误判；统一非 YouTube URL 的安全搜索降级；增加社区帖归属过滤；修复 Super Chat 跨 tick cursor、失败重试与同进程恢复去重；排除 `memberChatEvent` 误计会员事件；扩展 API 形状和错误码校验。
+- Agent B（Core 数据/迁移/同步）：补齐中间 beta 库 `NULL/空` 平台值回填及迁移前备份条件；在 Store、Sync mutation 和 Import snapshot 三层强制关联账号与主播平台一致；补充关闭开关后的请求门闩。
+- Agent C（服务端安全/OAuth/API）：严格校验 OAuth scope；state 一次性消费并串行化 start/complete/refresh/logout；refresh token 轮换后锁内重读；`invalid_grant` 清除失效授权；运行时凭据重新投影；Windows 主密钥 ACL 重置；损坏凭据槽可显式覆盖/清除；API Key 环境变量绕过保持为零。
+- Agent D（桌面/前端）：补齐桌面 `oauthExpired`；避免桌面 OAuth 重复打开浏览器；清除敏感输入残留；远端开关缺失时 fail-closed；关闭后阻断陈旧直播通知；阻止 Enter 重复消耗搜索配额。
+- Agent E（验证/CI）：重写验证矩阵和发布门禁，补充 fixture 契约校验，并将 YouTube fixture 校验步骤加入 CI。账号输入契约已统一为“显式非 YouTube URL 仅作为安全搜索词”。
+
+### 20.2 当前状态
+
+- 源码层 P0：未发现。
+- 代码层 P1：本轮发现并修复；真实环境验证缺口仍存在。
+- 必须披露的 P2：进程重启后的聊天/Super Chat 水位不持久化、社区页首屏限制、预约只查最近 20 个上传、`streamers.mid` 全局唯一、Super Chat 明细本地优先、无统一搜索 TTL 缓存。
+- `scripts/youtube-fixtures/validate-fixtures.mjs`、Rust 测试、TypeScript 类型检查和构建均未在本机执行。
+- CI 必须通过 PR 或手动 `workflow_dispatch` 触发；`youtube` 分支的 push 不包含在当前 `ci.yml` push 分支列表中。
+- beta 发布前必须取得 CI 链接、外部迁移/OAuth/零请求/真实 UI/B 站回归证据；stable 必须等待用户明确确认。
+
+### 20.3 收口门禁
+
+- [x] 只修改 YouTube 功能相关写集，未触碰既有无关改动。
+- [x] 计划、验证矩阵和并行 Agent 结果已落盘。
+- [x] 账号输入 fixture、生产解析器和 Rust 回归契约静态对齐。
+- [ ] `git diff --check` 通过（提交前执行）。
+- [ ] GitHub Actions 全绿（待外部执行）。
+- [ ] SQLite 迁移/备份/回滚演练（待外部执行）。
+- [ ] 真实 Google OAuth、Data API、会员 Cookie 和 Windows ACL（待外部执行）。
+- [ ] 总开关关闭零请求（待外部执行）。
+- [ ] YouTube 独立 UI、日程、通知和统计真实验收（待外部执行）。
+- [ ] B 站完整回归（待外部执行）。

@@ -21,7 +21,7 @@ use crate::secrets::{
 use crate::sync_api;
 use crate::update_manager::ServerUpdateManager;
 use crate::youtube_oauth::{
-    init_youtube_runtime, youtube_feature_enabled, youtube_runtime,
+    init_youtube_runtime, runtime_youtube_access_token, youtube_feature_enabled, youtube_runtime,
 };
 
 // Retention bounds are checked hourly, so growth between checks is expected.
@@ -94,21 +94,22 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
             }
         };
     if settings.youtube_enabled && persisted_youtube_oauth.is_some() {
-        match youtube_runtime()
+        if let Err(error) = youtube_runtime()
             .refresh_oauth_if_needed(&store, &secret_vault)
             .await
         {
-            Ok(_) => {
-                if let Ok(Some(refreshed)) =
-                    load_persisted_youtube_oauth(&store, &secret_vault).await
-                {
-                    persisted_youtube_oauth = Some(refreshed);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(code = error.code, "启动时刷新 YouTube OAuth 凭据失败");
-            }
+            tracing::warn!(code = error.code, "启动时刷新 YouTube OAuth 凭据失败");
         }
+        // Reload even after an error: invalid_grant removes the dead grant and
+        // must not leave the pre-refresh token in the runtime snapshot.
+        persisted_youtube_oauth =
+            match load_persisted_youtube_oauth(&store, &secret_vault).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "刷新后重新读取 YouTube OAuth 凭据失败");
+                    None
+                }
+            };
     }
     let persisted_youtube_web_session =
         match load_persisted_youtube_web_session(&store, &secret_vault).await {
@@ -119,7 +120,9 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
             }
         };
     let youtube_api_key_configured = persisted_youtube_api_key.is_some();
-    let youtube_oauth_configured = persisted_youtube_oauth.is_some();
+    let youtube_oauth_configured = persisted_youtube_oauth
+        .as_ref()
+        .is_some_and(|persisted| !persisted.token.refresh_token.trim().is_empty());
     let youtube_web_session_configured = persisted_youtube_web_session.is_some();
     tracing::info!(
         api_key = youtube_api_key_configured,
@@ -147,7 +150,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         runtime_secrets.youtube_api_key = Some(persisted.api_key);
     }
     if let Some(persisted) = persisted_youtube_oauth {
-        if let Some(access_token) = persisted.token.access_token {
+        if let Some(access_token) = runtime_youtube_access_token(&persisted.token) {
             runtime_secrets.youtube_oauth_access_token = Some(access_token);
         }
     }
@@ -344,6 +347,11 @@ pub fn spawn_background_tasks(state: AppState) {
                         Ok(false) => {}
                         Err(error) => {
                             tracing::warn!(code = error.code, "YouTube OAuth 后台刷新失败");
+                            if let Err(sync_error) =
+                                sync_runtime_secrets_from_vault(&youtube_oauth_state).await
+                            {
+                                tracing::warn!(%sync_error, "YouTube OAuth 后台刷新失败后同步运行时凭据失败");
+                            }
                         }
                     }
                 }

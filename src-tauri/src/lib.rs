@@ -217,6 +217,7 @@ struct YoutubeCredentialStatus {
     api_key_configured: bool,
     api_key_valid: Option<bool>,
     oauth_configured: bool,
+    oauth_expired: bool,
     oauth_account: Option<String>,
     web_session_configured: bool,
     web_session_account: Option<String>,
@@ -1464,6 +1465,20 @@ fn youtube_search_result(channel: YouTubeChannel) -> AccountSearchResult {
     }
 }
 
+fn youtube_oauth_expired() -> bool {
+    let Ok(Some(token)) = load_desktop_youtube_oauth_token() else {
+        return false;
+    };
+    let access_expired = token.access_token.is_none()
+        || token.access_token_expires_at.is_none_or(|expires_at| {
+            expires_at
+                <= Utc::now() + ChronoDuration::seconds(YOUTUBE_OAUTH_REFRESH_SKEW_SECONDS)
+        });
+    let required_scope_missing = !token.scopes.is_empty()
+        && !token.scopes.iter().any(|scope| scope == YOUTUBE_OAUTH_SCOPE);
+    access_expired || required_scope_missing
+}
+
 fn youtube_credential_status() -> YoutubeCredentialStatus {
     let api_key_configured = get_secret(KEY_YOUTUBE_API_KEY).is_some();
     let web_session_configured = get_secret(KEY_YOUTUBE_WEB_SESSION).is_some();
@@ -1471,6 +1486,7 @@ fn youtube_credential_status() -> YoutubeCredentialStatus {
         api_key_configured,
         api_key_valid: None,
         oauth_configured: youtube_oauth_configured(),
+        oauth_expired: youtube_oauth_expired(),
         oauth_account: None,
         web_session_configured,
         web_session_account: None,

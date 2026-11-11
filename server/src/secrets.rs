@@ -103,11 +103,19 @@ impl SecretVault {
         explicit_material: Option<&str>,
         key_file_override: Option<&Path>,
     ) -> Self {
-        if let Some(material) = explicit_material {
-            return Self::from_material(material);
-        }
-
         let legacy_key = Some(derive_key(&legacy_key_material(api_token, database_path)));
+        if let Some(material) = explicit_material {
+            // An operator may introduce OSHICAL_SECRETS_KEY during rollout. New
+            // writes use that key, but credentials written by the intermediate
+            // predictable-key release still need a one-time compatible read.
+            return Self {
+                key: Some(derive_key(material)),
+                legacy_key,
+                key_source: SecretKeySource::Explicit,
+                key_file: None,
+                key_error: None,
+            };
+        }
         let key_file = key_file_override
             .map(Path::to_path_buf)
             .unwrap_or_else(|| default_master_key_file(database_path));
@@ -373,6 +381,9 @@ fn read_master_key_file(path: &Path) -> Result<[u8; 32], String> {
             path.display()
         ));
     }
+    // Tighten ACLs before reading key bytes so a pre-existing broad ACL cannot
+    // expose the key during startup.
+    restrict_key_file_permissions(path)?;
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("读取主密钥文件 {} 失败: {error}", path.display()))?;
     let trimmed = raw.trim();
@@ -396,7 +407,6 @@ fn read_master_key_file(path: &Path) -> Result<[u8; 32], String> {
     }
     let mut key = [0_u8; MASTER_KEY_BYTES];
     key.copy_from_slice(&bytes);
-    restrict_key_file_permissions(path)?;
     Ok(key)
 }
 
@@ -451,6 +461,24 @@ fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn run_icacls(path: &Path, args: &[&str]) -> Result<(), String> {
+    use std::process::Command;
+
+    let status = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .status()
+        .map_err(|error| format!("调用 icacls 收紧主密钥文件权限失败: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "收紧主密钥文件 {} 的 Windows ACL 失败；请改设 OSHICAL_SECRETS_KEY",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
     use std::process::Command;
 
@@ -467,19 +495,14 @@ fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
     if account.is_empty() || account.chars().any(char::is_control) {
         return Err("当前 Windows 账号无效，无法收紧主密钥文件权限".to_owned());
     }
-    let status = Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(format!("{account}:F"))
-        .status()
-        .map_err(|error| format!("调用 icacls 收紧主密钥文件权限失败: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "收紧主密钥文件 {} 的 Windows ACL 失败；请改设 OSHICAL_SECRETS_KEY",
-            path.display()
-        ));
-    }
+
+    // Inheritance removal alone preserves explicit ACEs (for example Everyone
+    // or Users). Reset first to discard them, then strip inherited entries and
+    // grant only the service account.
+    run_icacls(path, &["/reset"])?;
+    run_icacls(path, &["/inheritance:r"])?;
+    let grant = format!("{account}:F");
+    run_icacls(path, &["/grant:r", &grant])?;
     Ok(())
 }
 
@@ -821,6 +844,28 @@ async fn load_stored_youtube_secret(
         .transpose()
 }
 
+async fn existing_youtube_secret_revision(
+    store: &SqliteStore,
+    key: &str,
+) -> Result<Option<i64>, AppError> {
+    let Some(raw) = store.get_client_sync_state(key).await? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str::<StoredSecret>(&raw)
+        .ok()
+        .map(|stored| stored.revision))
+}
+
+pub(crate) fn is_recoverable_youtube_secret_read_error(error: &AppError) -> bool {
+    match error {
+        AppError::Json(_) => true,
+        AppError::External { code, .. } => {
+            code.as_str() == "SECRET_VAULT" || code.as_str() == "SECRET_VAULT_DECRYPT_FAILED"
+        }
+        _ => false,
+    }
+}
+
 async fn store_youtube_secret(
     store: &SqliteStore,
     key: &str,
@@ -882,7 +927,16 @@ pub async fn save_persisted_youtube_api_key(
     api_key: &str,
 ) -> Result<PersistedYoutubeApiKey, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    let previous = load_persisted_youtube_api_key_unlocked(store, vault).await?;
+    let fallback_revision =
+        existing_youtube_secret_revision(store, YOUTUBE_API_KEY_STATE_KEY).await?;
+    let previous = match load_persisted_youtube_api_key_unlocked(store, vault).await {
+        Ok(value) => value,
+        Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
+            tracing::warn!(code = error.code(), "现有 YouTube API Key 密文损坏，将允许显式覆盖");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(previous) = previous.as_ref().filter(|value| value.api_key == api_key) {
         return Ok(PersistedYoutubeApiKey {
             api_key: previous.api_key.clone(),
@@ -893,7 +947,9 @@ pub async fn save_persisted_youtube_api_key(
     }
     let revision = previous
         .as_ref()
-        .map_or(1, |value| value.revision.saturating_add(1));
+        .map(|value| value.revision)
+        .or(fallback_revision)
+        .map_or(1, |value| value.saturating_add(1));
     let updated_at = Utc::now().to_rfc3339();
     let stored = StoredSecret {
         ciphertext: vault.encrypt_youtube_api_key(api_key)?,
@@ -952,10 +1008,11 @@ pub async fn save_persisted_youtube_oauth(
     token: &YoutubeOAuthToken,
 ) -> Result<PersistedYoutubeOAuthToken, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    let previous = load_persisted_youtube_oauth_unlocked(store, vault).await?;
-    let revision = previous
-        .as_ref()
-        .map_or(1, |value| value.revision.saturating_add(1));
+    // A new authorization must be able to replace an unreadable OAuth slot.
+    // Only the non-secret revision is needed from the previous envelope.
+    let previous_revision =
+        existing_youtube_secret_revision(store, YOUTUBE_OAUTH_STATE_KEY).await?;
+    let revision = previous_revision.map_or(1, |value| value.saturating_add(1));
     let updated_at = Utc::now().to_rfc3339();
     let stored = StoredSecret {
         ciphertext: vault.encrypt_youtube_oauth(&serde_json::to_string(token)?)?,
@@ -1030,7 +1087,16 @@ pub async fn save_persisted_youtube_web_session(
     cookie: &str,
 ) -> Result<PersistedYoutubeWebSession, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    let previous = load_persisted_youtube_web_session_unlocked(store, vault).await?;
+    let fallback_revision =
+        existing_youtube_secret_revision(store, YOUTUBE_WEB_SESSION_STATE_KEY).await?;
+    let previous = match load_persisted_youtube_web_session_unlocked(store, vault).await {
+        Ok(value) => value,
+        Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
+            tracing::warn!(code = error.code(), "现有 YouTube 网页会话密文损坏，将允许显式覆盖");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(previous) = previous.as_ref().filter(|value| value.cookie == cookie) {
         return Ok(PersistedYoutubeWebSession {
             cookie: previous.cookie.clone(),
@@ -1041,7 +1107,9 @@ pub async fn save_persisted_youtube_web_session(
     }
     let revision = previous
         .as_ref()
-        .map_or(1, |value| value.revision.saturating_add(1));
+        .map(|value| value.revision)
+        .or(fallback_revision)
+        .map_or(1, |value| value.saturating_add(1));
     let updated_at = Utc::now().to_rfc3339();
     let stored = StoredSecret {
         ciphertext: vault.encrypt_youtube_web_session(cookie)?,
@@ -1349,6 +1417,130 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn explicit_master_key_can_migrate_legacy_youtube_ciphertext() {
+        let root = temporary_test_dir("explicit-legacy-migration");
+        let database_path = root.join("oshical.db");
+        let key_file = root.join("must-not-exist.secrets-key");
+        let legacy = SecretVault::from_material(&legacy_key_material(None, &database_path));
+        let store = SqliteStore::in_memory().await.unwrap();
+        let stored = StoredSecret {
+            ciphertext: legacy
+                .encrypt_youtube_api_key("AIza-legacy-before-explicit-key")
+                .unwrap(),
+            revision: 3,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: None,
+            pending_url_binding: false,
+        };
+        store_youtube_secret(&store, YOUTUBE_API_KEY_STATE_KEY, &stored)
+            .await
+            .unwrap();
+
+        let explicit = SecretVault::from_config_material(
+            None,
+            &database_path,
+            Some("new-explicit-master-key"),
+            Some(&key_file),
+        );
+        let loaded = load_persisted_youtube_api_key(&store, &explicit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.api_key, "AIza-legacy-before-explicit-key");
+        let raw = store
+            .get_client_sync_state(YOUTUBE_API_KEY_STATE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let migrated: StoredSecret = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            explicit
+                .decrypt_youtube_api_key_detailed(&migrated.ciphertext)
+                .unwrap(),
+            ("AIza-legacy-before-explicit-key".to_owned(), false)
+        );
+        assert!(!key_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_youtube_slots_can_be_explicitly_overwritten() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let vault = SecretVault::from_material("replacement-master-key");
+        for key in [
+            YOUTUBE_API_KEY_STATE_KEY,
+            YOUTUBE_OAUTH_STATE_KEY,
+            YOUTUBE_WEB_SESSION_STATE_KEY,
+        ] {
+            store_youtube_secret(
+                &store,
+                key,
+                &StoredSecret {
+                    ciphertext: "not-valid-base64".to_owned(),
+                    revision: 9,
+                    updated_at: Utc::now().to_rfc3339(),
+                    bound_base_url: None,
+                    pending_url_binding: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let api_key = save_persisted_youtube_api_key(&store, &vault, "AIza-replacement")
+            .await
+            .unwrap();
+        assert_eq!(api_key.revision, 10);
+        assert_eq!(api_key.api_key, "AIza-replacement");
+
+        let token = YoutubeOAuthToken {
+            refresh_token: "replacement-refresh".to_owned(),
+            access_token: Some("replacement-access".to_owned()),
+            access_token_expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+            scopes: vec![
+                "https://www.googleapis.com/auth/youtube.readonly".to_owned(),
+            ],
+            token_type: "Bearer".to_owned(),
+        };
+        let oauth = save_persisted_youtube_oauth(&store, &vault, &token)
+            .await
+            .unwrap();
+        assert_eq!(oauth.revision, 10);
+
+        let session = save_persisted_youtube_web_session(&store, &vault, "SAPISID=replacement")
+            .await
+            .unwrap();
+        assert_eq!(session.revision, 10);
+
+        assert_eq!(
+            load_persisted_youtube_api_key(&store, &vault)
+                .await
+                .unwrap()
+                .unwrap()
+                .api_key,
+            "AIza-replacement"
+        );
+        assert_eq!(
+            load_persisted_youtube_oauth(&store, &vault)
+                .await
+                .unwrap()
+                .unwrap()
+                .token
+                .refresh_token,
+            "replacement-refresh"
+        );
+        assert_eq!(
+            load_persisted_youtube_web_session(&store, &vault)
+                .await
+                .unwrap()
+                .unwrap()
+                .cookie,
+            "SAPISID=replacement"
+        );
     }
 
     #[tokio::test]

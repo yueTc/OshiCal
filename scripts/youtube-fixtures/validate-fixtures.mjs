@@ -7,7 +7,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const fixtureDirectory = dirname(fileURLToPath(import.meta.url));
-const channelIdPattern = /^UC[A-Za-z0-9_-]{20,}$/;
+const expectedFixtureVersion = 1;
+const channelIdPattern = /^UC[A-Za-z0-9_-]{22}$/;
 const handlePattern = /^@[A-Za-z0-9._-]{3,30}$/;
 const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
 
@@ -24,6 +25,29 @@ function fixtureError(code, message) {
 
 function normalizedHost(url) {
   return url.hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
+}
+
+function assertFixtureVersion(fixture, name) {
+  assert.equal(
+    fixture.fixtureVersion,
+    expectedFixtureVersion,
+    `${name} fixture version must be ${expectedFixtureVersion}`,
+  );
+}
+
+function isYoutubeHost(host) {
+  return host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com");
+}
+
+function looksLikeUrlInput(input) {
+  const lower = input.toLowerCase();
+  return lower.startsWith("http://")
+    || lower.startsWith("https://")
+    || lower.startsWith("youtube.com/")
+    || lower.startsWith("www.youtube.com/")
+    || lower.startsWith("m.youtube.com/")
+    || lower.startsWith("music.youtube.com/")
+    || lower.startsWith("youtu.be/");
 }
 
 function canonicalChannelUrl(channelId) {
@@ -59,6 +83,12 @@ export function parseAccountInput(rawInput) {
       canonicalUrl: canonicalChannelUrl(input),
     });
   }
+  if (videoIdPattern.test(input)) {
+    return parsedAccount("video", {
+      videoId: input,
+      canonicalUrl: canonicalVideoUrl(input),
+    });
+  }
   if (handlePattern.test(input)) {
     return parsedAccount("handle", {
       handle: input,
@@ -68,21 +98,21 @@ export function parseAccountInput(rawInput) {
   if (input.startsWith("@")) {
     throw fixtureError("INVALID_HANDLE", "invalid YouTube handle");
   }
-  if (!input.includes("://") && !input.startsWith("www.") && !input.startsWith("m.youtube.com/")) {
+  if (!looksLikeUrlInput(input)) {
     return parsedAccount("search", { canonicalUrl: null });
   }
 
   let url;
   try {
-    const urlInput = input.startsWith("www.") || input.startsWith("m.youtube.com/") || input.startsWith("youtube.com/")
-      ? `https://${input}`
-      : input;
+    const urlInput = input.includes("://") ? input : `https://${input}`;
     url = new URL(urlInput);
   } catch {
     throw fixtureError("INVALID_CHANNEL_ID", "unsupported account input");
   }
   const host = normalizedHost(url);
-  if (!["youtube.com", "youtu.be", "youtube-nocookie.com"].includes(host)) {
+  if (!isYoutubeHost(host)) {
+    // Product contract: explicit non-YouTube URLs are safe free-text searches.
+    // They are never navigated to or used as an upstream request URL.
     return parsedAccount("search", { canonicalUrl: null });
   }
 
@@ -113,7 +143,7 @@ export function parseAccountInput(rawInput) {
   if (segments[0] === "channel") {
     const channelId = segments[1] ?? "";
     if (!channelIdPattern.test(channelId)) {
-      throw fixtureError("INVALID_CHANNEL_ID", "invalid YouTube channel id");
+      return parsedAccount("search", { canonicalUrl: null });
     }
     return parsedAccount("channel", {
       channelId,
@@ -123,17 +153,17 @@ export function parseAccountInput(rawInput) {
   if (segments[0] === "watch") {
     const videoId = url.searchParams.get("v") ?? "";
     if (!videoIdPattern.test(videoId)) {
-      throw fixtureError("INVALID_VIDEO_ID", "invalid watch video id");
+      return parsedAccount("search", { canonicalUrl: null });
     }
     return parsedAccount("video", {
       videoId,
       canonicalUrl: canonicalVideoUrl(videoId),
     });
   }
-  if (segments[0] === "live") {
+  if (["live", "embed", "shorts", "v"].includes(segments[0])) {
     const videoId = segments[1] ?? "";
     if (!videoIdPattern.test(videoId)) {
-      throw fixtureError("INVALID_VIDEO_ID", "invalid live video id");
+      return parsedAccount("search", { canonicalUrl: null });
     }
     return parsedAccount("video", {
       videoId,
@@ -141,7 +171,7 @@ export function parseAccountInput(rawInput) {
     });
   }
 
-  throw fixtureError("INVALID_CHANNEL_ID", "unsupported YouTube URL");
+  return parsedAccount("search", { canonicalUrl: null });
 }
 
 function bestThumbnail(thumbnails) {
@@ -223,16 +253,23 @@ function walk(value, visit) {
 }
 
 function collectImageUrls(post) {
-  const urls = [];
+  const byUrl = new Map();
   walk(post.backstageAttachment ?? {}, (value) => {
     if (!value || typeof value !== "object") {
       return;
     }
     if (typeof value.url === "string" && value.url.startsWith("http")) {
-      urls.push(value.url);
+      const width = Number(value.width ?? 0);
+      const height = Number(value.height ?? 0);
+      const area = Number.isFinite(width * height) ? width * height : 0;
+      const previous = byUrl.get(value.url);
+      if (!previous || area > previous.area) {
+        byUrl.set(value.url, { url: value.url, area });
+      }
     }
   });
-  return [...new Set(urls)].slice(-1);
+  const largest = [...byUrl.values()].sort((left, right) => right.area - left.area)[0];
+  return largest ? [largest.url] : [];
 }
 
 function postSourceUrl(post, postId) {
@@ -241,6 +278,26 @@ function postSourceUrl(post, postId) {
     return relative.startsWith("http") ? relative : `https://www.youtube.com${relative}`;
   }
   return `https://www.youtube.com/post/${postId}`;
+}
+
+function hasMembershipUnavailableSignal(initialData) {
+  let matched = false;
+  walk(initialData, (value) => {
+    if (matched || !value || typeof value !== "object") {
+      return;
+    }
+    const renderer = value.alertRenderer ?? value.messageRenderer ?? value.membershipUnavailableRenderer;
+    if (!renderer) {
+      return;
+    }
+    const text = [
+      collectText(renderer.text),
+      collectText(renderer.title),
+      collectText(renderer.messageText),
+    ].join(" ");
+    matched = /members only|members-only|channel members only|会员专属|仅限会员|会员专享/i.test(text);
+  });
+  return matched;
 }
 
 function parseCommunityFixture(entry) {
@@ -266,9 +323,7 @@ function parseCommunityFixture(entry) {
     });
   });
 
-  const serialized = JSON.stringify(initialData);
-  const membershipUnavailable =
-    posts.length === 0 && /members only|channel members only|会员专属/i.test(serialized);
+  const membershipUnavailable = posts.length === 0 && hasMembershipUnavailableSignal(initialData);
   return {
     skipped: membershipUnavailable,
     skipReason: membershipUnavailable ? "membership_session_unavailable" : null,
@@ -284,6 +339,13 @@ function mapLivePage(entry) {
   const videoId = finalUrl.searchParams.get("v");
 
   if (!videoId) {
+    const recognizedChannel = typeof details.channelId === "string" && details.channelId.length > 0;
+    if (!recognizedChannel && details.isLive !== false) {
+      throw fixtureError(
+        "YOUTUBE_LIVE_FORMAT",
+        "live page has neither a video id nor a recognizable offline channel page",
+      );
+    }
     return {
       state: "offline",
       videoId: null,
@@ -291,7 +353,9 @@ function mapLivePage(entry) {
       startedAt: null,
     };
   }
-  if (details.isLive === true && broadcast.isLiveNow !== false) {
+  const explicitLive = details.isLive === true || broadcast.isLiveNow === true;
+  const explicitOffline = details.isLive === false || broadcast.isLiveNow === false;
+  if (explicitLive && !explicitOffline) {
     return {
       state: "live",
       videoId,
@@ -299,20 +363,24 @@ function mapLivePage(entry) {
       startedAt: broadcast.startTimestamp ?? null,
     };
   }
-  // /live falling through to a completed video is indistinguishable from a
-  // channel page in the production probe. Ended broadcasts are authoritative
-  // only from videos.list with actualEndTime.
-  return {
-    state: "offline",
-    videoId: null,
-    title: null,
-    startedAt: null,
-  };
+  if (explicitOffline) {
+    // /live falling through to a completed video is offline for this probe.
+    // Ended broadcasts are authoritative only from videos.list actualEndTime.
+    return {
+      state: "offline",
+      videoId: null,
+      title: null,
+      startedAt: null,
+    };
+  }
+  throw fixtureError(
+    "YOUTUBE_LIVE_FORMAT",
+    "live page has a video id but no explicit live/offline signal",
+  );
 }
 
 function evaluateOAuthCase(testCase, requiredScopes) {
   if (
-    testCase.hasOAuth &&
     testCase.callbackState !== null &&
     testCase.callbackState !== testCase.expectedState
   ) {
@@ -330,9 +398,26 @@ function compact(actual) {
 }
 
 const accountFixtures = await readFixture("account-inputs.json");
+assertFixtureVersion(accountFixtures, "account-inputs");
 for (const testCase of accountFixtures.validCases) {
+  let parsed;
+  try {
+    parsed = parseAccountInput(testCase.input);
+  } catch (error) {
+    if (
+      testCase.expected.kind === "search"
+      && looksLikeUrlInput(testCase.input)
+      && error?.code === "INVALID_CHANNEL_ID"
+    ) {
+      throw fixtureError(
+        "PRODUCTION_CONTRACT_MISMATCH",
+        `fixture expects a non-YouTube URL to become a search term, but the fixture validator rejected it: ${testCase.input}`,
+      );
+    }
+    throw error;
+  }
   assert.deepEqual(
-    compact(parseAccountInput(testCase.input)),
+    compact(parsed),
     testCase.expected,
     `account input failed: ${testCase.input}`,
   );
@@ -344,8 +429,20 @@ for (const testCase of accountFixtures.invalidCases) {
     `invalid input did not fail as ${testCase.expectedError}: ${testCase.input}`,
   );
 }
+assert.deepEqual(
+  compact(parseAccountInput("dQw4w9WgXcQ")),
+  {
+    kind: "video",
+    channelId: null,
+    handle: null,
+    videoId: "dQw4w9WgXcQ",
+    canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  },
+  "bare video id must follow production parser precedence",
+);
 
 const dataApi = await readFixture("data-api.json");
+assertFixtureVersion(dataApi, "data-api");
 assert.match(dataApi.search.items[0].id.channelId, channelIdPattern);
 assert.match(dataApi.channels.items[0].id, channelIdPattern);
 assert.deepEqual(mapSearchItem(dataApi.search.items[0]), dataApi.expected.searchFirst);
@@ -360,6 +457,7 @@ for (const item of dataApi.videos.items) {
 }
 
 const community = await readFixture("community.json");
+assertFixtureVersion(community, "community");
 for (const key of ["public", "membersOnlyAccessible", "membersOnlyUnavailable"]) {
   assert.deepEqual(
     parseCommunityFixture(community[key]),
@@ -367,8 +465,24 @@ for (const key of ["public", "membersOnlyAccessible", "membersOnlyUnavailable"])
     `community fixture failed: ${key}`,
   );
 }
+assert.deepEqual(
+  parseCommunityFixture({
+    htmlResponse: {
+      ytInitialData: {
+        contents: {
+          twoColumnBrowseResultsRenderer: {
+            tabs: [],
+          },
+        },
+      },
+    },
+  }),
+  { skipped: false, skipReason: null, posts: [] },
+  "an empty page without an explicit membership error must not be reported as a membership skip",
+);
 
 const livePage = await readFixture("live-page.json");
+assertFixtureVersion(livePage, "live-page");
 for (const key of ["live", "notLiveChannelPage", "endedBroadcastPage"]) {
   assert.deepEqual(
     mapLivePage(livePage[key]),
@@ -376,8 +490,17 @@ for (const key of ["live", "notLiveChannelPage", "endedBroadcastPage"]) {
     `live page fixture failed: ${key}`,
   );
 }
+const ambiguousLivePage = structuredClone(livePage.live);
+delete ambiguousLivePage.playerResponse.videoDetails.isLive;
+delete ambiguousLivePage.playerResponse.microformat.playerMicroformatRenderer.liveBroadcastDetails.isLiveNow;
+assert.throws(
+  () => mapLivePage(ambiguousLivePage),
+  (error) => error?.code === "YOUTUBE_LIVE_FORMAT",
+  "a live URL with no explicit live/offline signal must remain unknown",
+);
 
 const oauth = await readFixture("oauth-contract.json");
+assertFixtureVersion(oauth, "oauth-contract");
 for (const testCase of oauth.cases) {
   assert.equal(
     evaluateOAuthCase(testCase, oauth.requiredScopes),
@@ -385,8 +508,25 @@ for (const testCase of oauth.cases) {
     `oauth scenario failed: ${testCase.name}`,
   );
 }
+assert.equal(
+  evaluateOAuthCase(
+    {
+      hasApiKey: true,
+      hasOAuth: false,
+      tokenStatus: "missing",
+      scopes: [],
+      capability: "live_chat",
+      callbackState: "tampered-state",
+      expectedState: "state-001",
+    },
+    oauth.requiredScopes,
+  ),
+  "reject_callback",
+  "state mismatch must be rejected before checking whether OAuth is present",
+);
 
 const legacy = await readFixture("legacy-bilibili.json");
+assertFixtureVersion(legacy, "legacy-bilibili");
 for (const table of ["streamers", "linkedAccounts"]) {
   assert.equal(
     legacy.sourceSchema[table].includes("platform"),
@@ -396,6 +536,12 @@ for (const table of ["streamers", "linkedAccounts"]) {
   for (const expected of legacy.expected[table]) {
     const source = legacy.rows[table].find((row) => row.id === expected.id);
     assert.ok(source, `legacy ${table} row ${expected.id} is missing`);
+    assert.deepEqual(
+      Object.keys(source).sort(),
+      [...legacy.sourceSchema[table]].sort(),
+      `legacy ${table} row ${expected.id} does not match its declared source schema`,
+    );
+    assert.equal(source.mid, expected.mid, `legacy ${table} row ${expected.id} mid changed`);
     assert.equal(expected.platform, "bilibili", `legacy ${table} platform default`);
     assert.equal(expected.handle, null, `legacy ${table} handle default`);
   }

@@ -208,6 +208,7 @@ export default function YouTubeSettingsPanel({
     setActionError(null);
     try {
       setStatus(await actions.clearApiKey());
+      setApiKey("");
       setStatusMessage("YouTube API Key 已清除。");
     } catch (error) {
       const message = credentialErrorMessage(error);
@@ -227,12 +228,15 @@ export default function YouTubeSettingsPanel({
     setStatusMessage(null);
     try {
       const start = await actions.startOAuth();
-      if (start.authorizationUrl) {
+      // Desktop local mode opens the system browser inside the Tauri command.
+      // Only the server/Web flow needs the frontend to open the returned URL.
+      if (serverMode) {
+        if (!start.authorizationUrl) {
+          throw new Error("YouTube OAuth 启动响应缺少授权地址");
+        }
         await openExternalUrl(start.authorizationUrl);
-        setStatusMessage("已打开 Google 授权页面，完成后返回这里刷新状态。");
-      } else {
-        setStatusMessage("已打开 Google 授权窗口，完成后返回这里刷新状态。");
       }
+      setStatusMessage("已打开 Google 授权页面，完成后返回这里刷新状态。");
       void loadStatus();
     } catch (error) {
       const message = credentialErrorMessage(error);
@@ -313,6 +317,7 @@ export default function YouTubeSettingsPanel({
     setActionError(null);
     try {
       setStatus(await actions.clearWebSession());
+      setWebCookie("");
       setStatusMessage("YouTube 网页会话已清除。");
     } catch (error) {
       const message = credentialErrorMessage(error);

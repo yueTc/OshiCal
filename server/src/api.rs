@@ -19,8 +19,8 @@ use crate::secrets::{
 use crate::sync_api;
 use crate::update_manager::{ServerUpdateManager, ServerUpdateSettings, ServerUpdateView};
 use crate::youtube_oauth::{
-    oauth_callback, youtube_feature_enabled, youtube_runtime, YouTubeError,
-    YouTubeOAuthStatus,
+    oauth_callback, runtime_youtube_access_token, youtube_feature_enabled, youtube_runtime,
+    YouTubeError, YouTubeOAuthStatus,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
@@ -66,19 +66,47 @@ pub struct AppState {
 /// snapshot; it never refreshes OAuth or performs another network request.
 pub(crate) async fn sync_runtime_secrets_from_vault(state: &AppState) -> Result<(), AppError> {
     let store = state.service.store();
-    let youtube_api_key = load_persisted_youtube_api_key(store, &state.secret_vault)
-        .await?
-        .map(|persisted| persisted.api_key);
-    let youtube_oauth_access_token = load_persisted_youtube_oauth(store, &state.secret_vault)
-        .await?
-        .and_then(|persisted| persisted.token.access_token);
-    let youtube_web_cookie = load_persisted_youtube_web_session(store, &state.secret_vault)
-        .await?
-        .map(|persisted| persisted.cookie);
-    let bili_cookie = load_persisted_bili_secret(store, &state.secret_vault)
-        .await?
-        .map(|persisted| persisted.cookie)
-        .or_else(|| std::env::var("OSHICAL_BILI_COOKIE").ok());
+    let mut first_error = None;
+    // A corrupt or temporarily unreadable slot must clear that credential from
+    // the live runtime, not leave an older plaintext copy usable in memory.
+    let youtube_api_key = match load_persisted_youtube_api_key(store, &state.secret_vault).await {
+        Ok(value) => value.map(|persisted| persisted.api_key),
+        Err(error) => {
+            tracing::warn!(%error, "读取 YouTube API Key 以同步运行时凭据失败");
+            first_error.get_or_insert(error);
+            None
+        }
+    };
+    let youtube_oauth_access_token =
+        match load_persisted_youtube_oauth(store, &state.secret_vault).await {
+            Ok(value) => value.and_then(|persisted| {
+                runtime_youtube_access_token(&persisted.token)
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "读取 YouTube OAuth 以同步运行时凭据失败");
+                first_error.get_or_insert(error);
+                None
+            }
+        };
+    let youtube_web_cookie =
+        match load_persisted_youtube_web_session(store, &state.secret_vault).await {
+            Ok(value) => value.map(|persisted| persisted.cookie),
+            Err(error) => {
+                tracing::warn!(%error, "读取 YouTube 网页会话以同步运行时凭据失败");
+                first_error.get_or_insert(error);
+                None
+            }
+        };
+    let bili_cookie = match load_persisted_bili_secret(store, &state.secret_vault).await {
+        Ok(value) => value
+            .map(|persisted| persisted.cookie)
+            .or_else(|| std::env::var("OSHICAL_BILI_COOKIE").ok()),
+        Err(error) => {
+            tracing::warn!(%error, "读取 B 站登录以同步运行时凭据失败");
+            first_error.get_or_insert(error);
+            None
+        }
+    };
     // Keep the live model key (including an env/bootstrap-only value) untouched.
     let llm_api_key = state.service.llm_api_key().await;
 
@@ -91,7 +119,11 @@ pub(crate) async fn sync_runtime_secrets_from_vault(state: &AppState) -> Result<
             youtube_oauth_access_token: non_empty_secret(youtube_oauth_access_token),
             youtube_web_cookie: non_empty_secret(youtube_web_cookie),
         })
-        .await
+        .await?;
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn non_empty_secret(value: Option<String>) -> Option<String> {
@@ -1643,7 +1675,9 @@ async fn put_youtube_api_key(
         api_key,
     )
     .await?;
-    sync_runtime_secrets_from_vault(&state).await?;
+    if let Err(error) = sync_runtime_secrets_from_vault(&state).await {
+        tracing::warn!(code = error.code(), "保存 YouTube API Key 后同步运行时凭据失败");
+    }
     state
         .service
         .store()
@@ -1660,9 +1694,22 @@ async fn put_youtube_api_key(
 
 async fn delete_youtube_api_key(State(state): State<AppState>) -> ApiResult {
     require_youtube_enabled(&state).await?;
-    let previous = youtube_api_key_status(state.service.store(), &state.secret_vault).await?;
+    let previous_revision = match youtube_api_key_status(
+        state.service.store(),
+        &state.secret_vault,
+    )
+    .await
+    {
+        Ok(status) => status.revision,
+        Err(error) => {
+            tracing::warn!(code = error.code(), "读取损坏的 YouTube API Key 状态失败；仍允许清除");
+            0
+        }
+    };
     let deleted = clear_persisted_youtube_api_key(state.service.store()).await?;
-    sync_runtime_secrets_from_vault(&state).await?;
+    if let Err(error) = sync_runtime_secrets_from_vault(&state).await {
+        tracing::warn!(code = error.code(), "清除 YouTube API Key 后同步运行时凭据失败");
+    }
     state
         .service
         .store()
@@ -1670,7 +1717,7 @@ async fn delete_youtube_api_key(State(state): State<AppState>) -> ApiResult {
             "server_secret",
             "youtube_api_key",
             "delete",
-            previous.revision.saturating_add(1).max(1),
+            previous_revision.saturating_add(1).max(1),
             Some(json!({"id": "youtube_api_key", "configured": false})),
         )
         .await?;
@@ -1700,25 +1747,51 @@ async fn complete_youtube_oauth(
             "YouTube OAuth code 和 state 不能为空",
         )));
     }
-    let status = youtube_runtime()
+    let result = youtube_runtime()
         .complete_oauth(
             state.service.store(),
             &state.secret_vault,
             code,
             oauth_state,
         )
-        .await?;
-    sync_runtime_secrets_from_vault(&state).await?;
-    ok(status)
+        .await;
+    match result {
+        Ok(status) => {
+            if let Err(sync_error) = sync_runtime_secrets_from_vault(&state).await {
+                tracing::warn!(code = sync_error.code(), "YouTube OAuth 完成后同步运行时凭据失败");
+            }
+            ok(status)
+        }
+        Err(error) => {
+            // Even a failed exchange can leave an expired or insufficiently
+            // scoped token in the runtime; re-project the vault fail-closed.
+            if let Err(sync_error) = sync_runtime_secrets_from_vault(&state).await {
+                tracing::warn!(%sync_error, "YouTube OAuth 失败后同步运行时凭据失败");
+            }
+            Err(error.into())
+        }
+    }
 }
 
 async fn refresh_youtube_oauth(State(state): State<AppState>) -> ApiResult {
     require_youtube_enabled(&state).await?;
-    let status = youtube_runtime()
+    let result = youtube_runtime()
         .refresh_oauth(state.service.store(), &state.secret_vault)
-        .await?;
-    sync_runtime_secrets_from_vault(&state).await?;
-    ok(status)
+        .await;
+    match result {
+        Ok(status) => {
+            if let Err(sync_error) = sync_runtime_secrets_from_vault(&state).await {
+                tracing::warn!(code = sync_error.code(), "YouTube OAuth 刷新后同步运行时凭据失败");
+            }
+            ok(status)
+        }
+        Err(error) => {
+            if let Err(sync_error) = sync_runtime_secrets_from_vault(&state).await {
+                tracing::warn!(%sync_error, "YouTube OAuth 刷新失败后同步运行时凭据失败");
+            }
+            Err(error.into())
+        }
+    }
 }
 
 async fn logout_youtube_oauth(State(state): State<AppState>) -> ApiResult {
@@ -1726,7 +1799,9 @@ async fn logout_youtube_oauth(State(state): State<AppState>) -> ApiResult {
     let status = youtube_runtime()
         .logout(state.service.store(), &state.secret_vault)
         .await?;
-    sync_runtime_secrets_from_vault(&state).await?;
+    if let Err(error) = sync_runtime_secrets_from_vault(&state).await {
+        tracing::warn!(code = error.code(), "YouTube OAuth 登出后同步运行时凭据失败");
+    }
     ok(status)
 }
 
@@ -1764,7 +1839,9 @@ async fn put_youtube_session(
         cookie,
     )
     .await?;
-    sync_runtime_secrets_from_vault(&state).await?;
+    if let Err(error) = sync_runtime_secrets_from_vault(&state).await {
+        tracing::warn!(code = error.code(), "保存 YouTube 网页会话后同步运行时凭据失败");
+    }
     state
         .service
         .store()
@@ -1785,10 +1862,22 @@ async fn put_youtube_session(
 
 async fn delete_youtube_session(State(state): State<AppState>) -> ApiResult {
     require_youtube_enabled(&state).await?;
-    let previous =
-        youtube_web_session_status(state.service.store(), &state.secret_vault).await?;
+    let previous_revision = match youtube_web_session_status(
+        state.service.store(),
+        &state.secret_vault,
+    )
+    .await
+    {
+        Ok(status) => status.revision,
+        Err(error) => {
+            tracing::warn!(code = error.code(), "读取损坏的 YouTube 网页会话状态失败；仍允许清除");
+            0
+        }
+    };
     let deleted = clear_persisted_youtube_web_session(state.service.store()).await?;
-    sync_runtime_secrets_from_vault(&state).await?;
+    if let Err(error) = sync_runtime_secrets_from_vault(&state).await {
+        tracing::warn!(code = error.code(), "清除 YouTube 网页会话后同步运行时凭据失败");
+    }
     state
         .service
         .store()
@@ -1796,7 +1885,7 @@ async fn delete_youtube_session(State(state): State<AppState>) -> ApiResult {
             "server_secret",
             "youtube_web_session",
             "delete",
-            previous.revision.saturating_add(1).max(1),
+            previous_revision.saturating_add(1).max(1),
             Some(json!({"id": "youtube_web_session", "configured": false})),
         )
         .await?;

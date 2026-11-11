@@ -99,6 +99,22 @@ async fn run_youtube_request<T>(
     }
 }
 
+fn youtube_feature_disabled_error() -> AppError {
+    AppError::External {
+        code: "YOUTUBE_FEATURE_DISABLED".to_owned(),
+        message: "YouTube 功能未开启".to_owned(),
+    }
+}
+
+async fn run_required_youtube_request<T>(
+    store: &SqliteStore,
+    request: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    run_youtube_request(store, request)
+        .await
+        .unwrap_or_else(|| Err(youtube_feature_disabled_error()))
+}
+
 /// LAPLACE 抓取单飞标记：同一进程内只允许一个抓取在跑，避免重复请求把上游刷成风控。
 static FERTILITY_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -497,9 +513,12 @@ impl AppService {
         let client = self.youtube_client();
         let channels = match YouTubeClient::parse_account_input(keyword)? {
             crate::youtube::YouTubeAccountInput::Search(query) => {
-                client.search_channels(&query, 20).await?
+                run_required_youtube_request(&self.store, client.search_channels(&query, 20))
+                    .await?
             }
-            _ => vec![client.resolve_channel(keyword).await?],
+            _ => vec![
+                run_required_youtube_request(&self.store, client.resolve_channel(keyword)).await?,
+            ],
         };
         Ok(channels
             .into_iter()
@@ -511,10 +530,7 @@ impl AppService {
         if load_settings(&self.store).await?.youtube_enabled {
             Ok(())
         } else {
-            Err(AppError::External {
-                code: "YOUTUBE_FEATURE_DISABLED".to_owned(),
-                message: "YouTube 功能未开启".to_owned(),
-            })
+            Err(youtube_feature_disabled_error())
         }
     }
 
@@ -529,7 +545,10 @@ impl AppService {
     pub async fn add_subscription(&self, mut input: AddSubscription) -> AppResult<Streamer> {
         if input.platform == Platform::Youtube {
             self.require_youtube_enabled().await?;
-            let channel = self.youtube_client().resolve_channel(&input.mid).await?;
+            let client = self.youtube_client();
+            let channel =
+                run_required_youtube_request(&self.store, client.resolve_channel(&input.mid))
+                    .await?;
             input.mid = channel.id;
             input.name = Some(channel.name);
             input.avatar_url = channel.avatar_url;
@@ -585,7 +604,9 @@ impl AppService {
         }
         if platform == Platform::Youtube {
             self.require_youtube_enabled().await?;
-            let channel = self.youtube_client().resolve_channel(mid).await?;
+            let client = self.youtube_client();
+            let channel =
+                run_required_youtube_request(&self.store, client.resolve_channel(mid)).await?;
             return self
                 .store
                 .add_linked_account_for_platform(
@@ -895,15 +916,17 @@ impl AppService {
         let fans = match streamer.platform {
             Platform::Bilibili => self.bili_client().fetch_fan_count(&streamer.mid).await?,
             Platform::Youtube => {
-                self.require_youtube_enabled().await?;
-                self.youtube_client()
-                    .fetch_channel_metadata(&streamer.mid)
-                    .await?
-                    .subscriber_count
-                    .ok_or_else(|| AppError::External {
-                        code: "YOUTUBE_SUBSCRIBER_COUNT_MISSING".to_owned(),
-                        message: "YouTube 频道未返回订阅者数".to_owned(),
-                    })?
+                let client = self.youtube_client();
+                run_required_youtube_request(
+                    &self.store,
+                    client.fetch_channel_metadata(&streamer.mid),
+                )
+                .await?
+                .subscriber_count
+                .ok_or_else(|| AppError::External {
+                    code: "YOUTUBE_SUBSCRIBER_COUNT_MISSING".to_owned(),
+                    message: "YouTube 频道未返回订阅者数".to_owned(),
+                })?
             }
         };
         self.store
@@ -924,15 +947,22 @@ impl AppService {
         for (index, streamer) in streamers.iter().enumerate() {
             let fans = match streamer.platform {
                 Platform::Bilibili => bili.fetch_fan_count(&streamer.mid).await,
-                Platform::Youtube if youtube_enabled => youtube
-                    .fetch_channel_metadata(&streamer.mid)
+                Platform::Youtube if youtube_enabled => {
+                    let Some(result) = run_youtube_request(
+                        &self.store,
+                        youtube.fetch_channel_metadata(&streamer.mid),
+                    )
                     .await
-                    .and_then(|channel| {
+                    else {
+                        continue;
+                    };
+                    result.and_then(|channel| {
                         channel.subscriber_count.ok_or_else(|| AppError::External {
                             code: "YOUTUBE_SUBSCRIBER_COUNT_MISSING".to_owned(),
                             message: "YouTube 频道未返回订阅者数".to_owned(),
                         })
-                    }),
+                    })
+                }
                 Platform::Youtube => continue,
             };
             match fans {
@@ -1353,12 +1383,17 @@ impl AppService {
         streamer: &Streamer,
         stats_enabled: bool,
     ) -> AppResult<Option<(bool, LiveSnapshot)>> {
+        if !youtube_requests_enabled(&self.store).await {
+            return Ok(None);
+        }
+        let client = self.youtube_client();
         if streamer.fans.is_none() {
-            match self
-                .youtube_client()
-                .fetch_channel_metadata(&streamer.mid)
-                .await
-            {
+            let Some(metadata) =
+                run_youtube_request(&self.store, client.fetch_channel_metadata(&streamer.mid)).await
+            else {
+                return Ok(None);
+            };
+            match metadata {
                 Ok(channel) => {
                     if let Some(fans) = channel.subscriber_count {
                         if let Err(error) = self
@@ -1375,7 +1410,12 @@ impl AppService {
                 }
             }
         }
-        let probe = match self.youtube_client().probe_live_page(&streamer.mid).await {
+        let Some(probe) =
+            run_youtube_request(&self.store, client.probe_live_page(&streamer.mid)).await
+        else {
+            return Ok(None);
+        };
+        let probe = match probe {
             Ok(probe) => probe,
             Err(error) => {
                 self.store
@@ -1398,11 +1438,15 @@ impl AppService {
         let mut active_live_chat_id = None;
         if probe.is_live {
             if let Some(video_id) = probe.video_id.as_deref() {
-                match self
-                    .youtube_client()
-                    .fetch_videos(&[video_id.to_owned()])
-                    .await
-                {
+                let Some(videos) = run_youtube_request(
+                    &self.store,
+                    client.fetch_videos(&[video_id.to_owned()]),
+                )
+                .await
+                else {
+                    return Ok(None);
+                };
+                match videos {
                     Ok(videos) => {
                         if let Some(video) = videos.into_iter().next() {
                             snapshot.title = video.title;

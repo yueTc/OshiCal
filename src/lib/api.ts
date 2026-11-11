@@ -100,7 +100,7 @@ export function normalizeYoutubeStatus(value: unknown): YoutubeCredentialStatus 
   const webSession = recordValue(
     secrets.webSession ?? secrets.web_session ?? secrets.session ?? secrets,
   );
-  const oauthExpired = booleanFrom(oauth.expired) === true;
+  const oauthExpired = booleanFrom(oauth.oauthExpired ?? oauth.oauth_expired ?? oauth.expired) === true;
   // Status is deliberately projected to state only. Provider errors can echo
   // request details, so never put a raw token/key/cookie or arbitrary error text
   // into the credential panel DOM.
