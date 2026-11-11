@@ -100,6 +100,30 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run build:web
 
+      - name: Install isolated UI test runtime
+        if: success()
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP 'oshical-ui-runtime'
+          npm install --prefix $runtime --no-package-lock --ignore-scripts playwright@1.56.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node (Join-Path $runtime 'node_modules/playwright/cli.js') install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "OSHICAL_UI_RUNTIME=$runtime" >> $env:GITHUB_ENV
+
+      - name: Live online chart browser interactions
+        if: success()
+        run: node scripts/live-online-ui.mjs
+
+      - name: Upload UI verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-online-ui
+          path: ui-artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Upload web preview for UI verification
         if: success()
         uses: actions/upload-artifact@v4
