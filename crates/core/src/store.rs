@@ -4310,7 +4310,7 @@ mod tests {
         }
     }
 
-    async fn remove_test_directory_when_released(path: &Path) {
+    pub(super) async fn remove_test_directory_when_released(path: &Path) {
         let mut last_error = None;
         for _ in 0..20 {
             match tokio::fs::remove_dir_all(path).await {

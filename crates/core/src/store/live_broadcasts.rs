@@ -836,7 +836,7 @@ mod tests {
         );
         store.pool.close().await;
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::store::tests::remove_test_directory_when_released(&dir).await;
     }
     #[tokio::test]
     async fn same_platform_start_and_network_failures_do_not_split_a_long_broadcast() {
