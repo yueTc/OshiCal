@@ -669,3 +669,156 @@ CI: node scripts/youtube-fixtures/validate-fixtures.mjs
 - YouTube 搜索和频道元数据尚无统一 TTL 缓存，频繁显式搜索会消耗用户自己的 API 配额。
 - 桌面、服务端和本地命令仍存在三套搜索/添加调用路径，搜索数量与本地结果合并策略尚未完全统一。
 - 真实 Google OAuth、YouTube Data API、会员 Cookie、Windows ACL、SQLite 迁移回滚和真实 UI 关闭零请求仍需在 CI 或外部构建机验收。
+
+## 19. Wave 3：多智能体并行审查与收口（2026-11-12）
+
+### 19.1 目标与边界
+
+本 Wave 不再重做已完成的 YouTube 主功能，而是对提交 `f93012b` 做独立审查、修复确定的 P0/P1 缺陷，并把所有结果收敛到 `youtube` 分支。
+
+强制边界：
+
+- 只允许在 `youtube` 分支工作；不得切换分支、提交、推送、发布或合并。
+- 禁止在当前主机执行任何构建、测试、编译、格式化或包管理命令，包括 `cargo *`、`npm run *`、`npx tauri *`、`docker build`。
+- 不得触碰未纳入本功能的既有改动：`video/oshical-promo/**`、`docs/67-*`、`docs/71-*`、`.ai-memory/**`、`target/**`、`release/**`、`dist/**`。
+- 每个智能体只能修改自己的写入范围；发现跨范围问题时只报告，不直接改别人的文件。
+- 只修复有明确证据的 P0/P1；P2 默认记录为 beta 已知限制，除非修复不需要扩大影响面。
+- 禁止通过放宽断言、删除测试、隐藏未验证项来“通过”审查。
+
+### 19.2 并行任务
+
+#### Agent A：YouTube 解析与统计
+
+写入范围：
+
+```text
+crates/core/src/youtube.rs
+crates/core/src/youtube_stats.rs
+scripts/youtube-fixtures/**
+```
+
+审查重点：
+
+- 频道 ID、handle、频道 URL、视频 URL 解析边界。
+- Data API 错误、配额、429、分页 token、空响应和页面结构变化。
+- `/live` 状态判定不能把未知页面误判为开播。
+- 社区帖公开/会员帖解析、会员权限缺失时跳过。
+- 直播聊天、Super Chat/Super Sticker、会员事件、去重、分页上限和原币种。
+- 总开关关闭后不得继续发起下一页请求。
+
+产出：修复范围内的确定问题；输出文件行号、证据、未修复 P2、静态检查命令与结果。
+
+#### Agent B：数据模型、迁移与同步
+
+写入范围：
+
+```text
+crates/core/src/models.rs
+crates/core/src/settings.rs
+crates/core/src/store.rs
+crates/core/src/store/**
+crates/core/src/service.rs
+crates/core/src/weekly.rs
+```
+
+审查重点：
+
+- `Platform` 默认值与旧 B 站数据迁移。
+- schema 2 → 3、中间 beta schema、备份、事务回滚。
+- `streamers.mid` 唯一约束、平台过滤、关联账号和跨平台隔离。
+- `LiveSession.membershipCount`、`youtubeStatsAvailable` 在查询、同步 bootstrap/changes、导入导出中的完整性。
+- 关闭总开关后后台刷新/采样不再启动。
+- 迁移失败必须 fail-closed，不得静默继续使用半迁移数据库。
+
+产出：修复范围内确定问题；输出迁移路径、回滚路径、静态字段链路证据和未验证项。
+
+#### Agent C：服务端 OAuth、SecretVault 与 API
+
+写入范围：
+
+```text
+server/src/api.rs
+server/src/config.rs
+server/src/runtime.rs
+server/src/secrets.rs
+server/src/youtube_oauth.rs
+server/tests/youtube_api.rs
+```
+
+审查重点：
+
+- OAuth PKCE、state 一次性校验、回调重放、token 刷新轮换、logout。
+- API Key/OAuth refresh token/网页 Cookie 三类凭据隔离，接口、日志、错误和同步 payload 不回显。
+- 主密钥文件生成、权限、旧密钥兼容迁移和失败恢复。
+- YouTube 总开关在后端所有路由与后台任务 fail-closed。
+- 每个最终用户自行填写 API Key，不存在环境变量绕过。
+- 动态 `YOUTUBE_HTTP_<status>` 和其他 `YOUTUBE_*` 错误码不折叠。
+- 服务端测试本身可静态编译通过 Type/字段/函数引用检查。
+
+产出：修复范围内确定问题；输出安全审计结论、接口清单、测试覆盖缺口和未验证项。
+
+#### Agent D：桌面桥、前端与交互
+
+写入范围：
+
+```text
+src-tauri/src/lib.rs
+src-tauri/src/sync_client.rs
+src/types.ts
+src/lib/api.ts
+src/lib/live-online.ts
+src/lib/sync.ts
+src/lib/syncStorage.ts
+src/App.tsx
+src/components/CreatorsView.tsx
+src/components/SettingsView.tsx
+src/components/YouTubeSettingsPanel.tsx
+src/styles.css
+```
+
+审查重点：
+
+- 设置页最下方 YouTube 总开关，默认关闭；关闭时隐藏入口/卡片并停止 OAuth、网页登录和后台请求。
+- B 站与 YouTube 独立卡片、独立统计口径和独立添加流程。
+- API Key/OAuth/网页会话状态只显示 configured/expired，不进入 DOM、localStorage 或日志。
+- 系统浏览器 OAuth + 回环 callback 的 state、超时、取消和重复回调处理。
+- 受控 WebView Cookie 捕获、清除范围不得误删通用 Google 账号 Cookie。
+- 前端与 Tauri/Sync 字段类型一致，空值/旧数据/失败态不崩溃。
+- 键盘操作、禁用态、错误提示和移动端布局。
+
+产出：修复范围内确定问题；输出 UI 入口静态链路、敏感值扫描结果、未验证的真实 UI 项。
+
+#### Agent E：验证、CI 与发布门禁
+
+写入范围：
+
+```text
+docs/79-youtube-feature-verification.md
+scripts/youtube-fixtures/validate-fixtures.mjs
+```
+
+审查重点：
+
+- 测试矩阵是否覆盖用户需求和已有实现路径。
+- CI 命令、fixture 校验、迁移演练、OAuth 真实测试、关闭零请求验证是否可执行。
+- 发布说明门禁、beta/stable 节奏、回滚步骤是否正确。
+- 找出静态审查能发现但不能替代的真实环境验证项。
+- 不修改业务源码，不与 A-D 的测试/实现写集冲突。
+
+产出：补强验证文档和 fixture 校验；输出最终验收清单、缺口类型、发布建议。
+
+### 19.3 集成顺序
+
+1. 五个智能体并行审查；每个先给出问题清单，再只修复自己范围内的确定 P0/P1。
+2. 主代理逐个读取结果，核对文件行号、diff 和未验证项，不抽样、不直接采信子代理结论。
+3. 主代理统一处理跨范围接口对齐，禁止把跨范围修改偷偷塞进某个智能体范围。
+4. 只暂存 YouTube 功能相关文件，先运行 `git diff --check` 和静态 `rg` 扫描，再提交到 `youtube`。
+5. CI/外部构建机通过后，才允许进入 beta 发布说明和发布流程。
+
+### 19.4 出口校验
+
+- `git branch --show-current` 输出 `youtube`。
+- `git status --short` 中除了既有无关改动，不出现未归属范围的临时文件。
+- 每个智能体报告：已完成、相关文件、证据、未完成、阻塞、P0/P1/P2。
+- 所有 P0/P1 均有修复 diff 或明确的阻断说明；P2 全部进入 beta 已知限制。
+- 静态检查通过不代表构建通过；CI 结果未返回前，状态只能是“待外部验证”。
