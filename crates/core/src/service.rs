@@ -8894,6 +8894,54 @@ mod tests {
             2,
             "changed content bypasses backoff"
         );
+        let mut changed_pool = test_pool("other-model");
+        service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&changed_pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            analyzer.0.load(Ordering::SeqCst),
+            3,
+            "model change bypasses backoff"
+        );
+        changed_pool.config.api_key = "changed-key".to_owned();
+        service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&changed_pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            analyzer.0.load(Ordering::SeqCst),
+            4,
+            "credential change bypasses backoff"
+        );
+        changed_pool.config.reasoning_effort = ReasoningEffort::High;
+        service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&changed_pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            analyzer.0.load(Ordering::SeqCst),
+            5,
+            "reasoning change bypasses backoff"
+        );
         assert!(store.list_all_schedules().await.unwrap().is_empty());
         let successes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM post_analyses")
             .fetch_one(store.pool())

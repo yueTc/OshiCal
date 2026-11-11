@@ -553,10 +553,15 @@ async fn refresh_job_streamer(State(state): State<AppState>, Path(id): Path<i64>
                 .await;
             match result {
                 Ok(report) => {
-                    let stage = if report.failed_streamers.is_empty() {
-                        "主播刷新完成"
-                    } else {
-                        "主播刷新完成，部分来源失败"
+                    let shared_all = background
+                        .jobs
+                        .get(&job_id)
+                        .is_some_and(|job| job.progress.stage.contains("共享全量结果"));
+                    let stage = match (shared_all, report.failed_streamers.is_empty()) {
+                        (true, true) => "已完成共享全量刷新",
+                        (true, false) => "共享全量刷新完成，部分来源失败",
+                        (false, true) => "主播刷新完成",
+                        (false, false) => "主播刷新完成，部分来源失败",
                     };
                     if let Some(job) = background.jobs.finish(&job_id, report, stage) {
                         publish_job_progress(&background, &job);
@@ -1951,6 +1956,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod protocol_tests {
+    #[test]
+    fn shared_refresh_errors_keep_the_original_http_classification() {
+        use axum::http::StatusCode;
+        use oshical_core::AppError;
+        for (code, status) in [
+            ("VALIDATION_ERROR", StatusCode::BAD_REQUEST),
+            ("NOT_FOUND", StatusCode::NOT_FOUND),
+            ("DATABASE_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
+            ("NETWORK_ERROR", StatusCode::BAD_GATEWAY),
+            ("NOT_CONFIGURED", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let error = super::ApiError::from(AppError::Shared {
+                code,
+                message: "shared fixture".to_owned(),
+            });
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+        }
+    }
+
     use super::*;
 
     #[test]
