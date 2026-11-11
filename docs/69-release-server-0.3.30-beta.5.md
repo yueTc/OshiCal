@@ -15,6 +15,7 @@
 - 启动时自动新增 live_online_samples 表及索引，旧场次不回填不存在的历史观测。采样随所属场次保留，删除所属主播会级联删除，不受同步历史保留窗口影响。
 - 新增需鉴权的 GET /api/live-sessions/{id}/online-samples?afterId=0&limit=500；返回 metric=bilibili_high_energy_users、sampleIntervalSeconds=30、samples、nextAfterId 和 hasMore，limit 为 1–1000。
 - 现有同步协议 v2 和场次汇总接口保持兼容。曲线按需查询；现有桌面安装包和界面不新增曲线，也不会离线同步这张采样表。需要离线曲线或图形展示需后续客户端支持。
+- 共用 crates/core 的无变化更新保护、独立采样表和采集逻辑也适用于以后重新构建的独立桌面模式；本次只发布服务端，不更新桌面安装包或桌面更新清单。每小时历史清理调度仅在服务端启用。
 - 本版无新增环境变量。离线客户端需要的旧日志若已过期，将按现有 resetRequired 机制重新全量同步；7 天不是保证可补增量的时长，数量或容量限制可能更早触发。
 
 ## 升级与回滚
