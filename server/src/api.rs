@@ -463,8 +463,10 @@ fn publish_job_progress(state: &AppState, job: &RefreshJob) {
 }
 
 async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
-    let request_key = state.service.refresh_request_key(None).await?;
-    let registration = state.jobs.create_all_with_key(request_key);
+    let prepared = state.service.prepare_refresh_request(None).await?;
+    let registration = state
+        .jobs
+        .create_all_with_key(prepared.request_key().to_owned());
     let accepted = RefreshJobAccepted::from(&registration);
     if registration.created {
         publish_job_progress(&state, &registration.job);
@@ -492,7 +494,7 @@ async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
             let progress_job_id = job_id.clone();
             match background
                 .service
-                .refresh_all_with_progress(move |progress| {
+                .refresh_prepared_with_progress(prepared, move |progress| {
                     if let Some(job) =
                         progress_registry.update_streamer_progress(&progress_job_id, &progress)
                     {
@@ -524,11 +526,15 @@ async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
 
 async fn refresh_job_streamer(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
     let streamer = state.service.store().get_streamer(id).await?;
-    let request_key = state.service.refresh_request_key(Some(streamer.id)).await?;
-    let registration =
-        state
-            .jobs
-            .create_streamer_with_key(streamer.id, streamer.name.clone(), request_key);
+    let prepared = state
+        .service
+        .prepare_refresh_request(Some(streamer.id))
+        .await?;
+    let registration = state.jobs.create_streamer_with_key(
+        streamer.id,
+        streamer.name.clone(),
+        prepared.request_key().to_owned(),
+    );
     let accepted = RefreshJobAccepted::from(&registration);
     if registration.created {
         publish_job_progress(&state, &registration.job);
@@ -543,7 +549,7 @@ async fn refresh_job_streamer(State(state): State<AppState>, Path(id): Path<i64>
             let progress_job_id = job_id.clone();
             let result = background
                 .service
-                .refresh_streamer_with_progress(id, move |progress| {
+                .refresh_prepared_with_progress(prepared, move |progress| {
                     if let Some(job) =
                         progress_registry.update_streamer_progress(&progress_job_id, &progress)
                     {

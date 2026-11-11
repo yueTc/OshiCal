@@ -74,6 +74,26 @@ fn begin_fertility_refresh() -> Option<FertilityRefreshGuard> {
     Some(FertilityRefreshGuard)
 }
 
+/// Immutable input snapshot shared by job registration and actual execution.
+/// Credentials remain in memory; callers only receive an opaque request key.
+#[derive(Clone)]
+pub struct PreparedRefresh {
+    settings: AppSettings,
+    streamers: Vec<Streamer>,
+    config: Option<LlmConfig>,
+    scope: RefreshScope,
+    streamer_id: Option<i64>,
+    bili: Arc<BilibiliClient>,
+    llm: Arc<dyn ContentAnalyzer>,
+    request_key: String,
+}
+
+impl PreparedRefresh {
+    pub fn request_key(&self) -> &str {
+        &self.request_key
+    }
+}
+
 #[derive(Clone)]
 pub struct AppService {
     store: SqliteStore,
@@ -1078,16 +1098,13 @@ impl AppService {
     /// Opaque snapshot used by the HTTP job registry too. Runtime fields such
     /// as last_refresh_at must not invalidate a still-running refresh.
     pub async fn refresh_request_key(&self, streamer_id: Option<i64>) -> AppResult<String> {
-        let (_, _, _, scope) = self.prepare_refresh(streamer_id).await?;
-        Ok(text_digest(&serde_json::to_string(&json!({
-            "config": scope.config_key, "targets": scope.targets, "all": scope.all,
-        }))?))
+        Ok(self.prepare_refresh_request(streamer_id).await?.request_key)
     }
 
-    async fn prepare_refresh(
+    pub async fn prepare_refresh_request(
         &self,
         streamer_id: Option<i64>,
-    ) -> AppResult<(AppSettings, Vec<Streamer>, Option<LlmConfig>, RefreshScope)> {
+    ) -> AppResult<PreparedRefresh> {
         let settings = load_settings(&self.store).await?;
         let streamers = match streamer_id {
             Some(id) => vec![self.store.get_streamer(id).await?],
@@ -1128,16 +1145,25 @@ impl AppService {
                 (streamer.id, fingerprint)
             })
             .collect::<BTreeMap<_, _>>();
-        Ok((
+        let scope = RefreshScope {
+            config_key,
+            targets,
+            all: streamer_id.is_none(),
+        };
+        let request_key = text_digest(
+            &json!({ "config": scope.config_key, "targets": scope.targets, "all": scope.all })
+                .to_string(),
+        );
+        Ok(PreparedRefresh {
             settings,
             streamers,
             config,
-            RefreshScope {
-                config_key,
-                targets,
-                all: streamer_id.is_none(),
-            },
-        ))
+            scope,
+            streamer_id,
+            bili: self.bili_client(),
+            llm: self.llm_analyzer(),
+            request_key,
+        })
     }
 
     async fn coordinate_refresh(
@@ -1145,7 +1171,36 @@ impl AppService {
         streamer_id: Option<i64>,
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> AppResult<RefreshReport> {
-        let (settings, streamers, config, scope) = self.prepare_refresh(streamer_id).await?;
+        let prepared = self.prepare_refresh_request(streamer_id).await?;
+        self.run_prepared_refresh(prepared, on_progress).await
+    }
+
+    pub async fn refresh_prepared_with_progress<P>(
+        &self,
+        prepared: PreparedRefresh,
+        on_progress: P,
+    ) -> AppResult<RefreshReport>
+    where
+        P: Fn(RefreshProgress) + Send + Sync,
+    {
+        self.run_prepared_refresh(prepared, &on_progress).await
+    }
+
+    async fn run_prepared_refresh(
+        &self,
+        prepared: PreparedRefresh,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+    ) -> AppResult<RefreshReport> {
+        let PreparedRefresh {
+            settings,
+            streamers,
+            config,
+            scope,
+            streamer_id,
+            bili,
+            llm,
+            ..
+        } = prepared;
         let target = match streamers.first().filter(|_| streamer_id.is_some()) {
             Some(streamer) => ProgressTarget::for_streamer(streamer),
             None => ProgressTarget::all(),
@@ -1153,8 +1208,8 @@ impl AppService {
         let mut service = self.clone();
         // Freeze the selected clients along with the request scope. A setting
         // change creates a different task instead of silently mutating this one.
-        service.bili = Arc::new(StdRwLock::new(self.bili_client()));
-        service.llm = Arc::new(StdRwLock::new(self.llm_analyzer()));
+        service.bili = Arc::new(StdRwLock::new(bili));
+        service.llm = Arc::new(StdRwLock::new(llm));
         self.refresh_coordinator.run(scope, on_progress, move |sink: ProgressSink| async move {
             let refresh_id = uuid::Uuid::new_v4().to_string();
             let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = if streamer_id.is_none() { "all" } else { "streamer" });
@@ -1188,28 +1243,33 @@ impl AppService {
         on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
     ) -> tokio::sync::MutexGuard<'a, ()> {
         let queue_timer = PhaseTimer::start("refresh_queue_wait");
+        if let Ok(guard) = self.refresh_lock.try_lock() {
+            queue_timer.finish(true);
+            return guard;
+        }
         let started = std::time::Instant::now();
-        let mut waited_seconds = 0u64;
+        let acquisition = self.refresh_lock.lock();
+        tokio::pin!(acquisition);
         loop {
-            match self.refresh_lock.try_lock() {
-                Ok(guard) => {
+            emit_progress(
+                target,
+                &format!(
+                    "等待上一轮刷新结束（已等待 {} 秒）",
+                    started.elapsed().as_secs()
+                ),
+                0,
+                1,
+                1,
+                false,
+                false,
+                on_progress,
+            );
+            tokio::select! {
+                guard = &mut acquisition => {
                     queue_timer.finish(true);
                     return guard;
                 }
-                Err(_) => {
-                    emit_progress(
-                        target,
-                        &format!("等待上一轮刷新结束（已等待 {waited_seconds} 秒）"),
-                        0,
-                        1,
-                        1,
-                        false,
-                        false,
-                        on_progress,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    waited_seconds = started.elapsed().as_secs();
-                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
             }
         }
     }
@@ -8669,6 +8729,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_job_executes_the_same_snapshot_used_for_its_key() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let service = AppService::with_analyzer(
+            store.clone(),
+            RuntimeSecrets::default(),
+            Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new())),
+        )
+        .unwrap();
+        let prepared = service.prepare_refresh_request(None).await.unwrap();
+        let key = prepared.request_key().to_owned();
+        // A changed (here deliberately invalid) setting after job registration
+        // must not be read again by this already prepared operation.
+        sqlx::query("INSERT INTO settings(key,value,updated_at) VALUES('llm_model','invalid-json','2026-11-11T00:00:00Z') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .execute(store.pool()).await.unwrap();
+        assert!(service.refresh_request_key(None).await.is_err());
+        assert_eq!(prepared.request_key(), key);
+        let result = service
+            .refresh_prepared_with_progress(prepared, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.refreshed_streamers, 0);
+        assert!(result.failed_streamers.is_empty());
+    }
+
+    #[tokio::test]
     async fn refresh_request_fingerprint_ignores_runtime_state_but_tracks_inputs() {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
@@ -8926,13 +9011,16 @@ mod tests {
             4,
             "credential change bypasses backoff"
         );
-        changed_pool.config.reasoning_effort = ReasoningEffort::High;
+        let changed_settings = AppSettings {
+            llm_reasoning_effort: ReasoningEffort::High,
+            ..settings.clone()
+        };
         service
             .process_source_posts(
                 &streamer.mid,
                 std::slice::from_ref(&streamer),
                 std::slice::from_ref(&post),
-                &settings,
+                &changed_settings,
                 Some(&changed_pool),
             )
             .await
