@@ -1635,6 +1635,76 @@ mod tests {
         assert!(stats.take_online_observation(Utc::now()).is_none());
     }
 
+    #[tokio::test]
+    async fn online_checkpoint_persists_latest_window_then_final_point_and_gap() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&AddSubscription {
+                mid: "345".to_owned(),
+                name: Some("测试".to_owned()),
+                avatar_url: None,
+                room_id: Some("678".to_owned()),
+                aliases: None,
+                schedule_enabled: true,
+                live_notify_enabled: true,
+                live_stats_enabled: true,
+            })
+            .await
+            .unwrap();
+        let start = Utc::now() - chrono::Duration::minutes(1);
+        let session = store
+            .ensure_live_session(streamer.id, "678", "测试", "直播", None, start, start)
+            .await
+            .unwrap();
+        let mut stats = CollectorStats {
+            connection_established: true,
+            has_connected_once: true,
+            ..Default::default()
+        };
+        for count in [100, 70] {
+            parse_live_message(
+                &mut stats,
+                &serde_json::json!({
+                    "cmd": "ONLINE_RANK_COUNT", "data": {"online_count": count}
+                }),
+            );
+        }
+        let at = Utc::now();
+        save_online_checkpoint(&store, session.id, &mut stats, at, "active").await;
+        let final_at = at + chrono::Duration::seconds(30);
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({"cmd":"ONLINE_RANK_COUNT", "data":{"online_count":0}}),
+        );
+        save_online_checkpoint(&store, session.id, &mut stats, final_at, "finished").await;
+        store
+            .finish_live_session(
+                session.id,
+                final_at,
+                &stats.snapshot("complete", "finished"),
+            )
+            .await
+            .unwrap();
+        let page = store
+            .list_live_online_samples(session.id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.samples.len(), 2);
+        assert_eq!(page.samples[0].high_energy_count, Some(70));
+        assert_eq!(page.samples[1].high_energy_count, Some(0));
+        assert_eq!(page.samples[1].collector_state, "finished");
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .await
+                .unwrap()
+                .peak_high_energy,
+            100
+        );
+        // No synthetic samples are created for times between checkpoints.
+        assert!(stats.take_online_observation(final_at).is_none());
+    }
+
     #[test]
     fn invalid_online_messages_are_missing_not_zero() {
         for data in [
@@ -2021,7 +2091,8 @@ mod tests {
             resumed.updated_at > resumed.created_at,
             "续开的场次应当已经被写过"
         );
-        let resumed_stats = CollectorStats::from_session(&resumed, true);
+        let mut resumed_stats = CollectorStats::from_session(&resumed, true);
+        assert!(resumed_stats.take_online_observation(Utc::now()).is_none());
         assert_eq!(
             resumed_stats.snapshot("complete", "finished").data_quality,
             "partial",

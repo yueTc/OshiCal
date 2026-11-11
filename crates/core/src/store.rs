@@ -3444,7 +3444,13 @@ impl SqliteStore {
                  reconnect_count = ?, data_quality = ?, collector_state = ?, updated_at = ?,
                  revision = revision + 1
              WHERE id = ? AND ended_at IS NULL
-               AND (peak_high_energy IS NOT ? OR revenue_cents IS NOT ? OR gift_revenue_cents IS NOT ? OR super_chat_revenue_cents IS NOT ? OR guard_revenue_cents IS NOT ? OR paid_user_count IS NOT ? OR interactive_user_count IS NOT ? OR danmaku_count IS NOT ? OR gift_count IS NOT ? OR super_chat_count IS NOT ? OR guard_count IS NOT ? OR reconnect_count IS NOT ? OR data_quality IS NOT ? OR collector_state IS NOT ?)",
+               AND (peak_high_energy IS NOT ? OR revenue_cents IS NOT ?
+                    OR gift_revenue_cents IS NOT ? OR super_chat_revenue_cents IS NOT ?
+                    OR guard_revenue_cents IS NOT ? OR paid_user_count IS NOT ?
+                    OR interactive_user_count IS NOT ? OR danmaku_count IS NOT ?
+                    OR gift_count IS NOT ? OR super_chat_count IS NOT ?
+                    OR guard_count IS NOT ? OR reconnect_count IS NOT ?
+                    OR data_quality IS NOT ? OR collector_state IS NOT ?)",
         )
         .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)

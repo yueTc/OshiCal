@@ -172,6 +172,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn samples_survive_reinitialization_and_segment_reopening() {
+        let (store, session) = fixture().await;
+        let at = Utc::now();
+        store
+            .record_live_online_sample(session.id, at, Some((at, 42)), "active")
+            .await
+            .unwrap();
+        store
+            .finish_open_live_session(session.id, at)
+            .await
+            .unwrap();
+        let reopened = store
+            .ensure_live_session(
+                session.streamer_id,
+                &session.room_id,
+                &session.streamer_name,
+                &session.title,
+                None,
+                at + chrono::Duration::seconds(60),
+                at + chrono::Duration::seconds(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.id, session.id);
+        // Re-running schema initialization must not erase existing sample rows.
+        let reinitialized = SqliteStore::initialize(store.pool.clone()).await.unwrap();
+        let page = reinitialized
+            .list_live_online_samples(session.id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.samples.len(), 1);
+        assert_eq!(page.samples[0].high_energy_count, Some(42));
+        let next_at = at + chrono::Duration::seconds(90);
+        reinitialized
+            .record_live_online_sample(session.id, next_at, None, "reconnecting")
+            .await
+            .unwrap();
+        let page = reinitialized
+            .list_live_online_samples(session.id, page.next_after_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.samples.len(), 1);
+        assert_eq!(page.samples[0].collector_state, "reconnecting");
+        assert!(page.samples[0].high_energy_count.is_none());
+    }
+
+    #[tokio::test]
     async fn validates_and_keeps_old_sessions_without_fabricated_history() {
         let (store, session) = fixture().await;
         assert!(store
