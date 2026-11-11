@@ -34,6 +34,7 @@
 ## 正式产物与更新渠道
 
 - 正式标签：`server-v0.3.30`。固定镜像：`ghcr.io/yuetc/oshical-server:0.3.30`；正式浮动镜像：`ghcr.io/yuetc/oshical-server:latest`。实际更新以签名清单中的不可变镜像摘要为准。
+- 新安装配置模板中的 `OSHICAL_IMAGE` 固定为本版 `0.3.30`，不再指向旧示例版本；不会自动改写用户已有的 `.env`。
 - Release 同时提供 Linux x86_64 包 `oshical-server-0.3.30-linux-x86_64.tar.gz`、Windows x86_64 包 `oshical-server-0.3.30-windows-x86_64.zip` 及各自 SHA-256 校验文件；编译包包含 Web 界面资源。
 - 本版更新正式 `server-latest` 清单与 Docker `latest`，保留 `server-beta` 测试清单和镜像 `beta`。两端设置均保留 stable/beta；测试渠道同时读取正式与测试清单并选择较高 SemVer，定时更新不会自动降级。
 - 由 GitHub Actions 构建、回归、签名和发布。服务端清单使用现有 HMAC 签名；仓库使用 `OSHICAL_SERVER_UPDATE_HMAC_KEY` Secret 签名；宿主机更新代理通过 `OSHICAL_UPDATE_HMAC_KEY_FILE` 指向内容匹配的密钥文件，并保持镜像仓库、版本及摘要检查，不要绕过验签。

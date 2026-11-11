@@ -124,7 +124,7 @@ await page.addInitScript(() => {
       menuPresent: Boolean(document.querySelector('[role="menu"][aria-label="日程操作"]')),
       cardTop: rect?.top, cardBottom: rect?.bottom,
       viewportScroll: document.querySelector('.timeline-viewport')?.scrollTop });
-    window.__liveChartEntrance = window.__liveChartEntrance.slice(-100);
+    window.__liveChartEntrance = window.__liveChartEntrance.slice(-300);
   };
   for (const type of ["contextmenu", "click", "scroll", "pointerdown", "pointerup"])
     window.addEventListener(type, record, true);
@@ -135,7 +135,13 @@ try {
   await page.getByRole("button", { name: "连接服务器", exact: true }).click();
   const card = page.locator('[data-schedule-id="1"]').filter({ visible: true });
   await card.waitFor();
+  // A user must finish scrolling the card into view before right-clicking it.
+  // Drain the driver's implicit-scroll frames; do not disable the app's scroll-to-dismiss behavior.
+  await card.scrollIntoViewIfNeeded();
+  await card.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   await card.click({ button: "right" });
+  await page.getByRole("menu", { name: "日程操作", exact: true }).waitFor();
+  await writeFile(join(out, "entrance-first-open.json"), JSON.stringify(await page.evaluate(() => window.__liveChartEntrance), null, 2));
   await page.getByRole("button", { name: "查看直播数据", exact: true }).click();
   await page.getByRole("button", { name: "查看最高同时在线人数变化曲线", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "同接变化", exact: true });

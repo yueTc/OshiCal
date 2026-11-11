@@ -175,7 +175,11 @@ try {
   assert.ok((await today.getAttribute("class")).includes("is-live"));
   assert.equal(await page.locator('[data-schedule-id="3"].is-live').count(), 0);
   results.push("重连后平台开播时间重置且另一卡片更近，仍绑定原卡");
+  // Settle driver-initiated scrolling before testing the user's right-click entrance.
+  await today.scrollIntoViewIfNeeded();
+  await today.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   await today.click({ button: "right" });
+  await page.getByRole("menu", { name: "日程操作", exact: true }).waitFor();
   await page.getByRole("button", { name: "查看直播数据", exact: true }).click();
   await page.getByRole("button", { name: "查看最高同时在线人数变化曲线", exact: true }).waitFor();
   assert.deepEqual(requests.filter((r) => r.scheduleLookup).map((r) => r.scheduleLookup), ["/api/live-sessions/by-schedule/1"]);
