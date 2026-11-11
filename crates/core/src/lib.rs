@@ -13,6 +13,7 @@ pub mod settings;
 pub mod store;
 mod timing;
 pub mod weekly;
+pub mod youtube;
 
 pub use error::{AppError, AppResult};
 pub use fertility::{

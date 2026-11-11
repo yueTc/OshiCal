@@ -1,0 +1,72 @@
+{
+  "fixtureVersion": 1,
+  "requiredScopes": [
+    "https://www.googleapis.com/auth/youtube.readonly"
+  ],
+  "cases": [
+    {
+      "name": "api_key_is_not_oauth",
+      "hasApiKey": true,
+      "hasOAuth": false,
+      "tokenStatus": "missing",
+      "scopes": [],
+      "capability": "live_chat",
+      "callbackState": null,
+      "expectedState": "state-001",
+      "expected": "reauth_required"
+    },
+    {
+      "name": "oauth_without_required_scope",
+      "hasApiKey": true,
+      "hasOAuth": true,
+      "tokenStatus": "valid",
+      "scopes": [
+        "openid",
+        "email"
+      ],
+      "capability": "super_chat",
+      "callbackState": "state-001",
+      "expectedState": "state-001",
+      "expected": "reauth_required"
+    },
+    {
+      "name": "expired_refresh_token",
+      "hasApiKey": true,
+      "hasOAuth": true,
+      "tokenStatus": "expired",
+      "scopes": [
+        "https://www.googleapis.com/auth/youtube.readonly"
+      ],
+      "capability": "membership_events",
+      "callbackState": "state-001",
+      "expectedState": "state-001",
+      "expected": "reauth_required"
+    },
+    {
+      "name": "oauth_state_mismatch",
+      "hasApiKey": true,
+      "hasOAuth": true,
+      "tokenStatus": "valid",
+      "scopes": [
+        "https://www.googleapis.com/auth/youtube.readonly"
+      ],
+      "capability": "live_chat",
+      "callbackState": "tampered-state",
+      "expectedState": "state-001",
+      "expected": "reject_callback"
+    },
+    {
+      "name": "valid_oauth_for_live_chat",
+      "hasApiKey": true,
+      "hasOAuth": true,
+      "tokenStatus": "valid",
+      "scopes": [
+        "https://www.googleapis.com/auth/youtube.readonly"
+      ],
+      "capability": "live_chat",
+      "callbackState": "state-001",
+      "expectedState": "state-001",
+      "expected": "allowed"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 use std::fmt;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -22,13 +24,36 @@ const LEGACY_ACCOUNT_SCOPED_LLM_STATE_KEY: &str = "server:secret:llm_api_key:v1:
 const LEGACY_ACCOUNT_SCOPED_LLM_AAD: &[u8] = b"oshical:server-secret:llm-api-key:v1:default";
 const BILI_SECRET_STATE_KEY: &str = "server:secret:bilibili_cookie:v1";
 const BILI_AAD: &[u8] = b"oshical:server-secret:bilibili-cookie:v1";
+const YOUTUBE_API_KEY_STATE_KEY: &str = "server:secret:youtube_api_key:v1";
+const YOUTUBE_API_KEY_AAD: &[u8] = b"oshical:server-secret:youtube-api-key:v1";
+const YOUTUBE_OAUTH_STATE_KEY: &str = "server:secret:youtube_oauth:v1";
+const YOUTUBE_OAUTH_AAD: &[u8] = b"oshical:server-secret:youtube-oauth:v1";
+const YOUTUBE_WEB_SESSION_STATE_KEY: &str = "server:secret:youtube_web_session:v1";
+const YOUTUBE_WEB_SESSION_AAD: &[u8] = b"oshical:server-secret:youtube-web-session:v1";
 const NONCE_BYTES: usize = 12;
+const MASTER_KEY_BYTES: usize = 32;
+const MASTER_KEY_FILE_ENV: &str = "OSHICAL_SECRETS_KEY_FILE";
+const MASTER_KEY_FILE_SUFFIX: &str = ".secrets-key";
 const LLM_PENDING_URL_BINDING_TTL_SECONDS: i64 = 15 * 60;
 static SECRET_WRITE_LOCK: Mutex<()> = Mutex::const_new(());
+static LEGACY_KEY_WARNING: std::sync::Once = std::sync::Once::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretKeySource {
+    Explicit,
+    GeneratedFile,
+    Unavailable,
+}
 
 #[derive(Clone)]
 pub struct SecretVault {
-    key: [u8; 32],
+    key: Option<[u8; 32]>,
+    /// Compatibility-only key for ciphertext written by the old predictable
+    /// derivation. It is never used to encrypt new credentials.
+    legacy_key: Option<[u8; 32]>,
+    key_source: SecretKeySource,
+    key_file: Option<PathBuf>,
+    key_error: Option<String>,
 }
 
 impl fmt::Debug for SecretVault {
@@ -36,32 +61,104 @@ impl fmt::Debug for SecretVault {
         formatter
             .debug_struct("SecretVault")
             .field("key", &"[redacted]")
+            .field("key_source", &self.key_source)
+            .field("key_file", &self.key_file)
+            .field("legacy_key_available", &self.legacy_key.is_some())
+            .field("key_error", &self.key_error)
             .finish()
     }
 }
 
 impl SecretVault {
     pub fn from_env(api_token: Option<&str>, database_path: &Path) -> Self {
-        let material = std::env::var("OSHICAL_SECRETS_KEY")
+        let explicit_material = std::env::var("OSHICAL_SECRETS_KEY")
             .ok()
             .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| match api_token {
-                Some(token) => format!("oshical-api-token:{token}"),
-                None => format!("oshical-local-db:{}", database_path.display()),
-            });
-        Self::from_material(&material)
+            .filter(|value| !value.is_empty());
+        let key_file_override = std::env::var(MASTER_KEY_FILE_ENV)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        Self::from_config_material(
+            api_token,
+            database_path,
+            explicit_material.as_deref(),
+            key_file_override.as_deref().map(Path::new),
+        )
     }
 
     pub fn from_material(material: &str) -> Self {
-        let digest = Sha256::digest(material.as_bytes());
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&digest);
-        Self { key }
+        Self {
+            key: Some(derive_key(material)),
+            legacy_key: None,
+            key_source: SecretKeySource::Explicit,
+            key_file: None,
+            key_error: None,
+        }
+    }
+
+    fn from_config_material(
+        api_token: Option<&str>,
+        database_path: &Path,
+        explicit_material: Option<&str>,
+        key_file_override: Option<&Path>,
+    ) -> Self {
+        if let Some(material) = explicit_material {
+            return Self::from_material(material);
+        }
+
+        let legacy_key = Some(derive_key(&legacy_key_material(api_token, database_path)));
+        let key_file = key_file_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| default_master_key_file(database_path));
+        match load_or_create_master_key(&key_file) {
+            Ok(key) => {
+                tracing::info!(
+                    key_file = %key_file.display(),
+                    "服务端使用随机主密钥文件加密凭据；请与数据库一起备份"
+                );
+                Self {
+                    key: Some(key),
+                    legacy_key,
+                    key_source: SecretKeySource::GeneratedFile,
+                    key_file: Some(key_file),
+                    key_error: None,
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    key_file = %key_file.display(),
+                    %error,
+                    "安全主密钥文件不可用；不会退回可预测默认密钥"
+                );
+                Self {
+                    key: None,
+                    legacy_key,
+                    key_source: SecretKeySource::Unavailable,
+                    key_file: Some(key_file),
+                    key_error: Some(error),
+                }
+            }
+        }
+    }
+
+    fn require_write_key(&self) -> Result<&[u8; 32], AppError> {
+        self.key.as_ref().ok_or_else(|| AppError::External {
+            code: "SECRET_MASTER_KEY_UNAVAILABLE".to_owned(),
+            message: format!(
+                "无法保存服务端凭据：安全主密钥不可用。请修复 {} 或设置 OSHICAL_SECRETS_KEY 后重启，再重新保存 YouTube 凭据；已有 B 站或模型凭据不会被删除。原因：{}",
+                self.key_file
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "服务端主密钥配置".to_owned()),
+                self.key_error.as_deref().unwrap_or("未生成安全主密钥")
+            ),
+        })
     }
 
     fn encrypt_with_aad(&self, plaintext: &str, aad: &[u8]) -> Result<String, AppError> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|error| AppError::External {
+        let key = self.require_write_key()?;
+        let cipher = Aes256Gcm::new_from_slice(key).map_err(|error| AppError::External {
             code: "SECRET_VAULT".to_owned(),
             message: format!("初始化密钥加密器失败: {error}"),
         })?;
@@ -85,7 +182,11 @@ impl SecretVault {
         Ok(BASE64.encode(encoded))
     }
 
-    fn decrypt_with_aad(&self, encoded: &str, aad: &[u8]) -> Result<String, AppError> {
+    fn decrypt_with_aad_detailed(
+        &self,
+        encoded: &str,
+        aad: &[u8],
+    ) -> Result<(String, bool), AppError> {
         let bytes = BASE64.decode(encoded).map_err(|_| AppError::External {
             code: "SECRET_VAULT".to_owned(),
             message: "服务端密钥密文格式无效".to_owned(),
@@ -96,37 +197,54 @@ impl SecretVault {
                 message: "服务端密钥密文长度无效".to_owned(),
             });
         }
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|error| AppError::External {
-            code: "SECRET_VAULT".to_owned(),
-            message: format!("初始化密钥解密器失败: {error}"),
-        })?;
         let (nonce, ciphertext) = bytes.split_at(NONCE_BYTES);
-        let plaintext = cipher
-            .decrypt(
-                nonce.into(),
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
-            .map_err(|_| AppError::External {
-                code: "SECRET_VAULT".to_owned(),
-                message: "服务端密钥解密失败，请重新保存该密钥".to_owned(),
-            })?;
-        String::from_utf8(plaintext).map_err(|_| AppError::External {
-            code: "SECRET_VAULT".to_owned(),
-            message: "服务端密钥明文编码无效".to_owned(),
+
+        if let Some(key) = self.key.as_ref() {
+            if let Some(plaintext) = decrypt_bytes(key, nonce, ciphertext, aad) {
+                return decode_plaintext(plaintext).map(|value| (value, false));
+            }
+        }
+        if let Some(key) = self.legacy_key.as_ref() {
+            if let Some(plaintext) = decrypt_bytes(key, nonce, ciphertext, aad) {
+                LEGACY_KEY_WARNING.call_once(|| {
+                    tracing::warn!(
+                        "读取到旧版可预测默认密钥加密的凭据；YouTube 凭据会尝试自动迁移，B 站/模型凭据在后续显式更新时会迁移。安全主密钥不可用时将拒绝新写入"
+                    );
+                });
+                return decode_plaintext(plaintext).map(|value| (value, true));
+            }
+        }
+
+        Err(AppError::External {
+            code: "SECRET_VAULT_DECRYPT_FAILED".to_owned(),
+            message: "服务端密钥解密失败：主密钥文件或 OSHICAL_SECRETS_KEY 与数据库密文不匹配。请恢复原密钥，或在设置页重新保存对应凭据；旧数据不会被自动删除。".to_owned(),
         })
     }
 
-    /// 模型密钥加密（AAD 绑定单密钥槽位）。
-    pub fn encrypt(&self, plaintext: &str) -> Result<String, AppError> {
-        self.encrypt_with_aad(plaintext, LLM_AAD)
+    fn decrypt_with_aad(&self, encoded: &str, aad: &[u8]) -> Result<String, AppError> {
+        self.decrypt_with_aad_detailed(encoded, aad)
+            .map(|(plaintext, _)| plaintext)
     }
 
-    /// 模型密钥解密，与 [`SecretVault::encrypt`] 配套。
-    pub fn decrypt(&self, encoded: &str) -> Result<String, AppError> {
-        self.decrypt_with_aad(encoded, LLM_AAD)
+    fn decrypt_youtube_api_key_detailed(
+        &self,
+        encoded: &str,
+    ) -> Result<(String, bool), AppError> {
+        self.decrypt_with_aad_detailed(encoded, YOUTUBE_API_KEY_AAD)
+    }
+
+    fn decrypt_youtube_oauth_detailed(
+        &self,
+        encoded: &str,
+    ) -> Result<(String, bool), AppError> {
+        self.decrypt_with_aad_detailed(encoded, YOUTUBE_OAUTH_AAD)
+    }
+
+    fn decrypt_youtube_web_session_detailed(
+        &self,
+        encoded: &str,
+    ) -> Result<(String, bool), AppError> {
+        self.decrypt_with_aad_detailed(encoded, YOUTUBE_WEB_SESSION_AAD)
     }
 
     fn encrypt_bili_cookie(&self, cookie: &str) -> Result<String, AppError> {
@@ -136,6 +254,238 @@ impl SecretVault {
     fn decrypt_bili_cookie(&self, encoded: &str) -> Result<String, AppError> {
         self.decrypt_with_aad(encoded, BILI_AAD)
     }
+
+    fn encrypt_youtube_api_key(&self, api_key: &str) -> Result<String, AppError> {
+        self.encrypt_with_aad(api_key, YOUTUBE_API_KEY_AAD)
+    }
+
+
+    fn encrypt_youtube_oauth(&self, token: &str) -> Result<String, AppError> {
+        self.encrypt_with_aad(token, YOUTUBE_OAUTH_AAD)
+    }
+
+
+    fn encrypt_youtube_web_session(&self, cookie: &str) -> Result<String, AppError> {
+        self.encrypt_with_aad(cookie, YOUTUBE_WEB_SESSION_AAD)
+    }
+
+
+}
+
+fn derive_key(material: &str) -> [u8; 32] {
+    let digest = Sha256::digest(material.as_bytes());
+    let mut key = [0_u8; MASTER_KEY_BYTES];
+    key.copy_from_slice(&digest);
+    key
+}
+
+fn legacy_key_material(api_token: Option<&str>, database_path: &Path) -> String {
+    match api_token {
+        Some(token) => format!("oshical-api-token:{token}"),
+        None => format!("oshical-local-db:{}", database_path.display()),
+    }
+}
+
+fn decrypt_bytes(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .ok()
+}
+
+fn decode_plaintext(plaintext: Vec<u8>) -> Result<String, AppError> {
+    String::from_utf8(plaintext).map_err(|_| AppError::External {
+        code: "SECRET_VAULT".to_owned(),
+        message: "服务端密钥明文编码无效".to_owned(),
+    })
+}
+
+fn default_master_key_file(database_path: &Path) -> PathBuf {
+    let mut file_name = database_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("oshical.db"))
+        .to_os_string();
+    file_name.push(MASTER_KEY_FILE_SUFFIX);
+    database_path.with_file_name(file_name)
+}
+
+fn load_or_create_master_key(path: &Path) -> Result<[u8; 32], String> {
+    if path.exists() {
+        return read_master_key_file(path);
+    }
+
+    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "创建主密钥目录 {} 失败: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let key = random_master_key();
+    let encoded = format!("{}\n", BASE64.encode(key));
+    let temp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("master-key"),
+        Uuid::new_v4()
+    ));
+    if let Err(error) = write_private_file(&temp_path, encoded.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    // A hard link gives create-if-absent semantics. Unlike rename on Unix, it
+    // cannot silently replace a key concurrently created by another process.
+    match fs::hard_link(&temp_path, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temp_path);
+        }
+        Err(_) if path.exists() => {
+            let _ = fs::remove_file(&temp_path);
+            return read_master_key_file(path);
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!(
+                "发布主密钥文件 {} 失败: {error}",
+                path.display()
+            ));
+        }
+    }
+    restrict_key_file_permissions(path)?;
+    read_master_key_file(path)
+}
+
+fn read_master_key_file(path: &Path) -> Result<[u8; 32], String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("读取主密钥文件 {} 元数据失败: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "主密钥路径 {} 不是普通文件；拒绝符号链接或特殊文件",
+            path.display()
+        ));
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("读取主密钥文件 {} 失败: {error}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return Err(format!(
+            "主密钥文件 {} 内容无效；请恢复备份或设置 OSHICAL_SECRETS_KEY",
+            path.display()
+        ));
+    }
+    let bytes = BASE64.decode(trimmed).map_err(|_| {
+        format!(
+            "主密钥文件 {} 内容无效；请恢复备份或设置 OSHICAL_SECRETS_KEY",
+            path.display()
+        )
+    })?;
+    if bytes.len() != MASTER_KEY_BYTES {
+        return Err(format!(
+            "主密钥文件 {} 长度无效；请恢复备份或设置 OSHICAL_SECRETS_KEY",
+            path.display()
+        ));
+    }
+    let mut key = [0_u8; MASTER_KEY_BYTES];
+    key.copy_from_slice(&bytes);
+    restrict_key_file_permissions(path)?;
+    Ok(key)
+}
+
+fn random_master_key() -> [u8; MASTER_KEY_BYTES] {
+    let mut key = [0_u8; MASTER_KEY_BYTES];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    key
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("创建主密钥临时文件 {} 失败: {error}", path.display()))?;
+    // Tighten Windows ACLs before writing key bytes. Unix already created the
+    // file with mode 0600 through OpenOptionsExt.
+    restrict_key_file_permissions(path)?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("写入主密钥临时文件 {} 失败: {error}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        format!(
+            "收紧主密钥文件 {} 权限失败: {error}",
+            path.display()
+        )
+    })?;
+    let mode = fs::metadata(path)
+        .map_err(|error| format!("读取主密钥文件 {} 权限失败: {error}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "主密钥文件 {} 权限不安全（{:o}），必须仅当前用户可读写",
+            path.display(),
+            mode & 0o777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let account = Command::new("whoami")
+        .output()
+        .map_err(|error| format!("读取当前 Windows 账号失败: {error}"))?;
+    if !account.status.success() {
+        return Err("读取当前 Windows 账号失败，无法收紧主密钥文件权限".to_owned());
+    }
+    let account = String::from_utf8(account.stdout)
+        .map_err(|_| "当前 Windows 账号编码无效".to_owned())?
+        .trim()
+        .to_owned();
+    if account.is_empty() || account.chars().any(char::is_control) {
+        return Err("当前 Windows 账号无效，无法收紧主密钥文件权限".to_owned());
+    }
+    let status = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{account}:F"))
+        .status()
+        .map_err(|error| format!("调用 icacls 收紧主密钥文件权限失败: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "收紧主密钥文件 {} 的 Windows ACL 失败；请改设 OSHICAL_SECRETS_KEY",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_key_file_permissions(_path: &Path) -> Result<(), String> {
+    Err("当前平台无法安全限制主密钥文件权限；请设置 OSHICAL_SECRETS_KEY".to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +523,53 @@ pub struct LlmSecretStatus {
 pub struct PersistedBiliSecret {
     pub cookie: String,
     pub revision: i64,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeSecretStatus {
+    pub configured: bool,
+    pub revision: i64,
+    pub updated_at: Option<String>,
+}
+
+pub struct PersistedYoutubeApiKey {
+    pub api_key: String,
+    pub revision: i64,
+    pub updated_at: String,
+    pub changed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeOAuthToken {
+    pub refresh_token: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub access_token_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_token_type")]
+    pub token_type: String,
+}
+
+fn default_token_type() -> String {
+    "Bearer".to_owned()
+}
+
+pub struct PersistedYoutubeOAuthToken {
+    pub token: YoutubeOAuthToken,
+    pub revision: i64,
+    pub updated_at: String,
+    pub changed: bool,
+}
+
+pub struct PersistedYoutubeWebSession {
+    pub cookie: String,
+    pub revision: i64,
+    pub updated_at: String,
     pub changed: bool,
 }
 
@@ -413,6 +810,276 @@ pub async fn clear_persisted_bili_secret(store: &SqliteStore) -> Result<bool, Ap
     store.delete_client_sync_state(BILI_SECRET_STATE_KEY).await
 }
 
+async fn load_stored_youtube_secret(
+    store: &SqliteStore,
+    key: &str,
+) -> Result<Option<StoredSecret>, AppError> {
+    store
+        .get_client_sync_state(key)
+        .await?
+        .map(|raw| serde_json::from_str(&raw).map_err(AppError::from))
+        .transpose()
+}
+
+async fn store_youtube_secret(
+    store: &SqliteStore,
+    key: &str,
+    stored: &StoredSecret,
+) -> Result<(), AppError> {
+    store
+        .set_client_sync_state(key, &serde_json::to_string(stored)?)
+        .await
+}
+
+pub async fn load_persisted_youtube_api_key(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeApiKey>, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    load_persisted_youtube_api_key_unlocked(store, vault).await
+}
+
+async fn load_persisted_youtube_api_key_unlocked(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeApiKey>, AppError> {
+    let Some(mut stored) = load_stored_youtube_secret(store, YOUTUBE_API_KEY_STATE_KEY).await?
+    else {
+        return Ok(None);
+    };
+    let (api_key, legacy_ciphertext) =
+        vault.decrypt_youtube_api_key_detailed(&stored.ciphertext)?;
+    if legacy_ciphertext {
+        stored.ciphertext = vault.encrypt_youtube_api_key(&api_key)?;
+        store_youtube_secret(store, YOUTUBE_API_KEY_STATE_KEY, &stored).await?;
+        tracing::info!("已将 YouTube API Key 从旧版可预测默认密钥迁移到安全主密钥");
+    }
+    Ok(Some(PersistedYoutubeApiKey {
+        api_key,
+        revision: stored.revision,
+        updated_at: stored.updated_at,
+        changed: false,
+    }))
+}
+
+pub async fn youtube_api_key_status(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<YoutubeSecretStatus, AppError> {
+    let Some(stored) = load_persisted_youtube_api_key(store, vault).await? else {
+        return Ok(YoutubeSecretStatus::default());
+    };
+    Ok(YoutubeSecretStatus {
+        configured: true,
+        revision: stored.revision,
+        updated_at: Some(stored.updated_at),
+    })
+}
+
+pub async fn save_persisted_youtube_api_key(
+    store: &SqliteStore,
+    vault: &SecretVault,
+    api_key: &str,
+) -> Result<PersistedYoutubeApiKey, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    let previous = load_persisted_youtube_api_key_unlocked(store, vault).await?;
+    if let Some(previous) = previous.as_ref().filter(|value| value.api_key == api_key) {
+        return Ok(PersistedYoutubeApiKey {
+            api_key: previous.api_key.clone(),
+            revision: previous.revision,
+            updated_at: previous.updated_at.clone(),
+            changed: false,
+        });
+    }
+    let revision = previous
+        .as_ref()
+        .map_or(1, |value| value.revision.saturating_add(1));
+    let updated_at = Utc::now().to_rfc3339();
+    let stored = StoredSecret {
+        ciphertext: vault.encrypt_youtube_api_key(api_key)?,
+        revision,
+        updated_at: updated_at.clone(),
+        bound_base_url: None,
+        pending_url_binding: false,
+    };
+    store_youtube_secret(store, YOUTUBE_API_KEY_STATE_KEY, &stored).await?;
+    Ok(PersistedYoutubeApiKey {
+        api_key: api_key.to_owned(),
+        revision,
+        updated_at,
+        changed: true,
+    })
+}
+
+pub async fn clear_persisted_youtube_api_key(store: &SqliteStore) -> Result<bool, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    store.delete_client_sync_state(YOUTUBE_API_KEY_STATE_KEY).await
+}
+
+pub async fn load_persisted_youtube_oauth(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeOAuthToken>, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    load_persisted_youtube_oauth_unlocked(store, vault).await
+}
+
+async fn load_persisted_youtube_oauth_unlocked(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeOAuthToken>, AppError> {
+    let Some(mut stored) = load_stored_youtube_secret(store, YOUTUBE_OAUTH_STATE_KEY).await? else {
+        return Ok(None);
+    };
+    let (plaintext, legacy_ciphertext) =
+        vault.decrypt_youtube_oauth_detailed(&stored.ciphertext)?;
+    if legacy_ciphertext {
+        stored.ciphertext = vault.encrypt_youtube_oauth(&plaintext)?;
+        store_youtube_secret(store, YOUTUBE_OAUTH_STATE_KEY, &stored).await?;
+        tracing::info!("已将 YouTube OAuth 凭据从旧版可预测默认密钥迁移到安全主密钥");
+    }
+    Ok(Some(PersistedYoutubeOAuthToken {
+        token: serde_json::from_str(&plaintext)?,
+        revision: stored.revision,
+        updated_at: stored.updated_at,
+        changed: false,
+    }))
+}
+
+pub async fn save_persisted_youtube_oauth(
+    store: &SqliteStore,
+    vault: &SecretVault,
+    token: &YoutubeOAuthToken,
+) -> Result<PersistedYoutubeOAuthToken, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    let previous = load_persisted_youtube_oauth_unlocked(store, vault).await?;
+    let revision = previous
+        .as_ref()
+        .map_or(1, |value| value.revision.saturating_add(1));
+    let updated_at = Utc::now().to_rfc3339();
+    let stored = StoredSecret {
+        ciphertext: vault.encrypt_youtube_oauth(&serde_json::to_string(token)?)?,
+        revision,
+        updated_at: updated_at.clone(),
+        bound_base_url: None,
+        pending_url_binding: false,
+    };
+    store_youtube_secret(store, YOUTUBE_OAUTH_STATE_KEY, &stored).await?;
+    Ok(PersistedYoutubeOAuthToken {
+        token: token.clone(),
+        revision,
+        updated_at,
+        changed: true,
+    })
+}
+
+pub async fn clear_persisted_youtube_oauth(store: &SqliteStore) -> Result<bool, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    store.delete_client_sync_state(YOUTUBE_OAUTH_STATE_KEY).await
+}
+
+pub async fn load_persisted_youtube_web_session(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeWebSession>, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    load_persisted_youtube_web_session_unlocked(store, vault).await
+}
+
+async fn load_persisted_youtube_web_session_unlocked(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<Option<PersistedYoutubeWebSession>, AppError> {
+    let Some(mut stored) =
+        load_stored_youtube_secret(store, YOUTUBE_WEB_SESSION_STATE_KEY).await?
+    else {
+        return Ok(None);
+    };
+    let (cookie, legacy_ciphertext) =
+        vault.decrypt_youtube_web_session_detailed(&stored.ciphertext)?;
+    if legacy_ciphertext {
+        stored.ciphertext = vault.encrypt_youtube_web_session(&cookie)?;
+        store_youtube_secret(store, YOUTUBE_WEB_SESSION_STATE_KEY, &stored).await?;
+        tracing::info!("已将 YouTube 网页会话从旧版可预测默认密钥迁移到安全主密钥");
+    }
+    Ok(Some(PersistedYoutubeWebSession {
+        cookie,
+        revision: stored.revision,
+        updated_at: stored.updated_at,
+        changed: false,
+    }))
+}
+
+pub async fn youtube_web_session_status(
+    store: &SqliteStore,
+    vault: &SecretVault,
+) -> Result<YoutubeSecretStatus, AppError> {
+    let Some(stored) = load_persisted_youtube_web_session(store, vault).await? else {
+        return Ok(YoutubeSecretStatus::default());
+    };
+    Ok(YoutubeSecretStatus {
+        configured: true,
+        revision: stored.revision,
+        updated_at: Some(stored.updated_at),
+    })
+}
+
+pub async fn save_persisted_youtube_web_session(
+    store: &SqliteStore,
+    vault: &SecretVault,
+    cookie: &str,
+) -> Result<PersistedYoutubeWebSession, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    let previous = load_persisted_youtube_web_session_unlocked(store, vault).await?;
+    if let Some(previous) = previous.as_ref().filter(|value| value.cookie == cookie) {
+        return Ok(PersistedYoutubeWebSession {
+            cookie: previous.cookie.clone(),
+            revision: previous.revision,
+            updated_at: previous.updated_at.clone(),
+            changed: false,
+        });
+    }
+    let revision = previous
+        .as_ref()
+        .map_or(1, |value| value.revision.saturating_add(1));
+    let updated_at = Utc::now().to_rfc3339();
+    let stored = StoredSecret {
+        ciphertext: vault.encrypt_youtube_web_session(cookie)?,
+        revision,
+        updated_at: updated_at.clone(),
+        bound_base_url: None,
+        pending_url_binding: false,
+    };
+    store_youtube_secret(store, YOUTUBE_WEB_SESSION_STATE_KEY, &stored).await?;
+    Ok(PersistedYoutubeWebSession {
+        cookie: cookie.to_owned(),
+        revision,
+        updated_at,
+        changed: true,
+    })
+}
+
+pub async fn clear_persisted_youtube_web_session(
+    store: &SqliteStore,
+) -> Result<bool, AppError> {
+    let _guard = SECRET_WRITE_LOCK.lock().await;
+    store
+        .delete_client_sync_state(YOUTUBE_WEB_SESSION_STATE_KEY)
+        .await
+}
+
+pub async fn seed_youtube_web_session_from_env(
+    store: &SqliteStore,
+    vault: &SecretVault,
+    cookie: Option<&str>,
+) -> Result<bool, AppError> {
+    let Some(cookie) = cookie.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    save_persisted_youtube_web_session(store, vault, cookie).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +1288,256 @@ mod tests {
             vault.decrypt(&migrated_stored.ciphertext).unwrap(),
             "sk-scoped"
         );
+    }
+
+    fn temporary_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "oshical-{label}-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn generated_master_key_is_random_private_and_stable() {
+        let root = temporary_test_dir("master-key");
+        let database_path = root.join("oshical.db");
+        let key_file = default_master_key_file(&database_path);
+        let first = load_or_create_master_key(&key_file).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let second = load_or_create_master_key(&key_file).unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            derive_key(&legacy_key_material(None, &database_path))
+        );
+        assert!(key_file.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "key file is readable by other users");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_master_key_does_not_create_generated_key_file() {
+        let root = temporary_test_dir("explicit-key");
+        let database_path = root.join("oshical.db");
+        let key_file = root.join("must-not-exist.secrets-key");
+        let vault = SecretVault::from_config_material(
+            None,
+            &database_path,
+            Some("explicit-test-master-key"),
+            Some(&key_file),
+        );
+
+        assert_eq!(vault.key_source, SecretKeySource::Explicit);
+        assert!(!key_file.exists());
+        let ciphertext = vault.encrypt_youtube_api_key("AIza-explicit-key").unwrap();
+        assert_eq!(
+            vault.decrypt_youtube_api_key_detailed(&ciphertext).unwrap(),
+            ("AIza-explicit-key".to_owned(), false)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_youtube_ciphertext_migrates_without_breaking_bili_or_llm_secrets() {
+        let root = temporary_test_dir("legacy-migration");
+        let database_path = root.join("oshical.db");
+        let key_file = default_master_key_file(&database_path);
+        let legacy = SecretVault::from_material(&legacy_key_material(None, &database_path));
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let youtube_stored = StoredSecret {
+            ciphertext: legacy.encrypt_youtube_api_key("AIza-legacy-youtube").unwrap(),
+            revision: 4,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: None,
+            pending_url_binding: false,
+        };
+        store_youtube_secret(&store, YOUTUBE_API_KEY_STATE_KEY, &youtube_stored)
+            .await
+            .unwrap();
+        let bili_stored = StoredSecret {
+            ciphertext: legacy.encrypt_bili_cookie("SESSDATA=legacy").unwrap(),
+            revision: 2,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: None,
+            pending_url_binding: false,
+        };
+        store
+            .set_client_sync_state(
+                BILI_SECRET_STATE_KEY,
+                &serde_json::to_string(&bili_stored).unwrap(),
+            )
+            .await
+            .unwrap();
+        let llm_stored = StoredSecret {
+            ciphertext: legacy.encrypt("sk-legacy-llm").unwrap(),
+            revision: 7,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: Some("https://llm.example/v1".to_owned()),
+            pending_url_binding: false,
+        };
+        store
+            .set_client_sync_state(
+                LLM_SECRET_STATE_KEY,
+                &serde_json::to_string(&llm_stored).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let safe = SecretVault::from_config_material(
+            None,
+            &database_path,
+            None,
+            Some(&key_file),
+        );
+        assert_eq!(safe.key_source, SecretKeySource::GeneratedFile);
+
+        let youtube = load_persisted_youtube_api_key(&store, &safe)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(youtube.api_key, "AIza-legacy-youtube");
+        let raw = store
+            .get_client_sync_state(YOUTUBE_API_KEY_STATE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let migrated: StoredSecret = serde_json::from_str(&raw).unwrap();
+        let (plaintext, used_legacy) = safe
+            .decrypt_youtube_api_key_detailed(&migrated.ciphertext)
+            .unwrap();
+        assert_eq!(plaintext, "AIza-legacy-youtube");
+        assert!(!used_legacy, "YouTube ciphertext was not migrated");
+        assert!(
+            legacy
+                .decrypt_youtube_api_key_detailed(&migrated.ciphertext)
+                .is_err(),
+            "migrated YouTube ciphertext is still decryptable by the legacy key"
+        );
+
+        let bili = load_persisted_bili_secret(&store, &safe)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bili.cookie, "SESSDATA=legacy");
+        let llm = load_persisted_llm_secret(&store, &safe)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(llm.api_key, "sk-legacy-llm");
+        save_persisted_llm_secret(&store, &safe, "sk-legacy-llm", None)
+            .await
+            .unwrap();
+        let llm_raw = store
+            .get_client_sync_state(LLM_SECRET_STATE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let llm_migrated: StoredSecret = serde_json::from_str(&llm_raw).unwrap();
+        assert_eq!(
+            safe.decrypt(&llm_migrated.ciphertext).unwrap(),
+            "sk-legacy-llm"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unavailable_safe_key_rejects_youtube_migration_but_preserves_legacy_data() {
+        let root = temporary_test_dir("unavailable-key");
+        let database_path = root.join("oshical.db");
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, b"blocker").unwrap();
+        let unavailable_key_file = blocker.join("master.secrets-key");
+        let legacy = SecretVault::from_material(&legacy_key_material(None, &database_path));
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let youtube_stored = StoredSecret {
+            ciphertext: legacy.encrypt_youtube_api_key("AIza-must-survive").unwrap(),
+            revision: 1,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: None,
+            pending_url_binding: false,
+        };
+        store_youtube_secret(&store, YOUTUBE_API_KEY_STATE_KEY, &youtube_stored)
+            .await
+            .unwrap();
+        let bili_stored = StoredSecret {
+            ciphertext: legacy.encrypt_bili_cookie("SESSDATA=still-readable").unwrap(),
+            revision: 1,
+            updated_at: Utc::now().to_rfc3339(),
+            bound_base_url: None,
+            pending_url_binding: false,
+        };
+        store
+            .set_client_sync_state(
+                BILI_SECRET_STATE_KEY,
+                &serde_json::to_string(&bili_stored).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let unavailable = SecretVault::from_config_material(
+            None,
+            &database_path,
+            None,
+            Some(&unavailable_key_file),
+        );
+        assert_eq!(unavailable.key_source, SecretKeySource::Unavailable);
+        let error = match load_persisted_youtube_api_key(&store, &unavailable).await {
+            Ok(_) => panic!("unsafe key unexpectedly accepted"),
+            Err(error) => error,
+        };
+        match error {
+            AppError::External { code, message } => {
+                assert_eq!(code, "SECRET_MASTER_KEY_UNAVAILABLE");
+                assert!(message.contains("OSHICAL_SECRETS_KEY"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(store
+            .get_client_sync_state(YOUTUBE_API_KEY_STATE_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        let bili = load_persisted_bili_secret(&store, &unavailable)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bili.cookie, "SESSDATA=still-readable");
+
+        let fresh_store = SqliteStore::in_memory().await.unwrap();
+        let save_error = match save_persisted_youtube_api_key(
+            &fresh_store,
+            &unavailable,
+            "AIza-new-must-be-rejected",
+        )
+        .await
+        {
+            Ok(_) => panic!("new YouTube credential was written with an unsafe key"),
+            Err(error) => error,
+        };
+        match save_error {
+            AppError::External { code, .. } => {
+                assert_eq!(code, "SECRET_MASTER_KEY_UNAVAILABLE");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 }

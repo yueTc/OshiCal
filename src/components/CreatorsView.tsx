@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DragEvent as ReactDragEvent } from "react";
+import type {
+  DragEvent as ReactDragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   BadgeCheck,
   CalendarClock,
@@ -27,6 +30,7 @@ import type {
   FanHistory,
   FertilitySnapshot,
   LinkedAccount,
+  Platform,
   RefreshProgress,
   RefreshReport,
   Streamer,
@@ -54,6 +58,48 @@ import { CreatorRecentLives, type RecentLiveActions } from "./CreatorRecentLives
 
 const A_SOUL_OFFICIAL_MID = "703007996";
 const A_SOUL_MEMBER_MIDS = new Set(["672342685", "672328094", "672353429"]);
+
+function streamerPlatform(streamer: Pick<Streamer, "platform">): Platform {
+  return streamer.platform === "youtube" ? "youtube" : "bilibili";
+}
+
+function accountPlatform(account: Pick<AccountSearchResult, "platform">): Platform {
+  return account.platform === "youtube" ? "youtube" : "bilibili";
+}
+
+function accountKey(platform: Platform, mid: string): string {
+  return `${platform}:${mid}`;
+}
+
+function looksLikeYoutubeAccountInput(value: string): boolean {
+  const input = value.trim();
+  if (!input) {
+    return false;
+  }
+  if (
+    input.startsWith("@")
+    || /^UC[A-Za-z0-9_-]{22}$/.test(input)
+    || /^(?:(?:www|m|music)\.)?youtube\.com\//i.test(input)
+    || /^youtu\.be\//i.test(input)
+  ) {
+    return true;
+  }
+  try {
+    const url = new URL(input);
+    return (url.protocol === "http:" || url.protocol === "https:")
+      && (url.hostname === "youtu.be" || url.hostname === "youtube.com" || url.hostname.endsWith(".youtube.com"));
+  } catch {
+    return false;
+  }
+}
+
+function PlatformBadge({ platform }: { platform: Platform }) {
+  return (
+    <span className={`platform-badge ${platform}`}>
+      {platform === "youtube" ? "YouTube" : "Bilibili"}
+    </span>
+  );
+}
 const WEEKDAYS = [
   { bit: 1, label: "一", full: "周一" },
   { bit: 2, label: "二", full: "周二" },
@@ -65,13 +111,13 @@ const WEEKDAYS = [
 ];
 
 interface CreatorActions extends RecentLiveActions {
-  search: (keyword: string) => Promise<AccountSearchResult[]>;
+  search: (keyword: string, platform: Platform) => Promise<AccountSearchResult[]>;
   add: (account: AccountSearchResult) => Promise<Streamer>;
   update: (id: number, update: UpdateSubscriptionInput) => Promise<Streamer>;
   reorder: (ids: number[]) => Promise<Streamer[]>;
   remove: (id: number) => Promise<void>;
-  addLink: (id: number, mid: string) => Promise<unknown>;
-  removeLink: (id: number, mid: string) => Promise<void>;
+  addLink: (id: number, platform: Platform, mid: string) => Promise<unknown>;
+  removeLink: (id: number, platform: Platform, mid: string) => Promise<void>;
   refresh: (id: number) => Promise<RefreshReport>;
   fanHistory: (streamerId: number, days?: number) => Promise<FanHistory>;
   refreshFans: (streamerId: number) => Promise<FanHistory>;
@@ -271,6 +317,7 @@ export default function CreatorsView({
   refreshProgress,
   liveStatsEnabled,
   fertilityEnabled,
+  youtubeEnabled,
   actions,
   onChanged,
   onOpenLiveRoom,
@@ -280,17 +327,19 @@ export default function CreatorsView({
   refreshProgress: Record<number, RefreshProgress>;
   liveStatsEnabled: boolean;
   fertilityEnabled: boolean;
+  youtubeEnabled: boolean;
   actions: CreatorActions;
   onChanged: () => Promise<void>;
   onOpenLiveRoom: (streamer: Streamer) => Promise<void>;
   onError: (message: string) => void;
 }) {
+  const [platform, setPlatform] = useState<Platform>("bilibili");
   const [keyword, setKeyword] = useState("");
   const [results, setResults] = useState<AccountSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
-  const [busy, setBusy] = useState<number | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   const addBusyRef = useRef(false);
   const [toggleBusyKeys, setToggleBusyKeys] = useState<Set<string>>(() => new Set());
   const toggleBusyKeysRef = useRef<Set<string>>(new Set());
@@ -302,6 +351,8 @@ export default function CreatorsView({
   const searchRequestSeq = useRef(0);
   const searchCache = useRef(new Map<string, { at: number; results: AccountSearchResult[] }>());
   const [linkTarget, setLinkTarget] = useState<Streamer | null>(null);
+  const [linkPlatform, setLinkPlatform] = useState<Platform>("bilibili");
+  const linkPlatformRef = useRef<Platform>("bilibili");
   const [linkKeyword, setLinkKeyword] = useState("");
   const [linkResults, setLinkResults] = useState<AccountSearchResult[]>([]);
   const [linkSearching, setLinkSearching] = useState(false);
@@ -354,10 +405,92 @@ export default function CreatorsView({
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const [optimisticOrder, setOptimisticOrder] = useState<number[] | null>(null);
   const { stickyRef, stickyPinned } = useStickyHeader<HTMLDivElement>();
+  // Every visible gate and handler uses this derived value. It closes the
+  // one-render window where persisted state could still say "youtube" after the
+  // feature switch has already been turned off.
+  const currentPlatform: Platform = youtubeEnabled ? platform : "bilibili";
+  const visibleResults = useMemo(
+    () => results.filter((account) => accountPlatform(account) === currentPlatform),
+    [currentPlatform, results],
+  );
 
   useEffect(() => {
     setOptimisticOrder(null);
   }, [subscriptions]);
+
+  useEffect(() => {
+    if (youtubeEnabled) {
+      return;
+    }
+    // Disabling the feature must also close entry points that are already open,
+    // especially a recent-lives/statistics dialog owned by a hidden YT card.
+    if (linkTarget && streamerPlatform(linkTarget) === "youtube") {
+      linkSearchSeq.current += 1;
+      linkTargetIdRef.current = null;
+      linkQueryRef.current = "";
+      linkActionBusyRef.current = false;
+      setLinkTarget(null);
+      setLinkPlatform("bilibili");
+      linkPlatformRef.current = "bilibili";
+      setLinkKeyword("");
+      setLinkResults([]);
+      setLinkSearching(false);
+      setLinkBusyMid(null);
+    }
+    if (moreMenu && streamerPlatform(moreMenu.streamer) === "youtube") {
+      setMoreMenu(null);
+    }
+    if (recentTarget && streamerPlatform(recentTarget) === "youtube") {
+      setRecentTarget(null);
+    }
+    if (aliasTarget && streamerPlatform(aliasTarget) === "youtube") {
+      aliasRequestSeq.current += 1;
+      aliasTargetIdRef.current = null;
+      setAliasTarget(null);
+      setAliasText("");
+    }
+    if (weeklyTarget && streamerPlatform(weeklyTarget) === "youtube") {
+      weeklyRequestSeq.current += 1;
+      weeklyTargetIdRef.current = null;
+      setWeeklyTarget(null);
+      setWeeklyDrafts([]);
+      setWeeklyRemovedIds([]);
+    }
+    if (fanTarget && streamerPlatform(fanTarget) === "youtube") {
+      fanRequestSeq.current += 1;
+      fanLoadSeq.current += 1;
+      fanRefreshSeq.current += 1;
+      fanTargetIdRef.current = null;
+      setFanTarget(null);
+      setFanHistory(null);
+    }
+    if (fertilityTarget && streamerPlatform(fertilityTarget) === "youtube") {
+      setFertilityTarget(null);
+    }
+  }, [
+    aliasTarget,
+    fanTarget,
+    fertilityTarget,
+    linkTarget,
+    moreMenu,
+    recentTarget,
+    weeklyTarget,
+    youtubeEnabled,
+  ]);
+
+  useEffect(() => {
+    if (youtubeEnabled || platform === "bilibili") {
+      return;
+    }
+    cancelSearchTimer();
+    searchRequestSeq.current += 1;
+    setPlatform("bilibili");
+    setKeyword("");
+    setResults([]);
+    setSearchError(null);
+    setHasSearched(false);
+    setSearching(false);
+  }, [platform, youtubeEnabled]);
 
   useEffect(() => {
     fertilityRequestSeq.current += 1;
@@ -443,6 +576,12 @@ export default function CreatorsView({
     });
     return ordered.length === subscriptions.length ? ordered : subscriptions;
   }, [optimisticOrder, subscriptions]);
+  const platformSubscriptions = useMemo(
+    () => orderedSubscriptions.filter((streamer) => (
+      streamerPlatform(streamer) === currentPlatform
+    )),
+    [currentPlatform, orderedSubscriptions],
+  );
 
   const fanBuckets = useMemo(
     () => aggregateFanHistory(
@@ -459,6 +598,9 @@ export default function CreatorsView({
   const fanPeriodChange = fanBuckets.length > 1
     ? fanBuckets[fanBuckets.length - 1].fans - fanBuckets[0].fans
     : null;
+  const fanTargetLabel = fanTarget && streamerPlatform(fanTarget) === "youtube"
+    ? "订阅者"
+    : "粉丝";
 
   function cancelSearchTimer() {
     if (searchTimerRef.current) {
@@ -473,8 +615,15 @@ export default function CreatorsView({
       return;
     }
     cancelSearchTimer();
+    const searchPlatform = currentPlatform;
+    if (searchPlatform === "youtube" && !youtubeEnabled) {
+      setResults([]);
+      setSearchError("YouTube 功能未开启");
+      setHasSearched(true);
+      return;
+    }
     const requestId = ++searchRequestSeq.current;
-    const cacheKey = query.toLocaleLowerCase();
+    const cacheKey = `${searchPlatform}:${query.toLocaleLowerCase()}`;
     const cached = searchCache.current.get(cacheKey);
     if (cached && Date.now() - cached.at < 5 * 60 * 1000) {
       setResults(cached.results);
@@ -487,12 +636,13 @@ export default function CreatorsView({
     setSearchError(null);
     setHasSearched(false);
     try {
-      const nextResults = await actions.search(query);
-      if (requestId !== searchRequestSeq.current) {
+      const nextResults = await actions.search(query, searchPlatform);
+      if (requestId !== searchRequestSeq.current || searchPlatform !== currentPlatform) {
         return;
       }
-      searchCache.current.set(cacheKey, { at: Date.now(), results: nextResults });
-      setResults(nextResults);
+      const platformResults = nextResults.filter((account) => accountPlatform(account) === searchPlatform);
+      searchCache.current.set(cacheKey, { at: Date.now(), results: platformResults });
+      setResults(platformResults);
       setHasSearched(true);
     } catch (error) {
       if (requestId !== searchRequestSeq.current) {
@@ -519,9 +669,58 @@ export default function CreatorsView({
       setSearching(false);
       return;
     }
+    if (currentPlatform === "youtube") {
+      // YouTube search.list 使用独立且昂贵的配额，只允许显式提交。
+      searchRequestSeq.current += 1;
+      setResults([]);
+      setSearchError(null);
+      setSearching(false);
+      return;
+    }
     searchTimerRef.current = setTimeout(() => {
       void performSearch(value);
     }, 300);
+  }
+
+  function selectPlatform(next: Platform) {
+    if (next === currentPlatform || (next === "youtube" && !youtubeEnabled)) {
+      return;
+    }
+    cancelSearchTimer();
+    searchRequestSeq.current += 1;
+    setPlatform(next);
+    setKeyword("");
+    setResults([]);
+    setSearchError(null);
+    setHasSearched(false);
+    setSearching(false);
+    searchInputRef.current?.focus();
+  }
+
+  function handlePlatformTabKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    current: Platform,
+  ) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const order: Platform[] = ["bilibili", "youtube"];
+    const currentIndex = order.indexOf(current);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? order.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + order.length) % order.length;
+    const next = order[nextIndex];
+    selectPlatform(next);
+    const tablist = event.currentTarget.parentElement;
+    requestAnimationFrame(() => {
+      tablist
+        ?.querySelectorAll<HTMLButtonElement>('[role="tab"]')
+        .item(nextIndex)
+        ?.focus();
+    });
   }
 
   function clearSearch() {
@@ -556,11 +755,45 @@ export default function CreatorsView({
     if (addBusyRef.current) {
       return;
     }
+    if (accountPlatform(account) === "youtube" && !youtubeEnabled) {
+      onError("YouTube 功能未开启");
+      return;
+    }
     addBusyRef.current = true;
-    setBusy(Number(account.mid));
+    setBusy(accountKey(accountPlatform(account), account.mid));
     try {
       const streamer = await actions.add(account);
       await onChanged();
+      void refreshStreamer(streamer);
+    } catch (error) {
+      onError(explainError(error));
+    } finally {
+      addBusyRef.current = false;
+      setBusy(null);
+    }
+  }
+
+  async function addYoutubeInput() {
+    const input = keyword.trim();
+    if (!youtubeEnabled || currentPlatform !== "youtube" || !input || !looksLikeYoutubeAccountInput(input) || addBusyRef.current) {
+      return;
+    }
+    addBusyRef.current = true;
+    const busyKey = accountKey("youtube", input);
+    setBusy(busyKey);
+    try {
+      const streamer = await actions.add({
+        platform: "youtube",
+        mid: input,
+        name: input,
+        avatarUrl: "",
+        sign: "",
+        roomId: null,
+        fans: 0,
+        isLive: false,
+      });
+      await onChanged();
+      clearSearch();
       void refreshStreamer(streamer);
     } catch (error) {
       onError(explainError(error));
@@ -625,10 +858,17 @@ export default function CreatorsView({
   }
 
   function openLinkDialog(streamer: Streamer) {
+    if (streamerPlatform(streamer) === "youtube" && !youtubeEnabled) {
+      onError("YouTube 功能未开启");
+      return;
+    }
     linkSearchSeq.current += 1;
     linkTargetIdRef.current = streamer.id;
     linkQueryRef.current = "";
     setLinkTarget(streamer);
+    const platform = streamerPlatform(streamer);
+    linkPlatformRef.current = platform;
+    setLinkPlatform(platform);
     setLinkKeyword("");
     setLinkResults([]);
     setLinkSearching(false);
@@ -639,6 +879,8 @@ export default function CreatorsView({
     linkTargetIdRef.current = null;
     linkQueryRef.current = "";
     setLinkTarget(null);
+    linkPlatformRef.current = "bilibili";
+    setLinkPlatform("bilibili");
     setLinkKeyword("");
     setLinkResults([]);
     setLinkSearching(false);
@@ -659,22 +901,29 @@ export default function CreatorsView({
       return;
     }
     const requestId = ++linkSearchSeq.current;
+    const searchPlatform = linkPlatform;
+    if (searchPlatform === "youtube" && !youtubeEnabled) {
+      onError("YouTube 功能未开启");
+      return;
+    }
     linkQueryRef.current = query;
     setLinkSearching(true);
     try {
-      const results = await actions.search(query);
+      const results = await actions.search(query, searchPlatform);
       if (
         linkSearchSeq.current !== requestId
         || linkTargetIdRef.current !== target.id
+        || linkPlatformRef.current !== searchPlatform
         || linkQueryRef.current.trim() !== query
       ) {
         return;
       }
-      setLinkResults(results);
+      setLinkResults(results.filter((account) => accountPlatform(account) === searchPlatform));
     } catch (error) {
       if (
         linkSearchSeq.current === requestId
         && linkTargetIdRef.current === target.id
+        && linkPlatformRef.current === searchPlatform
         && linkQueryRef.current.trim() === query
       ) {
         onError(explainError(error));
@@ -683,6 +932,7 @@ export default function CreatorsView({
       if (
         linkSearchSeq.current === requestId
         && linkTargetIdRef.current === target.id
+        && linkPlatformRef.current === searchPlatform
         && linkQueryRef.current.trim() === query
       ) {
         setLinkSearching(false);
@@ -697,10 +947,17 @@ export default function CreatorsView({
     }
     const targetId = target.id;
     const requestId = linkSearchSeq.current;
+    const accountPlatformValue = accountPlatform(account);
+    if (accountPlatformValue !== linkPlatform || (accountPlatformValue === "youtube" && !youtubeEnabled)) {
+      onError(accountPlatformValue === "youtube" && !youtubeEnabled
+        ? "YouTube 功能未开启"
+        : "只能关联同一平台的频道");
+      return;
+    }
     linkActionBusyRef.current = true;
     setLinkBusyMid(account.mid);
     try {
-      await actions.addLink(targetId, account.mid);
+      await actions.addLink(targetId, accountPlatformValue, account.mid);
       if (linkSearchSeq.current === requestId && linkTargetIdRef.current === targetId) {
         closeLinkDialog();
       }
@@ -721,13 +978,18 @@ export default function CreatorsView({
   }
 
   async function removeLink(streamer: Streamer, linked: LinkedAccount) {
-    const key = `link:${streamer.id}:${linked.mid}`;
+    const linkedPlatform = linked.platform === "youtube" ? "youtube" : streamerPlatform(streamer);
+    if (linkedPlatform === "youtube" && !youtubeEnabled) {
+      onError("YouTube 功能未开启");
+      return;
+    }
+    const key = `link:${streamer.id}:${linkedPlatform}:${linked.mid}`;
     if (removeBusyRef.current.has(key)) {
       return;
     }
     removeBusyRef.current.add(key);
     try {
-      await actions.removeLink(streamer.id, linked.mid);
+      await actions.removeLink(streamer.id, linkedPlatform, linked.mid);
       await onChanged();
     } catch (error) {
       onError(explainError(error));
@@ -1036,16 +1298,24 @@ export default function CreatorsView({
     }
   }
 
+  function mergePlatformOrder(nextPlatformOrder: Streamer[]): Streamer[] {
+    const visibleIds = new Set(nextPlatformOrder.map((streamer) => streamer.id));
+    let cursor = 0;
+    return orderedSubscriptions.map((streamer) => (
+      visibleIds.has(streamer.id) ? nextPlatformOrder[cursor++] : streamer
+    ));
+  }
+
   function moveStreamer(streamerId: number, delta: number) {
-    const from = orderedSubscriptions.findIndex((streamer) => streamer.id === streamerId);
+    const from = platformSubscriptions.findIndex((streamer) => streamer.id === streamerId);
     const to = from + delta;
-    if (from < 0 || to < 0 || to >= orderedSubscriptions.length) {
+    if (from < 0 || to < 0 || to >= platformSubscriptions.length) {
       return;
     }
-    const next = [...orderedSubscriptions];
+    const next = [...platformSubscriptions];
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved);
-    void persistOrder(next);
+    void persistOrder(mergePlatformOrder(next));
   }
 
   function beginReorderDrag(event: ReactDragEvent<HTMLButtonElement>, streamerId: number) {
@@ -1093,15 +1363,15 @@ export default function CreatorsView({
     if (!Number.isFinite(sourceId) || sourceId === streamerId) {
       return;
     }
-    const from = orderedSubscriptions.findIndex((streamer) => streamer.id === sourceId);
-    const to = orderedSubscriptions.findIndex((streamer) => streamer.id === streamerId);
+    const from = platformSubscriptions.findIndex((streamer) => streamer.id === sourceId);
+    const to = platformSubscriptions.findIndex((streamer) => streamer.id === streamerId);
     if (from < 0 || to < 0) {
       return;
     }
-    const next = [...orderedSubscriptions];
+    const next = [...platformSubscriptions];
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved);
-    void persistOrder(next);
+    void persistOrder(mergePlatformOrder(next));
   }
 
   async function loadFanHistory(streamer: Streamer) {
@@ -1272,17 +1542,46 @@ export default function CreatorsView({
             <h1 className="schedule-title">主播库</h1>
           </div>
           <div className="stat-chip" role="status">
-            <UsersRound size={17} />{reorderBusy ? "正在保存顺序…" : `${subscriptions.length} 位主播`}
+            <UsersRound size={17} />{reorderBusy ? "正在保存顺序…" : `${platformSubscriptions.length} 位主播`}
           </div>
         </header>
 
         <div className="search-panel">
+          {youtubeEnabled ? (
+            <div className="creator-platform-switch" role="tablist" aria-label="主播平台">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentPlatform === "bilibili"}
+                className={currentPlatform === "bilibili" ? "active" : ""}
+                tabIndex={currentPlatform === "bilibili" ? 0 : -1}
+                onClick={() => selectPlatform("bilibili")}
+                onKeyDown={(event) => handlePlatformTabKeyDown(event, "bilibili")}
+              >
+                Bilibili
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentPlatform === "youtube"}
+                className={currentPlatform === "youtube" ? "active" : ""}
+                tabIndex={currentPlatform === "youtube" ? 0 : -1}
+                onClick={() => selectPlatform("youtube")}
+                onKeyDown={(event) => handlePlatformTabKeyDown(event, "youtube")}
+              >
+                YouTube
+              </button>
+            </div>
+          ) : null}
           <div className="search-input">
             <div className="search-field">
               <Search size={18} />
               <input
                 ref={searchInputRef}
                 value={keyword}
+                aria-label={currentPlatform === "youtube"
+                  ? "搜索 YouTube 频道"
+                  : "搜索 B 站主播"}
                 onChange={(event) => handleKeywordChange(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
@@ -1292,7 +1591,9 @@ export default function CreatorsView({
                     clearSearch();
                   }
                 }}
-                placeholder="输入 B 站昵称、UID、@昵称或空间链接"
+                placeholder={currentPlatform === "youtube"
+                  ? "输入频道名、@handle、频道 ID 或 YouTube 链接"
+                  : "输入 B 站昵称、UID、@昵称或空间链接"}
               />
               {keyword ? (
                 <button
@@ -1307,6 +1608,7 @@ export default function CreatorsView({
               ) : null}
             </div>
             <button
+              type="button"
               className="button primary"
               onClick={() => {
                 cancelSearchTimer();
@@ -1314,38 +1616,65 @@ export default function CreatorsView({
               }}
               disabled={searching || !keyword.trim()}
             >
-              {searching ? "搜索中…" : "搜索"}
+              {searching ? "搜索中…" : currentPlatform === "youtube" ? "搜索频道" : "搜索"}
             </button>
+            {currentPlatform === "youtube" && looksLikeYoutubeAccountInput(keyword) ? (
+              <button
+                type="button"
+                className="button secondary youtube-direct-add"
+                aria-label="直接添加 YouTube 频道"
+                onClick={() => void addYoutubeInput()}
+                disabled={searching || busy !== null}
+              >
+                <UserPlus size={15} />
+                直接添加频道
+              </button>
+            ) : null}
           </div>
           {searchError ? <ErrorBanner message={searchError} onRetry={() => void performSearch(keyword)} /> : null}
         </div>
       </div>
 
-      {hasSearched && !searching && !searchError && results.length === 0 ? (
+      {hasSearched && !searching && !searchError && visibleResults.length === 0 ? (
         <div className="search-panel search-results-panel">
-          <div className="search-empty">未找到匹配主播，请尝试完整昵称、UID 或 @昵称。</div>
+          <div className="search-empty">
+            {currentPlatform === "youtube"
+              ? "未找到 YouTube 频道，请尝试 @handle、频道 ID 或完整频道链接。"
+              : "未找到匹配主播，请尝试完整昵称、UID 或 @昵称。"}
+          </div>
         </div>
       ) : null}
-      {results.length ? (
+      {visibleResults.length ? (
         <div className="search-panel search-results-panel">
           <div className="search-results">
-            <div className="search-result-count">找到 {results.length} 位主播</div>
-            {results.slice(0, 20).map((account) => {
-              const subscribed = subscriptions.some((streamer) => streamer.mid === account.mid);
+            <div className="search-result-count">找到 {visibleResults.length} 位主播</div>
+            {visibleResults.slice(0, 20).map((account) => {
+              const resultPlatform = accountPlatform(account);
+              const busyKey = accountKey(resultPlatform, account.mid);
+              const subscribed = subscriptions.some((streamer) => (
+                streamerPlatform(streamer) === resultPlatform && streamer.mid === account.mid
+              ));
+              const handle = account.handle?.trim();
               return (
-                <article className="search-result" key={account.mid}>
+                <article className={`search-result ${resultPlatform}`} key={busyKey}>
                   <Avatar url={account.avatarUrl} name={account.name} size="lg" live={account.isLive} />
                   <div>
-                    <h3>{account.name}</h3>
-                    <p>UID {account.mid} · {account.fans.toLocaleString()} 粉丝</p>
+                    <div className="search-result-title"><h3>{account.name}</h3><PlatformBadge platform={resultPlatform} /></div>
+                    <p>
+                      {resultPlatform === "youtube"
+                        ? `${handle || account.mid} · ${account.fans.toLocaleString()} 订阅者`
+                        : `UID ${account.mid} · ${account.fans.toLocaleString()} 粉丝`}
+                      {account.isLive ? " · 直播中" : ""}
+                    </p>
                     {account.sign ? <p className="result-sign">{account.sign}</p> : null}
                   </div>
                   <button
+                    type="button"
                     className="button small"
                     onClick={() => void addAccount(account)}
                     disabled={subscribed || busy !== null}
                   >
-                    {subscribed ? <><BadgeCheck size={15} />已订阅</> : busy === Number(account.mid) ? "订阅中…" : <><UserPlus size={15} />订阅</>}
+                    {subscribed ? <><BadgeCheck size={15} />已订阅</> : busy === busyKey ? "订阅中…" : <><UserPlus size={15} />订阅</>}
                   </button>
                 </article>
               );
@@ -1354,7 +1683,7 @@ export default function CreatorsView({
         </div>
       ) : null}
 
-      {moreMenu ? (
+      {moreMenu && (youtubeEnabled || streamerPlatform(moreMenu.streamer) === "bilibili") ? (
         <div id="creator-more-menu" className="context-menu creator-more-menu" ref={moreMenuRef}
           role="menu" aria-label={`${moreMenu.streamer.name} 的更多操作`}
           style={{ left: moreMenu.x, top: moreMenu.y }}
@@ -1387,7 +1716,7 @@ export default function CreatorsView({
           }}><History size={16} />查看最近直播</button>
         </div>
       ) : null}
-      {recentTarget ? (
+      {recentTarget && (youtubeEnabled || streamerPlatform(recentTarget) === "bilibili") ? (
         <CreatorRecentLives key={recentTarget.id} streamer={recentTarget} actions={actions}
           onClose={() => {
             setRecentTarget(null);
@@ -1395,14 +1724,36 @@ export default function CreatorsView({
           }} />
       ) : null}
 
-      {subscriptions.length === 0 ? (
-        <EmptyState title="还没有订阅主播" description="在上方搜索 B 站账号并添加。" />
+      {platformSubscriptions.length === 0 ? (
+        <EmptyState
+          title={currentPlatform === "youtube" ? "还没有订阅 YouTube 频道" : "还没有订阅主播"}
+          description={currentPlatform === "youtube"
+            ? "在上方搜索频道、@handle 或粘贴频道链接并添加。"
+            : "在上方搜索 B 站账号并添加。"}
+        />
       ) : (
         <div className="creator-list">
-          {orderedSubscriptions.map((streamer, index) => (
+          {platformSubscriptions.map((streamer, index) => {
+            const cardPlatform = streamerPlatform(streamer);
+            const channelLabel = cardPlatform === "youtube"
+              ? streamer.handle?.trim() || streamer.mid
+              : `UID ${streamer.mid}`;
+            const youtubeLiveUrl = cardPlatform === "youtube"
+              ? streamer.liveUrl || (streamer.liveVideoId
+                ? `https://www.youtube.com/watch?v=${encodeURIComponent(streamer.liveVideoId)}`
+                : null)
+              : null;
+            const canOpen = Boolean(youtubeLiveUrl || streamer.liveUrl || streamer.roomId || streamer.profileUrl || streamer.mid);
+            return (
             <article
-              className={`creator-card ${streamer.isLive ? "is-live" : ""} ${draggingId === streamer.id ? "is-dragging" : ""} ${dropTargetId === streamer.id ? "is-drop-target" : ""}`}
+              className={`creator-card ${cardPlatform} ${streamer.isLive ? "is-live" : ""} ${draggingId === streamer.id ? "is-dragging" : ""} ${dropTargetId === streamer.id ? "is-drop-target" : ""}`}
               key={streamer.id}
+              onDoubleClick={(event) => {
+                if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
+                  return;
+                }
+                void onOpenLiveRoom(streamer);
+              }}
               onDragOver={(event) => dragOverStreamer(event, streamer.id)}
               onDragLeave={() => setDropTargetId((current) => current === streamer.id ? null : current)}
               onDrop={(event) => dropOnStreamer(event, streamer.id)}
@@ -1439,7 +1790,7 @@ export default function CreatorsView({
                   className="creator-order-step"
                   title={`下移 ${streamer.name}`}
                   aria-label={`下移 ${streamer.name}`}
-                  disabled={reorderBusy || index === orderedSubscriptions.length - 1}
+                  disabled={reorderBusy || index === platformSubscriptions.length - 1}
                   onClick={() => moveStreamer(streamer.id, 1)}
                 >
                   <ChevronDown size={14} />
@@ -1449,11 +1800,12 @@ export default function CreatorsView({
               <div className="creator-main">
                 <div className="creator-title">
                   <h3>{streamer.name}</h3>
-                  <span>UID {streamer.mid}</span>
+                  <PlatformBadge platform={cardPlatform} />
+                  <span className="creator-channel-id">{channelLabel}</span>
                   {streamer.isLive ? <span className="live-label">直播中</span> : null}
                 </div>
                 <div className="creator-actions">
-                  {fertilityEnabled ? (
+                  {fertilityEnabled && cardPlatform === "bilibili" ? (
                     (() => {
                       const status = findFertilityStatus(fertilitySnapshot, streamer);
                       const meta = status ? fertilityStatusMeta(status.status) : null;
@@ -1485,22 +1837,30 @@ export default function CreatorsView({
                   <button
                     type="button"
                     className="creator-fan-button"
-                    title={streamer.fans === null ? "尚未采集粉丝数" : `${FAN_COUNT_FORMATTER.format(streamer.fans)} 粉丝，点击查看变化`}
+                    title={streamer.fans === null
+                      ? (cardPlatform === "youtube" ? "尚未采集订阅者数" : "尚未采集粉丝数")
+                      : `${FAN_COUNT_FORMATTER.format(streamer.fans)} ${cardPlatform === "youtube" ? "订阅者" : "粉丝"}，点击查看变化`}
                     onClick={() => openFanHistory(streamer)}
                   >
                     <TrendingUp size={14} />
                     <strong>{formatFanCount(streamer.fans)}</strong>
-                    <span>粉丝</span>
+                    <span>{cardPlatform === "youtube" ? "订阅者" : "粉丝"}</span>
                     <em>查看趋势</em>
                   </button>
                   <button
                     className={`icon-button live-room ${streamer.isLive ? "is-live" : ""}`}
-                    title={streamer.liveUrl || streamer.roomId
-                      ? `进入 ${streamer.name} 的直播间`
-                      : `${streamer.name} 暂未配置直播间地址`}
-                    aria-label={`进入 ${streamer.name} 的直播间`}
+                    title={cardPlatform === "youtube"
+                      ? streamer.isLive && youtubeLiveUrl
+                        ? `进入 ${streamer.name} 的 YouTube 直播间`
+                        : `打开 ${streamer.name} 的 YouTube 频道`
+                      : streamer.liveUrl || streamer.roomId
+                        ? `进入 ${streamer.name} 的直播间`
+                        : `${streamer.name} 暂未配置直播间地址`}
+                    aria-label={cardPlatform === "youtube" && !(streamer.isLive && youtubeLiveUrl)
+                      ? `打开 ${streamer.name} 的 YouTube 频道`
+                      : `进入 ${streamer.name} 的直播间`}
                     onClick={() => void onOpenLiveRoom(streamer)}
-                    disabled={!streamer.liveUrl && !streamer.roomId}
+                    disabled={!canOpen}
                   >
                     <ExternalLink size={17} />
                   </button>
@@ -1532,7 +1892,15 @@ export default function CreatorsView({
                       setMoreMenu({ streamer, x: bounds.right - 200, y: bounds.bottom + 6 });
                     }}
                   ><MoreHorizontal size={17} /></button>
-                  <button className="icon-button danger" title="删除主播" onClick={() => void removeStreamer(streamer)}><Trash2 size={17} /></button>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    title="删除主播"
+                    aria-label={`删除主播 ${streamer.name}`}
+                    onClick={() => void removeStreamer(streamer)}
+                  >
+                    <Trash2 size={17} />
+                  </button>
                 </div>
                 {streamer.lastError ? <p className="inline-error">{streamer.lastError}</p> : null}
                 <div className="creator-toggles">
@@ -1573,35 +1941,43 @@ export default function CreatorsView({
                   </div>
                 ) : null}
                 <div className="linked-row">
-                  <span className="linked-label"><Link2 size={14} />官号</span>
-                  {streamer.linkedAccounts.length ? streamer.linkedAccounts.map((linked) => (
-                    <span className="linked-pill" key={linked.mid}>
+                  <span className="linked-label"><Link2 size={14} />{cardPlatform === "youtube" ? "频道" : "官号"}</span>
+                  {streamer.linkedAccounts.length ? streamer.linkedAccounts.map((linked) => {
+                    const linkedPlatform = linked.platform === "youtube" ? "youtube" : cardPlatform;
+                    return (
+                    <span className="linked-pill" key={accountKey(linkedPlatform, linked.mid)}>
                       {linked.name}
-                      <button aria-label={`移除官号 ${linked.name}`} onClick={() => void removeLink(streamer, linked)}>
+                      <button
+                        type="button"
+                        aria-label={`${cardPlatform === "youtube" ? "移除频道" : "移除官号"} ${linked.name}`}
+                        onClick={() => void removeLink(streamer, linked)}
+                      >
                         <X size={12} />
                       </button>
                     </span>
-                  )) : A_SOUL_MEMBER_MIDS.has(streamer.mid) ? null : (
+                    );
+                  }) : cardPlatform === "bilibili" && A_SOUL_MEMBER_MIDS.has(streamer.mid) ? null : (
                     <span className="linked-empty">未关联</span>
                   )}
-                  {A_SOUL_MEMBER_MIDS.has(streamer.mid) &&
+                  {cardPlatform === "bilibili" && A_SOUL_MEMBER_MIDS.has(streamer.mid) &&
                   !streamer.linkedAccounts.some((linked) => linked.mid === A_SOUL_OFFICIAL_MID) ? (
                     <span className="linked-pill automatic" title="A-SOUL 成员会自动抓取该官号">
                       <Link2 size={12} />A-SOUL_Official · 自动
                     </span>
                   ) : null}
-                  <button className="text-button" onClick={() => openLinkDialog(streamer)}>
-                    <Plus size={13} />关联官号
+                  <button type="button" className="text-button" onClick={() => openLinkDialog(streamer)}>
+                    <Plus size={13} />{cardPlatform === "youtube" ? "关联频道" : "关联官号"}
                   </button>
                 </div>
               </div>
             </article>
-          ))}
+            );
+          })}
         </div>
       )}
 
-      {fanTarget ? (
-        <Modal title={`粉丝变化 · ${fanTarget.name}`} onClose={closeFanHistory} wide>
+      {fanTarget && (youtubeEnabled || streamerPlatform(fanTarget) === "bilibili") ? (
+        <Modal title={`${fanTargetLabel}变化 · ${fanTarget.name}`} onClose={closeFanHistory} wide>
           <div className="fan-modal">
             <div className="fan-modal-note">
               <Clock3 size={15} />
@@ -1614,7 +1990,7 @@ export default function CreatorsView({
             </div>
             <div className="fan-stat-grid">
               <div>
-                <span>当前粉丝</span>
+                <span>当前{fanTargetLabel}</span>
                 <strong>{fanLatest === null ? "--" : FAN_COUNT_FORMATTER.format(fanLatest)}</strong>
               </div>
               <div>
@@ -1669,21 +2045,21 @@ export default function CreatorsView({
             ) : fanLoading ? (
               <div className="fan-loading" role="status">
                 <LoaderCircle className="spin" size={20} />
-                正在读取粉丝历史…
+                正在读取{fanTargetLabel}历史…
               </div>
             ) : fanBuckets.length === 0 ? (
               <div className="fan-chart-empty">
                 <TrendingUp size={22} />
-                <strong>还没有粉丝快照</strong>
+                <strong>还没有{fanTargetLabel}快照</strong>
                 <span>后台将在启动后及之后每小时自动采集，也可以点击“立即采集”。</span>
               </div>
             ) : (
               <>
                 <FanTrendChart buckets={fanBuckets} />
-                <div className="fan-history-table" aria-label="粉丝历史统计">
+                <div className="fan-history-table" aria-label={`${fanTargetLabel}历史统计`}>
                   <div className="fan-history-row is-head">
                     <span>时间</span>
-                    <span>粉丝数</span>
+                    <span>{fanTargetLabel}数</span>
                     <span>变化</span>
                   </div>
                   {[...fanBuckets].reverse().map((bucket) => (
@@ -1702,7 +2078,7 @@ export default function CreatorsView({
         </Modal>
       ) : null}
 
-      {fertilityTarget ? (
+      {fertilityTarget && (youtubeEnabled || streamerPlatform(fertilityTarget) === "bilibili") ? (
         <Modal
           title={`月相 · ${fertilityTarget.name}`}
           onClose={() => setFertilityTarget(null)}
@@ -1780,13 +2156,14 @@ export default function CreatorsView({
         </Modal>
       ) : null}
 
-      {linkTarget ? (
-        <Modal title={`为 ${linkTarget.name} 关联官号`} onClose={closeLinkDialog}>
+      {linkTarget && (youtubeEnabled || streamerPlatform(linkTarget) === "bilibili") ? (
+        <Modal title={`为 ${linkTarget.name} 关联${linkPlatform === "youtube" ? "频道" : "官号"}`} onClose={closeLinkDialog}>
           <div className="search-input compact">
             <div className="search-field">
               <Search size={17} />
               <input
                 value={linkKeyword}
+                aria-label={`搜索${linkPlatform === "youtube" ? " YouTube 频道" : " B 站官号"}`}
                 onChange={(event) => updateLinkKeyword(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
@@ -1795,14 +2172,16 @@ export default function CreatorsView({
                     updateLinkKeyword("");
                   }
                 }}
-                placeholder="搜索官号昵称、UID、@昵称或空间链接"
+                placeholder={linkPlatform === "youtube"
+                  ? "搜索 YouTube 频道名、@handle、频道 ID 或链接"
+                  : "搜索官号昵称、UID、@昵称或空间链接"}
               />
               {linkKeyword ? (
                 <button
                   type="button"
                   className="search-clear"
-                  aria-label="清空官号搜索"
-                  title="清空官号搜索"
+                  aria-label={`清空${linkPlatform === "youtube" ? "频道" : "官号"}搜索`}
+                  title={`清空${linkPlatform === "youtube" ? "频道" : "官号"}搜索`}
                   onClick={() => updateLinkKeyword("")}
                 >
                   <X size={15} />
@@ -1810,6 +2189,7 @@ export default function CreatorsView({
               ) : null}
             </div>
             <button
+              type="button"
               className="button secondary small"
               onClick={() => void searchLinkAccounts()}
               disabled={linkSearching || !linkKeyword.trim()}
@@ -1819,12 +2199,20 @@ export default function CreatorsView({
           </div>
           <div className="modal-list">
             {linkResults.map((account) => {
-              const already = linkTarget.linkedAccounts.some((linked) => linked.mid === account.mid);
+              const resultPlatform = accountPlatform(account);
+              const already = linkTarget.linkedAccounts.some((linked) => (
+                (linked.platform === "youtube" ? "youtube" : linkPlatform) === resultPlatform
+                  && linked.mid === account.mid
+              ));
               return (
-                <div className="modal-list-row" key={account.mid}>
+                <div className="modal-list-row youtube-link-row" key={accountKey(resultPlatform, account.mid)}>
                   <Avatar url={account.avatarUrl} name={account.name} />
-                  <div><strong>{account.name}</strong><span>UID {account.mid}</span></div>
+                  <div>
+                    <div className="search-result-title"><strong>{account.name}</strong><PlatformBadge platform={resultPlatform} /></div>
+                    <span>{resultPlatform === "youtube" ? account.handle || account.mid : `UID ${account.mid}`}</span>
+                  </div>
                   <button
+                    type="button"
                     className="button small"
                     disabled={already || linkBusyMid !== null}
                     onClick={() => void linkAccount(account)}
@@ -1838,7 +2226,7 @@ export default function CreatorsView({
         </Modal>
       ) : null}
 
-      {aliasTarget ? (
+      {aliasTarget && (youtubeEnabled || streamerPlatform(aliasTarget) === "bilibili") ? (
         <Modal
           title={`${aliasTarget.name} 的识别别名`}
           onClose={closeAlias}
@@ -1858,7 +2246,7 @@ export default function CreatorsView({
         </Modal>
       ) : null}
 
-      {weeklyTarget ? (
+      {weeklyTarget && (youtubeEnabled || streamerPlatform(weeklyTarget) === "bilibili") ? (
         <Modal
           title={`${weeklyTarget.name} 的固定周表`}
           onClose={closeWeeklyRules}
@@ -1953,10 +2341,3 @@ export default function CreatorsView({
     </section>
   );
 }
-
-
-
-
-
-
-

@@ -1,6 +1,7 @@
 export type DataMode = "local" | "server";
 export type ViewMode = "timeline" | "grid";
-export type SourceKind = "text" | "reserve" | "image" | "manual" | "editor" | "weekly" | "live";
+export type Platform = "bilibili" | "youtube";
+export type SourceKind = "text" | "reserve" | "image" | "manual" | "editor" | "weekly" | "live" | "youtube_community" | "youtube_live";
 
 /** 思考程度：`auto` 表示请求体不发送 `reasoning_effort` 字段。 */
 export type LlmReasoningEffort = "auto" | "low" | "medium" | "high";
@@ -20,6 +21,8 @@ export interface AppSettings {
   notificationsEnabled: boolean;
   liveStatsEnabled: boolean;
   fertilityEnabled: boolean;
+  /** YouTube 总开关；缺省表示关闭，旧设置不会触发任何 YouTube 请求。 */
+  youtubeEnabled?: boolean;
   llmBaseUrl: string;
   llmModel: string;
   llmPromptVersion: string;
@@ -34,6 +37,30 @@ export interface SecretStatus {
   llmConfigured: boolean;
   biliConfigured: boolean;
   serverTokenConfigured: boolean;
+}
+
+export interface YoutubeCredentialStatus {
+  apiKeyConfigured: boolean;
+  apiKeyValid?: boolean | null;
+  oauthConfigured: boolean;
+  /** Google OAuth 令牌已过期；与“未授权”分开显示，但不暴露令牌内容。 */
+  oauthExpired?: boolean;
+  oauthAccount?: string | null;
+  webSessionConfigured: boolean;
+  webSessionAccount?: string | null;
+  checkedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface YoutubeOAuthStart {
+  authorizationUrl: string;
+  state?: string | null;
+  expiresInSeconds?: number;
+}
+
+export interface YoutubeWebLoginStart {
+  loginUrl?: string | null;
+  message?: string | null;
 }
 
 export interface BiliQrLoginStart {
@@ -67,30 +94,42 @@ export interface ServerBiliStatus {
 }
 
 export interface AccountSearchResult {
+  platform?: Platform;
   mid: string;
   name: string;
   avatarUrl: string;
   sign: string;
+  handle?: string | null;
+  profileUrl?: string | null;
+  uploadsPlaylistId?: string | null;
   roomId: string | null;
   fans: number;
   isLive: boolean;
+  liveUrl?: string | null;
 }
 
 export interface LinkedAccount {
   id?: number;
   streamerId?: number;
+  platform?: Platform;
   mid: string;
   name: string;
   avatarUrl: string;
+  handle?: string | null;
+  profileUrl?: string | null;
   revision?: number;
   createdAt: string;
 }
 
 export interface Streamer {
   id: number;
+  platform?: Platform;
   mid: string;
   name: string;
   avatarUrl: string;
+  handle?: string | null;
+  profileUrl?: string | null;
+  uploadsPlaylistId?: string | null;
   roomId: string | null;
   liveUrl: string | null;
   aliases: string[];
@@ -103,6 +142,7 @@ export interface Streamer {
   isLive: boolean;
   liveTitle: string | null;
   liveCover: string | null;
+  liveVideoId?: string | null;
   liveStartedAt: string | null;
   liveCheckedAt: string | null;
   linkedAccounts: LinkedAccount[];
@@ -195,6 +235,8 @@ export interface LiveSession {
   id: number;
   streamerId: number;
   streamerName: string;
+  /** 后端显式提供时优先使用，缺失时才回退到 roomId 推断。 */
+  platform?: Platform;
   roomId: string;
   title: string;
   coverUrl: string | null;
@@ -216,6 +258,10 @@ export interface LiveSession {
   giftCount: number;
   superChatCount: number;
   guardCount: number;
+  /** YouTube 会员事件数；null 表示 OAuth 统计从未可用，不代表 0。 */
+  membershipCount?: number | null;
+  /** YouTube 统计可用性；null 表示旧数据或尚不可知，false 表示已明确不可用。 */
+  youtubeStatsAvailable?: boolean | null;
   reconnectCount: number;
   /** 本场由几段拼成：主播断流重开后并回同一场，段数递增。 */
   segmentCount: number;
@@ -233,13 +279,28 @@ export interface LiveOnlineSample {
   collectorState: string;
 }
 
+export type LiveOnlineMetric = "bilibili_high_energy_users" | "youtube_concurrent_viewers";
+
+/** YouTube Super Chat / Super Sticker totals grouped by original currency. */
+export interface LiveSuperChatTotal {
+  currency: string | null;
+  amountMicros: number;
+  eventCount: number;
+}
+
 export interface LiveOnlineSamplesPage {
   sessionId: number;
-  metric: "bilibili_high_energy_users";
+  platform?: Platform;
+  metric: LiveOnlineMetric;
   sampleIntervalSeconds: number;
   samples: LiveOnlineSample[];
   nextAfterId: number;
   hasMore: boolean;
+  /** `null` means YouTube OAuth-backed collection was unavailable, not zero. */
+  membershipCount?: number | null;
+  /** `null` means the server did not report whether OAuth event collection worked. */
+  statsAvailable?: boolean | null;
+  superChatTotals?: LiveSuperChatTotal[];
 }
 
 export interface FanSnapshot {
@@ -257,6 +318,8 @@ export interface FanHistory {
 export interface LiveStatus {
   scheduleId?: number | null;
   scheduleKnown?: boolean;
+  platform?: Platform;
+  liveVideoId?: string | null;
   streamerId: number;
   mid: string;
   streamerName: string;
@@ -536,6 +599,7 @@ export interface WeeklyScheduleException {
 export interface ScheduleSource {
   id: number;
   scheduleId: number;
+  platform?: Platform;
   sourceKind: SourceKind;
   sourcePostId: string | null;
   sourceImageUrl: string | null;
@@ -548,6 +612,7 @@ export interface ScheduleSource {
 
 export interface SourceSuppression {
   id: number;
+  platform?: Platform;
   streamerId: number;
   sourcePostId: string;
   sourceFingerprint: string;
@@ -561,6 +626,7 @@ export interface ServerSettings {
   autoAnalyzeImages?: boolean;
   liveStatsEnabled?: boolean;
   fertilityEnabled?: boolean;
+  youtubeEnabled?: boolean;
   llmBaseUrl?: string;
   llmModel?: string;
   llmPromptVersion?: string;

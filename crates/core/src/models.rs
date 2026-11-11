@@ -1,19 +1,61 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 账号、直播和日程来源所属的平台。
+///
+/// 数据库继续沿用 `mid` 作为平台内账号 ID，避免把现有 B 站字段整体改名。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    #[default]
+    Bilibili,
+    Youtube,
+}
+
+impl Platform {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bilibili => "bilibili",
+            Self::Youtube => "youtube",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bilibili" => Some(Self::Bilibili),
+            "youtube" => Some(Self::Youtube),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSearchResult {
+    #[serde(default)]
+    pub platform: Platform,
     pub mid: String,
     pub name: String,
     pub avatar_url: String,
     #[serde(default)]
     pub sign: String,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
     pub room_id: Option<String>,
     #[serde(default)]
     pub fans: u64,
     #[serde(default)]
     pub is_live: bool,
+    #[serde(default)]
+    pub live_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23,9 +65,15 @@ pub struct LinkedAccount {
     pub id: i64,
     #[serde(default)]
     pub streamer_id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub mid: String,
     pub name: String,
     pub avatar_url: String,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
     #[serde(default)]
     pub revision: i64,
     pub created_at: DateTime<Utc>,
@@ -35,9 +83,17 @@ pub struct LinkedAccount {
 #[serde(rename_all = "camelCase")]
 pub struct Streamer {
     pub id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub mid: String,
     pub name: String,
     pub avatar_url: String,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    #[serde(default)]
+    pub uploads_playlist_id: Option<String>,
     pub room_id: Option<String>,
     pub live_url: Option<String>,
     pub aliases: Vec<String>,
@@ -52,6 +108,8 @@ pub struct Streamer {
     pub is_live: bool,
     pub live_title: Option<String>,
     pub live_cover: Option<String>,
+    #[serde(default)]
+    pub live_video_id: Option<String>,
     pub live_started_at: Option<DateTime<Utc>>,
     pub live_checked_at: Option<DateTime<Utc>>,
     pub linked_accounts: Vec<LinkedAccount>,
@@ -121,9 +179,17 @@ pub struct UpdateSubscription {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddSubscription {
+    #[serde(default)]
+    pub platform: Platform,
     pub mid: String,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    #[serde(default)]
+    pub uploads_playlist_id: Option<String>,
     pub room_id: Option<String>,
     pub aliases: Option<Vec<String>>,
     #[serde(default = "default_true")]
@@ -365,10 +431,14 @@ pub struct LiveRoomOwner {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSnapshot {
+    #[serde(default)]
+    pub platform: Platform,
     pub is_live: bool,
     pub title: String,
     pub cover_url: Option<String>,
     pub live_url: Option<String>,
+    #[serde(default)]
+    pub live_video_id: Option<String>,
     pub online: u64,
     pub started_at: Option<DateTime<Utc>>,
     pub checked_at: DateTime<Utc>,
@@ -379,6 +449,8 @@ pub struct LiveSnapshot {
 pub struct SourceSuppression {
     pub id: i64,
     pub streamer_id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub source_post_id: String,
     pub source_fingerprint: String,
     #[serde(default)]
@@ -404,6 +476,8 @@ pub struct WeeklyScheduleException {
 pub struct ScheduleSource {
     pub id: i64,
     pub schedule_id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub source_kind: String,
     pub source_post_id: Option<String>,
     pub source_image_url: Option<String>,
@@ -470,6 +544,14 @@ pub struct LiveSession {
     /// 段数递增而不是新建一条记录。
     #[serde(default = "default_segment_count")]
     pub segment_count: u64,
+    /// YouTube channel-membership events. `None` means OAuth-backed collection
+    /// has never been available for this session; it is never a fabricated zero.
+    #[serde(default)]
+    pub membership_count: Option<i64>,
+    /// Whether OAuth-backed YouTube chat, Super Chat and membership collection
+    /// was usable. `None` preserves older payloads that predate this field.
+    #[serde(default)]
+    pub youtube_stats_available: Option<bool>,
     pub data_quality: String,
     pub collector_state: String,
     pub created_at: DateTime<Utc>,
@@ -478,8 +560,9 @@ pub struct LiveSession {
     pub revision: i64,
 }
 
-/// One checkpoint of public high-energy-user observations, not true CCU.
-/// A missing observation is null, never a synthetic zero.
+/// One checkpoint of a platform viewer metric: Bilibili public high-energy
+/// users or YouTube concurrent viewers. A missing observation is null, never a
+/// synthetic zero.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveOnlineSample {
@@ -491,15 +574,68 @@ pub struct LiveOnlineSample {
     pub collector_state: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSuperChatTotal {
+    pub currency: Option<String>,
+    pub amount_micros: i64,
+    pub event_count: i64,
+}
+
+/// Original YouTube Super Chat / Super Sticker event. Amounts are kept in the
+/// provider's currency and micros; they are never converted to Bilibili CNY.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSuperChatEvent {
+    pub id: String,
+    pub session_id: i64,
+    pub kind: String,
+    pub live_chat_id: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub user_channel_id: Option<String>,
+    pub user_display_name: Option<String>,
+    pub amount_micros: Option<i64>,
+    pub currency: Option<String>,
+    pub amount_display_string: Option<String>,
+    pub tier: Option<i64>,
+    pub captured_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SuperChatEventInput {
+    pub id: String,
+    pub kind: String,
+    pub live_chat_id: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub user_channel_id: Option<String>,
+    pub user_display_name: Option<String>,
+    pub amount_micros: Option<u64>,
+    pub currency: Option<String>,
+    pub amount_display_string: Option<String>,
+    pub tier: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveOnlineSamplesPage {
     pub session_id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub metric: String,
     pub sample_interval_seconds: u64,
     pub samples: Vec<LiveOnlineSample>,
     pub next_after_id: i64,
     pub has_more: bool,
+    /// YouTube channel-membership events. `None` means the collector did not
+    /// have OAuth access; it is never coerced to a fabricated zero.
+    #[serde(default)]
+    pub membership_count: Option<i64>,
+    /// Whether OAuth-backed chat/Super Chat/membership collection was usable.
+    #[serde(default)]
+    pub stats_available: Option<bool>,
+    #[serde(default)]
+    pub super_chat_totals: Vec<LiveSuperChatTotal>,
 }
 
 pub fn default_segment_count() -> u64 {
@@ -556,6 +692,8 @@ pub struct LiveStatus {
     #[serde(default)]
     pub schedule_known: bool,
     pub streamer_id: i64,
+    #[serde(default)]
+    pub platform: Platform,
     pub mid: String,
     pub streamer_name: String,
     pub avatar_url: String,
@@ -563,6 +701,8 @@ pub struct LiveStatus {
     pub title: String,
     pub cover_url: Option<String>,
     pub live_url: Option<String>,
+    #[serde(default)]
+    pub live_video_id: Option<String>,
     pub online: u64,
     pub started_at: Option<DateTime<Utc>>,
     pub checked_at: DateTime<Utc>,
@@ -578,6 +718,9 @@ pub struct ServerSettings {
     pub dynamic_poll_seconds: u64,
     pub auto_analyze_images: bool,
     pub live_stats_enabled: bool,
+    /// YouTube 功能总开关；关闭时不发起任何 YouTube 请求。
+    #[serde(default)]
+    pub youtube_enabled: bool,
     /// 「寻血猎犬」开关：开启后服务端才会抓取 LAPLACE 生理期数据。
     #[serde(default)]
     pub fertility_enabled: bool,
@@ -602,6 +745,7 @@ impl Default for ServerSettings {
             dynamic_poll_seconds: 300,
             auto_analyze_images: true,
             live_stats_enabled: false,
+            youtube_enabled: false,
             fertility_enabled: false,
             llm_base_url: "https://api.openai.com/v1".to_owned(),
             llm_model: String::new(),

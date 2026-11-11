@@ -1,0 +1,211 @@
+{
+  "fixtureVersion": 1,
+  "search": {
+    "kind": "youtube#searchListResponse",
+    "etag": "fixture-search-etag",
+    "items": [
+      {
+        "kind": "youtube#searchResult",
+        "id": {
+          "kind": "youtube#channel",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+        },
+        "snippet": {
+          "publishedAt": "2026-11-01T00:00:00Z",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "title": "Fixture Channel",
+          "description": "YouTube fixture channel",
+          "thumbnails": {
+            "default": {
+              "url": "https://i.ytimg.com/vi/fixture/default.jpg",
+              "width": 88,
+              "height": 88
+            },
+            "high": {
+              "url": "https://i.ytimg.com/vi/fixture/high.jpg",
+              "width": 800,
+              "height": 800
+            }
+          },
+          "channelTitle": "Fixture Channel",
+          "liveBroadcastContent": "none"
+        }
+      }
+    ]
+  },
+  "channels": {
+    "kind": "youtube#channelListResponse",
+    "etag": "fixture-channel-etag",
+    "items": [
+      {
+        "kind": "youtube#channel",
+        "id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "snippet": {
+          "title": "Fixture Channel",
+          "description": "YouTube fixture channel",
+          "customUrl": "@fixture_channel",
+          "publishedAt": "2020-01-02T03:04:05Z",
+          "thumbnails": {
+            "high": {
+              "url": "https://yt3.googleusercontent.com/fixture-channel.jpg",
+              "width": 800,
+              "height": 800
+            }
+          }
+        },
+        "contentDetails": {
+          "relatedPlaylists": {
+            "uploads": "UU_x5XG1OV2P6uZZ5FSM9Ttw"
+          }
+        },
+        "statistics": {
+          "viewCount": "9876543",
+          "subscriberCount": "123456",
+          "hiddenSubscriberCount": false,
+          "videoCount": "456"
+        }
+      }
+    ]
+  },
+  "videos": {
+    "kind": "youtube#videoListResponse",
+    "etag": "fixture-video-etag",
+    "items": [
+      {
+        "kind": "youtube#video",
+        "id": "LiveVid0001",
+        "snippet": {
+          "publishedAt": "2026-11-12T10:00:00Z",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "title": "正在直播：Fixture Live",
+          "description": "live fixture",
+          "thumbnails": {
+            "high": {
+              "url": "https://i.ytimg.com/vi/LiveVid0001/high.jpg",
+              "width": 480,
+              "height": 360
+            }
+          },
+          "channelTitle": "Fixture Channel",
+          "liveBroadcastContent": "live"
+        },
+        "liveStreamingDetails": {
+          "actualStartTime": "2026-11-12T10:01:02Z",
+          "scheduledStartTime": "2026-11-12T10:00:00Z",
+          "concurrentViewers": "321"
+        }
+      },
+      {
+        "kind": "youtube#video",
+        "id": "Upcoming001",
+        "snippet": {
+          "publishedAt": "2026-11-12T11:00:00Z",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "title": "预约直播：Fixture Upcoming",
+          "description": "upcoming fixture",
+          "thumbnails": {
+            "high": {
+              "url": "https://i.ytimg.com/vi/Upcoming001/high.jpg",
+              "width": 480,
+              "height": 360
+            }
+          },
+          "channelTitle": "Fixture Channel",
+          "liveBroadcastContent": "upcoming"
+        },
+        "liveStreamingDetails": {
+          "scheduledStartTime": "2026-11-13T12:30:00Z"
+        }
+      },
+      {
+        "kind": "youtube#video",
+        "id": "EndedVid001",
+        "snippet": {
+          "publishedAt": "2026-11-10T09:00:00Z",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "title": "已结束：Fixture Ended",
+          "description": "ended fixture",
+          "thumbnails": {
+            "high": {
+              "url": "https://i.ytimg.com/vi/EndedVid001/high.jpg",
+              "width": 480,
+              "height": 360
+            }
+          },
+          "channelTitle": "Fixture Channel",
+          "liveBroadcastContent": "none"
+        },
+        "liveStreamingDetails": {
+          "actualStartTime": "2026-11-10T09:05:00Z",
+          "actualEndTime": "2026-11-10T11:06:07Z",
+          "scheduledStartTime": "2026-11-10T09:00:00Z"
+        }
+      },
+      {
+        "kind": "youtube#video",
+        "id": "Ordinary001",
+        "snippet": {
+          "publishedAt": "2026-11-09T08:00:00Z",
+          "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "title": "普通视频：Fixture Ordinary",
+          "description": "ordinary fixture",
+          "thumbnails": {
+            "high": {
+              "url": "https://i.ytimg.com/vi/Ordinary001/high.jpg",
+              "width": 480,
+              "height": 360
+            }
+          },
+          "channelTitle": "Fixture Channel",
+          "liveBroadcastContent": "none"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "searchFirst": {
+      "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+      "title": "Fixture Channel",
+      "avatarUrl": "https://i.ytimg.com/vi/fixture/high.jpg",
+      "profileUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"
+    },
+    "channel": {
+      "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+      "handle": "@fixture_channel",
+      "title": "Fixture Channel",
+      "uploadsPlaylistId": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+      "subscriberCount": 123456,
+      "hiddenSubscriberCount": false
+    },
+    "videos": {
+      "LiveVid0001": {
+        "state": "live",
+        "scheduledStartTime": "2026-11-12T10:00:00Z",
+        "actualStartTime": "2026-11-12T10:01:02Z",
+        "actualEndTime": null,
+        "concurrentViewers": 321
+      },
+      "Upcoming001": {
+        "state": "upcoming",
+        "scheduledStartTime": "2026-11-13T12:30:00Z",
+        "actualStartTime": null,
+        "actualEndTime": null,
+        "concurrentViewers": null
+      },
+      "EndedVid001": {
+        "state": "ended",
+        "scheduledStartTime": "2026-11-10T09:00:00Z",
+        "actualStartTime": "2026-11-10T09:05:00Z",
+        "actualEndTime": "2026-11-10T11:06:07Z",
+        "concurrentViewers": null
+      },
+      "Ordinary001": {
+        "state": "none",
+        "scheduledStartTime": null,
+        "actualStartTime": null,
+        "actualEndTime": null,
+        "concurrentViewers": null
+      }
+    }
+  }
+}

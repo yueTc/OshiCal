@@ -454,7 +454,8 @@ impl SqliteStore {
             .and_then(Value::as_str)
             .ok_or_else(|| AppError::validation("缺少官号 mid"))?;
         let existing = sqlx::query_as::<_, LinkedAccountRow>(
-            "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+            "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url,
+                    revision, created_at
              FROM linked_accounts WHERE streamer_id = ? AND mid = ?",
         )
         .bind(streamer_id)
@@ -476,7 +477,6 @@ impl SqliteStore {
         let actor = sync_actor_for_mutation(mutation);
         let result = match mutation.operation.as_str() {
             "create" => {
-                validate_mid(mid)?;
                 let streamer_name: String =
                     sqlx::query_scalar("SELECT name FROM streamers WHERE id = ?")
                         .bind(streamer_id)
@@ -499,27 +499,56 @@ impl SqliteStore {
                     .or_else(|| mutation.payload.get("avatar_url"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let platform = mutation
+                    .payload
+                    .get("platform")
+                    .and_then(Value::as_str)
+                    .map(parse_platform)
+                    .transpose()?
+                    .unwrap_or(Platform::Bilibili);
+                let handle = mutation
+                    .payload
+                    .get("handle")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let profile_url = mutation
+                    .payload
+                    .get("profileUrl")
+                    .or_else(|| mutation.payload.get("profile_url"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                validate_platform_mid(platform, mid)?;
                 sqlx::query(
-                    "INSERT INTO linked_accounts (streamer_id, mid, name, avatar_url, created_at)
-                     VALUES (?, ?, ?, ?, ?)
+                    "INSERT INTO linked_accounts
+                        (streamer_id, platform, mid, name, avatar_url, handle, profile_url, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(streamer_id, mid) DO UPDATE SET
+                        platform = excluded.platform,
                         name = excluded.name,
                         avatar_url = CASE
                             WHEN excluded.avatar_url LIKE 'data:image/%' THEN excluded.avatar_url
                             WHEN linked_accounts.avatar_url LIKE 'data:image/%' THEN linked_accounts.avatar_url
                             WHEN excluded.avatar_url <> '' THEN excluded.avatar_url
                             ELSE linked_accounts.avatar_url END,
+                        handle = COALESCE(excluded.handle, linked_accounts.handle),
+                        profile_url = COALESCE(excluded.profile_url, linked_accounts.profile_url),
                         revision = linked_accounts.revision + 1",
                 )
                 .bind(streamer_id)
+                .bind(platform.as_str())
                 .bind(mid)
                 .bind(name)
                 .bind(avatar_url)
+                .bind(handle)
+                .bind(profile_url)
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
                 let row = sqlx::query_as::<_, LinkedAccountRow>(
-                    "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+                    "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url,
+                            revision, created_at
                      FROM linked_accounts WHERE streamer_id = ? AND mid = ?",
                 )
                 .bind(streamer_id)
@@ -531,7 +560,10 @@ impl SqliteStore {
                 json!({
                     "linkedAccountId": row.id,
                     "streamerId": streamer_id,
+                    "platform": row.platform,
                     "mid": mid,
+                    "handle": row.handle,
+                    "profileUrl": row.profile_url,
                     "revision": row.revision,
                 })
             }
@@ -614,6 +646,10 @@ mod tests {
     async fn fixture(store: &SqliteStore) -> Schedule {
         let streamer = store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "100".into(),
                 name: Some("同步主播".into()),
                 avatar_url: None,
@@ -671,6 +707,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "100200300".into(),
                 name: Some("离线主播".into()),
                 avatar_url: None,
@@ -888,6 +928,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "310".into(),
                 name: Some("并发订阅主播".into()),
                 avatar_url: None,
@@ -929,6 +973,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "311".into(),
                 name: Some("幂等订阅主播".into()),
                 avatar_url: None,
@@ -968,6 +1016,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "312".into(),
                 name: Some("官号同步主播".into()),
                 avatar_url: None,

@@ -1,8 +1,35 @@
-import type { LiveOnlineSample, LiveOnlineSamplesPage } from "../types";
+import type {
+  LiveOnlineMetric, LiveOnlineSample, LiveOnlineSamplesPage, LiveSession, Platform,
+} from "../types";
 
 export type OnlinePageLoader = (
   sessionId: number, afterId: number, signal?: AbortSignal,
 ) => Promise<LiveOnlineSamplesPage>;
+
+const ONLINE_METRICS: ReadonlySet<LiveOnlineMetric> =
+  new Set<LiveOnlineMetric>([
+    "bilibili_high_energy_users",
+    "youtube_concurrent_viewers",
+  ]);
+
+export function platformForMetric(metric: LiveOnlineMetric): Platform {
+  return metric === "youtube_concurrent_viewers" ? "youtube" : "bilibili";
+}
+
+/**
+ * Prefer the explicit projection supplied by newer transports. Older payloads
+ * have no platform field, so retain the room-id fallback in one place: Bilibili
+ * room IDs are numeric while YouTube uses channel/video IDs.
+ */
+export function platformFromLiveSession(
+  session: Pick<LiveSession, "roomId" | "platform">,
+): Platform {
+  if (session.platform === "youtube" || session.platform === "bilibili") {
+    return session.platform;
+  }
+  const roomId = session.roomId.trim();
+  return roomId !== "" && !/^\d+$/.test(roomId) ? "youtube" : "bilibili";
+}
 
 /** Read every page, never silently label a partial first page as a whole session. */
 export async function loadOnlineSamplePages(
@@ -10,18 +37,39 @@ export async function loadOnlineSamplePages(
   sessionId: number,
   afterId = 0,
   signal?: AbortSignal,
-): Promise<{ samples: LiveOnlineSample[]; nextAfterId: number }> {
+): Promise<{
+  samples: LiveOnlineSample[];
+  nextAfterId: number;
+  platform: Platform;
+  metric: LiveOnlineMetric;
+}> {
   const samples: LiveOnlineSample[] = [];
   let cursor = afterId;
+  let resultPlatform: Platform | null = null;
+  let resultMetric: LiveOnlineMetric | null = null;
   for (let pageIndex = 0; pageIndex < 1000; pageIndex += 1) {
     if (signal?.aborted) throw new Error("人数曲线请求已取消");
     const page = await loadPage(sessionId, cursor, signal);
     if (signal?.aborted) throw new Error("人数曲线请求已取消");
-    if (page.sessionId !== sessionId || page.metric !== "bilibili_high_energy_users"
+    if (page.sessionId !== sessionId || !ONLINE_METRICS.has(page.metric)
       || !Array.isArray(page.samples) || typeof page.hasMore !== "boolean"
       || !Number.isSafeInteger(page.nextAfterId) || page.nextAfterId < cursor) {
       throw new Error("人数曲线响应格式或统计口径不匹配");
     }
+    if (page.platform !== undefined && page.platform !== "bilibili" && page.platform !== "youtube") {
+      throw new Error("人数曲线平台字段无效");
+    }
+    const metricPlatform = platformForMetric(page.metric);
+    const pagePlatform = page.platform ?? metricPlatform;
+    if (pagePlatform !== metricPlatform) {
+      throw new Error("人数曲线平台与统计口径不一致");
+    }
+    if ((resultMetric !== null && resultMetric !== page.metric)
+      || (resultPlatform !== null && resultPlatform !== pagePlatform)) {
+      throw new Error("人数曲线分页统计口径前后不一致");
+    }
+    resultMetric = page.metric;
+    resultPlatform = pagePlatform;
     let lastId = cursor;
     for (const sample of page.samples) {
       if (sample.sessionId !== sessionId || !Number.isSafeInteger(sample.id) || sample.id <= lastId) {
@@ -34,7 +82,17 @@ export async function loadOnlineSamplePages(
     }
     samples.push(...page.samples);
     cursor = lastId;
-    if (!page.hasMore) return { samples, nextAfterId: cursor };
+    if (!page.hasMore) {
+      if (resultPlatform === null || resultMetric === null) {
+        throw new Error("人数曲线响应缺少统计口径");
+      }
+      return {
+        samples,
+        nextAfterId: cursor,
+        platform: resultPlatform,
+        metric: resultMetric,
+      };
+    }
   }
   throw new Error("本场人数历史过长，暂时无法完整读取，请稍后重试");
 }

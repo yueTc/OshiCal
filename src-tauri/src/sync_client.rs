@@ -4,14 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use oshical_core::{
-    LiveSession, LiveStatus, NewSchedule, Schedule, SourceSuppression, SqliteStore, Streamer,
-    UpdateSchedule, WeeklyScheduleRule,
+    LiveSession, LiveStatus, NewSchedule, Platform, Schedule, SourceSuppression, SqliteStore,
+    Streamer, UpdateSchedule, WeeklyScheduleRule,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{sqlite::Sqlite, Row, SqlitePool, Transaction};
 
-const SYNC_SCHEMA_VERSION: u32 = 2;
+const SYNC_SCHEMA_VERSION: u32 = 3;
 
 const SYNC_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -292,15 +292,28 @@ struct LinkPayload {
     #[serde(default)]
     id: Option<i64>,
     streamer_id: i64,
+    #[serde(default)]
+    platform: Platform,
     mid: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
     avatar_url: String,
     #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    profile_url: Option<String>,
+    #[serde(default)]
     revision: i64,
     #[serde(default)]
     created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkTarget {
+    streamer_id: i64,
+    platform: Platform,
+    mid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +337,8 @@ struct ScheduleSourcePayload {
     #[serde(default)]
     id: Option<i64>,
     schedule_id: i64,
+    #[serde(default)]
+    platform: Platform,
     source_kind: String,
     source_post_id: Option<String>,
     source_image_url: Option<String>,
@@ -913,20 +928,41 @@ async fn apply_delete(
             // sync_link_id_map instead of rejecting an otherwise valid deletion.
             let payload_link = payload
                 .and_then(|payload| serde_json::from_value::<LinkPayload>(payload.clone()).ok());
-            let payload_target = payload_link
-                .as_ref()
-                .map(|link| (link.streamer_id, link.mid.trim().to_owned()))
-                .filter(|(_, mid)| !mid.is_empty());
-            let entity_target = entity_id
-                .split_once(':')
-                .filter(|(_, mid)| !mid.trim().is_empty())
-                .map(|(streamer_id, mid)| {
-                    let streamer_id = streamer_id
-                        .parse::<i64>()
-                        .map_err(|_| "link tombstone 的 streamerId 无效".to_owned())?;
-                    Ok::<_, String>((streamer_id, mid.trim().to_owned()))
+            let payload_target = payload_link.as_ref().and_then(|link| {
+                let mid = link.mid.trim();
+                (!mid.is_empty()).then(|| LinkTarget {
+                    streamer_id: link.streamer_id,
+                    platform: link.platform,
+                    mid: mid.to_owned(),
                 })
-                .transpose()?;
+            });
+            let numeric_entity_id = entity_id.parse::<i64>().ok();
+            let mut entity_target = if numeric_entity_id.is_some() {
+                None
+            } else {
+                parse_link_target(entity_id)?
+            };
+            // Older feeds emit `streamerId:mid` even for YouTube. When a
+            // tombstone carries no platform payload, recover the platform from
+            // the mirrored linked account before defaulting to Bilibili.
+            if payload_target.is_none() && entity_id.split(':').count() == 2 {
+                if let Some(target) = entity_target.as_mut() {
+                    if let Some(platform) = sqlx::query_scalar::<_, String>(
+                        "SELECT platform FROM linked_accounts
+                         WHERE streamer_id = ? AND mid = ?",
+                    )
+                    .bind(target.streamer_id)
+                    .bind(&target.mid)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(db_error)?
+                    {
+                        target.platform = Platform::parse(&platform).ok_or_else(|| {
+                            format!("官号平台数据无效: {platform}")
+                        })?;
+                    }
+                }
+            }
             if entity_target
                 .as_ref()
                 .zip(payload_target.as_ref())
@@ -936,7 +972,6 @@ async fn apply_delete(
                     "SYNC_CACHE_INCONSISTENT: link tombstone 身份冲突（entityId {entity_id}）"
                 ));
             }
-            let numeric_entity_id = entity_id.parse::<i64>().ok();
             let mut target = entity_target.or(payload_target);
 
             if let Some(legacy_id) = numeric_entity_id {
@@ -966,16 +1001,15 @@ async fn apply_delete(
                 }
             }
 
-            if target.is_none() {
-                let Some(legacy_id) = numeric_entity_id else {
-                    return Err(format!(
-                        "{entity_type} tombstone 的 entityId 无效: {entity_id}"
-                    ));
-                };
-                return Err(format!(
-                    "SYNC_CACHE_INCONSISTENT: 无法解析旧版官号 tombstone {legacy_id}，需要重建缓存"
-                ));
-            }
+            let target = target.ok_or_else(|| {
+                if let Some(legacy_id) = numeric_entity_id {
+                    format!(
+                        "SYNC_CACHE_INCONSISTENT: 无法解析旧版官号 tombstone {legacy_id}，需要重建缓存"
+                    )
+                } else {
+                    format!("{entity_type} tombstone 的 entityId 无效: {entity_id}")
+                }
+            })?;
 
             let mut cache_ids = vec![entity_id.to_owned()];
             if let Some(legacy_id) = numeric_entity_id {
@@ -984,49 +1018,47 @@ async fn apply_delete(
             if let Some(link_id) = payload_link.as_ref().and_then(|link| link.id) {
                 cache_ids.push(link_id.to_string());
             }
-
-            if let Some((streamer_id, mid)) = target.as_ref() {
-                let legacy_id = sqlx::query_scalar::<_, i64>(
-                    "SELECT legacy_link_id FROM sync_link_id_map
-                     WHERE server_key = ? AND streamer_id = ? AND mid = ?",
-                )
-                .bind(server_key)
-                .bind(*streamer_id)
-                .bind(mid)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(db_error)?;
-                if let Some(legacy_id) = legacy_id {
-                    cache_ids.push(legacy_id.to_string());
-                }
-                cache_ids.push(format!("{streamer_id}:{mid}"));
-
-                sqlx::query("DELETE FROM linked_accounts WHERE streamer_id = ? AND mid = ?")
-                    .bind(*streamer_id)
-                    .bind(mid)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(db_error)?;
-                sqlx::query(
-                    "DELETE FROM sync_link_id_map
-                     WHERE server_key = ? AND streamer_id = ? AND mid = ?",
-                )
-                .bind(server_key)
-                .bind(*streamer_id)
-                .bind(mid)
-                .execute(&mut **tx)
-                .await
-                .map_err(db_error)?;
-            } else if let Some(legacy_id) = numeric_entity_id {
-                sqlx::query(
-                    "DELETE FROM sync_link_id_map WHERE server_key = ? AND legacy_link_id = ?",
-                )
-                .bind(server_key)
-                .bind(legacy_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(db_error)?;
+            let legacy_id = sqlx::query_scalar::<_, i64>(
+                "SELECT legacy_link_id FROM sync_link_id_map
+                 WHERE server_key = ? AND streamer_id = ? AND mid = ?",
+            )
+            .bind(server_key)
+            .bind(target.streamer_id)
+            .bind(&target.mid)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_error)?;
+            if let Some(legacy_id) = legacy_id {
+                cache_ids.push(legacy_id.to_string());
             }
+            cache_ids.push(format!("{}:{}", target.streamer_id, target.mid));
+            cache_ids.push(format!(
+                "{}:{}:{}",
+                target.streamer_id,
+                target.platform.as_str(),
+                target.mid
+            ));
+
+            sqlx::query(
+                "DELETE FROM linked_accounts
+                 WHERE streamer_id = ? AND platform = ? AND mid = ?",
+            )
+            .bind(target.streamer_id)
+            .bind(target.platform.as_str())
+            .bind(&target.mid)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error)?;
+            sqlx::query(
+                "DELETE FROM sync_link_id_map
+                 WHERE server_key = ? AND streamer_id = ? AND mid = ?",
+            )
+            .bind(server_key)
+            .bind(target.streamer_id)
+            .bind(&target.mid)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error)?;
 
             cache_ids.sort();
             cache_ids.dedup();
@@ -1087,7 +1119,7 @@ async fn apply_delete(
         }
         "live_status" => {
             let id = parse_entity_id(entity_id, "live_status")?;
-            sqlx::query("UPDATE streamers SET live_is_live = 0 WHERE id = ?")
+            sqlx::query("UPDATE streamers SET live_is_live = 0, live_video_id = NULL WHERE id = ?")
                 .bind(id)
                 .execute(&mut **tx)
                 .await
@@ -1127,13 +1159,17 @@ async fn apply_subscription(
     let aliases = serde_json::to_string(&value.aliases).map_err(|error| error.to_string())?;
     let created = value.created_at.to_rfc3339();
     sqlx::query(
-        "INSERT INTO streamers(id, mid, name, avatar_url, room_id, live_url,
-            schedule_enabled, live_notify_enabled, live_stats_enabled, fans, aliases_json,
-            last_error, last_refresh_at, live_is_live, live_title, live_cover,
-            live_started_at, live_checked_at, sort_order, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO streamers(id, platform, mid, name, avatar_url, handle, profile_url,
+            uploads_playlist_id, room_id, live_url, schedule_enabled, live_notify_enabled,
+            live_stats_enabled, fans, aliases_json, last_error, last_refresh_at,
+            live_is_live, live_title, live_cover, live_video_id, live_started_at,
+            live_checked_at, sort_order, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-            mid = excluded.mid, name = excluded.name, avatar_url = excluded.avatar_url,
+            platform = excluded.platform, mid = excluded.mid, name = excluded.name,
+            avatar_url = excluded.avatar_url, handle = excluded.handle,
+            profile_url = excluded.profile_url,
+            uploads_playlist_id = excluded.uploads_playlist_id,
             room_id = excluded.room_id, live_url = excluded.live_url,
             schedule_enabled = excluded.schedule_enabled,
             live_notify_enabled = excluded.live_notify_enabled,
@@ -1142,14 +1178,19 @@ async fn apply_subscription(
             aliases_json = excluded.aliases_json, last_error = excluded.last_error,
             last_refresh_at = excluded.last_refresh_at, live_is_live = excluded.live_is_live,
             live_title = excluded.live_title, live_cover = excluded.live_cover,
+            live_video_id = excluded.live_video_id,
             live_started_at = excluded.live_started_at,
             live_checked_at = excluded.live_checked_at,
             sort_order = excluded.sort_order, updated_at = excluded.updated_at",
     )
     .bind(value.id)
+    .bind(value.platform.as_str())
     .bind(&value.mid)
     .bind(&value.name)
     .bind(&value.avatar_url)
+    .bind(&value.handle)
+    .bind(&value.profile_url)
+    .bind(&value.uploads_playlist_id)
     .bind(&value.room_id)
     .bind(&value.live_url)
     .bind(value.schedule_enabled)
@@ -1162,6 +1203,7 @@ async fn apply_subscription(
     .bind(value.is_live)
     .bind(&value.live_title)
     .bind(&value.live_cover)
+    .bind(&value.live_video_id)
     .bind(value.live_started_at.map(|time| time.to_rfc3339()))
     .bind(value.live_checked_at.map(|time| time.to_rfc3339()))
     .bind(value.sort_order)
@@ -1182,9 +1224,12 @@ async fn apply_subscription(
             tx,
             server_key,
             value.id,
+            link.platform,
             &link.mid,
             &link.name,
             &link.avatar_url,
+            link.handle.as_deref(),
+            link.profile_url.as_deref(),
             Some(link.id).filter(|id| *id > 0),
             link.revision,
             link.created_at.to_rfc3339(),
@@ -1209,9 +1254,12 @@ async fn apply_link(
         tx,
         server_key,
         value.streamer_id,
+        value.platform,
         &value.mid,
         &value.name,
         &value.avatar_url,
+        value.handle.as_deref(),
+        value.profile_url.as_deref(),
         value.id.filter(|id| *id > 0),
         value.revision,
         created,
@@ -1224,9 +1272,12 @@ async fn upsert_linked_account(
     tx: &mut Transaction<'_, Sqlite>,
     server_key: &str,
     streamer_id: i64,
+    platform: Platform,
     mid: &str,
     name: &str,
     avatar_url: &str,
+    handle: Option<&str>,
+    profile_url: Option<&str>,
     legacy_link_id: Option<i64>,
     revision: i64,
     created_at: String,
@@ -1276,17 +1327,24 @@ async fn upsert_linked_account(
     // legacy link ID. The compatibility map is the only source of truth for
     // resolving old numeric tombstones.
     sqlx::query(
-        "INSERT INTO linked_accounts(streamer_id, mid, name, avatar_url, created_at, revision)
-         VALUES(?, ?, ?, ?, ?, ?)
+        "INSERT INTO linked_accounts
+            (streamer_id, platform, mid, name, avatar_url, handle, profile_url, created_at, revision)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(streamer_id, mid) DO UPDATE SET
+            platform = excluded.platform,
             name = excluded.name,
             avatar_url = excluded.avatar_url,
+            handle = COALESCE(excluded.handle, linked_accounts.handle),
+            profile_url = COALESCE(excluded.profile_url, linked_accounts.profile_url),
             revision = MAX(linked_accounts.revision, excluded.revision)",
     )
     .bind(streamer_id)
+    .bind(platform.as_str())
     .bind(mid)
     .bind(name)
     .bind(avatar_url)
+    .bind(handle)
+    .bind(profile_url)
     .bind(created_at)
     .bind(revision.max(1))
     .execute(&mut **tx)
@@ -1303,21 +1361,52 @@ async fn upsert_linked_account(
     stale_ids.sort_unstable();
     stale_ids.dedup();
     for legacy_id in stale_ids {
-        // The stable `streamerId:mid` cache entry is written by apply_upsert;
+        // The platform-aware stable cache entry is written by apply_upsert;
         // numeric aliases from older clients must not survive an upsert.
         remove_cached_link_aliases(tx, server_key, &legacy_id.to_string()).await?;
     }
     Ok(())
 }
 
+fn parse_link_target(entity_id: &str) -> Result<Option<LinkTarget>, String> {
+    let mut parts = entity_id.splitn(3, ':');
+    let Some(streamer_id) = parts.next().filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(second) = parts.next().filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let streamer_id = streamer_id
+        .parse::<i64>()
+        .map_err(|_| "link tombstone 的 streamerId 无效".to_owned())?;
+    if let Some(mid) = parts.next().filter(|value| !value.trim().is_empty()) {
+        let platform = Platform::parse(second).ok_or_else(|| {
+            format!("link tombstone 的 platform 无效: {}", second.trim())
+        })?;
+        return Ok(Some(LinkTarget {
+            streamer_id,
+            platform,
+            mid: mid.trim().to_owned(),
+        }));
+    }
+    Ok(Some(LinkTarget {
+        streamer_id,
+        platform: Platform::Bilibili,
+        mid: second.trim().to_owned(),
+    }))
+}
+
 async fn resolve_legacy_link_target(
     tx: &mut Transaction<'_, Sqlite>,
     server_key: &str,
     legacy_id: i64,
-) -> Result<Option<(i64, String)>, String> {
-    if let Some(target) = sqlx::query_as::<_, (i64, String)>(
-        "SELECT streamer_id, mid FROM sync_link_id_map
-         WHERE server_key = ? AND legacy_link_id = ?",
+) -> Result<Option<LinkTarget>, String> {
+    if let Some((streamer_id, platform, mid)) = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT m.streamer_id, COALESCE(l.platform, 'bilibili'), m.mid
+         FROM sync_link_id_map m
+         LEFT JOIN linked_accounts l
+           ON l.streamer_id = m.streamer_id AND l.mid = m.mid
+         WHERE m.server_key = ? AND m.legacy_link_id = ?",
     )
     .bind(server_key)
     .bind(legacy_id)
@@ -1325,7 +1414,13 @@ async fn resolve_legacy_link_target(
     .await
     .map_err(db_error)?
     {
-        return Ok(Some(target));
+        let platform = Platform::parse(&platform)
+            .ok_or_else(|| format!("旧版官号映射的 platform 无效: {platform}"))?;
+        return Ok(Some(LinkTarget {
+            streamer_id,
+            platform,
+            mid,
+        }));
     }
 
     // Compatibility for caches written before sync_link_id_map existed.
@@ -1350,7 +1445,11 @@ async fn resolve_legacy_link_target(
         if link.id != Some(legacy_id) {
             continue;
         }
-        let candidate = (link.streamer_id, link.mid);
+        let candidate = LinkTarget {
+            streamer_id: link.streamer_id,
+            platform: link.platform,
+            mid: link.mid.trim().to_owned(),
+        };
         if cached_target
             .as_ref()
             .is_some_and(|existing| existing != &candidate)
@@ -1607,11 +1706,12 @@ async fn apply_schedule_source(
         .map_err(db_error)?;
         sqlx::query(
             "INSERT INTO schedule_sources
-                (id, schedule_id, source_kind, source_post_id, source_image_url,
+                (id, schedule_id, platform, source_kind, source_post_id, source_image_url,
                  source_fingerprint, source_identity, confidence, created_at, revision)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 schedule_id = excluded.schedule_id,
+                platform = excluded.platform,
                 source_kind = excluded.source_kind,
                 source_post_id = excluded.source_post_id,
                 source_image_url = excluded.source_image_url,
@@ -1622,6 +1722,7 @@ async fn apply_schedule_source(
         )
         .bind(id)
         .bind(value.schedule_id)
+        .bind(value.platform.as_str())
         .bind(&value.source_kind)
         .bind(&value.source_post_id)
         .bind(&value.source_image_url)
@@ -1635,10 +1736,11 @@ async fn apply_schedule_source(
         .map_err(db_error)?;
     } else {
         sqlx::query(
-            "INSERT INTO schedule_sources(schedule_id, source_kind, source_post_id,
+            "INSERT INTO schedule_sources(schedule_id, platform, source_kind, source_post_id,
                 source_image_url, source_fingerprint, source_identity, confidence, created_at, revision)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
+                platform = excluded.platform,
                 source_kind = excluded.source_kind, source_post_id = excluded.source_post_id,
                 source_image_url = excluded.source_image_url,
                 source_fingerprint = excluded.source_fingerprint,
@@ -1646,6 +1748,7 @@ async fn apply_schedule_source(
                 revision = excluded.revision",
         )
         .bind(value.schedule_id)
+        .bind(value.platform.as_str())
         .bind(&value.source_kind)
         .bind(&value.source_post_id)
         .bind(&value.source_image_url)
@@ -1668,16 +1771,18 @@ async fn apply_source_suppression(
     let value = serde_json::from_value::<SourceSuppression>(payload.clone())
         .map_err(|error| format!("source_suppression payload 无效: {error}"))?;
     sqlx::query(
-        "INSERT INTO source_suppressions(id, streamer_id, source_post_id,
+        "INSERT INTO source_suppressions(id, streamer_id, platform, source_post_id,
             source_fingerprint, created_at)
-         VALUES(?, ?, ?, ?, ?)
+         VALUES(?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id,
+            platform = excluded.platform,
             source_post_id = excluded.source_post_id,
             source_fingerprint = excluded.source_fingerprint",
     )
     .bind(value.id)
     .bind(value.streamer_id)
+    .bind(value.platform.as_str())
     .bind(&value.source_post_id)
     .bind(&value.source_fingerprint)
     .bind(value.created_at.to_rfc3339())
@@ -1695,13 +1800,15 @@ async fn apply_live_status(
         .map_err(|error| format!("live_status payload 无效: {error}"))?;
     sqlx::query(
         "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
-            live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?, live_schedule_known = ?
+            live_url = ?, live_video_id = ?, live_started_at = ?, live_checked_at = ?,
+            live_schedule_id = ?, live_schedule_known = ?
          WHERE id = ?",
     )
     .bind(value.is_live)
     .bind(&value.title)
     .bind(&value.cover_url)
     .bind(&value.live_url)
+    .bind(&value.live_video_id)
     .bind(value.started_at.map(|time| time.to_rfc3339()))
     .bind(value.checked_at.to_rfc3339())
     .bind(value.schedule_id)
@@ -1724,9 +1831,9 @@ async fn apply_live_session(
             started_at, ended_at, duration_seconds, peak_online, peak_high_energy, avg_online,
             online_samples, online_total, revenue_cents, gift_revenue_cents, super_chat_revenue_cents,
             guard_revenue_cents, paid_user_count, interactive_user_count, danmaku_count,
-            gift_count, super_chat_count, guard_count, reconnect_count, segment_count, data_quality,
-            collector_state, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            gift_count, super_chat_count, guard_count, membership_count, youtube_stats_available,
+            reconnect_count, segment_count, data_quality, collector_state, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             streamer_id = excluded.streamer_id, streamer_name = excluded.streamer_name,
             room_id = excluded.room_id, title = excluded.title,
@@ -1744,6 +1851,8 @@ async fn apply_live_session(
             danmaku_count = excluded.danmaku_count, gift_count = excluded.gift_count,
             super_chat_count = excluded.super_chat_count,
             guard_count = excluded.guard_count,
+            membership_count = excluded.membership_count,
+            youtube_stats_available = excluded.youtube_stats_available,
             reconnect_count = excluded.reconnect_count,
             segment_count = excluded.segment_count,
             data_quality = excluded.data_quality,
@@ -1773,6 +1882,8 @@ async fn apply_live_session(
     .bind(value.gift_count)
     .bind(value.super_chat_count)
     .bind(value.guard_count)
+    .bind(value.membership_count)
+    .bind(value.youtube_stats_available.map(|value| if value { 1_i64 } else { 0_i64 }))
     .bind(value.reconnect_count)
     .bind(value.segment_count as i64)
     .bind(&value.data_quality)
@@ -1804,6 +1915,7 @@ async fn apply_server_settings(
         ("dynamicPollSeconds", "dynamic_poll_seconds"),
         ("autoAnalyzeImages", "auto_analyze_images"),
         ("liveStatsEnabled", "live_stats_enabled"),
+        ("youtubeEnabled", "youtube_enabled"),
         ("fertilityEnabled", "fertility_enabled"),
         ("llmBaseUrl", "llm_base_url"),
         ("llmModel", "llm_model"),
@@ -1869,11 +1981,26 @@ async fn upsert_cache(
 
 fn entity_id_from_payload(entity_type: &str, payload: &Value) -> Result<String, String> {
     let value = match entity_type {
-        "link" | "linked_account" => payload
-            .get("streamerId")
-            .and_then(Value::as_i64)
-            .zip(payload.get("mid").and_then(Value::as_str))
-            .map(|(streamer_id, mid)| format!("{streamer_id}:{mid}")),
+        "link" | "linked_account" => {
+            let streamer_id = payload.get("streamerId").and_then(Value::as_i64);
+            let mid = payload.get("mid").and_then(Value::as_str);
+            let platform = match payload.get("platform").and_then(Value::as_str) {
+                Some(value) => Some(Platform::parse(value).ok_or_else(|| {
+                    format!("{entity_type} payload 的 platform 无效: {value}")
+                })?),
+                None => Some(Platform::Bilibili),
+            };
+            streamer_id
+                .zip(mid)
+                .zip(platform)
+                .map(|((streamer_id, mid), platform)| {
+                    if platform == Platform::Bilibili {
+                        format!("{streamer_id}:{mid}")
+                    } else {
+                        format!("{streamer_id}:{}:{mid}", platform.as_str())
+                    }
+                })
+        }
         "live_status" => payload
             .get("streamerId")
             .and_then(Value::as_i64)
@@ -3176,6 +3303,8 @@ mod tests {
         let owner = source.add_subscription(&input).await.unwrap();
         let now = Utc::now();
         let snapshot = oshical_core::models::LiveSnapshot {
+            platform: Platform::Bilibili,
+            live_video_id: None,
             is_live: true,
             title: "无预告直播".into(),
             cover_url: None,
@@ -3230,5 +3359,91 @@ mod tests {
             None
         );
         assert!(mirror.get_schedule(schedule_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn youtube_live_session_stats_survive_bootstrap_and_incremental_sync() {
+        let source = SqliteStore::in_memory().await.unwrap();
+        let input: oshical_core::models::AddSubscription = serde_json::from_value(json!({
+            "platform": "youtube",
+            "mid": "UC-sync-roundtrip",
+            "name": "YouTube 同步测试",
+            "liveStatsEnabled": true
+        }))
+        .unwrap();
+        let streamer = source.add_subscription(&input).await.unwrap();
+        let started_at = Utc::now() - chrono::Duration::minutes(5);
+        let session = source
+            .ensure_youtube_live_session(
+                streamer.id,
+                "video-sync-roundtrip",
+                &streamer.name,
+                "同步直播",
+                None,
+                started_at,
+                started_at,
+            )
+            .await
+            .unwrap();
+        source
+            .update_youtube_live_metrics(
+                session.id,
+                1200,
+                900,
+                3,
+                2400,
+                300,
+                Some(12),
+                Some(2),
+                Some(7),
+                Some(2),
+                Some(4),
+                true,
+                "partial",
+                "active",
+            )
+            .await
+            .unwrap();
+
+        let bootstrap = source.sync_bootstrap().await.unwrap();
+        let cursor = bootstrap.snapshot_revision;
+        let bootstrap: SyncBootstrap =
+            serde_json::from_value(serde_json::to_value(bootstrap).unwrap()).unwrap();
+        let mirror = store().await;
+        apply_bootstrap(&mirror, "https://youtube-sync.example.com", &bootstrap)
+            .await
+            .unwrap();
+        let bootstrapped = mirror.get_live_session(session.id).await.unwrap();
+        assert_eq!(bootstrapped.membership_count, Some(7));
+        assert_eq!(bootstrapped.youtube_stats_available, Some(true));
+
+        source
+            .update_youtube_live_metrics(
+                session.id,
+                1500,
+                1000,
+                4,
+                3000,
+                420,
+                Some(18),
+                Some(3),
+                Some(9),
+                Some(3),
+                Some(6),
+                false,
+                "partial",
+                "active",
+            )
+            .await
+            .unwrap();
+        let changes = source.sync_changes_after(cursor, 200).await.unwrap();
+        let batch: SyncBatch =
+            serde_json::from_value(serde_json::to_value(changes).unwrap()).unwrap();
+        apply_batch(&mirror, "https://youtube-sync.example.com", &batch)
+            .await
+            .unwrap();
+        let updated = mirror.get_live_session(session.id).await.unwrap();
+        assert_eq!(updated.membership_count, Some(9));
+        assert_eq!(updated.youtube_stats_available, Some(false));
     }
 }

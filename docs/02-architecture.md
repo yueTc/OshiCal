@@ -90,7 +90,7 @@ crates/core
 
 ### live_online_samples
 
-服务端自 0.3.30-beta.5 起将人数采样独立存表：id、session_id、sampled_at、observed_at、high_energy_count、collector_state。约每 30 秒保存窗口内最新公开高能用户数；没有新观测或断线时为空，不是全体观众真实同接。人数下降和零值有效，旧场次不回填。随场次保留，外键级联删除；不把完整历史嵌入 sync_changes。鉴权分页接口：GET /api/live-sessions/{id}/online-samples?afterId=0&limit=500，最多每页 1000 条，metric=bilibili_high_energy_users。现有客户端不会自动缓存该表。
+服务端自 0.3.30-beta.5 起将人数采样独立存表：id、session_id、sampled_at、observed_at、high_energy_count、collector_state。`high_energy_count` 是平台无关的采样值列，按场次平台解释；约每 30 秒保存窗口内最新公开观测，没有新观测或断线时为空。人数下降和零值有效，旧场次不回填。随场次保留，外键级联删除；不把完整历史嵌入 sync_changes。鉴权分页接口：GET /api/live-sessions/{id}/online-samples?afterId=0&limit=500，最多每页 1000 条；metric 由场次平台决定，B 站为 `bilibili_high_energy_users`（高能用户数），YouTube 为 `youtube_concurrent_viewers`（公开 concurrentViewers 同时观看人数，不是累计观看次数）。YouTube OAuth 或会员事件采集不可用时，会员数、Super Chat 和互动统计以 `statsAvailable=false`/空值表示，不能伪造成 0；公开观看人数采样仍可独立有效。现有客户端不会自动缓存该表。
 
 同步历史默认每小时检查，启动后约 60 秒首轮；保留近 7 天、最新 10000 条及 20 MiB JSON 内容，哪个限制先到即删除连续旧前缀，并在同一事务推进最早有效游标。长期离线客户端通过 resetRequired 重拉当前快照。容量不含索引、空闲页或 WAL，检查之间可短暂超限；不自动 VACUUM。
 ### linked_accounts
@@ -350,4 +350,3 @@ crates/core
 - 通知点击只允许打开 `https://live.bilibili.com/` 地址。
 - 官号不进入开播监控集合。
 - 第一版不实现日程开始前提醒。
-

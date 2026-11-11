@@ -10,14 +10,19 @@ use oshical_core::{
 };
 use tokio::sync::broadcast;
 
-use crate::api::{build_router, persist_changed_settings, AppState};
+use crate::api::{build_router, persist_changed_settings, sync_runtime_secrets_from_vault, AppState};
 use crate::config::ServerConfig;
 use crate::jobs::RefreshJobManager;
 use crate::secrets::{
-    load_persisted_bili_secret, load_persisted_llm_secret, seed_llm_secret_from_env, SecretVault,
+    load_persisted_bili_secret, load_persisted_llm_secret, load_persisted_youtube_api_key,
+    load_persisted_youtube_oauth, load_persisted_youtube_web_session, seed_llm_secret_from_env,
+    seed_youtube_web_session_from_env, SecretVault,
 };
 use crate::sync_api;
 use crate::update_manager::ServerUpdateManager;
+use crate::youtube_oauth::{
+    init_youtube_runtime, youtube_feature_enabled, youtube_runtime,
+};
 
 // Retention bounds are checked hourly, so growth between checks is expected.
 const SYNC_RETENTION_DAYS: i64 = 7;
@@ -26,6 +31,7 @@ const SYNC_RETENTION_PAYLOAD_BYTES: i64 = 20 * 1024 * 1024;
 const SYNC_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub async fn run_server(config: ServerConfig) -> Result<(), String> {
+    let youtube_config = config.youtube.clone();
     let store = SqliteStore::connect(&config.database_path)
         .await
         .map_err(|error| format!("打开数据库失败: {error}"))?;
@@ -55,6 +61,72 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         .await
         .map_err(|error| format!("保存服务端设置失败: {error}"))?;
     let secret_vault = SecretVault::from_env(config.api_token.as_deref(), &config.database_path);
+    // YouTube API Keys are user-scoped credentials. Never seed or inherit the
+    // server's API Key from process configuration; only SecretVault may provide it.
+    match seed_youtube_web_session_from_env(
+        &store,
+        &secret_vault,
+        youtube_config.web_session_cookie.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => tracing::info!("已从环境变量写入 YouTube 网页会话"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "写入环境变量 YouTube 网页会话失败"),
+    }
+    init_youtube_runtime(youtube_config)?;
+    // YouTube 凭据只能来自 SecretVault；这里统一解密一次，确认已保存的配置
+    // 可在启动后按需使用，同时只记录是否配置，不输出任何明文。
+    let persisted_youtube_api_key =
+        match load_persisted_youtube_api_key(&store, &secret_vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "读取服务端 YouTube API Key 失败");
+                None
+            }
+        };
+    let mut persisted_youtube_oauth =
+        match load_persisted_youtube_oauth(&store, &secret_vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "读取服务端 YouTube OAuth 凭据失败");
+                None
+            }
+        };
+    if settings.youtube_enabled && persisted_youtube_oauth.is_some() {
+        match youtube_runtime()
+            .refresh_oauth_if_needed(&store, &secret_vault)
+            .await
+        {
+            Ok(_) => {
+                if let Ok(Some(refreshed)) =
+                    load_persisted_youtube_oauth(&store, &secret_vault).await
+                {
+                    persisted_youtube_oauth = Some(refreshed);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(code = error.code, "启动时刷新 YouTube OAuth 凭据失败");
+            }
+        }
+    }
+    let persisted_youtube_web_session =
+        match load_persisted_youtube_web_session(&store, &secret_vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "读取服务端 YouTube 网页会话失败");
+                None
+            }
+        };
+    let youtube_api_key_configured = persisted_youtube_api_key.is_some();
+    let youtube_oauth_configured = persisted_youtube_oauth.is_some();
+    let youtube_web_session_configured = persisted_youtube_web_session.is_some();
+    tracing::info!(
+        api_key = youtube_api_key_configured,
+        oauth = youtube_oauth_configured,
+        web_session = youtube_web_session_configured,
+        "YouTube 凭据状态已从 SecretVault 加载"
+    );
     // 先把环境变量里的密钥写进 vault，再搬走 config.secrets。
     match seed_llm_secret_from_env(
         &store,
@@ -69,6 +141,19 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         Err(error) => tracing::warn!(%error, "写入环境变量模型密钥失败"),
     }
     let mut runtime_secrets = config.secrets;
+    // Enforce the user-configured boundary even for programmatically built configs.
+    runtime_secrets.youtube_api_key = None;
+    if let Some(persisted) = persisted_youtube_api_key {
+        runtime_secrets.youtube_api_key = Some(persisted.api_key);
+    }
+    if let Some(persisted) = persisted_youtube_oauth {
+        if let Some(access_token) = persisted.token.access_token {
+            runtime_secrets.youtube_oauth_access_token = Some(access_token);
+        }
+    }
+    if let Some(persisted) = persisted_youtube_web_session {
+        runtime_secrets.youtube_web_cookie = Some(persisted.cookie);
+    }
     let mut persisted_llm_binding = None;
     if let Some(persisted) = load_persisted_llm_secret(&store, &secret_vault)
         .await
@@ -219,6 +304,47 @@ pub fn spawn_background_tasks(state: AppState) {
                         }
                         Ok(None) => {}
                         Err(error) => tracing::warn!(%error, "LAPLACE 生理期数据采集失败"),
+                    }
+                }
+            },
+        )
+        .await;
+    });
+
+    let youtube_oauth_state = state.clone();
+    tokio::spawn(async move {
+        run_poll_loop(
+            || async { Duration::from_secs(300) },
+            move |_| {
+                let service = youtube_oauth_state.service.clone();
+                async move {
+                    match youtube_feature_enabled(service.store()).await {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(error) => {
+                            tracing::warn!(%error, "读取 YouTube 功能开关失败");
+                            return;
+                        }
+                    }
+                    let runtime = youtube_runtime();
+                    if !runtime.oauth_configured() {
+                        return;
+                    }
+                    match runtime
+                        .refresh_oauth_if_needed(service.store(), &youtube_oauth_state.secret_vault)
+                        .await
+                    {
+                        Ok(true) => {
+                            if let Err(error) =
+                                sync_runtime_secrets_from_vault(&youtube_oauth_state).await
+                            {
+                                tracing::warn!(%error, "YouTube OAuth 刷新后同步运行时凭据失败");
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(code = error.code, "YouTube OAuth 后台刷新失败");
+                        }
                     }
                 }
             },

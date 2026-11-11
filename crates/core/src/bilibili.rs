@@ -15,7 +15,7 @@ use url::form_urlencoded::Serializer;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     reserve_room_id_from_url, AccountSearchResult, DynamicPost, LiveRoomOwner, LiveSnapshot,
-    ReserveCard,
+    Platform, ReserveCard,
 };
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
@@ -531,6 +531,7 @@ impl BilibiliClient {
                     .and_then(value_to_string)
                     .filter(|value| value != "0");
                 Some(AccountSearchResult {
+                    platform: Platform::Bilibili,
                     mid,
                     name,
                     avatar_url,
@@ -539,9 +540,12 @@ impl BilibiliClient {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    handle: None,
+                    profile_url: None,
                     room_id,
                     fans: item.get("fans").and_then(Value::as_u64).unwrap_or(0),
                     is_live: item.get("is_live").and_then(Value::as_i64).unwrap_or(0) == 1,
+                    live_url: None,
                 })
             })
             .collect())
@@ -688,13 +692,17 @@ impl BilibiliClient {
             .unwrap_or(0);
         let room_id = self.resolve_room_id(mid).await.ok().flatten();
         Ok(AccountSearchResult {
+            platform: Platform::Bilibili,
             mid: mid.to_owned(),
             name,
             avatar_url,
             sign,
+            handle: None,
+            profile_url: None,
             room_id,
             fans,
             is_live: false,
+            live_url: None,
         })
     }
 
@@ -784,6 +792,7 @@ impl BilibiliClient {
             .filter(|value| !value.is_empty())
             .and_then(normalize_image_url);
         Ok(LiveSnapshot {
+            platform: Platform::Bilibili,
             is_live: live_status == 1,
             title: data
                 .get("title")
@@ -792,6 +801,7 @@ impl BilibiliClient {
                 .to_owned(),
             cover_url: cover,
             live_url: Some(format!("https://live.bilibili.com/{room_id}")),
+            live_video_id: None,
             online: data.get("online").and_then(Value::as_u64).unwrap_or(0),
             started_at,
             checked_at: Utc::now(),

@@ -1,0 +1,75 @@
+{
+  "fixtureVersion": 1,
+  "sourceSchema": {
+    "streamers": [
+      "id",
+      "mid",
+      "name",
+      "avatar_url",
+      "room_id",
+      "live_url",
+      "schedule_enabled",
+      "live_notify_enabled",
+      "live_stats_enabled",
+      "created_at",
+      "updated_at"
+    ],
+    "linkedAccounts": [
+      "id",
+      "streamer_id",
+      "mid",
+      "name",
+      "avatar_url",
+      "created_at"
+    ]
+  },
+  "rows": {
+    "streamers": [
+      {
+        "id": 1,
+        "mid": "10001",
+        "name": "旧版 B 站主播",
+        "avatar_url": "https://i0.hdslb.com/bfs/face/fixture.jpg",
+        "room_id": "20001",
+        "live_url": "https://live.bilibili.com/20001",
+        "schedule_enabled": 1,
+        "live_notify_enabled": 1,
+        "live_stats_enabled": 0,
+        "created_at": "2025-01-02T03:04:05Z",
+        "updated_at": "2025-01-02T03:04:05Z"
+      }
+    ],
+    "linkedAccounts": [
+      {
+        "id": 1,
+        "streamer_id": 1,
+        "mid": "10002",
+        "name": "旧版关联账号",
+        "avatar_url": "https://i0.hdslb.com/bfs/face/linked.jpg",
+        "created_at": "2025-01-02T03:04:05Z"
+      }
+    ]
+  },
+  "expected": {
+    "streamers": [
+      {
+        "id": 1,
+        "mid": "10001",
+        "platform": "bilibili",
+        "handle": null,
+        "profile_url": null,
+        "uploads_playlist_id": null
+      }
+    ],
+    "linkedAccounts": [
+      {
+        "id": 1,
+        "streamer_id": 1,
+        "mid": "10002",
+        "platform": "bilibili",
+        "handle": null,
+        "profile_url": null
+      }
+    ]
+  }
+}

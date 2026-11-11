@@ -23,8 +23,9 @@ use crate::llm::{
 };
 use crate::models::{
     AddSubscription, DynamicPost, FanHistory, FanRefreshReport, FertilitySnapshot, FertilityStatus,
-    LiveStatus, NewSchedule, NewWeeklyScheduleRule, RefreshProgress, RefreshReport, Schedule,
-    Streamer, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    LiveStatus, LiveSnapshot, NewSchedule, NewWeeklyScheduleRule, Platform, RefreshProgress,
+    RefreshReport, Schedule, Streamer, UpdateSchedule, UpdateSubscription,
+    UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
 use crate::refresh_coordinator::{ProgressSink, RefreshCoordinator, RefreshScope};
@@ -32,6 +33,11 @@ use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedul
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::{FertilityCache, SqliteStore};
 use crate::timing::{measure, PhaseTimer};
+use crate::youtube::{YouTubeChannel, YouTubeClient, YouTubeCommunityPost, YouTubeVideo};
+
+#[path = "youtube_stats.rs"]
+mod youtube_stats;
+use youtube_stats::YouTubeStatsManager;
 
 const A_SOUL_OFFICIAL_MID: &str = "703007996";
 const A_SOUL_MEMBER_MIDS: &[&str] = &["672342685", "672328094", "672353429"];
@@ -53,6 +59,45 @@ const FAN_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 const SOURCE_FETCH_START_INTERVAL_MS: u64 = 70;
 /// 「立即刷新」最多等待的秒数：超过就回落到缓存，避免界面长时间停在「读取中」。
 const FERTILITY_FORCE_REFRESH_TIMEOUT_SECONDS: u64 = 15;
+/// In-flight YouTube requests poll the global switch at this interval. When the
+/// switch turns off, dropping the request future prevents encapsulated paging
+/// from starting another upstream call.
+const YOUTUBE_SWITCH_RECHECK_INTERVAL_MS: u64 = 250;
+
+async fn youtube_requests_enabled(store: &SqliteStore) -> bool {
+    load_settings(store)
+        .await
+        .map(|settings| settings.youtube_enabled)
+        .unwrap_or(false)
+}
+
+async fn wait_for_youtube_disabled(store: &SqliteStore) {
+    loop {
+        if !youtube_requests_enabled(store).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            YOUTUBE_SWITCH_RECHECK_INTERVAL_MS,
+        ))
+        .await;
+    }
+}
+
+/// Runs one potentially paginated YouTube operation while watching the global
+/// switch. `None` means the switch was disabled (or could not be read) and the
+/// operation was cancelled before it could continue.
+async fn run_youtube_request<T>(
+    store: &SqliteStore,
+    request: impl std::future::Future<Output = AppResult<T>>,
+) -> Option<AppResult<T>> {
+    tokio::select! {
+        // Read the switch before polling the request. If it is already off,
+        // the request future is dropped without ever starting its first API call.
+        biased;
+        _ = wait_for_youtube_disabled(store) => None,
+        result = request => Some(result),
+    }
+}
 
 /// LAPLACE 抓取单飞标记：同一进程内只允许一个抓取在跑，避免重复请求把上游刷成风控。
 static FERTILITY_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -84,6 +129,7 @@ pub struct PreparedRefresh {
     scope: RefreshScope,
     streamer_id: Option<i64>,
     bili: Arc<BilibiliClient>,
+    youtube: Arc<YouTubeClient>,
     llm: Arc<dyn ContentAnalyzer>,
     request_key: String,
 }
@@ -98,11 +144,13 @@ impl PreparedRefresh {
 pub struct AppService {
     store: SqliteStore,
     bili: Arc<StdRwLock<Arc<BilibiliClient>>>,
+    youtube: Arc<StdRwLock<Arc<YouTubeClient>>>,
     llm: Arc<StdRwLock<Arc<dyn ContentAnalyzer>>>,
     fertility: Arc<StdRwLock<Arc<FertilityClient>>>,
     secrets: Arc<RwLock<RuntimeSecrets>>,
     llm_key_binding: Arc<RwLock<Option<(String, String)>>>,
     live_stats: LiveStatsManager,
+    youtube_stats: YouTubeStatsManager,
     refresh_lock: Arc<Mutex<()>>,
     refresh_coordinator: RefreshCoordinator,
     // Protect the cross-streamer find/merge/insert sequence for joint streams.
@@ -125,10 +173,13 @@ impl AppService {
             secrets.bili_cookie.clone(),
             proxy_port,
         )?);
+        let youtube =
+            Arc::new(YouTubeClient::new_optional(secrets.youtube_api_key.clone(), proxy_port)?);
         let llm = Arc::new(LlmClient::new_with_proxy(proxy_port)?);
         Ok(Self {
             store,
             bili: Arc::new(StdRwLock::new(bili)),
+            youtube: Arc::new(StdRwLock::new(youtube)),
             llm: Arc::new(StdRwLock::new(llm)),
             fertility: Arc::new(StdRwLock::new(Arc::new(FertilityClient::new_with_proxy(
                 proxy_port,
@@ -136,6 +187,7 @@ impl AppService {
             secrets: Arc::new(RwLock::new(secrets)),
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
+            youtube_stats: YouTubeStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
             refresh_coordinator: RefreshCoordinator::default(),
             auto_schedule_write_lock: Arc::new(Mutex::new(())),
@@ -149,14 +201,20 @@ impl AppService {
         analyzer: Arc<dyn ContentAnalyzer>,
     ) -> AppResult<Self> {
         let bili = Arc::new(BilibiliClient::new(secrets.bili_cookie.clone())?);
+        let youtube = Arc::new(YouTubeClient::new_optional(
+            secrets.youtube_api_key.clone(),
+            None,
+        )?);
         Ok(Self {
             store,
             bili: Arc::new(StdRwLock::new(bili)),
+            youtube: Arc::new(StdRwLock::new(youtube)),
             llm: Arc::new(StdRwLock::new(analyzer)),
             fertility: Arc::new(StdRwLock::new(Arc::new(FertilityClient::new()?))),
             secrets: Arc::new(RwLock::new(secrets)),
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
+            youtube_stats: YouTubeStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
             refresh_coordinator: RefreshCoordinator::default(),
             auto_schedule_write_lock: Arc::new(Mutex::new(())),
@@ -170,6 +228,13 @@ impl AppService {
 
     fn bili_client(&self) -> Arc<BilibiliClient> {
         self.bili
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn youtube_client(&self) -> Arc<YouTubeClient> {
+        self.youtube
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -190,14 +255,25 @@ impl AppService {
     }
 
     pub async fn update_proxy_port(&self, proxy_port: Option<u16>) -> AppResult<()> {
-        let bili_cookie = self.secrets.read().await.bili_cookie.clone();
-        let bili = Arc::new(BilibiliClient::new_with_proxy(bili_cookie, proxy_port)?);
+        let secrets = self.secrets.read().await.clone();
+        let bili = Arc::new(BilibiliClient::new_with_proxy(
+            secrets.bili_cookie,
+            proxy_port,
+        )?);
+        let youtube = Arc::new(YouTubeClient::new_optional(
+            secrets.youtube_api_key,
+            proxy_port,
+        )?);
         let llm: Arc<dyn ContentAnalyzer> = Arc::new(LlmClient::new_with_proxy(proxy_port)?);
         let fertility = Arc::new(FertilityClient::new_with_proxy(proxy_port)?);
         *self
             .bili
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = bili;
+        *self
+            .youtube
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = youtube;
         *self
             .llm
             .write()
@@ -239,7 +315,10 @@ impl AppService {
     async fn backfill_avatar_captures(&self, streamers: &[Streamer]) {
         let mut seen = HashSet::new();
         for streamer in streamers {
-            if !seen.insert(streamer.id) || streamer.avatar_url.starts_with("data:image/") {
+            if streamer.platform != Platform::Bilibili
+                || !seen.insert(streamer.id)
+                || streamer.avatar_url.starts_with("data:image/")
+            {
                 continue;
             }
             let Some(avatar) = self.capture_avatar_data(&streamer.avatar_url).await else {
@@ -260,7 +339,25 @@ impl AppService {
         self.bili_client()
             .set_cookie(secrets.bili_cookie.clone())
             .await;
+        self.youtube_client()
+            .set_api_key(secrets.youtube_api_key.clone())
+            .await;
         *self.secrets.write().await = secrets;
+        Ok(())
+    }
+
+    pub async fn youtube_api_key_configured(&self) -> bool {
+        self.youtube_client().api_key_configured().await
+    }
+
+    pub async fn update_youtube_api_key(&self, api_key: Option<String>) -> AppResult<()> {
+        let api_key = api_key
+            .map(|value| value.replace(['\r', '\n'], "").trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self.youtube_client()
+            .set_api_key(api_key.clone())
+            .await;
+        self.secrets.write().await.youtube_api_key = api_key;
         Ok(())
     }
 
@@ -346,22 +443,44 @@ impl AppService {
         &self,
         keyword: &str,
     ) -> AppResult<Vec<crate::models::AccountSearchResult>> {
+        self.search_accounts_by_platform(keyword, Platform::Bilibili)
+            .await
+    }
+
+    pub async fn search_accounts_by_platform(
+        &self,
+        keyword: &str,
+        platform: Platform,
+    ) -> AppResult<Vec<crate::models::AccountSearchResult>> {
+        if platform == Platform::Youtube {
+            self.require_youtube_enabled().await?;
+        }
         let keyword = keyword.trim();
         if keyword.is_empty() || keyword.chars().count() > 100 {
             return Err(crate::error::AppError::validation(
                 "搜索关键词长度必须为 1 到 100 字",
             ));
         }
-        let subscriptions = self.store.list_streamers().await?;
+        let subscriptions: Vec<Streamer> = self
+            .store
+            .list_streamers()
+            .await?
+            .into_iter()
+            .filter(|streamer| streamer.platform == platform)
+            .collect();
         let local_matches: Vec<crate::models::AccountSearchResult> = subscriptions
             .iter()
             .filter(|streamer| search_matches_subscription(keyword, streamer))
             .map(account_from_streamer)
             .collect();
-        let mut results = match self.bili_client().search_accounts(keyword).await {
+        let remote = match platform {
+            Platform::Bilibili => self.bili_client().search_accounts(keyword).await,
+            Platform::Youtube => self.search_youtube_channels(keyword).await,
+        };
+        let mut results = match remote {
             Ok(results) => results,
             Err(error) if !local_matches.is_empty() => {
-                tracing::warn!(%error, "Bilibili account search failed; using local exact matches");
+                tracing::warn!(%error, %platform, "account search failed; using local exact matches");
                 Vec::new()
             }
             Err(error) => return Err(error),
@@ -369,6 +488,34 @@ impl AppService {
         results.extend(local_matches);
         dedupe_and_rank_search_results(&mut results, keyword, &subscriptions);
         Ok(results)
+    }
+
+    async fn search_youtube_channels(
+        &self,
+        keyword: &str,
+    ) -> AppResult<Vec<crate::models::AccountSearchResult>> {
+        let client = self.youtube_client();
+        let channels = match YouTubeClient::parse_account_input(keyword)? {
+            crate::youtube::YouTubeAccountInput::Search(query) => {
+                client.search_channels(&query, 20).await?
+            }
+            _ => vec![client.resolve_channel(keyword).await?],
+        };
+        Ok(channels
+            .into_iter()
+            .map(youtube_account_search_result)
+            .collect())
+    }
+
+    async fn require_youtube_enabled(&self) -> AppResult<()> {
+        if load_settings(&self.store).await?.youtube_enabled {
+            Ok(())
+        } else {
+            Err(AppError::External {
+                code: "YOUTUBE_FEATURE_DISABLED".to_owned(),
+                message: "YouTube 功能未开启".to_owned(),
+            })
+        }
     }
 
     pub async fn create_bili_qr_login(&self) -> AppResult<QrLoginStart> {
@@ -380,6 +527,18 @@ impl AppService {
     }
 
     pub async fn add_subscription(&self, mut input: AddSubscription) -> AppResult<Streamer> {
+        if input.platform == Platform::Youtube {
+            self.require_youtube_enabled().await?;
+            let channel = self.youtube_client().resolve_channel(&input.mid).await?;
+            input.mid = channel.id;
+            input.name = Some(channel.name);
+            input.avatar_url = channel.avatar_url;
+            input.handle = channel.handle;
+            input.profile_url = Some(channel.profile_url);
+            input.uploads_playlist_id = channel.uploads_playlist_id;
+            input.room_id = None;
+            return self.store.add_subscription(&input).await;
+        }
         if input.name.as_deref().unwrap_or_default().trim().is_empty()
             || input
                 .avatar_url
@@ -408,6 +567,38 @@ impl AppService {
         streamer_id: i64,
         mid: &str,
     ) -> AppResult<crate::models::LinkedAccount> {
+        self.add_linked_account_for_platform(streamer_id, Platform::Bilibili, mid)
+            .await
+    }
+
+    pub async fn add_linked_account_for_platform(
+        &self,
+        streamer_id: i64,
+        platform: Platform,
+        mid: &str,
+    ) -> AppResult<crate::models::LinkedAccount> {
+        let parent = self.store.get_streamer(streamer_id).await?;
+        if parent.platform != platform {
+            return Err(AppError::validation(
+                "关联账号必须与主播使用同一平台",
+            ));
+        }
+        if platform == Platform::Youtube {
+            self.require_youtube_enabled().await?;
+            let channel = self.youtube_client().resolve_channel(mid).await?;
+            return self
+                .store
+                .add_linked_account_for_platform(
+                    streamer_id,
+                    Platform::Youtube,
+                    &channel.id,
+                    &channel.name,
+                    channel.avatar_url.as_deref().unwrap_or_default(),
+                    channel.handle.as_deref(),
+                    Some(channel.profile_url.as_str()),
+                )
+                .await;
+        }
         let account = self.bili_client().fetch_account(mid).await?;
         let avatar_url = self
             .capture_avatar_data(&account.avatar_url)
@@ -425,7 +616,15 @@ impl AppService {
     ) -> AppResult<Streamer> {
         let updated = self.store.update_subscription(id, update).await?;
         if update.live_stats_enabled == Some(false) {
-            self.live_stats.stop(id, Utc::now()).await;
+            let now = Utc::now();
+            let open_session = self.store.latest_open_live_session(id).await?;
+            self.live_stats.stop(id, now).await;
+            self.youtube_stats.stop(id, now).await;
+            if updated.platform == Platform::Youtube {
+                if let Some(session) = open_session {
+                    self.store.finish_open_live_session(session.id, now).await?;
+                }
+            }
         }
         Ok(updated)
     }
@@ -435,7 +634,9 @@ impl AppService {
     }
 
     pub async fn delete_subscription(&self, id: i64) -> AppResult<()> {
-        self.live_stats.stop(id, Utc::now()).await;
+        let stopped_at = Utc::now();
+        self.live_stats.stop(id, stopped_at).await;
+        self.youtube_stats.stop(id, stopped_at).await;
         self.store.delete_subscription(id).await?;
         if let Err(error) = self
             .store
@@ -691,7 +892,20 @@ impl AppService {
 
     pub async fn refresh_streamer_fans(&self, streamer_id: i64) -> AppResult<FanHistory> {
         let streamer = self.store.get_streamer(streamer_id).await?;
-        let fans = self.bili_client().fetch_fan_count(&streamer.mid).await?;
+        let fans = match streamer.platform {
+            Platform::Bilibili => self.bili_client().fetch_fan_count(&streamer.mid).await?,
+            Platform::Youtube => {
+                self.require_youtube_enabled().await?;
+                self.youtube_client()
+                    .fetch_channel_metadata(&streamer.mid)
+                    .await?
+                    .subscriber_count
+                    .ok_or_else(|| AppError::External {
+                        code: "YOUTUBE_SUBSCRIBER_COUNT_MISSING".to_owned(),
+                        message: "YouTube 频道未返回订阅者数".to_owned(),
+                    })?
+            }
+        };
         self.store
             .record_fan_snapshot(streamer.id, fans, Utc::now())
             .await?;
@@ -704,9 +918,24 @@ impl AppService {
             refreshed_streamers: 0,
             failed_streamers: Vec::new(),
         };
+        let youtube_enabled = load_settings(&self.store).await?.youtube_enabled;
         let bili = self.bili_client();
+        let youtube = self.youtube_client();
         for (index, streamer) in streamers.iter().enumerate() {
-            match bili.fetch_fan_count(&streamer.mid).await {
+            let fans = match streamer.platform {
+                Platform::Bilibili => bili.fetch_fan_count(&streamer.mid).await,
+                Platform::Youtube if youtube_enabled => youtube
+                    .fetch_channel_metadata(&streamer.mid)
+                    .await
+                    .and_then(|channel| {
+                        channel.subscriber_count.ok_or_else(|| AppError::External {
+                            code: "YOUTUBE_SUBSCRIBER_COUNT_MISSING".to_owned(),
+                            message: "YouTube 频道未返回订阅者数".to_owned(),
+                        })
+                    }),
+                Platform::Youtube => continue,
+            };
+            match fans {
                 Ok(fans) => {
                     match self
                         .store
@@ -968,8 +1197,18 @@ impl AppService {
 
     async fn check_live_all_inner(&self, emit_transitions: bool) -> AppResult<Vec<LiveStatus>> {
         let streamers = self.store.list_streamers().await?;
-        let live_stats_enabled = load_settings(&self.store).await?.live_stats_enabled;
+        let settings = load_settings(&self.store).await?;
+        let live_stats_enabled = settings.live_stats_enabled;
         for (index, streamer) in streamers.iter().enumerate() {
+            if streamer.platform == Platform::Youtube && !settings.youtube_enabled {
+                let now = Utc::now();
+                let open_session = self.store.latest_open_live_session(streamer.id).await?;
+                self.youtube_stats.stop(streamer.id, now).await;
+                if let Some(session) = open_session {
+                    self.store.finish_open_live_session(session.id, now).await?;
+                }
+                continue;
+            }
             let streamer_lock = self.live_check_lock(streamer.id).await;
             let _streamer_guard = streamer_lock.lock().await;
             let stats_enabled = live_stats_enabled && streamer.live_stats_enabled;
@@ -979,6 +1218,7 @@ impl AppService {
                 let disabled_at = Utc::now();
                 let open_session = self.store.latest_open_live_session(streamer.id).await?;
                 self.live_stats.stop(streamer.id, disabled_at).await;
+                self.youtube_stats.stop(streamer.id, disabled_at).await;
                 if let Some(session) = open_session {
                     self.store
                         .finish_open_live_session(session.id, disabled_at)
@@ -988,77 +1228,19 @@ impl AppService {
             if index > 0 && index % 5 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            let room_id = match streamer.room_id.clone() {
-                Some(room_id) => Some(room_id),
-                None => match self.bili_client().resolve_room_id(&streamer.mid).await {
-                    Ok(room_id) => {
-                        if let Some(room_id) = &room_id {
-                            if let Err(error) =
-                                self.store.set_streamer_room(streamer.id, room_id).await
-                            {
-                                tracing::warn!(%error, streamer_id = streamer.id, "save room id failed");
-                            }
-                        }
-                        room_id
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, mid = %streamer.mid, "resolve room id failed");
-                        self.store
-                            .record_streamer_error(streamer.id, &error.to_string())
-                            .await?;
-                        continue;
-                    }
-                },
+            let result = match streamer.platform {
+                Platform::Bilibili => {
+                    self.check_bilibili_live_streamer(streamer, stats_enabled)
+                        .await?
+                }
+                Platform::Youtube => {
+                    self.check_youtube_live_streamer(streamer, stats_enabled)
+                        .await?
+                }
             };
-            let Some(room_id) = room_id else {
+            let Some((previous, snapshot)) = result else {
                 continue;
             };
-            let snapshot = match self.bili_client().fetch_live_status(&room_id).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.store
-                        .record_streamer_error(streamer.id, &error.to_string())
-                        .await?;
-                    continue;
-                }
-            };
-            let previous = self.store.set_live_status(streamer.id, &snapshot).await?;
-            if stats_enabled && snapshot.is_live {
-                let old_session = self.store.latest_open_live_session(streamer.id).await?;
-                match self
-                    .store
-                    .ensure_broadcast_live_session(
-                        streamer.id,
-                        &snapshot.title,
-                        snapshot.cover_url.as_deref(),
-                        snapshot.checked_at,
-                    )
-                    .await
-                {
-                    Ok(session) => {
-                        if let Some(old) = old_session.filter(|old| old.id != session.id) {
-                            self.live_stats.stop(streamer.id, snapshot.checked_at).await;
-                            self.store
-                                .finish_open_live_session(old.id, snapshot.checked_at)
-                                .await?;
-                        }
-                        self.live_stats
-                            .start(self.store.clone(), self.bili_client(), session)
-                            .await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, streamer_id = streamer.id, "创建直播数据场次失败");
-                    }
-                }
-            } else if stats_enabled {
-                let open_session = self.store.latest_open_live_session(streamer.id).await?;
-                self.live_stats.stop(streamer.id, snapshot.checked_at).await;
-                if let Some(session) = open_session {
-                    self.store
-                        .finish_open_live_session(session.id, snapshot.checked_at)
-                        .await?;
-                }
-            }
             if emit_transitions
                 && streamer.live_checked_at.is_some()
                 && previous != snapshot.is_live
@@ -1067,6 +1249,7 @@ impl AppService {
                     .append_event(
                         "live_status",
                         &json!({
+                            "platform": streamer.platform,
                             "streamerId": streamer.id,
                             "mid": streamer.mid,
                             "streamerName": streamer.name,
@@ -1075,6 +1258,7 @@ impl AppService {
                             "title": snapshot.title,
                             "coverUrl": snapshot.cover_url,
                             "liveUrl": snapshot.live_url,
+                            "liveVideoId": snapshot.live_video_id,
                             "online": snapshot.online,
                             "startedAt": snapshot.started_at,
                             "checkedAt": snapshot.checked_at,
@@ -1085,6 +1269,220 @@ impl AppService {
             }
         }
         self.store.list_live_statuses().await
+    }
+
+    async fn check_bilibili_live_streamer(
+        &self,
+        streamer: &Streamer,
+        stats_enabled: bool,
+    ) -> AppResult<Option<(bool, LiveSnapshot)>> {
+        let room_id = match streamer.room_id.clone() {
+            Some(room_id) => Some(room_id),
+            None => match self.bili_client().resolve_room_id(&streamer.mid).await {
+                Ok(room_id) => {
+                    if let Some(room_id) = &room_id {
+                        if let Err(error) = self.store.set_streamer_room(streamer.id, room_id).await {
+                            tracing::warn!(%error, streamer_id = streamer.id, "save room id failed");
+                        }
+                    }
+                    room_id
+                }
+                Err(error) => {
+                    tracing::warn!(%error, mid = %streamer.mid, "resolve room id failed");
+                    self.store
+                        .record_streamer_error(streamer.id, &error.to_string())
+                        .await?;
+                    return Ok(None);
+                }
+            },
+        };
+        let Some(room_id) = room_id else {
+            return Ok(None);
+        };
+        let snapshot = match self.bili_client().fetch_live_status(&room_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.store
+                    .record_streamer_error(streamer.id, &error.to_string())
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let previous = self.store.set_live_status(streamer.id, &snapshot).await?;
+        if stats_enabled && snapshot.is_live {
+            let old_session = self.store.latest_open_live_session(streamer.id).await?;
+            match self
+                .store
+                .ensure_broadcast_live_session(
+                    streamer.id,
+                    &snapshot.title,
+                    snapshot.cover_url.as_deref(),
+                    snapshot.checked_at,
+                )
+                .await
+            {
+                Ok(session) => {
+                    if let Some(old) = old_session.filter(|old| old.id != session.id) {
+                        self.live_stats.stop(streamer.id, snapshot.checked_at).await;
+                        self.store
+                            .finish_open_live_session(old.id, snapshot.checked_at)
+                            .await?;
+                    }
+                    self.live_stats
+                        .start(self.store.clone(), self.bili_client(), session)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, streamer_id = streamer.id, "创建直播数据场次失败");
+                }
+            }
+        } else if stats_enabled {
+            let open_session = self.store.latest_open_live_session(streamer.id).await?;
+            self.live_stats.stop(streamer.id, snapshot.checked_at).await;
+            if let Some(session) = open_session {
+                self.store
+                    .finish_open_live_session(session.id, snapshot.checked_at)
+                    .await?;
+            }
+        }
+        Ok(Some((previous, snapshot)))
+    }
+
+    async fn check_youtube_live_streamer(
+        &self,
+        streamer: &Streamer,
+        stats_enabled: bool,
+    ) -> AppResult<Option<(bool, LiveSnapshot)>> {
+        if streamer.fans.is_none() {
+            match self
+                .youtube_client()
+                .fetch_channel_metadata(&streamer.mid)
+                .await
+            {
+                Ok(channel) => {
+                    if let Some(fans) = channel.subscriber_count {
+                        if let Err(error) = self
+                            .store
+                            .record_fan_snapshot(streamer.id, fans, Utc::now())
+                            .await
+                        {
+                            tracing::warn!(%error, streamer_id = streamer.id, "保存 YouTube 订阅者数失败");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, mid = %streamer.mid, "读取 YouTube 频道信息失败");
+                }
+            }
+        }
+        let probe = match self.youtube_client().probe_live_page(&streamer.mid).await {
+            Ok(probe) => probe,
+            Err(error) => {
+                self.store
+                    .record_streamer_error(streamer.id, &error.to_string())
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let mut snapshot = LiveSnapshot {
+            platform: Platform::Youtube,
+            is_live: probe.is_live,
+            title: probe.title.clone(),
+            cover_url: probe.cover_url.clone(),
+            live_url: probe.live_url.clone(),
+            live_video_id: probe.video_id.clone(),
+            online: probe.concurrent_viewers.unwrap_or(0),
+            started_at: probe.started_at.or(probe.scheduled_start_at),
+            checked_at: probe.checked_at,
+        };
+        let mut active_live_chat_id = None;
+        if probe.is_live {
+            if let Some(video_id) = probe.video_id.as_deref() {
+                match self
+                    .youtube_client()
+                    .fetch_videos(&[video_id.to_owned()])
+                    .await
+                {
+                    Ok(videos) => {
+                        if let Some(video) = videos.into_iter().next() {
+                            snapshot.title = video.title;
+                            snapshot.cover_url = video.thumbnail_url.or(snapshot.cover_url);
+                            snapshot.live_url = video.live_url().or(snapshot.live_url);
+                            snapshot.started_at = video
+                                .actual_start_at
+                                .or(video.scheduled_start_at)
+                                .or(snapshot.started_at);
+                            snapshot.online = video
+                                .concurrent_viewers
+                                .unwrap_or(snapshot.online);
+                            active_live_chat_id = video.active_live_chat_id;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, streamer_id = streamer.id, "读取 YouTube 直播详情失败");
+                    }
+                }
+            }
+        }
+        let previous = self.store.set_youtube_live_status(streamer.id, &snapshot).await?;
+        if stats_enabled && snapshot.is_live {
+            let old_session = self.store.latest_open_live_session(streamer.id).await?;
+            let started_at = snapshot
+                .started_at
+                .or_else(|| old_session.as_ref().map(|session| session.started_at))
+                .unwrap_or(snapshot.checked_at);
+            let room_id = snapshot
+                .live_video_id
+                .as_deref()
+                .unwrap_or(streamer.mid.as_str());
+            match self
+                .store
+                .ensure_youtube_live_session(
+                    streamer.id,
+                    room_id,
+                    &streamer.name,
+                    &snapshot.title,
+                    snapshot.cover_url.as_deref(),
+                    started_at,
+                    snapshot.checked_at,
+                )
+                .await
+            {
+                Ok(session) => {
+                    if let Some(old) = old_session.filter(|old| old.id != session.id) {
+                        self.youtube_stats.stop(streamer.id, snapshot.checked_at).await;
+                        self.store
+                            .finish_open_live_session(old.id, snapshot.checked_at)
+                            .await?;
+                    }
+                    self.youtube_stats
+                        .start(
+                            self.store.clone(),
+                            self.youtube_client(),
+                            Arc::clone(&self.secrets),
+                            streamer.id,
+                            session,
+                            snapshot.live_video_id.clone(),
+                            active_live_chat_id,
+                            snapshot.online,
+                            started_at,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, streamer_id = streamer.id, "创建 YouTube 直播数据场次失败");
+                }
+            }
+        } else if stats_enabled {
+            let open_session = self.store.latest_open_live_session(streamer.id).await?;
+            self.youtube_stats.stop(streamer.id, snapshot.checked_at).await;
+            if let Some(session) = open_session {
+                self.store
+                    .finish_open_live_session(session.id, snapshot.checked_at)
+                    .await?;
+            }
+        }
+        Ok(Some((previous, snapshot)))
     }
 
     pub async fn refresh_all(&self) -> AppResult<RefreshReport> {
@@ -1115,19 +1513,21 @@ impl AppService {
         };
         let config = self.current_llm_config(&settings).await;
         let binding = self.llm_key_binding.read().await.clone();
-        let cookie_fingerprint = self
-            .secrets
-            .read()
-            .await
-            .bili_cookie
-            .as_deref()
-            .map(text_digest);
+        let secrets = self.secrets.read().await;
+        let cookie_fingerprint = secrets.bili_cookie.as_deref().map(text_digest);
+        let youtube_api_key = secrets.youtube_api_key.as_deref().map(text_digest);
+        let youtube_oauth = secrets.youtube_oauth_access_token.as_deref().map(text_digest);
+        let youtube_cookie = secrets.youtube_web_cookie.as_deref().map(text_digest);
+        drop(secrets);
         // Only hashes enter the scope. Do not retain or log raw credentials.
         let config_key = text_digest(&serde_json::to_string(&json!({
             "settings": &settings,
             "model_key": config.as_ref().map(|config| text_digest(&config.api_key)),
             "binding": binding.as_ref().map(|(key, url)| (text_digest(key), url)),
             "cookie": cookie_fingerprint,
+            "youtube_api_key": youtube_api_key,
+            "youtube_oauth": youtube_oauth,
+            "youtube_cookie": youtube_cookie,
         }))?);
         let targets = streamers
             .iter()
@@ -1164,6 +1564,7 @@ impl AppService {
             scope,
             streamer_id,
             bili: self.bili_client(),
+            youtube: self.youtube_client(),
             llm: self.llm_analyzer(),
             request_key,
         })
@@ -1201,6 +1602,7 @@ impl AppService {
             scope,
             streamer_id,
             bili,
+            youtube,
             llm,
             ..
         } = prepared;
@@ -1212,6 +1614,7 @@ impl AppService {
         // Freeze the selected clients along with the request scope. A setting
         // change creates a different task instead of silently mutating this one.
         service.bili = Arc::new(StdRwLock::new(bili));
+        service.youtube = Arc::new(StdRwLock::new(youtube));
         service.llm = Arc::new(StdRwLock::new(llm));
         self.refresh_coordinator.run(scope, on_progress, move |sink: ProgressSink| async move {
             let refresh_id = uuid::Uuid::new_v4().to_string();
@@ -1224,7 +1627,30 @@ impl AppService {
                     config, pool: LlmPool::new(settings.llm_parallelism),
                 });
                 let sources = sources_for_streamers(&streamers);
-                let result = service.refresh_sources(&sources, &settings, llm.as_ref(), Some(&target), sink.as_ref()).await;
+                let mut result = service
+                    .refresh_sources(&sources, &settings, llm.as_ref(), Some(&target), sink.as_ref())
+                    .await;
+                // YouTube uses an independent fetch pipeline. Run it even when
+                // the Bilibili dynamic pipeline fails, then preserve the Bili error
+                // as the overall refresh result.
+                let youtube_result = service
+                    .refresh_youtube_sources(&streamers, &settings, llm.as_ref(), Some(&target), sink.as_ref())
+                    .await;
+                match (&mut result, youtube_result) {
+                    (Ok(report), Ok(youtube)) => {
+                        report.refreshed_streamers += youtube.refreshed_streamers;
+                        report.failed_streamers.extend(youtube.failed_streamers);
+                        report.new_schedules += youtube.new_schedules;
+                        report.cancelled_schedules += youtube.cancelled_schedules;
+                        report.llm_calls += youtube.llm_calls;
+                        report.llm_cache_hits += youtube.llm_cache_hits;
+                    }
+                    (Ok(report), Err(error)) => report
+                        .failed_streamers
+                        .push(format!("YouTube 刷新: {error}")),
+                    (Err(_), Err(error)) => tracing::warn!(%error, "YouTube 刷新在 Bilibili 刷新失败后也失败"),
+                    (Err(_), Ok(_)) => {}
+                }
                 let failed = result.as_ref().map_or(true, |report| !report.failed_streamers.is_empty());
                 let stage = match &result {
                     Ok(_) if failed => "刷新完成，但部分来源失败".to_owned(),
@@ -1302,6 +1728,10 @@ impl AppService {
     where
         P: Fn(RefreshProgress) + Send + Sync,
     {
+        let streamer = self.store.get_streamer(streamer_id).await?;
+        if streamer.platform == Platform::Youtube {
+            self.require_youtube_enabled().await?;
+        }
         self.coordinate_refresh(Some(streamer_id), &on_progress)
             .await
     }
@@ -1353,6 +1783,267 @@ impl AppService {
             }
             result
         })
+        .await
+    }
+
+    async fn fetch_youtube_upcoming_live_gated(
+        &self,
+        client: &YouTubeClient,
+        channel_id: &str,
+        max_results: u32,
+    ) -> AppResult<Option<Vec<YouTubeVideo>>> {
+        if !youtube_requests_enabled(&self.store).await {
+            return Ok(None);
+        }
+        let Some(channel_result) =
+            run_youtube_request(&self.store, client.fetch_channel_metadata(channel_id)).await
+        else {
+            return Ok(None);
+        };
+        let channel = channel_result?;
+        let uploads_playlist_id = channel
+            .uploads_playlist_id
+            .ok_or_else(|| AppError::not_found("YouTube 频道上传列表"))?;
+
+        if !youtube_requests_enabled(&self.store).await {
+            return Ok(None);
+        }
+        let Some(uploads_result) = run_youtube_request(
+            &self.store,
+            client.fetch_recent_uploads(&uploads_playlist_id, max_results),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        let uploads = uploads_result?;
+        let ids = uploads
+            .into_iter()
+            .map(|item| item.video_id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        if !youtube_requests_enabled(&self.store).await {
+            return Ok(None);
+        }
+        let Some(videos_result) = run_youtube_request(&self.store, client.fetch_videos(&ids)).await
+        else {
+            return Ok(None);
+        };
+        let mut videos = videos_result?;
+        videos.retain(|video| video.is_live() || video.is_upcoming());
+        videos.sort_by(|left, right| {
+            left.scheduled_start_at
+                .cmp(&right.scheduled_start_at)
+                .then_with(|| left.actual_start_at.cmp(&right.actual_start_at))
+        });
+        Ok(Some(videos))
+    }
+
+    async fn refresh_youtube_sources(
+        &self,
+        streamers: &[Streamer],
+        settings: &AppSettings,
+        llm: Option<&PostAnalyzer>,
+        progress: Option<&ProgressTarget>,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+    ) -> AppResult<RefreshReport> {
+        let mut report = RefreshReport {
+            refreshed_streamers: 0,
+            failed_streamers: Vec::new(),
+            new_schedules: 0,
+            cancelled_schedules: 0,
+            llm_calls: 0,
+            llm_cache_hits: 0,
+        };
+        if !youtube_requests_enabled(&self.store).await {
+            return Ok(report);
+        }
+        let targets: Vec<Streamer> = streamers
+            .iter()
+            .filter(|streamer| {
+                streamer.platform == Platform::Youtube && streamer.schedule_enabled
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Ok(report);
+        }
+        let client = self.youtube_client();
+        let web_cookie = self
+            .secrets
+            .read()
+            .await
+            .youtube_web_cookie
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let mut event_state = RefreshEventState::default();
+        let total = targets.len();
+        for (index, streamer) in targets.iter().enumerate() {
+            // Re-read for every channel so a switch-off between channels cannot
+            // start the next community, metadata, uploads, or video request.
+            if !youtube_requests_enabled(&self.store).await {
+                break;
+            }
+            if let Some(target) = progress {
+                emit_progress(
+                    target,
+                    &format!("抓取 YouTube 社区帖（{}/{}）", index + 1, total),
+                    index,
+                    total,
+                    10 + (index * 80 / total) as u8,
+                    false,
+                    false,
+                    on_progress,
+                );
+            }
+            let targets_slice = std::slice::from_ref(streamer);
+            let mut errors = Vec::new();
+            let mut community_posts = Vec::new();
+            let Some(community_result) = run_youtube_request(
+                &self.store,
+                client.fetch_community_posts(&streamer.mid, web_cookie.as_deref()),
+            )
+            .await
+            else {
+                break;
+            };
+            match community_result {
+                Ok(fetch) => {
+                    let observed_at = Utc::now();
+                    let can_read_membership = web_cookie.is_some()
+                        && fetch.skipped_reason.as_deref()
+                            != Some("membership_session_unavailable");
+                    community_posts = fetch
+                        .posts
+                        .into_iter()
+                        .filter(|post| !post.membership_only || can_read_membership)
+                        .map(|post| {
+                            dynamic_post_from_youtube_community(post, streamer, observed_at)
+                        })
+                        .collect();
+                }
+                Err(error) if error.code() == "YOUTUBE_FORBIDDEN" => {
+                    tracing::debug!(streamer_id = streamer.id, "YouTube 会员社区帖不可用，跳过");
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+            let mut live_videos = Vec::new();
+            match self
+                .fetch_youtube_upcoming_live_gated(&client, &streamer.mid, 20)
+                .await
+            {
+                Ok(Some(videos)) => live_videos = videos,
+                Ok(None) => break,
+                Err(error) => errors.push(error.to_string()),
+            }
+            let stats = self
+                .process_source_posts_with_progress(
+                    &streamer.mid,
+                    targets_slice,
+                    &community_posts,
+                    settings,
+                    llm,
+                    &mut event_state,
+                    progress,
+                    on_progress,
+                    index,
+                    total,
+                )
+                .await?;
+            report.llm_calls += stats.llm_calls;
+            report.llm_cache_hits += stats.llm_cache_hits;
+            report.new_schedules += stats.new_schedules;
+            report.cancelled_schedules += stats.cancelled_schedules;
+            if let Some(error) = stats.analysis_errors.get(&streamer.id) {
+                errors.push(error.clone());
+            }
+            let mut seen_videos = HashSet::new();
+            for video in live_videos {
+                if !seen_videos.insert(video.id.clone()) {
+                    continue;
+                }
+                if self
+                    .upsert_youtube_live_schedule(streamer, &video)
+                    .await?
+                {
+                    report.new_schedules += 1;
+                }
+            }
+            if errors.is_empty() {
+                self.store.record_refresh_result(streamer.id, None).await?;
+                report.refreshed_streamers += 1;
+            } else {
+                let error = errors.join("; ");
+                self.store
+                    .record_refresh_result(streamer.id, Some(&error))
+                    .await?;
+                report
+                    .failed_streamers
+                    .push(format!("{}: {error}", streamer.name));
+            }
+        }
+        report.cancelled_schedules += self.apply_pending_cancellations(&mut event_state).await?;
+        match self.dedupe_schedule_duplicates().await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "merged duplicate schedules after YouTube refresh");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "deduplicate schedules after YouTube refresh failed"),
+        }
+        if report.new_schedules > 0 || report.cancelled_schedules > 0 {
+            self.store
+                .append_event(
+                    "schedule_changed",
+                    &json!({
+                        "action": "refresh_youtube",
+                        "newSchedules": report.new_schedules,
+                        "cancelledSchedules": report.cancelled_schedules
+                    }),
+                )
+                .await?;
+        }
+        Ok(report)
+    }
+    async fn upsert_youtube_live_schedule(
+        &self,
+        streamer: &Streamer,
+        video: &YouTubeVideo,
+    ) -> AppResult<bool> {
+        let Some(start_at) = video.actual_start_at.or(video.scheduled_start_at) else {
+            return Ok(false);
+        };
+        let post = dynamic_post_from_youtube_live(video, streamer);
+        let title = if video.title.trim().is_empty() {
+            "YouTube 直播".to_owned()
+        } else {
+            clean_schedule_title_value(video.title.clone(), streamer)
+        };
+        let schedule = ParsedSchedule {
+            title,
+            start_at,
+            end_at: None,
+            confidence: 1.0,
+        };
+        let identity = format!("youtube_live:{}:schedule", video.id);
+        let fingerprint = source_fingerprint(&post, &schedule.title, "youtube_live");
+        let participants = [streamer.name.clone()];
+        let live_url = video.live_url();
+        self.upsert_candidate(
+            streamer,
+            &schedule,
+            "youtube_live",
+            &post,
+            video.thumbnail_url.as_deref().unwrap_or_default(),
+            &identity,
+            &fingerprint,
+            live_url.as_deref(),
+            Some(&video.channel_id),
+            Some(streamer.name.as_str()),
+            &participants,
+        )
         .await
     }
 
@@ -1791,6 +2482,7 @@ impl AppService {
             // 带图动态与纯文字动态走同一条通道：正文（含预约卡）与前两图
             // 只在这一次请求里送出，任何一侧出现时间点都能被提取。
             let has_images = !post.images.is_empty();
+            let analysis_source_kind = post_source_kind(post, has_images);
             // 卡片那一场现在也由模型给出：命中同槽就记下“已覆盖”，
             // 后面不再补正则兜底。模型给的取消同样采信。
             let mut card_slot_covered = false;
@@ -1971,7 +2663,7 @@ impl AppService {
                     // 主播而没写进库里，也不代表它已经不存在了，清理时不能删。
                     let identity = event_source_identity(
                         &post.id,
-                        has_images,
+                        analysis_source_kind,
                         &text_hash,
                         &content_digest,
                         event_index,
@@ -2009,7 +2701,7 @@ impl AppService {
                         });
                         continue;
                     }
-                    let source_kind = if has_images { "image" } else { "text" };
+                    let source_kind = analysis_source_kind;
                     let fingerprint = format!(
                         "{}:{}:{}:{}",
                         source_fingerprint(post, &event.title, source_kind),
@@ -2276,6 +2968,21 @@ impl AppService {
         targets: &[Streamer],
         source_mid: &str,
     ) -> ResolvedRoom {
+        if target.platform == Platform::Youtube {
+            let event_url = event
+                .room_url
+                .as_deref()
+                .filter(|value| valid_youtube_room_url(value));
+            let fallback = target
+                .live_url
+                .clone()
+                .or_else(|| target.profile_url.clone())
+                .unwrap_or_default();
+            return ResolvedRoom::from_target(
+                event_url.map_or(fallback, ToOwned::to_owned),
+                target.clone(),
+            );
+        }
         let participants = event.participant_names();
         let owner_hint = event
             .room_owner
@@ -2645,7 +3352,9 @@ impl AppService {
                 room_owner_name: room_owner_name.map(ToOwned::to_owned),
                 source_kind: source_kind.to_owned(),
                 source_post_id: Some(post.id.clone()),
-                source_image_url: (source_kind == "image").then(|| image_url.to_owned()),
+                source_image_url: source_kind_has_image(source_kind)
+                    .then(|| image_url.to_owned())
+                    .filter(|value| !value.is_empty()),
                 source_author_mid: Some(post.author_mid.clone()),
                 source_fingerprint: Some(source_fingerprint.to_owned()),
                 source_identity: Some(source_identity.to_owned()),
@@ -2891,12 +3600,15 @@ fn is_asoul_member(mid: &str) -> bool {
 /// Group targets by source MID so a shared official account is fetched once per refresh.
 fn sources_for_streamers(streamers: &[Streamer]) -> Vec<(String, Vec<Streamer>)> {
     let mut source_targets: HashMap<String, Vec<Streamer>> = HashMap::new();
-    for streamer in streamers
-        .iter()
-        .filter(|streamer| streamer.schedule_enabled)
-    {
+    for streamer in streamers.iter().filter(|streamer| {
+        streamer.platform == Platform::Bilibili && streamer.schedule_enabled
+    }) {
         push_unique_target(&mut source_targets, &streamer.mid, streamer);
-        for linked in &streamer.linked_accounts {
+        for linked in streamer
+            .linked_accounts
+            .iter()
+            .filter(|linked| linked.platform == Platform::Bilibili)
+        {
             push_unique_target(&mut source_targets, &linked.mid, streamer);
         }
         if is_asoul_member(&streamer.mid) {
@@ -2985,7 +3697,23 @@ fn reserve_summary(post: &DynamicPost) -> Option<String> {
 /// 单次分析的来源种类。文字与图片不再是两条通道，合并、预约时间变更、
 /// 同槽回落这些判断都要同时认这两种 kind。
 fn is_post_analysis_source(source_kind: &str) -> bool {
-    matches!(source_kind, "text" | "image")
+    matches!(
+        source_kind,
+        "text" | "image" | "youtube_community" | "youtube_live"
+    )
+}
+
+fn post_source_kind(post: &DynamicPost, has_images: bool) -> &'static str {
+    match post.raw_kind.trim() {
+        "youtube_community" => "youtube_community",
+        "youtube_live" => "youtube_live",
+        _ if has_images => "image",
+        _ => "text",
+    }
+}
+
+fn source_kind_has_image(source_kind: &str) -> bool {
+    matches!(source_kind, "image" | "youtube_community" | "youtube_live")
 }
 
 /// 缓存里的空结果还没过重试窗口：当作命中，不再问模型。
@@ -3085,8 +3813,12 @@ fn search_matches_subscription(keyword: &str, streamer: &Streamer) -> bool {
     if query.is_empty() {
         return false;
     }
-    streamer.mid == query
+    normalize_search_value(&streamer.mid) == query
         || normalize_search_value(&streamer.name) == query
+        || streamer
+            .handle
+            .as_deref()
+            .is_some_and(|handle| normalize_search_value(handle) == query)
         || streamer
             .aliases
             .iter()
@@ -3095,13 +3827,108 @@ fn search_matches_subscription(keyword: &str, streamer: &Streamer) -> bool {
 
 fn account_from_streamer(streamer: &Streamer) -> crate::models::AccountSearchResult {
     crate::models::AccountSearchResult {
+        platform: streamer.platform,
         mid: streamer.mid.clone(),
         name: streamer.name.clone(),
         avatar_url: streamer.avatar_url.clone(),
         sign: String::new(),
+        handle: streamer.handle.clone(),
+        profile_url: streamer.profile_url.clone(),
         room_id: streamer.room_id.clone(),
         fans: 0,
         is_live: streamer.is_live,
+        live_url: streamer.live_url.clone(),
+    }
+}
+
+fn youtube_account_search_result(channel: YouTubeChannel) -> crate::models::AccountSearchResult {
+    crate::models::AccountSearchResult {
+        platform: Platform::Youtube,
+        mid: channel.id,
+        name: channel.name,
+        avatar_url: channel.avatar_url.unwrap_or_default(),
+        sign: channel.description,
+        handle: channel.handle,
+        profile_url: Some(channel.profile_url),
+        room_id: None,
+        fans: channel.subscriber_count.unwrap_or(0),
+        is_live: false,
+        live_url: None,
+    }
+}
+
+fn dynamic_post_from_youtube_community(
+    post: YouTubeCommunityPost,
+    streamer: &Streamer,
+    observed_at: DateTime<Utc>,
+) -> DynamicPost {
+    let published_text = post
+        .published_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未提供");
+    let time_context = match (post.published_at, post.published_at_estimated) {
+        (Some(value), true) => format!(
+            "[YouTube 发布时间原文：{published_text}；按抓取时间 {} 估算为 {}，可能存在误差]",
+            observed_at.to_rfc3339(),
+            value.to_rfc3339()
+        ),
+        (Some(value), false) => format!(
+            "[YouTube 发布时间：{published_text}；解析为 {}]",
+            value.to_rfc3339()
+        ),
+        (None, _) => format!(
+            "[YouTube 发布时间原文：{published_text}；无法可靠解析。以下相对日期只能按抓取时间 {} 近似解释，不能视为原发布时间]",
+            observed_at.to_rfc3339()
+        ),
+    };
+    let mut text = time_context;
+    if !post.text.trim().is_empty() {
+        text.push('\n');
+        text.push_str(post.text.trim());
+    }
+    DynamicPost {
+        id: format!("youtube:{}", post.id),
+        author_mid: post.channel_id,
+        author_name: post.author_name.unwrap_or_else(|| streamer.name.clone()),
+        published_at: post.published_at.unwrap_or(observed_at),
+        text,
+        images: post.images,
+        source_url: post.source_url,
+        raw_kind: "youtube_community".to_owned(),
+        reserve: None,
+    }
+}
+
+fn dynamic_post_from_youtube_live(video: &YouTubeVideo, streamer: &Streamer) -> DynamicPost {
+    let mut text = video.title.trim().to_owned();
+    if !video.description.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(video.description.trim());
+    }
+    DynamicPost {
+        id: format!("youtube_live:{}", video.id),
+        author_mid: video.channel_id.clone(),
+        author_name: if video.channel_title.trim().is_empty() {
+            streamer.name.clone()
+        } else {
+            video.channel_title.clone()
+        },
+        published_at: video
+            .published_at
+            .or(video.actual_start_at)
+            .or(video.scheduled_start_at)
+            .unwrap_or_else(Utc::now),
+        text,
+        images: video.thumbnail_url.clone().into_iter().collect(),
+        source_url: video
+            .live_url()
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={}", video.id)),
+        raw_kind: "youtube_live".to_owned(),
+        reserve: None,
     }
 }
 
@@ -3114,10 +3941,10 @@ fn search_result_rank(
     let name = normalize_search_value(&account.name);
     let subscribed = subscriptions
         .iter()
-        .any(|streamer| streamer.mid == account.mid);
+        .any(|streamer| streamer.platform == account.platform && streamer.mid == account.mid);
     let alias_exact = subscriptions
         .iter()
-        .filter(|streamer| streamer.mid == account.mid)
+        .filter(|streamer| streamer.platform == account.platform && streamer.mid == account.mid)
         .flat_map(|streamer| streamer.aliases.iter())
         .any(|alias| normalize_search_value(alias) == query);
     let match_rank = if account.mid == query || name == query {
@@ -3140,7 +3967,7 @@ fn dedupe_and_rank_search_results(
     subscriptions: &[Streamer],
 ) {
     let mut seen = std::collections::HashSet::new();
-    results.retain(|account| seen.insert(account.mid.clone()));
+    results.retain(|account| seen.insert((account.platform, account.mid.clone())));
     results.sort_by(|left, right| {
         search_result_rank(right, keyword, subscriptions)
             .cmp(&search_result_rank(left, keyword, subscriptions))
@@ -3312,6 +4139,17 @@ fn single_matching_target(
     }
 }
 
+fn valid_youtube_room_url(value: &str) -> bool {
+    url::Url::parse(value.trim()).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| {
+                host == "youtu.be"
+                    || host == "youtube.com"
+                    || host.ends_with(".youtube.com")
+            })
+    })
+}
+
 fn valid_live_room_url(value: &str) -> bool {
     url::Url::parse(value)
         .ok()
@@ -3358,15 +4196,18 @@ impl ResolvedRoom {
 /// 「这条事件在最新一轮分析里还在不在」。
 fn event_source_identity(
     post_id: &str,
-    has_images: bool,
+    source_kind: &str,
     text_hash: &str,
     content_digest: &str,
     event_index: usize,
 ) -> String {
-    if has_images {
-        format!("image:{post_id}:{content_digest}:{event_index}")
-    } else {
-        format!("text:{post_id}:{text_hash}:{event_index}")
+    match source_kind {
+        "image" => format!("image:{post_id}:{content_digest}:{event_index}"),
+        "youtube_community" => {
+            format!("youtube_community:{post_id}:{content_digest}:{event_index}")
+        }
+        "youtube_live" => format!("youtube_live:{post_id}:{content_digest}:{event_index}"),
+        _ => format!("text:{post_id}:{text_hash}:{event_index}"),
     }
 }
 
@@ -3833,7 +4674,7 @@ mod tests {
 
     use crate::llm::LlmAnalysis;
     use crate::models::ReserveCard;
-    use crate::settings::ReasoningEffort;
+    use crate::settings::{save_settings, ReasoningEffort};
 
     /// 一次 `analyze_post` 调用收到的完整输入，供断言使用。
     struct CapturedCall {
@@ -3953,6 +4794,10 @@ mod tests {
 
     fn subscription(mid: &str, name: &str) -> AddSubscription {
         AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: mid.to_owned(),
             name: Some(name.to_owned()),
             avatar_url: None,
@@ -3962,6 +4807,28 @@ mod tests {
             live_notify_enabled: true,
             live_stats_enabled: false,
         }
+    }
+
+    #[tokio::test]
+    async fn youtube_switch_off_stops_before_next_channel_request() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let mut settings = AppSettings::default();
+        settings.youtube_enabled = true;
+        save_settings(&store, &settings).await.expect("enable youtube");
+
+        let mut channels_started = 0;
+        for _ in 0..2 {
+            if !youtube_requests_enabled(&store).await {
+                break;
+            }
+            channels_started += 1;
+            settings.youtube_enabled = false;
+            save_settings(&store, &settings)
+                .await
+                .expect("disable youtube");
+        }
+
+        assert_eq!(channels_started, 1);
     }
 
     #[tokio::test]
@@ -4006,9 +4873,12 @@ mod tests {
             .push(crate::models::LinkedAccount {
                 id: 1,
                 streamer_id: 2,
+                platform: Platform::Bilibili,
                 mid: "901".to_owned(),
                 name: "官号".to_owned(),
                 avatar_url: String::new(),
+                handle: None,
+                profile_url: None,
                 revision: 1,
                 created_at: Utc::now(),
             });
@@ -4043,6 +4913,10 @@ mod tests {
 
     fn streamer_stub(id: i64, mid: &str, name: &str) -> Streamer {
         Streamer {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             id,
             mid: mid.to_owned(),
             name: name.to_owned(),
@@ -4059,6 +4933,7 @@ mod tests {
             is_live: false,
             live_title: None,
             live_cover: None,
+            live_video_id: None,
             live_started_at: None,
             live_checked_at: None,
             linked_accounts: Vec::new(),
@@ -4066,6 +4941,54 @@ mod tests {
             revision: 1,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn youtube_community_mapping_preserves_time_provenance() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let mut streamer = streamer_stub(1, "UC1234567890123456789012", "Example");
+        streamer.platform = Platform::Youtube;
+
+        let estimated = YouTubeCommunityPost {
+            id: "estimated".to_owned(),
+            channel_id: streamer.mid.clone(),
+            author_name: Some(streamer.name.clone()),
+            published_at: Some(observed_at - Duration::hours(3)),
+            published_at_estimated: true,
+            published_text: Some("3 hours ago".to_owned()),
+            text: "明天 20:00 直播".to_owned(),
+            images: Vec::new(),
+            source_url: "https://www.youtube.com/post/estimated".to_owned(),
+            renderer_kind: "backstagePostRenderer".to_owned(),
+            membership_only: false,
+        };
+        let mapped = dynamic_post_from_youtube_community(estimated, &streamer, observed_at);
+        assert_eq!(mapped.published_at, observed_at - Duration::hours(3));
+        assert!(mapped.text.contains("原始发布时间：3 hours ago"));
+        assert!(mapped.text.contains("估算"));
+        assert!(mapped.text.contains("2026-11-12T09:00:00+00:00"));
+        assert!(mapped.text.contains("明天 20:00 直播"));
+
+        let unknown = YouTubeCommunityPost {
+            id: "unknown".to_owned(),
+            channel_id: streamer.mid.clone(),
+            author_name: None,
+            published_at: None,
+            published_at_estimated: false,
+            published_text: Some("recently-ish".to_owned()),
+            text: "今晚直播".to_owned(),
+            images: Vec::new(),
+            source_url: "https://www.youtube.com/post/unknown".to_owned(),
+            renderer_kind: "backstagePostRenderer".to_owned(),
+            membership_only: false,
+        };
+        let mapped = dynamic_post_from_youtube_community(unknown, &streamer, observed_at);
+        assert_eq!(mapped.published_at, observed_at);
+        assert!(mapped.text.contains("无法可靠解析"));
+        assert!(mapped.text.contains("不能视为原发布时间"));
+        assert!(mapped.text.contains("recently-ish"));
     }
 
     #[tokio::test]
@@ -4131,6 +5054,10 @@ mod tests {
         };
         let targets = vec![
             Streamer {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 id: 1,
                 mid: "1".to_owned(),
                 name: "甲".to_owned(),
@@ -4147,6 +5074,7 @@ mod tests {
                 is_live: false,
                 live_title: None,
                 live_cover: None,
+                live_video_id: None,
                 live_started_at: None,
                 live_checked_at: None,
                 linked_accounts: Vec::new(),
@@ -4155,6 +5083,10 @@ mod tests {
                 created_at: now,
             },
             Streamer {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 id: 2,
                 mid: "2".to_owned(),
                 name: "乙".to_owned(),
@@ -4171,6 +5103,7 @@ mod tests {
                 is_live: false,
                 live_title: None,
                 live_cover: None,
+                live_video_id: None,
                 live_started_at: None,
                 live_checked_at: None,
                 linked_accounts: Vec::new(),
@@ -4513,6 +5446,10 @@ mod tests {
     #[test]
     fn asoul_member_sources_include_personal_and_official_accounts() {
         let streamer = Streamer {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             id: 1,
             mid: "672342685".to_owned(),
             name: "乃琳Queen".to_owned(),
@@ -4529,6 +5466,7 @@ mod tests {
             is_live: false,
             live_title: None,
             live_cover: None,
+            live_video_id: None,
             live_started_at: None,
             live_checked_at: None,
             linked_accounts: Vec::new(),
@@ -4560,6 +5498,10 @@ mod tests {
         ]
         .into_iter()
         .map(|(id, mid, name, alias)| Streamer {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             id,
             mid: mid.to_owned(),
             name: name.to_owned(),
@@ -4576,6 +5518,7 @@ mod tests {
             is_live: false,
             live_title: None,
             live_cover: None,
+            live_video_id: None,
             live_started_at: None,
             live_checked_at: None,
             linked_accounts: Vec::new(),
@@ -4603,6 +5546,10 @@ mod tests {
     fn search_ranks_exact_and_subscribed_accounts_and_deduplicates() {
         let now = Utc::now();
         let streamer = Streamer {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             id: 1,
             mid: "100".to_owned(),
             name: "嘉然".to_owned(),
@@ -4619,6 +5566,7 @@ mod tests {
             is_live: false,
             live_title: None,
             live_cover: None,
+            live_video_id: None,
             live_started_at: None,
             live_checked_at: None,
             linked_accounts: Vec::new(),
@@ -4628,13 +5576,17 @@ mod tests {
         };
         assert!(search_matches_subscription("@然然", &streamer));
         let account = |mid: &str, name: &str, fans: u64| crate::models::AccountSearchResult {
+            platform: Platform::Bilibili,
             mid: mid.to_owned(),
             name: name.to_owned(),
             avatar_url: String::new(),
             sign: String::new(),
+            handle: None,
+            profile_url: None,
             room_id: None,
             fans,
             is_live: false,
+            live_url: None,
         };
         let mut results = vec![
             account("200", "嘉然粉丝团", 999_999),

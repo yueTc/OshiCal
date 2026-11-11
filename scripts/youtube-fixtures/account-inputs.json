@@ -1,0 +1,125 @@
+{
+  "fixtureVersion": 1,
+  "validCases": [
+    {
+      "input": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+      "expected": {
+        "kind": "channel",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "handle": null,
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"
+      }
+    },
+    {
+      "input": "@fixture_channel",
+      "expected": {
+        "kind": "handle",
+        "channelId": null,
+        "handle": "@fixture_channel",
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/@fixture_channel"
+      }
+    },
+    {
+      "input": "https://www.youtube.com/@fixture_channel",
+      "expected": {
+        "kind": "handle",
+        "channelId": null,
+        "handle": "@fixture_channel",
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/@fixture_channel"
+      }
+    },
+    {
+      "input": "www.youtube.com/@fixture_channel",
+      "expected": {
+        "kind": "handle",
+        "channelId": null,
+        "handle": "@fixture_channel",
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/@fixture_channel"
+      }
+    },
+    {
+      "input": "https://m.youtube.com/@fixture_channel/videos",
+      "expected": {
+        "kind": "handle",
+        "channelId": null,
+        "handle": "@fixture_channel",
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/@fixture_channel"
+      }
+    },
+    {
+      "input": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw?view=0",
+      "expected": {
+        "kind": "channel",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "handle": null,
+        "videoId": null,
+        "canonicalUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"
+      }
+    },
+    {
+      "input": "https://youtu.be/dQw4w9WgXcQ?t=42",
+      "expected": {
+        "kind": "video",
+        "channelId": null,
+        "handle": null,
+        "videoId": "dQw4w9WgXcQ",
+        "canonicalUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+      }
+    },
+    {
+      "input": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
+      "expected": {
+        "kind": "video",
+        "channelId": null,
+        "handle": null,
+        "videoId": "dQw4w9WgXcQ",
+        "canonicalUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+      }
+    },
+    {
+      "input": "https://www.youtube.com/live/AbCdEf12345",
+      "expected": {
+        "kind": "video",
+        "channelId": null,
+        "handle": null,
+        "videoId": "AbCdEf12345",
+        "canonicalUrl": "https://www.youtube.com/watch?v=AbCdEf12345"
+      }
+    },
+    {
+      "input": "fixture search term",
+      "expected": {
+        "kind": "search",
+        "channelId": null,
+        "handle": null,
+        "videoId": null,
+        "canonicalUrl": null
+      }
+    },
+    {
+      "input": "https://example.com/@fixture_channel",
+      "expected": {
+        "kind": "search",
+        "channelId": null,
+        "handle": null,
+        "videoId": null,
+        "canonicalUrl": null
+      }
+    }
+  ],
+  "invalidCases": [
+    {
+      "input": "",
+      "expectedError": "EMPTY_INPUT"
+    },
+    {
+      "input": "@",
+      "expectedError": "INVALID_HANDLE"
+    }
+  ]
+}

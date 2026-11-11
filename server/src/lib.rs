@@ -6,6 +6,7 @@ pub mod runtime;
 pub mod secrets;
 pub mod sync_api;
 pub mod update_manager;
+pub mod youtube_oauth;
 
 pub use api::{build_router, AppState};
 pub use config::ServerConfig;

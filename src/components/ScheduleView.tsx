@@ -123,6 +123,8 @@ const SOURCE_LABELS: Record<SourceKind, string> = {
   editor: "文本",
   weekly: "固定周表",
   live: "开播补录",
+  youtube_community: "YouTube 社区",
+  youtube_live: "YouTube 预约",
 };
 
 const SOURCE_CLASS: Record<SourceKind, string> = {
@@ -133,6 +135,8 @@ const SOURCE_CLASS: Record<SourceKind, string> = {
   editor: "source-text",
   weekly: "source-weekly",
   live: "source-reserve",
+  youtube_community: "source-youtube-community",
+  youtube_live: "source-youtube-live",
 };
 
 function createManualSourceIdentity(): string {
@@ -1667,13 +1671,3 @@ export default function ScheduleView({
     </section>
   );
 }
-
-
-
-
-
-
-
-
-
-

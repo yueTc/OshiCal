@@ -1,6 +1,7 @@
 import type {
   LiveSession,
   LiveStatus,
+  Platform,
   Schedule,
   ScheduleSource,
   SourceSuppression,
@@ -11,8 +12,8 @@ import type {
   WeeklyScheduleRule,
 } from "../types";
 
-export const WEB_SYNC_CACHE_SCHEMA_VERSION = 2;
-const WEB_SYNC_DB_NAME = "oshical.web-sync.v2";
+export const WEB_SYNC_CACHE_SCHEMA_VERSION = 3;
+const WEB_SYNC_DB_NAME = "oshical.web-sync.v3";
 const WEB_SYNC_DB_VERSION = 1;
 const META_STORE = "sync_meta";
 const ENTITY_STORE = "sync_entity_cache";
@@ -150,19 +151,33 @@ function isLinkedAccountEntityType(entityType: string): boolean {
   return entityType === "link" || entityType === "linked_account";
 }
 
+type SyncPlatform = Platform;
+
+function platformValue(value: unknown): SyncPlatform {
+  return value === "youtube" ? "youtube" : "bilibili";
+}
+
+function linkedAccountKey(platform: unknown, mid: unknown): string | null {
+  const normalizedMid = idValue(mid);
+  return normalizedMid ? `${platformValue(platform)}\u0000${normalizedMid}` : null;
+}
+
 function linkedAccountIdentity(
   streamerId: unknown,
   mid: unknown,
-): { key: string; streamerId: string; mid: string } | null {
+  platform: unknown = "bilibili",
+): { key: string; streamerId: string; mid: string; platform: SyncPlatform } | null {
   const normalizedStreamerId = idValue(streamerId);
   const normalizedMid = idValue(mid);
   if (!normalizedStreamerId || !normalizedMid) {
     return null;
   }
+  const normalizedPlatform = platformValue(platform);
   return {
-    key: `${normalizedStreamerId}\u0000${normalizedMid}`,
+    key: `${normalizedStreamerId}\u0000${normalizedPlatform}\u0000${normalizedMid}`,
     streamerId: normalizedStreamerId,
     mid: normalizedMid,
+    platform: normalizedPlatform,
   };
 }
 
@@ -173,26 +188,64 @@ function linkedAccountIdentityFromPayload(payload: unknown) {
   return linkedAccountIdentity(
     payload.streamerId ?? payload.streamer_id,
     payload.mid,
+    payload.platform,
   );
 }
 
 function linkedAccountIdentityFromEntityId(entityId: string) {
-  const separator = entityId.indexOf(":");
-  if (separator <= 0 || separator === entityId.length - 1) {
-    return null;
+  const parts = entityId.split(":");
+  if (parts.length === 2) {
+    return linkedAccountIdentity(parts[0], parts[1], "bilibili");
   }
-  return linkedAccountIdentity(entityId.slice(0, separator), entityId.slice(separator + 1));
+  if (parts.length >= 3) {
+    return linkedAccountIdentity(parts[0], parts.slice(2).join(":"), parts[1]);
+  }
+  return null;
 }
 
 function normalizedLinkedAccount(payload: Record<string, unknown>): Record<string, unknown> {
   return {
     ...(payload.id === undefined ? {} : { id: payload.id }),
     ...(payload.revision === undefined ? {} : { revision: payload.revision }),
+    platform: platformValue(payload.platform),
     mid: idValue(payload.mid) ?? stringValue(payload.mid),
     name: stringValue(payload.name),
     avatarUrl: stringValue(payload.avatarUrl ?? payload.avatar_url),
+    handle: stringValue(payload.handle) || null,
+    profileUrl: stringValue(payload.profileUrl ?? payload.profile_url) || null,
     createdAt: stringValue(payload.createdAt ?? payload.created_at),
   };
+}
+
+function normalizedSubscription(payload: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...payload,
+    platform: platformValue(payload.platform),
+    handle: stringValue(payload.handle) || null,
+    profileUrl: stringValue(payload.profileUrl ?? payload.profile_url) || null,
+    uploadsPlaylistId: stringValue(payload.uploadsPlaylistId ?? payload.uploads_playlist_id) || null,
+    liveVideoId: stringValue(payload.liveVideoId ?? payload.live_video_id) || null,
+  };
+}
+
+function normalizedEntityPayload(entityType: string, payload: unknown): unknown {
+  if (!isRecord(payload)) {
+    return payload;
+  }
+  if (entityType === "subscription") {
+    return normalizedSubscription(payload);
+  }
+  if (isLinkedAccountEntityType(entityType)) {
+    return normalizedLinkedAccount(payload);
+  }
+  if (
+    entityType === "live_status"
+    || entityType === "schedule_source"
+    || entityType === "source_suppression"
+  ) {
+    return { ...payload, platform: platformValue(payload.platform) };
+  }
+  return payload;
 }
 
 interface EntityVersion {
@@ -205,7 +258,7 @@ interface LinkedAccountProjection {
   upserts: Map<
     string,
     {
-      identity: { key: string; streamerId: string; mid: string };
+      identity: { key: string; streamerId: string; mid: string; platform: SyncPlatform };
       payload: Record<string, unknown>;
       version: EntityVersion;
     }
@@ -251,7 +304,7 @@ function linkedAccountProjection(cache: Pick<WebSyncCache, "entities">): LinkedA
   const upserts = new Map<
     string,
     {
-      identity: { key: string; streamerId: string; mid: string };
+      identity: { key: string; streamerId: string; mid: string; platform: SyncPlatform };
       payload: Record<string, unknown>;
       version: EntityVersion;
     }
@@ -320,12 +373,14 @@ function projectLinkedAccounts(
     if (!mid) {
       continue;
     }
+    const platform = platformValue(link.platform);
+    const linkKey = `${platform}\u0000${mid}`;
     const baseVersion: EntityVersion = {
       revision: Math.max(subscriptionVersion.revision, nonNegativeInteger(link.revision)),
       updatedAt: subscriptionVersion.updatedAt,
       ...(subscriptionVersion.seq === undefined ? {} : { seq: subscriptionVersion.seq }),
     };
-    const stableTombstone = projection.tombstoneVersions.get(`${streamerId}\u0000${mid}`);
+    const stableTombstone = projection.tombstoneVersions.get(`${streamerId}\u0000${linkKey}`);
     if (stableTombstone && !versionIsNewer(baseVersion, stableTombstone)) {
       continue;
     }
@@ -336,7 +391,7 @@ function projectLinkedAccounts(
     if (legacyTombstone && !versionIsNewer(baseVersion, legacyTombstone)) {
       continue;
     }
-    links.set(mid, link);
+    links.set(linkKey, normalizedLinkedAccount(link));
   }
   for (const { identity, payload, version } of projection.upserts.values()) {
     if (identity.streamerId !== streamerId) {
@@ -353,15 +408,16 @@ function projectLinkedAccounts(
     if (legacyTombstone && !versionIsNewer(version, legacyTombstone)) {
       continue;
     }
-    links.set(identity.mid, {
-      ...(links.get(identity.mid) ?? {}),
+    links.set(linkedAccountKey(identity.platform, identity.mid) ?? identity.mid, {
+      ...(links.get(linkedAccountKey(identity.platform, identity.mid) ?? identity.mid) ?? {}),
       ...normalizedLinkedAccount(payload),
     });
   }
   return {
-    ...subscription,
+    ...normalizedSubscription(subscription),
     linkedAccounts: Array.from(links.values()).sort((left, right) =>
-      stringValue(left.name).localeCompare(stringValue(right.name), "zh-CN"),
+      stringValue(left.name).localeCompare(stringValue(right.name), "zh-CN")
+        || stringValue(left.platform).localeCompare(stringValue(right.platform)),
     ),
   };
 }
@@ -384,7 +440,7 @@ function makeEntityRecord(
     entityRevision,
     operation,
     ...(seq === undefined ? {} : { seq }),
-    payload,
+    payload: operation === "delete" ? payload : normalizedEntityPayload(entityType, payload),
     updatedAt,
   };
 }

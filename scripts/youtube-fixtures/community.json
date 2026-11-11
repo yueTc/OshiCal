@@ -1,0 +1,279 @@
+{
+  "fixtureVersion": 1,
+  "public": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/community",
+    "htmlResponse": {
+      "ytInitialData": {
+        "responseContext": {
+          "serviceTrackingParams": [
+            {
+              "service": "GFEEDBACK",
+              "params": [
+                {
+                  "key": "is_owner",
+                  "value": "false"
+                }
+              ]
+            }
+          ]
+        },
+        "contents": {
+          "twoColumnBrowseResultsRenderer": {
+            "tabs": [
+              {
+                "tabRenderer": {
+                  "selected": true,
+                  "content": {
+                    "sectionListRenderer": {
+                      "contents": [
+                        {
+                          "itemSectionRenderer": {
+                            "contents": [
+                              {
+                                "backstagePostRenderer": {
+                                  "postId": "UgkxPublic001",
+                                  "authorText": {
+                                    "simpleText": "Fixture Channel"
+                                  },
+                                  "authorThumbnail": {
+                                    "thumbnails": [
+                                      {
+                                        "url": "https://yt3.googleusercontent.com/fixture-channel.jpg",
+                                        "width": 48,
+                                        "height": 48
+                                      }
+                                    ]
+                                  },
+                                  "publishedTimeText": {
+                                    "runs": [
+                                      {
+                                        "text": "2026-11-10"
+                                      }
+                                    ]
+                                  },
+                                  "contentText": {
+                                    "runs": [
+                                      {
+                                        "text": "公开社区帖："
+                                      },
+                                      {
+                                        "text": "11 月 15 日 20:00 直播"
+                                      }
+                                    ]
+                                  },
+                                  "backstageAttachment": {
+                                    "backstageImageRenderer": {
+                                      "image": {
+                                        "thumbnails": [
+                                          {
+                                            "url": "https://yt3.googleusercontent.com/community-public-small.jpg",
+                                            "width": 320,
+                                            "height": 180
+                                          },
+                                          {
+                                            "url": "https://yt3.googleusercontent.com/community-public-large.jpg",
+                                            "width": 1280,
+                                            "height": 720
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "navigationEndpoint": {
+                                    "commandMetadata": {
+                                      "webCommandMetadata": {
+                                        "url": "/post/UgkxPublic001"
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "backstagePostRenderer": {
+                                  "postId": "UgkxPublic002",
+                                  "authorText": {
+                                    "simpleText": "Fixture Channel"
+                                  },
+                                  "publishedTimeText": {
+                                    "runs": [
+                                      {
+                                        "text": "2026-11-11"
+                                      }
+                                    ]
+                                  },
+                                  "contentText": {
+                                    "runs": [
+                                      {
+                                        "text": "公开社区帖：本周停播一次"
+                                      }
+                                    ]
+                                  },
+                                  "navigationEndpoint": {
+                                    "commandMetadata": {
+                                      "webCommandMetadata": {
+                                        "url": "/post/UgkxPublic002"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "expected": {
+      "skipped": false,
+      "skipReason": null,
+      "posts": [
+        {
+          "postId": "UgkxPublic001",
+          "authorName": "Fixture Channel",
+          "publishedText": "2026-11-10",
+          "text": "公开社区帖：11 月 15 日 20:00 直播",
+          "images": [
+            "https://yt3.googleusercontent.com/community-public-large.jpg"
+          ],
+          "sourceUrl": "https://www.youtube.com/post/UgkxPublic001",
+          "membershipOnly": false
+        },
+        {
+          "postId": "UgkxPublic002",
+          "authorName": "Fixture Channel",
+          "publishedText": "2026-11-11",
+          "text": "公开社区帖：本周停播一次",
+          "images": [],
+          "sourceUrl": "https://www.youtube.com/post/UgkxPublic002",
+          "membershipOnly": false
+        }
+      ]
+    }
+  },
+  "membersOnlyAccessible": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/community",
+    "htmlResponse": {
+      "ytInitialData": {
+        "contents": {
+          "twoColumnBrowseResultsRenderer": {
+            "tabs": [
+              {
+                "tabRenderer": {
+                  "selected": true,
+                  "content": {
+                    "sectionListRenderer": {
+                      "contents": [
+                        {
+                          "itemSectionRenderer": {
+                            "contents": [
+                              {
+                                "backstagePostRenderer": {
+                                  "postId": "UgkxMember001",
+                                  "authorText": {
+                                    "simpleText": "Fixture Channel"
+                                  },
+                                  "publishedTimeText": {
+                                    "runs": [
+                                      {
+                                        "text": "2026-11-12"
+                                      }
+                                    ]
+                                  },
+                                  "contentText": {
+                                    "runs": [
+                                      {
+                                        "text": "会员限定：11 月 16 日 21:30 直播"
+                                      }
+                                    ]
+                                  },
+                                  "sponsorsOnlyBadge": {
+                                    "liveBadgeRenderer": {
+                                      "label": {
+                                        "simpleText": "会员专属"
+                                      }
+                                    }
+                                  },
+                                  "navigationEndpoint": {
+                                    "commandMetadata": {
+                                      "webCommandMetadata": {
+                                        "url": "/post/UgkxMember001"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "expected": {
+      "skipped": false,
+      "skipReason": null,
+      "posts": [
+        {
+          "postId": "UgkxMember001",
+          "authorName": "Fixture Channel",
+          "publishedText": "2026-11-12",
+          "text": "会员限定：11 月 16 日 21:30 直播",
+          "images": [],
+          "sourceUrl": "https://www.youtube.com/post/UgkxMember001",
+          "membershipOnly": true
+        }
+      ]
+    }
+  },
+  "membersOnlyUnavailable": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/community",
+    "htmlResponse": {
+      "ytInitialData": {
+        "alerts": [
+          {
+            "alertRenderer": {
+              "type": "ERROR",
+              "text": {
+                "simpleText": "This post is available to channel members only."
+              }
+            }
+          }
+        ],
+        "contents": {
+          "twoColumnBrowseResultsRenderer": {
+            "tabs": [
+              {
+                "tabRenderer": {
+                  "selected": true,
+                  "content": {
+                    "sectionListRenderer": {
+                      "contents": []
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "expected": {
+      "skipped": true,
+      "skipReason": "membership_session_unavailable",
+      "posts": []
+    }
+  }
+}

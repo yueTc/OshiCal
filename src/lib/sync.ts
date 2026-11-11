@@ -15,6 +15,7 @@ import type {
   LiveSession,
   LiveStatus,
   LlmReasoningEffort,
+  Platform,
   Schedule,
   Streamer,
   SyncBootstrap,
@@ -25,7 +26,7 @@ import type {
 export type { DeviceInfo, SyncBootstrap, SyncChange } from "../types";
 
 export const SYNC_PROTOCOL_VERSION = 2;
-export const SYNC_SCHEMA_VERSION = 2;
+export const SYNC_SCHEMA_VERSION = 3;
 export const SYNC_CHANGES_LIMIT = 200;
 export const SYNC_ACK_INTERVAL_MS = 750;
 const SYNC_HTTP_TIMEOUT_MS = 30_000;
@@ -144,6 +145,46 @@ function syncFeedChanged(
   return normalizedLocal !== normalizedRemote;
 }
 
+function platformValue(value: unknown): Platform {
+  return value === "youtube" ? "youtube" : "bilibili";
+}
+
+function normalizeSubscriptionPayload(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  return {
+    ...value,
+    platform: platformValue(value.platform),
+    ...(Array.isArray(value.linkedAccounts)
+      ? {
+          linkedAccounts: value.linkedAccounts.map((link) => (
+            isRecord(link) ? { ...link, platform: platformValue(link.platform) } : link
+          )),
+        }
+      : {}),
+  };
+}
+
+function normalizeSyncEntityPayload(entityType: string, payload: unknown): unknown {
+  if (!isRecord(payload)) {
+    return payload;
+  }
+  if (entityType === "subscription") {
+    return normalizeSubscriptionPayload(payload);
+  }
+  if (
+    entityType === "link"
+    || entityType === "linked_account"
+    || entityType === "schedule_source"
+    || entityType === "source_suppression"
+    || entityType === "live_status"
+  ) {
+    return { ...payload, platform: platformValue(payload.platform) };
+  }
+  return payload;
+}
+
 function normalizeSyncChange(value: unknown): SyncChange | null {
   if (!isRecord(value)) {
     return null;
@@ -164,7 +205,7 @@ function normalizeSyncChange(value: unknown): SyncChange | null {
     entityId,
     operation,
     entityRevision: nonNegativeInteger(value.entityRevision),
-    payload: value.payload ?? null,
+    payload: normalizeSyncEntityPayload(entityType, value.payload ?? null),
     createdAt: stringValue(value.createdAt, new Date(0).toISOString()),
   };
 }
@@ -491,16 +532,33 @@ export async function fetchSyncBootstrap(
     snapshotRevision: requiredSequence(data.snapshotRevision, "snapshotRevision"),
     minRetainedSeq: requiredSequence(data.minRetainedSeq, "minRetainedSeq"),
     serverTime: stringValue(data.serverTime, new Date().toISOString()),
-    subscriptions: data.subscriptions as Streamer[],
+    subscriptions: data.subscriptions.map((item) => (
+      normalizeSubscriptionPayload(item) as Streamer
+    )),
     schedules: data.schedules as Schedule[],
     weeklyRules: Array.isArray(data.weeklyRules)
       ? (data.weeklyRules as WeeklyScheduleRule[])
       : [],
     weeklyExceptions: Array.isArray(data.weeklyExceptions) ? data.weeklyExceptions : [],
-    scheduleSources: Array.isArray(data.scheduleSources) ? data.scheduleSources : [],
-    sourceSuppressions: Array.isArray(data.sourceSuppressions) ? data.sourceSuppressions : [],
+    scheduleSources: Array.isArray(data.scheduleSources)
+      ? data.scheduleSources.map((item) => (
+          normalizeSyncEntityPayload("schedule_source", item) as SyncBootstrap["scheduleSources"][number]
+        ))
+      : [],
+    sourceSuppressions: Array.isArray(data.sourceSuppressions)
+      ? data.sourceSuppressions.map((item) => (
+          normalizeSyncEntityPayload(
+            "source_suppression",
+            item,
+          ) as SyncBootstrap["sourceSuppressions"][number]
+        ))
+      : [],
     serverSettings: isRecord(data.serverSettings) ? data.serverSettings : {},
-    liveStatuses: Array.isArray(data.liveStatuses) ? (data.liveStatuses as LiveStatus[]) : [],
+    liveStatuses: Array.isArray(data.liveStatuses)
+      ? data.liveStatuses.map((item) => (
+          normalizeSyncEntityPayload("live_status", item) as LiveStatus
+        ))
+      : [],
     liveSessions: Array.isArray(data.liveSessions) ? (data.liveSessions as LiveSession[]) : [],
   };
 }
@@ -650,6 +708,7 @@ export function mergeServerSettings(local: AppSettings, value: unknown): AppSett
     autoAnalyzeImages: boolOr("autoAnalyzeImages", local.autoAnalyzeImages),
     liveStatsEnabled: boolOr("liveStatsEnabled", local.liveStatsEnabled),
     fertilityEnabled: boolOr("fertilityEnabled", local.fertilityEnabled),
+    youtubeEnabled: boolOr("youtubeEnabled", local.youtubeEnabled ?? false),
     llmBaseUrl: stringOr("llmBaseUrl", local.llmBaseUrl),
     llmModel: stringOr("llmModel", local.llmModel),
     llmPromptVersion: stringOr("llmPromptVersion", local.llmPromptVersion),
@@ -673,6 +732,7 @@ export function serverSettingsForSave(local: AppSettings, remote: AppSettings): 
     autoAnalyzeImages: local.autoAnalyzeImages,
     liveStatsEnabled: local.liveStatsEnabled,
     fertilityEnabled: local.fertilityEnabled,
+    youtubeEnabled: local.youtubeEnabled ?? false,
     llmBaseUrl: local.llmBaseUrl,
     llmModel: local.llmModel,
     llmPromptVersion: local.llmPromptVersion,

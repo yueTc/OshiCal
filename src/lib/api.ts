@@ -26,6 +26,7 @@ import type {
   MigrationPreview,
   NewScheduleInput,
   NewWeeklyScheduleRuleInput,
+  Platform,
   ProxyTestReport,
   RefreshJob,
   RefreshJobAccepted,
@@ -45,6 +46,9 @@ import type {
   UpdateSubscriptionInput,
   UpdateWeeklyScheduleRuleInput,
   WeeklyScheduleRule,
+  YoutubeCredentialStatus,
+  YoutubeOAuthStart,
+  YoutubeWebLoginStart,
 } from "../types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -72,6 +76,121 @@ interface Envelope<T> {
 interface ServerApiOptions {
   baseUrl: string;
   token: string;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function stringFrom(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function booleanFrom(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+export function normalizeYoutubeStatus(value: unknown): YoutubeCredentialStatus {
+  const record = recordValue(value);
+  const secrets = recordValue(record.secrets ?? record);
+  const apiKey = recordValue(secrets.apiKey ?? secrets.api_key ?? secrets);
+  const oauth = recordValue(secrets.oauth ?? secrets);
+  const webSession = recordValue(
+    secrets.webSession ?? secrets.web_session ?? secrets.session ?? secrets,
+  );
+  const oauthExpired = booleanFrom(oauth.expired) === true;
+  // Status is deliberately projected to state only. Provider errors can echo
+  // request details, so never put a raw token/key/cookie or arbitrary error text
+  // into the credential panel DOM.
+  const oauthError = stringFrom(
+    oauth.lastError ?? oauth.last_error,
+  );
+  const statusError = stringFrom(
+    secrets.lastError ?? secrets.last_error ?? record.lastError ?? record.last_error,
+  );
+  return {
+    apiKeyConfigured:
+      booleanFrom(apiKey.configured ?? apiKey.apiKeyConfigured ?? apiKey.api_key_configured)
+      ?? false,
+    apiKeyValid: booleanFrom(apiKey.apiKeyValid ?? apiKey.api_key_valid),
+    oauthConfigured:
+      booleanFrom(oauth.configured ?? oauth.oauthConfigured ?? oauth.oauth_configured)
+      ?? false,
+    oauthExpired,
+    oauthAccount: stringFrom(oauth.account ?? oauth.oauthAccount ?? oauth.oauth_account),
+    webSessionConfigured:
+      booleanFrom(webSession.configured ?? webSession.webSessionConfigured ?? webSession.web_session_configured)
+      ?? false,
+    webSessionAccount: stringFrom(
+      webSession.account
+        ?? webSession.webSessionAccount
+        ?? webSession.web_session_account,
+    ),
+    checkedAt: stringFrom(record.checkedAt ?? record.checked_at),
+    lastError: oauthExpired
+      ? "Google OAuth 已过期，请重新授权。"
+      : oauthError || statusError
+        ? "YouTube 凭据状态检查失败，请重新授权或稍后重试。"
+        : null,
+  };
+}
+
+function normalizeYoutubeOAuthStart(value: unknown): YoutubeOAuthStart {
+  const record = recordValue(value);
+  return {
+    authorizationUrl: stringFrom(record.authorizationUrl ?? record.authUrl ?? record.url) ?? "",
+    state: stringFrom(record.state),
+    expiresInSeconds: typeof record.expiresInSeconds === "number" ? record.expiresInSeconds : undefined,
+  };
+}
+
+function normalizeYoutubeWebLoginStart(value: unknown): YoutubeWebLoginStart {
+  const record = recordValue(value);
+  return {
+    loginUrl: stringFrom(record.loginUrl ?? record.url),
+    message: stringFrom(record.message ?? record.note),
+  };
+}
+
+function normalizeAccountSearchResult(
+  value: unknown,
+  fallbackPlatform: Platform,
+): AccountSearchResult {
+  const record = recordValue(value);
+  const platform = record.platform === "youtube"
+    ? "youtube"
+    : record.platform === "bilibili"
+      ? "bilibili"
+      : fallbackPlatform;
+  const fans = typeof record.fans === "number" && Number.isFinite(record.fans)
+    ? Math.max(0, Math.trunc(record.fans))
+    : 0;
+  return {
+    platform,
+    mid: stringFrom(record.mid) ?? "",
+    name: stringFrom(record.name) ?? "",
+    avatarUrl: stringFrom(record.avatarUrl) ?? "",
+    sign: stringFrom(record.sign) ?? "",
+    handle: stringFrom(record.handle),
+    profileUrl: stringFrom(record.profileUrl),
+    uploadsPlaylistId: stringFrom(record.uploadsPlaylistId),
+    roomId: stringFrom(record.roomId),
+    fans,
+    isLive: booleanFrom(record.isLive) ?? false,
+    liveUrl: stringFrom(record.liveUrl),
+  };
+}
+
+function normalizeAccountSearchResults(
+  value: unknown,
+  fallbackPlatform: Platform,
+): AccountSearchResult[] {
+  if (!Array.isArray(value)) {
+    throw new ApiFailure("账号搜索响应格式无效", "INVALID_RESPONSE");
+  }
+  return value.map((item) => normalizeAccountSearchResult(item, fallbackPlatform));
 }
 
 export class ServerApi {
@@ -164,8 +283,11 @@ export class ServerApi {
     return this.request("/api/health");
   }
 
-  search(keyword: string): Promise<AccountSearchResult[]> {
-    return this.request(`/api/search?q=${encodeURIComponent(keyword)}`);
+  async search(keyword: string, platform: Platform = "bilibili"): Promise<AccountSearchResult[]> {
+    const path = platform === "youtube"
+      ? `/api/youtube/search?q=${encodeURIComponent(keyword)}`
+      : `/api/search?q=${encodeURIComponent(keyword)}`;
+    return normalizeAccountSearchResults(await this.request<unknown>(path), platform);
   }
 
   subscriptions(): Promise<Streamer[]> {
@@ -173,7 +295,7 @@ export class ServerApi {
   }
 
   addSubscription(input: NewSubscriptionInput): Promise<Streamer> {
-    return this.request("/api/subscriptions", {
+    return this.request(input.platform === "youtube" ? "/api/youtube/subscriptions" : "/api/subscriptions", {
       method: "POST",
       body: JSON.stringify(input),
     });
@@ -197,15 +319,19 @@ export class ServerApi {
     return this.request(`/api/subscriptions/${id}`, { method: "DELETE" });
   }
 
-  addLinkedAccount(id: number, mid: string): Promise<unknown> {
+  addLinkedAccount(id: number, mid: string, platform: Platform = "bilibili"): Promise<unknown> {
     return this.request(`/api/subscriptions/${id}/links`, {
       method: "POST",
-      body: JSON.stringify({ mid }),
+      body: JSON.stringify({ platform, mid }),
     });
   }
 
-  removeLinkedAccount(id: number, mid: string): Promise<unknown> {
-    return this.request(`/api/subscriptions/${id}/links/${mid}`, { method: "DELETE" });
+  removeLinkedAccount(id: number, mid: string, platform: Platform = "bilibili"): Promise<unknown> {
+    const base = platform === "youtube" ? "/api/youtube/subscriptions" : "/api/subscriptions";
+    return this.request(
+      `${base}/${id}/links/${encodeURIComponent(mid)}`,
+      { method: "DELETE" },
+    );
   }
 
   refresh(): Promise<RefreshReport> {
@@ -357,6 +483,82 @@ export class ServerApi {
     });
   }
 
+  async youtubeStatus(): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await this.request<unknown>("/api/secrets/youtube"));
+  }
+
+  async saveYoutubeApiKey(apiKey: string): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/secrets/youtube", {
+      method: "PUT",
+      body: JSON.stringify({ apiKey }),
+    });
+    return this.youtubeStatus();
+  }
+
+  async clearYoutubeApiKey(): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/secrets/youtube", { method: "DELETE" });
+    return this.youtubeStatus();
+  }
+
+  async testYoutubeApiKey(): Promise<YoutubeCredentialStatus> {
+    const status = await this.youtubeStatus();
+    if (!status.apiKeyConfigured) {
+      return { ...status, apiKeyValid: false, checkedAt: new Date().toISOString() };
+    }
+    // Data API search.list is invoked only by the explicit test button; status
+    // polling must never consume YouTube quota.
+    await this.search("YouTube", "youtube");
+    return {
+      ...status,
+      apiKeyValid: true,
+      checkedAt: new Date().toISOString(),
+      lastError: null,
+    };
+  }
+
+  async startYoutubeOAuth(): Promise<YoutubeOAuthStart> {
+    return normalizeYoutubeOAuthStart(await this.request<unknown>("/api/youtube/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }));
+  }
+
+  async completeYoutubeOAuth(code: string, state: string): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/youtube/oauth/complete", {
+      method: "POST",
+      body: JSON.stringify({ code, state }),
+    });
+    return this.youtubeStatus();
+  }
+
+  async clearYoutubeOAuth(): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/youtube/oauth/logout", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    return this.youtubeStatus();
+  }
+
+  async startYoutubeWebLogin(): Promise<YoutubeWebLoginStart> {
+    return normalizeYoutubeWebLoginStart(await this.request<unknown>("/api/youtube/session/start", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }));
+  }
+
+  async saveYoutubeWebSession(cookie: string): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/youtube/session", {
+      method: "PUT",
+      body: JSON.stringify({ cookie }),
+    });
+    return this.youtubeStatus();
+  }
+
+  async clearYoutubeWebSession(): Promise<YoutubeCredentialStatus> {
+    await this.request<unknown>("/api/youtube/session", { method: "DELETE" });
+    return this.youtubeStatus();
+  }
+
   serverBiliStatus(): Promise<ServerBiliStatus> {
     return this.request("/api/bilibili/status");
   }
@@ -492,9 +694,13 @@ export class ServerApi {
 }
 
 export interface NewSubscriptionInput {
+  platform?: Platform;
   mid: string;
   name?: string;
   avatarUrl?: string;
+  handle?: string | null;
+  profileUrl?: string | null;
+  uploadsPlaylistId?: string | null;
   roomId?: string | null;
   aliases?: string[];
   scheduleEnabled: boolean;
@@ -507,8 +713,11 @@ export class LocalApi {
     return invoke("bootstrap");
   }
 
-  search(keyword: string): Promise<AccountSearchResult[]> {
-    return invoke("search_accounts", { keyword });
+  async search(keyword: string, platform: Platform = "bilibili"): Promise<AccountSearchResult[]> {
+    return normalizeAccountSearchResults(
+      await invoke<unknown>("search_accounts", { keyword, platform }),
+      platform,
+    );
   }
 
   addSubscription(input: NewSubscriptionInput): Promise<Streamer> {
@@ -527,12 +736,12 @@ export class LocalApi {
     return invoke("delete_subscription", { id });
   }
 
-  addLinkedAccount(id: number, mid: string): Promise<unknown> {
-    return invoke("add_linked_account", { id, mid });
+  addLinkedAccount(id: number, mid: string, platform: Platform = "bilibili"): Promise<unknown> {
+    return invoke("add_linked_account", { id, mid, platform });
   }
 
-  removeLinkedAccount(id: number, mid: string): Promise<void> {
-    return invoke("remove_linked_account", { id, mid });
+  removeLinkedAccount(id: number, mid: string, platform: Platform = "bilibili"): Promise<void> {
+    return invoke("remove_linked_account", { id, mid, platform });
   }
 
   refresh(): Promise<RefreshReport> {
@@ -672,6 +881,56 @@ export class LocalApi {
     return invoke("clear_bilibili_cookie");
   }
 
+  async youtubeStatus(): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("youtube_status"));
+  }
+
+  async setYoutubeApiKey(apiKey: string): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("set_youtube_api_key", { apiKey }));
+  }
+
+  async clearYoutubeApiKey(): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("clear_youtube_api_key"));
+  }
+
+  async testYoutubeApiKey(): Promise<YoutubeCredentialStatus> {
+    const status = await this.youtubeStatus();
+    if (!status.apiKeyConfigured) {
+      return { ...status, apiKeyValid: false, checkedAt: new Date().toISOString() };
+    }
+    await this.search("YouTube", "youtube");
+    return {
+      ...status,
+      apiKeyValid: true,
+      checkedAt: new Date().toISOString(),
+      lastError: null,
+    };
+  }
+
+  async startYoutubeOAuth(): Promise<YoutubeOAuthStart> {
+    return normalizeYoutubeOAuthStart(await invoke<unknown>("start_youtube_oauth"));
+  }
+
+  async completeYoutubeOAuth(code: string, state: string): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("complete_youtube_oauth", { code, oauthState: state }));
+  }
+
+  async clearYoutubeOAuth(): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("clear_youtube_oauth"));
+  }
+
+  async startYoutubeWebLogin(): Promise<YoutubeWebLoginStart> {
+    return normalizeYoutubeWebLoginStart(await invoke<unknown>("start_youtube_web_login"));
+  }
+
+  async saveYoutubeWebSession(cookie: string): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("set_youtube_web_session", { cookie }));
+  }
+
+  async clearYoutubeWebSession(): Promise<YoutubeCredentialStatus> {
+    return normalizeYoutubeStatus(await invoke<unknown>("clear_youtube_web_session"));
+  }
+
   serverToken(): Promise<string | null> {
     return invoke("get_server_token");
   }
@@ -774,9 +1033,19 @@ export async function openExternalUrl(url: string): Promise<void> {
   const parsed = new URL(url);
   if (
     parsed.protocol !== "https:" ||
-    !["live.bilibili.com", "space.bilibili.com", "t.bilibili.com", "www.bilibili.com", "laplace.live"].includes(parsed.hostname)
+    ![
+      "live.bilibili.com",
+      "space.bilibili.com",
+      "t.bilibili.com",
+      "www.bilibili.com",
+      "laplace.live",
+      "youtube.com",
+      "www.youtube.com",
+      "youtu.be",
+      "accounts.google.com",
+    ].includes(parsed.hostname)
   ) {
-    throw new Error("只允许打开 B 站直播间、个人主页、动态、站内作品页面或 LAPLACE 生理期页面");
+    throw new Error("只允许打开 B 站、YouTube、Google 授权页面或 LAPLACE 生理期页面");
   }
   window.open(parsed.toString(), "_blank", "noopener,noreferrer");
 }
@@ -790,7 +1059,3 @@ export function explainError(error: unknown): string {
   }
   return String(error);
 }
-
-
-
-

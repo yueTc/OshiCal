@@ -5,7 +5,7 @@ use crate::models::{
 };
 use sqlx::{Row, SqliteConnection};
 
-pub const SYNC_SCHEMA_VERSION: u32 = 2;
+pub const SYNC_SCHEMA_VERSION: u32 = 3;
 const SYNC_PAGE_MAX: i64 = 500;
 const DEVICE_ONLINE_WINDOW_SECONDS: i64 = 90;
 const META_LATEST_SEQ: &str = "latest_seq";
@@ -59,6 +59,26 @@ CREATE TABLE IF NOT EXISTS devices (
     created_at TEXT NOT NULL,
     revoked_at TEXT
 );
+
+-- Original-currency YouTube Super Chat / Super Sticker events. This is a
+-- child history table and is intentionally separate from Bilibili CNY revenue.
+CREATE TABLE IF NOT EXISTS live_super_chat_events (
+    id TEXT PRIMARY KEY,
+    session_id INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    live_chat_id TEXT,
+    created_at TEXT,
+    user_channel_id TEXT,
+    user_display_name TEXT,
+    amount_micros INTEGER CHECK (amount_micros IS NULL OR amount_micros >= 0),
+    currency TEXT,
+    amount_display_string TEXT,
+    tier INTEGER CHECK (tier IS NULL OR tier >= 0),
+    captured_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_super_chat_events_session
+ON live_super_chat_events(session_id, captured_at, id);
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +194,18 @@ pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResu
             "last_segment_started_at",
             "ALTER TABLE live_sessions ADD COLUMN last_segment_started_at TEXT NOT NULL DEFAULT ''",
         ),
+        // YouTube membership events are distinct from Bilibili guard_count.
+        // Nullable means OAuth-backed collection has never been available.
+        (
+            "live_sessions",
+            "membership_count",
+            "ALTER TABLE live_sessions ADD COLUMN membership_count INTEGER",
+        ),
+        (
+            "live_sessions",
+            "youtube_stats_available",
+            "ALTER TABLE live_sessions ADD COLUMN youtube_stats_available INTEGER",
+        ),
     ] {
         add_column_if_missing(conn, table, column, definition).await?;
     }
@@ -235,9 +267,13 @@ async fn add_column_if_missing(
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SyncStreamerRow {
     id: i64,
+    platform: String,
     mid: String,
     name: String,
     avatar_url: String,
+    handle: Option<String>,
+    profile_url: Option<String>,
+    uploads_playlist_id: Option<String>,
     room_id: Option<String>,
     live_url: Option<String>,
     schedule_enabled: i64,
@@ -250,6 +286,7 @@ struct SyncStreamerRow {
     live_is_live: i64,
     live_title: Option<String>,
     live_cover: Option<String>,
+    live_video_id: Option<String>,
     live_started_at: Option<String>,
     live_checked_at: Option<String>,
     sort_order: i64,
@@ -261,9 +298,12 @@ struct SyncStreamerRow {
 struct SyncLinkedAccountRow {
     id: i64,
     streamer_id: i64,
+    platform: String,
     mid: String,
     name: String,
     avatar_url: String,
+    handle: Option<String>,
+    profile_url: Option<String>,
     revision: i64,
     created_at: String,
 }
@@ -283,6 +323,7 @@ struct SyncWeeklyExceptionRow {
 struct SyncScheduleSourceRow {
     id: i64,
     schedule_id: i64,
+    platform: String,
     source_kind: String,
     source_post_id: Option<String>,
     source_image_url: Option<String>,
@@ -297,6 +338,7 @@ struct SyncScheduleSourceRow {
 struct SyncSuppressionRow {
     id: i64,
     streamer_id: i64,
+    platform: String,
     source_post_id: String,
     source_fingerprint: String,
     revision: i64,
@@ -1253,16 +1295,18 @@ fn map_device(row: sqlx::sqlite::SqliteRow) -> AppResult<DeviceInfo> {
 
 async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>> {
     let rows = sqlx::query_as::<_, SyncStreamerRow>(
-        "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
-                last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
-                live_checked_at, sort_order, created_at, revision
+        "SELECT id, platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+                fans, aliases_json, last_error, last_refresh_at, live_is_live, live_title,
+                live_cover, live_video_id, live_started_at, live_checked_at, sort_order,
+                created_at, revision
          FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
     )
     .fetch_all(&mut *conn)
     .await?;
     let links = sqlx::query_as::<_, SyncLinkedAccountRow>(
-        "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+        "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url,
+                revision, created_at
          FROM linked_accounts ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&mut *conn)
@@ -1286,10 +1330,11 @@ async fn load_streamers(conn: &mut SqliteConnection) -> AppResult<Vec<Streamer>>
 
 async fn load_streamer(conn: &mut SqliteConnection, id: i64) -> AppResult<Streamer> {
     let row = sqlx::query_as::<_, SyncStreamerRow>(
-        "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                live_notify_enabled, live_stats_enabled, fans, aliases_json, last_error,
-                last_refresh_at, live_is_live, live_title, live_cover, live_started_at,
-                live_checked_at, sort_order, created_at, revision
+        "SELECT id, platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+                fans, aliases_json, last_error, last_refresh_at, live_is_live, live_title,
+                live_cover, live_video_id, live_started_at, live_checked_at, sort_order,
+                created_at, revision
          FROM streamers WHERE id = ?",
     )
     .bind(id)
@@ -1297,7 +1342,8 @@ async fn load_streamer(conn: &mut SqliteConnection, id: i64) -> AppResult<Stream
     .await?
     .ok_or_else(|| AppError::not_found(format!("主播 {id}")))?;
     let links = sqlx::query_as::<_, SyncLinkedAccountRow>(
-        "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+        "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url,
+                revision, created_at
          FROM linked_accounts WHERE streamer_id = ? ORDER BY name COLLATE NOCASE",
     )
     .bind(id)
@@ -1318,9 +1364,13 @@ fn map_streamer_row(
         .map_err(|_| AppError::validation("主播别名数据损坏"))?;
     Ok(Streamer {
         id: row.id,
+        platform: parse_platform(&row.platform)?,
         mid: row.mid,
         name: row.name,
         avatar_url: row.avatar_url,
+        handle: row.handle,
+        profile_url: row.profile_url,
+        uploads_playlist_id: row.uploads_playlist_id,
         room_id: row.room_id,
         live_url: row.live_url,
         aliases,
@@ -1333,6 +1383,7 @@ fn map_streamer_row(
         is_live: row.live_is_live != 0,
         live_title: row.live_title,
         live_cover: row.live_cover,
+        live_video_id: row.live_video_id,
         live_started_at: parse_opt_ts(row.live_started_at.as_deref())?,
         live_checked_at: parse_opt_ts(row.live_checked_at.as_deref())?,
         linked_accounts,
@@ -1347,7 +1398,8 @@ async fn load_linked_account_by_id(
     id: i64,
 ) -> AppResult<SyncLinkedAccountRow> {
     sqlx::query_as::<_, SyncLinkedAccountRow>(
-        "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+        "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url,
+                revision, created_at
          FROM linked_accounts WHERE id = ?",
     )
     .bind(id)
@@ -1360,9 +1412,12 @@ fn map_linked_account_row(row: SyncLinkedAccountRow) -> AppResult<LinkedAccount>
     Ok(LinkedAccount {
         id: row.id,
         streamer_id: row.streamer_id,
+        platform: parse_platform(&row.platform)?,
         mid: row.mid,
         name: row.name,
         avatar_url: row.avatar_url,
+        handle: row.handle,
+        profile_url: row.profile_url,
         revision: row.revision,
         created_at: parse_ts(&row.created_at)?,
     })
@@ -1372,9 +1427,12 @@ fn linked_account_payload(row: &SyncLinkedAccountRow) -> AppResult<Value> {
     Ok(json!({
         "id": row.id,
         "streamerId": row.streamer_id,
+        "platform": parse_platform(&row.platform)?,
         "mid": row.mid,
         "name": row.name,
         "avatarUrl": row.avatar_url,
+        "handle": row.handle,
+        "profileUrl": row.profile_url,
         "revision": row.revision,
         "createdAt": parse_ts(&row.created_at)?,
     }))
@@ -1480,7 +1538,7 @@ fn map_weekly_exception_row(row: SyncWeeklyExceptionRow) -> AppResult<WeeklySche
 
 async fn load_schedule_sources(conn: &mut SqliteConnection) -> AppResult<Vec<ScheduleSource>> {
     let rows = sqlx::query_as::<_, SyncScheduleSourceRow>(
-        "SELECT id, schedule_id, source_kind, source_post_id, source_image_url,
+        "SELECT id, schedule_id, platform, source_kind, source_post_id, source_image_url,
                 source_fingerprint, source_identity, confidence, revision, created_at
          FROM schedule_sources ORDER BY schedule_id, id",
     )
@@ -1494,7 +1552,7 @@ async fn load_schedule_source_by_id(
     id: i64,
 ) -> AppResult<SyncScheduleSourceRow> {
     sqlx::query_as::<_, SyncScheduleSourceRow>(
-        "SELECT id, schedule_id, source_kind, source_post_id, source_image_url,
+        "SELECT id, schedule_id, platform, source_kind, source_post_id, source_image_url,
                 source_fingerprint, source_identity, confidence, revision, created_at
          FROM schedule_sources WHERE id = ?",
     )
@@ -1508,6 +1566,7 @@ fn map_schedule_source_row(row: SyncScheduleSourceRow) -> AppResult<ScheduleSour
     Ok(ScheduleSource {
         id: row.id,
         schedule_id: row.schedule_id,
+        platform: parse_platform(&row.platform)?,
         source_kind: row.source_kind,
         source_post_id: row.source_post_id,
         source_image_url: row.source_image_url,
@@ -1522,7 +1581,8 @@ async fn load_source_suppressions(
     conn: &mut SqliteConnection,
 ) -> AppResult<Vec<SourceSuppression>> {
     let rows = sqlx::query_as::<_, SyncSuppressionRow>(
-        "SELECT id, streamer_id, source_post_id, source_fingerprint, revision, created_at
+        "SELECT id, streamer_id, platform, source_post_id, source_fingerprint, revision,
+                created_at
          FROM source_suppressions ORDER BY id",
     )
     .fetch_all(&mut *conn)
@@ -1535,7 +1595,8 @@ async fn load_source_suppression_by_id(
     id: i64,
 ) -> AppResult<SyncSuppressionRow> {
     sqlx::query_as::<_, SyncSuppressionRow>(
-        "SELECT id, streamer_id, source_post_id, source_fingerprint, revision, created_at
+        "SELECT id, streamer_id, platform, source_post_id, source_fingerprint, revision,
+                created_at
          FROM source_suppressions WHERE id = ?",
     )
     .bind(id)
@@ -1548,6 +1609,7 @@ fn map_source_suppression_row(row: SyncSuppressionRow) -> AppResult<SourceSuppre
     Ok(SourceSuppression {
         id: row.id,
         streamer_id: row.streamer_id,
+        platform: parse_platform(&row.platform)?,
         source_post_id: row.source_post_id,
         source_fingerprint: row.source_fingerprint,
         revision: row.revision,
@@ -1569,6 +1631,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
                 | "dynamic_poll_seconds"
                 | "auto_analyze_images"
                 | "live_stats_enabled"
+                | "youtube_enabled"
                 | "fertility_enabled"
                 | "llm_base_url"
                 | "llm_model"
@@ -1586,6 +1649,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
             "dynamic_poll_seconds" => settings.dynamic_poll_seconds = serde_json::from_str(&value)?,
             "auto_analyze_images" => settings.auto_analyze_images = serde_json::from_str(&value)?,
             "live_stats_enabled" => settings.live_stats_enabled = serde_json::from_str(&value)?,
+            "youtube_enabled" => settings.youtube_enabled = serde_json::from_str(&value)?,
             "fertility_enabled" => settings.fertility_enabled = serde_json::from_str(&value)?,
             "llm_base_url" => settings.llm_base_url = serde_json::from_str(&value)?,
             "llm_model" => settings.llm_model = serde_json::from_str(&value)?,
@@ -1602,8 +1666,9 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
 
 async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveStatus>> {
     let rows = sqlx::query(
-        "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_schedule_id, live_schedule_known, live_notify_enabled, live_revision
+        "SELECT id, platform, mid, name, avatar_url, live_is_live, live_title, live_cover,
+                live_url, live_video_id, live_checked_at, live_started_at, live_schedule_id,
+                live_schedule_known, live_notify_enabled, live_revision
          FROM streamers ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&mut *conn)
@@ -1613,8 +1678,9 @@ async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSt
 
 async fn load_live_status(conn: &mut SqliteConnection, streamer_id: i64) -> AppResult<LiveStatus> {
     let row = sqlx::query(
-        "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_schedule_id, live_schedule_known, live_notify_enabled, live_revision
+        "SELECT id, platform, mid, name, avatar_url, live_is_live, live_title, live_cover,
+                live_url, live_video_id, live_checked_at, live_started_at, live_schedule_id,
+                live_schedule_known, live_notify_enabled, live_revision
          FROM streamers WHERE id = ?",
     )
     .bind(streamer_id)
@@ -1629,6 +1695,7 @@ fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
         schedule_id: row.try_get("live_schedule_id")?,
         schedule_known: row.try_get::<i64, _>("live_schedule_known")? != 0,
         streamer_id: row.try_get("id")?,
+        platform: parse_platform(&row.try_get::<String, _>("platform")?)?,
         mid: row.try_get("mid")?,
         streamer_name: row.try_get("name")?,
         avatar_url: row.try_get("avatar_url")?,
@@ -1638,6 +1705,7 @@ fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
             .unwrap_or_default(),
         cover_url: row.try_get("live_cover")?,
         live_url: row.try_get("live_url")?,
+        live_video_id: row.try_get("live_video_id")?,
         online: 0,
         started_at: parse_opt_ts(
             row.try_get::<Option<String>, _>("live_started_at")?
@@ -1659,7 +1727,7 @@ async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSe
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                 created_at, updated_at, revision
          FROM live_sessions ORDER BY started_at DESC, id DESC",
     )
@@ -1674,7 +1742,7 @@ async fn load_live_session_by_id(conn: &mut SqliteConnection, id: i64) -> AppRes
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                 created_at, updated_at, revision
          FROM live_sessions WHERE id = ?",
     )
@@ -1695,12 +1763,20 @@ impl SqliteStore {
         let Some(identity) = input.source_identity.as_deref() else {
             return Ok(None);
         };
+        let platform: String = sqlx::query_scalar(
+            "SELECT st.platform FROM schedules s JOIN streamers st ON st.id = s.streamer_id
+             WHERE s.id = ?",
+        )
+        .bind(schedule_id)
+        .fetch_one(&mut *conn)
+        .await?;
         let changed = sqlx::query(
             "INSERT INTO schedule_sources
-                (schedule_id, source_kind, source_post_id, source_image_url,
+                (schedule_id, platform, source_kind, source_post_id, source_image_url,
                  source_fingerprint, source_identity, confidence, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
+                platform = excluded.platform,
                 confidence = MAX(schedule_sources.confidence, excluded.confidence),
                 source_fingerprint = COALESCE(excluded.source_fingerprint, schedule_sources.source_fingerprint),
                 revision = schedule_sources.revision + 1
@@ -1709,6 +1785,7 @@ impl SqliteStore {
                     AND excluded.source_fingerprint IS NOT schedule_sources.source_fingerprint)",
         )
         .bind(schedule_id)
+        .bind(platform)
         .bind(&input.source_kind)
         .bind(&input.source_post_id)
         .bind(&input.source_image_url)
@@ -1778,14 +1855,20 @@ impl SqliteStore {
         source_fingerprint: &str,
         actor: SyncActor<'_>,
     ) -> AppResult<i64> {
+        let platform: String = sqlx::query_scalar("SELECT platform FROM streamers WHERE id = ?")
+            .bind(streamer_id)
+            .fetch_one(&mut *conn)
+            .await?;
         sqlx::query(
             "INSERT INTO source_suppressions
-                (streamer_id, source_post_id, source_fingerprint, created_at)
-             VALUES (?, ?, ?, ?)
+                (streamer_id, platform, source_post_id, source_fingerprint, created_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(streamer_id, source_post_id, source_fingerprint) DO UPDATE SET
+                platform = excluded.platform,
                 revision = source_suppressions.revision + 1",
         )
         .bind(streamer_id)
+        .bind(platform)
         .bind(source_post_id)
         .bind(source_fingerprint)
         .bind(Utc::now().to_rfc3339())
@@ -1810,13 +1893,17 @@ mod tests {
     use super::*;
     use crate::models::{
         AddSubscription, LiveSessionStats, LiveSnapshot, NewSchedule, NewWeeklyScheduleRule,
-        UpdateSchedule, UpdateSubscription,
+        Platform, UpdateSchedule, UpdateSubscription,
     };
     use chrono::Duration;
 
     async fn add_streamer(store: &SqliteStore, mid: &str, name: &str) -> Streamer {
         store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: mid.to_owned(),
                 name: Some(name.to_owned()),
                 avatar_url: None,
@@ -2718,6 +2805,8 @@ mod tests {
         let latest = store.latest_sync_seq().await.expect("latest");
         let started_at = Utc::now();
         let first = LiveSnapshot {
+            platform: Platform::Bilibili,
+            live_video_id: None,
             is_live: true,
             title: "稳定开播".to_owned(),
             cover_url: None,

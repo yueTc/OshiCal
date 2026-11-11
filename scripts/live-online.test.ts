@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadOnlineSamplePages, nearestOnlinePoint, onlinePoints, onlineSegments, onlineTime, thinOnlineSegment } from "../src/lib/live-online.ts";
-import type { LiveOnlineSample, LiveOnlineSamplesPage } from "../src/types.ts";
+import type { LiveOnlineMetric, LiveOnlineSample, LiveOnlineSamplesPage, Platform } from "../src/types.ts";
 
 const BASE = Date.parse("2026-11-11T15:59:00Z");
 function sample(id: number, value: number | null, seconds = (id - 1) * 30): LiveOnlineSample {
@@ -9,8 +9,17 @@ function sample(id: number, value: number | null, seconds = (id - 1) * 30): Live
   return { id, sessionId: 7, sampledAt: time, observedAt: value === null ? null : time,
     highEnergyCount: value, collectorState: "active" };
 }
-function page(samples: LiveOnlineSample[], nextAfterId: number, hasMore = false): LiveOnlineSamplesPage {
-  return { sessionId: 7, metric: "bilibili_high_energy_users", sampleIntervalSeconds: 30, samples, nextAfterId, hasMore };
+function page(
+  samples: LiveOnlineSample[],
+  nextAfterId: number,
+  hasMore = false,
+  metric: LiveOnlineMetric = "bilibili_high_energy_users",
+  platform?: Platform,
+): LiveOnlineSamplesPage {
+  return {
+    sessionId: 7, metric, sampleIntervalSeconds: 30, samples, nextAfterId, hasMore,
+    ...(platform === undefined ? {} : { platform }),
+  };
 }
 
 test("loads all pages in order, then requests only newer samples", async () => {
@@ -30,6 +39,21 @@ test("loads all pages in order, then requests only newer samples", async () => {
   assert.deepEqual(cursors, [0, 1, 3]);
 });
 
+test("loads every YouTube concurrent-viewer page with the YouTube metric", async () => {
+  const cursors: number[] = [];
+  const loader = async (_id: number, afterId: number) => {
+    cursors.push(afterId);
+    return afterId === 0
+      ? page([sample(1, 321), sample(2, 280)], 2, true, "youtube_concurrent_viewers")
+      : page([sample(3, 0)], 3, false, "youtube_concurrent_viewers", "youtube");
+  };
+  const loaded = await loadOnlineSamplePages(loader, 7);
+  assert.deepEqual(cursors, [0, 2]);
+  assert.deepEqual(loaded.samples.map((s) => s.highEnergyCount), [321, 280, 0]);
+  assert.equal(loaded.platform, "youtube");
+  assert.equal(loaded.metric, "youtube_concurrent_viewers");
+});
+
 test("rejects empty/nonadvancing, overlapping, wrong-session and wrong-metric pages", async () => {
   const invalid = [
     page([], 0, true), page([sample(1, 1)], 0, true),
@@ -37,6 +61,7 @@ test("rejects empty/nonadvancing, overlapping, wrong-session and wrong-metric pa
     { ...page([sample(1, 1)], 1), sessionId: 8 },
     { ...page([sample(1, 1)], 1), metric: "total_viewers" },
     page([{ ...sample(1, 1), sessionId: 8 }], 1),
+    page([sample(1, 1)], 1, false, "youtube_concurrent_viewers", "bilibili"),
   ];
   for (const value of invalid) {
     await assert.rejects(loadOnlineSamplePages(async () => value as LiveOnlineSamplesPage, 7));

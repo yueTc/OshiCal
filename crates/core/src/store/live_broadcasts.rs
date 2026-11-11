@@ -261,6 +261,93 @@ impl SqliteStore {
         Ok(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_youtube_live_session(
+        &self,
+        streamer_id: i64,
+        room_id: &str,
+        streamer_name: &str,
+        title: &str,
+        cover: Option<&str>,
+        started_at: DateTime<Utc>,
+        checked: DateTime<Utc>,
+    ) -> AppResult<LiveSession> {
+        let platform: String = sqlx::query_scalar("SELECT platform FROM streamers WHERE id=?")
+            .bind(streamer_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if parse_platform(&platform)? != Platform::Youtube {
+            return Err(AppError::validation("主播不是 YouTube 频道"));
+        }
+        let started = started_at.to_rfc3339();
+        let now = checked.to_rfc3339();
+        let room_id = room_id.trim();
+        if room_id.is_empty() {
+            return Err(AppError::validation("YouTube 直播标识不能为空"));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM live_sessions WHERE streamer_id=? AND started_at=?",
+        )
+        .bind(streamer_id)
+        .bind(&started)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (id, changed) = if let Some(id) = existing {
+            let updated = sqlx::query(
+                "UPDATE live_sessions SET streamer_name=?, room_id=?, title=?,
+                        cover_url=COALESCE(?, cover_url), ended_at=NULL,
+                        collector_state='active', data_quality='partial', updated_at=?,
+                        revision=revision+1
+                 WHERE id=? AND (streamer_name<>? OR room_id<>? OR title<>?
+                        OR (? IS NOT NULL AND cover_url IS NOT ?)
+                        OR ended_at IS NOT NULL OR collector_state<>'active'
+                        OR data_quality<>'partial')",
+            )
+            .bind(streamer_name)
+            .bind(room_id)
+            .bind(title)
+            .bind(cover)
+            .bind(&now)
+            .bind(id)
+            .bind(streamer_name)
+            .bind(room_id)
+            .bind(title)
+            .bind(cover)
+            .bind(cover)
+            .execute(&mut *tx)
+            .await?;
+            (id, updated.rows_affected() > 0)
+        } else {
+            let id = sqlx::query(
+                "INSERT INTO live_sessions
+                    (streamer_id, streamer_name, room_id, title, cover_url, started_at,
+                     last_segment_started_at, data_quality, collector_state, segment_count,
+                     created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'partial', 'active', 1, ?, ?)",
+            )
+            .bind(streamer_id)
+            .bind(streamer_name)
+            .bind(room_id)
+            .bind(title)
+            .bind(cover)
+            .bind(&started)
+            .bind(&started)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+            (id, true)
+        };
+        if changed {
+            self.emit_live_session_change(&mut tx, id, "upsert", SyncActor::collector())
+                .await?;
+        }
+        tx.commit().await?;
+        self.get_live_session(id).await
+    }
+
     pub async fn ensure_broadcast_live_session(
         &self,
         streamer_id: i64,
@@ -376,6 +463,10 @@ mod tests {
     async fn owner(store: &SqliteStore) -> Streamer {
         store
             .add_subscription(&AddSubscription {
+                    platform: Platform::Bilibili,
+                    handle: None,
+                    profile_url: None,
+                    uploads_playlist_id: None,
                 mid: "100".into(),
                 name: Some("直播主播".into()),
                 avatar_url: None,
@@ -394,10 +485,12 @@ mod tests {
         live: bool,
     ) -> LiveSnapshot {
         LiveSnapshot {
+            platform: Platform::Bilibili,
             is_live: live,
             title: "无预告直播".into(),
             cover_url: None,
             live_url: Some("https://live.bilibili.com/12345".into()),
+            live_video_id: None,
             online: 0,
             started_at: started,
             checked_at: checked,

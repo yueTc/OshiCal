@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
+/// 导入快照格式保持 1：新增平台字段均为可选，旧快照按 B 站默认值读取。
+/// 实时同步协议另由 `SYNC_SCHEMA_VERSION` 管理。
 pub const SERVER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +88,7 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
     let mut ids = HashSet::new();
     let mut mids = HashSet::new();
     for streamer in &snapshot.subscriptions {
-        validate_mid(&streamer.mid)?;
+        validate_platform_mid(streamer.platform, &streamer.mid)?;
         if !ids.insert(streamer.id) || !mids.insert(&streamer.mid) {
             return Err(AppError::validation("快照含重复订阅 ID 或 MID"));
         }
@@ -94,7 +96,7 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
             return Err(AppError::validation("快照主播名称无效"));
         }
         for link in &streamer.linked_accounts {
-            validate_mid(&link.mid)?;
+            validate_platform_mid(link.platform, &link.mid)?;
         }
     }
 
@@ -276,8 +278,18 @@ fn new_schedule(remote: &Schedule, local_streamer: i64) -> NewSchedule {
 }
 
 fn streamer_values(value: &Streamer) -> Value {
-    json!({"name":value.name,"roomId":value.room_id,"scheduleEnabled":value.schedule_enabled,
-        "liveNotifyEnabled":value.live_notify_enabled,"liveStatsEnabled":value.live_stats_enabled,"aliases":value.aliases})
+    json!({
+        "platform": value.platform,
+        "name": value.name,
+        "handle": value.handle,
+        "profileUrl": value.profile_url,
+        "uploadsPlaylistId": value.uploads_playlist_id,
+        "roomId": value.room_id,
+        "scheduleEnabled": value.schedule_enabled,
+        "liveNotifyEnabled": value.live_notify_enabled,
+        "liveStatsEnabled": value.live_stats_enabled,
+        "aliases": value.aliases,
+    })
 }
 fn schedule_values(value: &Schedule) -> Value {
     json!({"participants":value.participants,"title":value.title,"startAt":value.start_at,
@@ -332,6 +344,7 @@ fn weekly_exception_values(
 fn schedule_source_values(source: &ScheduleSource, schedule: Option<&Schedule>) -> Value {
     json!({
         "schedule": schedule_reference(schedule),
+        "platform": source.platform,
         "sourceKind": source.source_kind,
         "sourcePostId": source.source_post_id,
         "sourceImageUrl": source.source_image_url,
@@ -345,6 +358,7 @@ fn schedule_source_values(source: &ScheduleSource, schedule: Option<&Schedule>) 
 fn source_suppression_values(suppression: &SourceSuppression, streamer_mid: &str) -> Value {
     json!({
         "streamerMid": streamer_mid,
+        "platform": suppression.platform,
         "sourcePostId": suppression.source_post_id,
         "sourceFingerprint": suppression.source_fingerprint,
         "revision": suppression.revision,
@@ -436,6 +450,7 @@ impl SqliteStore {
                 i64,
                 i64,
                 String,
+                String,
                 Option<String>,
                 Option<String>,
                 Option<String>,
@@ -445,7 +460,7 @@ impl SqliteStore {
                 String,
             ),
         >(
-            "SELECT id, schedule_id, source_kind, source_post_id, source_image_url,
+            "SELECT id, schedule_id, platform, source_kind, source_post_id, source_image_url,
                     source_fingerprint, source_identity, confidence, revision, created_at
              FROM schedule_sources ORDER BY id",
         )
@@ -455,6 +470,7 @@ impl SqliteStore {
         for (
             id,
             schedule_id,
+            platform,
             source_kind,
             source_post_id,
             source_image_url,
@@ -470,6 +486,7 @@ impl SqliteStore {
                 ScheduleSource {
                     id,
                     schedule_id,
+                    platform: parse_platform(&platform)?,
                     source_kind,
                     source_post_id,
                     source_image_url,
@@ -906,7 +923,7 @@ async fn migration_state_digest_on(
     .await?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"oshical-migration-state-v2\x00");
+    hasher.update(b"oshical-migration-state-v3\x00");
     for value in [latest_sync, latest_event] {
         digest_part(&mut hasher, &value.to_le_bytes());
     }
@@ -917,9 +934,13 @@ async fn migration_state_digest_on(
             "streamers",
             &[
                 "id",
+                "platform",
                 "mid",
                 "name",
                 "avatar_url",
+                "handle",
+                "profile_url",
+                "uploads_playlist_id",
                 "room_id",
                 "live_url",
                 "schedule_enabled",
@@ -932,6 +953,7 @@ async fn migration_state_digest_on(
                 "live_is_live",
                 "live_title",
                 "live_cover",
+                "live_video_id",
                 "live_started_at",
                 "live_checked_at",
                 "live_schedule_id",
@@ -949,9 +971,12 @@ async fn migration_state_digest_on(
             &[
                 "id",
                 "streamer_id",
+                "platform",
                 "mid",
                 "name",
                 "avatar_url",
+                "handle",
+                "profile_url",
                 "created_at",
                 "revision",
             ],
@@ -1027,6 +1052,7 @@ async fn migration_state_digest_on(
             &[
                 "id",
                 "schedule_id",
+                "platform",
                 "source_kind",
                 "source_post_id",
                 "source_image_url",
@@ -1043,6 +1069,7 @@ async fn migration_state_digest_on(
             &[
                 "id",
                 "streamer_id",
+                "platform",
                 "source_post_id",
                 "source_fingerprint",
                 "created_at",
@@ -1143,15 +1170,22 @@ async fn import_snapshot_on(
                 let local_updated_at = parse_ts(&local_updated_at)?;
                 let updated_at = local_updated_at.max(Utc::now()).to_rfc3339();
                 sqlx::query(
-                    "UPDATE streamers SET name=?, avatar_url=?, room_id=?, live_url=?,
-                            schedule_enabled=?, live_notify_enabled=?, live_stats_enabled=?, fans=?,
-                            aliases_json=?, updated_at=?, revision=MAX(revision + 1, ?)
+                    "UPDATE streamers SET platform=?, name=?, avatar_url=?, handle=?,
+                            profile_url=?, uploads_playlist_id=?, room_id=?, live_url=?,
+                            live_video_id=?, schedule_enabled=?, live_notify_enabled=?,
+                            live_stats_enabled=?, fans=?, aliases_json=?, updated_at=?,
+                            revision=MAX(revision + 1, ?)
                          WHERE id=?",
                 )
+                .bind(remote.platform.as_str())
                 .bind(&remote.name)
                 .bind(&remote.avatar_url)
+                .bind(&remote.handle)
+                .bind(&remote.profile_url)
+                .bind(&remote.uploads_playlist_id)
                 .bind(&remote.room_id)
                 .bind(&remote.live_url)
+                .bind(&remote.live_video_id)
                 .bind(remote.schedule_enabled)
                 .bind(remote.live_notify_enabled)
                 .bind(remote.live_stats_enabled)
@@ -1167,16 +1201,22 @@ async fn import_snapshot_on(
         } else {
             sqlx::query(
                 "INSERT INTO streamers
-                        (mid, name, avatar_url, room_id, live_url, schedule_enabled,
-                         live_notify_enabled, live_stats_enabled, fans, aliases_json,
-                         created_at, updated_at, revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (platform, mid, name, avatar_url, handle, profile_url,
+                         uploads_playlist_id, room_id, live_url, live_video_id,
+                         schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
+                         aliases_json, created_at, updated_at, revision)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(remote.platform.as_str())
             .bind(&remote.mid)
             .bind(&remote.name)
             .bind(&remote.avatar_url)
+            .bind(&remote.handle)
+            .bind(&remote.profile_url)
+            .bind(&remote.uploads_playlist_id)
             .bind(&remote.room_id)
             .bind(&remote.live_url)
+            .bind(&remote.live_video_id)
             .bind(remote.schedule_enabled)
             .bind(remote.live_notify_enabled)
             .bind(remote.live_stats_enabled)
@@ -1206,11 +1246,15 @@ async fn import_snapshot_on(
                 }
                 sqlx::query(
                     "UPDATE linked_accounts
-                         SET name=?, avatar_url=?, revision=?
+                         SET platform=?, name=?, avatar_url=?, handle=?, profile_url=?,
+                             revision=?
                          WHERE id=?",
                 )
+                .bind(link.platform.as_str())
                 .bind(&link.name)
                 .bind(&link.avatar_url)
+                .bind(&link.handle)
+                .bind(&link.profile_url)
                 .bind(advanced_revision(local_revision, link.revision))
                 .bind(link_id)
                 .execute(&mut **tx)
@@ -1218,13 +1262,17 @@ async fn import_snapshot_on(
             } else {
                 sqlx::query(
                     "INSERT INTO linked_accounts
-                            (streamer_id, mid, name, avatar_url, created_at, revision)
-                         VALUES (?, ?, ?, ?, ?, ?)",
+                            (streamer_id, platform, mid, name, avatar_url, handle,
+                             profile_url, created_at, revision)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(id)
+                .bind(link.platform.as_str())
                 .bind(&link.mid)
                 .bind(&link.name)
                 .bind(&link.avatar_url)
+                .bind(&link.handle)
+                .bind(&link.profile_url)
                 .bind(link.created_at.to_rfc3339())
                 .bind(link.revision.max(1))
                 .execute(&mut **tx)
@@ -1462,11 +1510,12 @@ async fn import_snapshot_on(
         let id = if let Some((id, local_revision)) = existing {
             if strategy == "server" {
                 sqlx::query(
-                    "UPDATE schedule_sources SET source_kind = ?, source_post_id = ?,
+                    "UPDATE schedule_sources SET platform = ?, source_kind = ?, source_post_id = ?,
                             source_image_url = ?, source_fingerprint = ?, confidence = ?,
                             revision = ?
                          WHERE id = ?",
                 )
+                .bind(remote.platform.as_str())
                 .bind(&remote.source_kind)
                 .bind(&remote.source_post_id)
                 .bind(&remote.source_image_url)
@@ -1481,11 +1530,12 @@ async fn import_snapshot_on(
         } else {
             sqlx::query(
                 "INSERT INTO schedule_sources
-                        (schedule_id, source_kind, source_post_id, source_image_url,
+                        (schedule_id, platform, source_kind, source_post_id, source_image_url,
                          source_fingerprint, source_identity, confidence, created_at, revision)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(local_schedule_id)
+            .bind(remote.platform.as_str())
             .bind(&remote.source_kind)
             .bind(&remote.source_post_id)
             .bind(&remote.source_image_url)
@@ -1514,20 +1564,25 @@ async fn import_snapshot_on(
         .await?;
         let id = if let Some((id, local_revision)) = existing {
             if strategy == "server" {
-                sqlx::query("UPDATE source_suppressions SET revision = ? WHERE id = ?")
-                    .bind(advanced_revision(local_revision, remote.revision))
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE source_suppressions SET platform = ?, revision = ? WHERE id = ?",
+                )
+                .bind(remote.platform.as_str())
+                .bind(advanced_revision(local_revision, remote.revision))
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
             }
             id
         } else {
             sqlx::query(
                 "INSERT INTO source_suppressions
-                        (streamer_id, source_post_id, source_fingerprint, created_at, revision)
-                     VALUES (?, ?, ?, ?, ?)",
+                        (streamer_id, platform, source_post_id, source_fingerprint,
+                         created_at, revision)
+                     VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(local_streamer_id)
+            .bind(remote.platform.as_str())
             .bind(&remote.source_post_id)
             .bind(&remote.source_fingerprint)
             .bind(remote.created_at.to_rfc3339())
@@ -1667,6 +1722,10 @@ mod tests {
     async fn seed(store: &SqliteStore, mid: &str, name: &str) -> Streamer {
         store
             .add_subscription(&AddSubscription {
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: mid.into(),
                 name: Some(name.into()),
                 avatar_url: None,

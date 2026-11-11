@@ -1,0 +1,86 @@
+{
+  "fixtureVersion": 1,
+  "live": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/live",
+    "finalUrl": "https://www.youtube.com/watch?v=LiveVid0001",
+    "playerResponse": {
+      "playabilityStatus": {
+        "status": "OK"
+      },
+      "videoDetails": {
+        "videoId": "LiveVid0001",
+        "title": "正在直播：Fixture Live",
+        "author": "Fixture Channel",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "isLive": true,
+        "isLiveContent": true
+      },
+      "microformat": {
+        "playerMicroformatRenderer": {
+          "liveBroadcastDetails": {
+            "isLiveNow": true,
+            "startTimestamp": "2026-11-12T10:01:02Z"
+          }
+        }
+      }
+    },
+    "expected": {
+      "state": "live",
+      "videoId": "LiveVid0001",
+      "title": "正在直播：Fixture Live",
+      "startedAt": "2026-11-12T10:01:02Z"
+    }
+  },
+  "notLiveChannelPage": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/live",
+    "finalUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw",
+    "playerResponse": {
+      "playabilityStatus": {
+        "status": "OK"
+      },
+      "videoDetails": {
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "isLive": false,
+        "isLiveContent": false
+      }
+    },
+    "expected": {
+      "state": "offline",
+      "videoId": null,
+      "title": null,
+      "startedAt": null
+    }
+  },
+  "endedBroadcastPage": {
+    "requestUrl": "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw/live",
+    "finalUrl": "https://www.youtube.com/watch?v=EndedVid001",
+    "playerResponse": {
+      "playabilityStatus": {
+        "status": "OK"
+      },
+      "videoDetails": {
+        "videoId": "EndedVid001",
+        "title": "已结束：Fixture Ended",
+        "author": "Fixture Channel",
+        "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "isLive": false,
+        "isLiveContent": true
+      },
+      "microformat": {
+        "playerMicroformatRenderer": {
+          "liveBroadcastDetails": {
+            "isLiveNow": false,
+            "startTimestamp": "2026-11-10T09:05:00Z",
+            "endTimestamp": "2026-11-10T11:06:07Z"
+          }
+        }
+      }
+    },
+    "expected": {
+      "state": "offline",
+      "videoId": null,
+      "title": null,
+      "startedAt": null
+    }
+  }
+}

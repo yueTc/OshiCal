@@ -55,6 +55,9 @@ pub struct AppSettings {
     pub notifications_enabled: bool,
     #[serde(default)]
     pub live_stats_enabled: bool,
+    /// YouTube 功能总开关；关闭时不发起任何 YouTube 请求。
+    #[serde(default)]
+    pub youtube_enabled: bool,
     /// 「寻血猎犬」：开启后才抓取 LAPLACE 生理期数据，默认关闭。
     #[serde(default)]
     pub fertility_enabled: bool,
@@ -87,6 +90,7 @@ impl Default for AppSettings {
             auto_analyze_images: true,
             notifications_enabled: true,
             live_stats_enabled: false,
+            youtube_enabled: false,
             fertility_enabled: false,
             llm_base_url: "https://api.openai.com/v1".to_owned(),
             llm_model: String::new(),
@@ -140,9 +144,12 @@ impl AppSettings {
 pub struct RuntimeSecrets {
     pub bili_cookie: Option<String>,
     pub llm_api_key: Option<String>,
+    pub youtube_api_key: Option<String>,
+    pub youtube_oauth_access_token: Option<String>,
+    pub youtube_web_cookie: Option<String>,
 }
 
-pub const SETTING_KEYS: [&str; 14] = [
+pub const SETTING_KEYS: [&str; 15] = [
     "data_mode",
     "server_url",
     "live_poll_seconds",
@@ -150,6 +157,7 @@ pub const SETTING_KEYS: [&str; 14] = [
     "auto_analyze_images",
     "notifications_enabled",
     "live_stats_enabled",
+    "youtube_enabled",
     "fertility_enabled",
     "llm_base_url",
     "llm_model",
@@ -203,6 +211,7 @@ pub async fn load_settings(store: &SqliteStore) -> AppResult<AppSettings> {
                 settings.notifications_enabled = serde_json::from_str(&value)?
             }
             "live_stats_enabled" => settings.live_stats_enabled = serde_json::from_str(&value)?,
+            "youtube_enabled" => settings.youtube_enabled = serde_json::from_str(&value)?,
             "fertility_enabled" => settings.fertility_enabled = serde_json::from_str(&value)?,
             "llm_base_url" => settings.llm_base_url = serde_json::from_str(&value)?,
             "llm_model" => settings.llm_model = serde_json::from_str(&value)?,
@@ -251,6 +260,10 @@ pub async fn save_settings(store: &SqliteStore, settings: &AppSettings) -> AppRe
             serde_json::to_string(&settings.live_stats_enabled)?,
         ),
         (
+            "youtube_enabled",
+            serde_json::to_string(&settings.youtube_enabled)?,
+        ),
+        (
             "fertility_enabled",
             serde_json::to_string(&settings.fertility_enabled)?,
         ),
@@ -281,6 +294,15 @@ impl std::fmt::Debug for RuntimeSecrets {
         f.debug_struct("RuntimeSecrets")
             .field("bili_cookie_configured", &self.bili_cookie.is_some())
             .field("llm_api_key_configured", &self.llm_api_key.is_some())
+            .field("youtube_api_key_configured", &self.youtube_api_key.is_some())
+            .field(
+                "youtube_oauth_access_token_configured",
+                &self.youtube_oauth_access_token.is_some(),
+            )
+            .field(
+                "youtube_web_cookie_configured",
+                &self.youtube_web_cookie.is_some(),
+            )
             .finish()
     }
 }

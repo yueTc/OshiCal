@@ -63,9 +63,10 @@ import {
 import type { DeviceInfo, JobProgress, SyncUiState } from "../lib/sync";
 import DeviceSyncPanel from "./DeviceSyncPanel";
 import AppearanceSettingsPanel from "./AppearanceSettings";
+import YouTubeSettingsPanel, { type YouTubeSettingsActions } from "./YouTubeSettingsPanel";
 import { ErrorBanner, Modal, Toggle } from "./ui";
 
-interface SettingsActions {
+interface SettingsActions extends YouTubeSettingsActions {
   save: (settings: AppSettings, secrets: SecretInput, autostart: boolean) => Promise<AppSettings>;
   testServer: (url: string, token: string) => Promise<string>;
   serverUpdate: () => Promise<ServerUpdateInfo>;
@@ -96,6 +97,7 @@ function settingsEqual(left: AppSettings, right: AppSettings): boolean {
     left.notificationsEnabled === right.notificationsEnabled &&
     left.liveStatsEnabled === right.liveStatsEnabled &&
     left.fertilityEnabled === right.fertilityEnabled &&
+    (left.youtubeEnabled ?? false) === (right.youtubeEnabled ?? false) &&
     left.llmBaseUrl === right.llmBaseUrl &&
     left.llmModel === right.llmModel &&
     left.llmPromptVersion === right.llmPromptVersion &&
@@ -419,6 +421,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         "autoAnalyzeImages",
         "liveStatsEnabled",
         "fertilityEnabled",
+        "youtubeEnabled",
         "llmBaseUrl",
         "llmModel",
         "llmPromptVersion",
@@ -438,6 +441,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     settings.livePollSeconds,
     settings.liveStatsEnabled,
     settings.fertilityEnabled,
+    settings.youtubeEnabled,
     settings.llmBaseUrl,
     settings.llmModel,
     settings.llmPromptVersion,
@@ -2015,6 +2019,18 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             )}
           </section>
         ) : null}
+
+        <YouTubeSettingsPanel
+          enabled={draft.youtubeEnabled ?? false}
+          active={settings.youtubeEnabled ?? false}
+          serverMode={serverMode}
+          actions={actions}
+          onEnabledChange={(enabled) => {
+            markFormChanged();
+            setDraft((current) => ({ ...current, youtubeEnabled: enabled }));
+          }}
+          onError={onError}
+        />
       </div>
 
       {bloodhoundOpen ? (

@@ -9,11 +9,19 @@ use crate::jobs::{
     job_progress_message, RefreshJob, RefreshJobAccepted, RefreshJobManager, RefreshJobProgress,
 };
 use crate::secrets::{
-    bind_persisted_llm_secret_url, llm_secret_status, load_persisted_llm_secret,
-    save_persisted_llm_secret, SecretVault,
+    bind_persisted_llm_secret_url, clear_persisted_youtube_api_key,
+    clear_persisted_youtube_web_session, llm_secret_status, load_persisted_bili_secret,
+    load_persisted_llm_secret, load_persisted_youtube_api_key, load_persisted_youtube_oauth,
+    load_persisted_youtube_web_session, save_persisted_llm_secret, save_persisted_youtube_api_key,
+    save_persisted_youtube_web_session, youtube_api_key_status,
+    youtube_web_session_status, SecretVault, YoutubeSecretStatus,
 };
 use crate::sync_api;
 use crate::update_manager::{ServerUpdateManager, ServerUpdateSettings, ServerUpdateView};
+use crate::youtube_oauth::{
+    oauth_callback, youtube_feature_enabled, youtube_runtime, YouTubeError,
+    YouTubeOAuthStatus,
+};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::uri::{Authority, Uri};
@@ -27,7 +35,7 @@ use futures_util::SinkExt;
 use oshical_core::settings::ReasoningEffort;
 use oshical_core::{
     load_settings, AppError, AppService, AppSettings, LlmConfig, LlmDiscoveryConfig, NewSchedule,
-    NewWeeklyScheduleRule, ProxyTestInput, SqliteStore, SyncMutation, UpdateSchedule,
+    NewWeeklyScheduleRule, ProxyTestInput, RuntimeSecrets, SqliteStore, SyncMutation, UpdateSchedule,
     UpdateSubscription, UpdateWeeklyScheduleRule,
 };
 use serde::{Deserialize, Serialize};
@@ -49,6 +57,45 @@ pub struct AppState {
     pub hub: broadcast::Sender<Value>,
     pub jobs: RefreshJobManager,
     pub updates: ServerUpdateManager,
+}
+
+/// Rebuild the complete runtime secret set from the encrypted vault.
+///
+/// YouTube credential changes must not wipe unrelated runtime values. This
+/// helper only reads persisted secrets and swaps the service's clients/secret
+/// snapshot; it never refreshes OAuth or performs another network request.
+pub(crate) async fn sync_runtime_secrets_from_vault(state: &AppState) -> Result<(), AppError> {
+    let store = state.service.store();
+    let youtube_api_key = load_persisted_youtube_api_key(store, &state.secret_vault)
+        .await?
+        .map(|persisted| persisted.api_key);
+    let youtube_oauth_access_token = load_persisted_youtube_oauth(store, &state.secret_vault)
+        .await?
+        .and_then(|persisted| persisted.token.access_token);
+    let youtube_web_cookie = load_persisted_youtube_web_session(store, &state.secret_vault)
+        .await?
+        .map(|persisted| persisted.cookie);
+    let bili_cookie = load_persisted_bili_secret(store, &state.secret_vault)
+        .await?
+        .map(|persisted| persisted.cookie)
+        .or_else(|| std::env::var("OSHICAL_BILI_COOKIE").ok());
+    // Keep the live model key (including an env/bootstrap-only value) untouched.
+    let llm_api_key = state.service.llm_api_key().await;
+
+    state
+        .service
+        .update_secrets(RuntimeSecrets {
+            bili_cookie: non_empty_secret(bili_cookie),
+            llm_api_key: non_empty_secret(llm_api_key),
+            youtube_api_key: non_empty_secret(youtube_api_key),
+            youtube_oauth_access_token: non_empty_secret(youtube_oauth_access_token),
+            youtube_web_cookie: non_empty_secret(youtube_web_cookie),
+        })
+        .await
+}
+
+fn non_empty_secret(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +120,7 @@ impl From<AppError> for ApiError {
                 "NOT_FOUND" => StatusCode::NOT_FOUND,
                 "NOT_CONFIGURED" => StatusCode::SERVICE_UNAVAILABLE,
                 "DATABASE_ERROR" | "IO_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+                code if code.starts_with("YOUTUBE_") => youtube_error_status(code),
                 _ => StatusCode::BAD_GATEWAY,
             },
             AppError::Validation(_) | AppError::Url(_) => StatusCode::BAD_REQUEST,
@@ -80,6 +128,9 @@ impl From<AppError> for ApiError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Database(_) | AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::External { code, .. } if code.starts_with("YOUTUBE_") => {
+                youtube_error_status(code)
+            }
             AppError::External { code, .. }
                 if matches!(
                     code.as_str(),
@@ -90,17 +141,9 @@ impl From<AppError> for ApiError {
             }
             _ => StatusCode::BAD_GATEWAY,
         };
-        let code = match &value {
-            AppError::External { code, .. }
-                if matches!(
-                    code.as_str(),
-                    "MIGRATION_STALE_PREVIEW" | "MIGRATION_PREVIEW_CONTENTION"
-                ) =>
-            {
-                code.clone()
-            }
-            _ => value.code().to_owned(),
-        };
+        // `AppError::api_code` preserves owned YOUTUBE_* codes while
+        // `AppError::code` retains the static projection used internally.
+        let code = value.api_code().to_owned();
         Self {
             code,
             message: value.to_string(),
@@ -109,9 +152,48 @@ impl From<AppError> for ApiError {
     }
 }
 
+fn youtube_error_status(code: &str) -> StatusCode {
+    if let Some(status) = code
+        .strip_prefix("YOUTUBE_HTTP_")
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error())
+    {
+        return status;
+    }
+    match code {
+        "YOUTUBE_FEATURE_DISABLED" | "YOUTUBE_FORBIDDEN" | "YOUTUBE_OAUTH_ACCESS_DENIED" => {
+            StatusCode::FORBIDDEN
+        }
+        "YOUTUBE_API_KEY_INVALID"
+        | "YOUTUBE_INVALID_INPUT"
+        | "YOUTUBE_BAD_REQUEST"
+        | "YOUTUBE_OAUTH_REFRESH_TOKEN_MISSING"
+        | "YOUTUBE_OAUTH_STATE_INVALID" => StatusCode::BAD_REQUEST,
+        "YOUTUBE_NOT_CONFIGURED" => StatusCode::SERVICE_UNAVAILABLE,
+        "YOUTUBE_QUOTA_EXCEEDED" | "YOUTUBE_RATE_LIMITED" | "YOUTUBE_OAUTH_BUSY" => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        "YOUTUBE_UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
+        "YOUTUBE_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "YOUTUBE_STORAGE_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(value: serde_json::Error) -> Self {
         AppError::Json(value).into()
+    }
+}
+
+impl From<YouTubeError> for ApiError {
+    fn from(value: YouTubeError) -> Self {
+        Self {
+            code: value.code.to_owned(),
+            message: value.message,
+            status: value.status,
+        }
     }
 }
 
@@ -131,6 +213,15 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
         }
     }
+
+    fn youtube_disabled() -> Self {
+        Self {
+            code: "YOUTUBE_FEATURE_DISABLED".to_owned(),
+            message: "YouTube 功能未开启".to_owned(),
+            status: StatusCode::FORBIDDEN,
+        }
+    }
+
 }
 
 impl IntoResponse for ApiError {
@@ -169,6 +260,19 @@ pub fn build_router(state: AppState) -> Router {
     let migration_lock = MigrationApplyLock::default();
     let protected = Router::new()
         .route("/api/search", get(search_accounts))
+        .route("/api/youtube/search", get(search_youtube_accounts))
+        .route(
+            "/api/youtube/subscriptions",
+            post(add_youtube_subscription_route),
+        )
+        .route(
+            "/api/youtube/subscriptions/{id}/links",
+            post(add_youtube_linked_account_route),
+        )
+        .route(
+            "/api/youtube/subscriptions/{id}/links/{mid}",
+            delete(remove_youtube_linked_account),
+        )
         .route(
             "/api/subscriptions",
             get(list_subscriptions).post(add_subscription),
@@ -224,6 +328,25 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/update/install", post(install_server_update))
         .route("/api/secrets/llm", get(get_llm_secret).put(put_llm_secret))
         .route(
+            "/api/secrets/youtube",
+            get(get_youtube_secrets)
+                .put(put_youtube_api_key)
+                .delete(delete_youtube_api_key),
+        )
+        .route("/api/youtube/oauth/start", post(start_youtube_oauth))
+        .route("/api/youtube/oauth/complete", post(complete_youtube_oauth))
+        .route("/api/youtube/oauth/refresh", post(refresh_youtube_oauth))
+        .route("/api/youtube/oauth/logout", post(logout_youtube_oauth))
+        .route(
+            "/api/youtube/session",
+            get(get_youtube_session)
+                .put(put_youtube_session)
+                .delete(delete_youtube_session),
+        )
+        .route("/api/youtube/session/status", get(get_youtube_session))
+        .route("/api/youtube/session/start", post(start_youtube_session))
+        .route("/api/youtube/status", get(get_youtube_status))
+        .route(
             "/api/bilibili/login/qr",
             post(crate::bili_login::start_qr_login),
         )
@@ -274,6 +397,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/ws", get(websocket))
+        .route("/api/youtube/oauth/callback", get(oauth_callback))
         .merge(protected)
         .fallback_service(ServeDir::new(dist).not_found_service(ServeFile::new(index)))
         .layer(Extension(bili_qr_manager))
@@ -282,7 +406,17 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             reject_cross_site_unsafe_http,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(
+                |request: &Request<axum::body::Body>| {
+                    tracing::debug_span!(
+                        "http",
+                        method = %request.method(),
+                        path = %request.uri().path()
+                    )
+                },
+            ),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -372,13 +506,62 @@ async fn health(State(state): State<AppState>) -> ApiResult {
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
     q: String,
+    #[serde(default)]
+    platform: Option<String>,
+}
+
+async fn require_youtube_enabled(state: &AppState) -> Result<(), ApiError> {
+    if youtube_feature_enabled(state.service.store()).await? {
+        Ok(())
+    } else {
+        Err(ApiError::youtube_disabled())
+    }
+}
+
+async fn require_streamer_youtube_enabled(
+    state: &AppState,
+    streamer_id: i64,
+) -> Result<(), ApiError> {
+    let streamer = state.service.store().get_streamer(streamer_id).await?;
+    if streamer.platform == oshical_core::models::Platform::Youtube {
+        require_youtube_enabled(state).await?;
+    }
+    Ok(())
 }
 
 async fn search_accounts(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> ApiResult {
+    let platform = query
+        .platform
+        .as_deref()
+        .unwrap_or("bilibili")
+        .to_ascii_lowercase();
+    if platform == "youtube" {
+        require_youtube_enabled(&state).await?;
+        let results = youtube_runtime()
+            .search_channels(state.service.store(), &state.secret_vault, &query.q)
+            .await?;
+        return ok(results);
+    }
+    if platform != "bilibili" {
+        return Err(ApiError::from(AppError::validation(
+            "platform 只支持 bilibili 或 youtube",
+        )));
+    }
     let results = state.service.search_accounts(&query.q).await?;
+    ok(results)
+}
+
+async fn search_youtube_accounts(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let results = youtube_runtime()
+        .search_channels(state.service.store(), &state.secret_vault, &query.q)
+        .await?;
     ok(results)
 }
 
@@ -386,11 +569,114 @@ async fn list_subscriptions(State(state): State<AppState>) -> ApiResult {
     ok(state.service.list_subscriptions().await?)
 }
 
+async fn add_youtube_subscription_route(
+    State(state): State<AppState>,
+    Json(mut payload): Json<Value>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let object = payload.as_object_mut().ok_or_else(|| {
+        ApiError::from(AppError::validation("添加主播请求必须是 JSON 对象"))
+    })?;
+    // The dedicated route is YouTube regardless of whether the caller supplied
+    // a platform field. This prevents a disabled YouTube feature from falling
+    // through to the Bilibili upstream path.
+    object.insert("platform".to_owned(), json!("youtube"));
+    add_subscription(State(state), Json(payload)).await
+}
+
 async fn add_subscription(
     State(state): State<AppState>,
-    Json(input): Json<oshical_core::models::AddSubscription>,
+    Json(mut payload): Json<Value>,
 ) -> ApiResult {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("bilibili")
+        .to_ascii_lowercase();
+    if platform == "youtube" {
+        require_youtube_enabled(&state).await?;
+        payload = prepare_youtube_subscription(&state, payload).await?;
+    } else if platform != "bilibili" {
+        return Err(ApiError::from(AppError::validation(
+            "platform 只支持 bilibili 或 youtube",
+        )));
+    }
+    let input: oshical_core::models::AddSubscription = serde_json::from_value(payload)?;
+    if platform == "youtube" {
+        return ok(state.service.store().add_subscription(&input).await?);
+    }
     ok(state.service.add_subscription(input).await?)
+}
+
+async fn prepare_youtube_subscription(
+    state: &AppState,
+    mut payload: Value,
+) -> Result<Value, ApiError> {
+    let input = payload
+        .get("mid")
+        .or_else(|| payload.get("channel"))
+        .or_else(|| payload.get("handle"))
+        .or_else(|| payload.get("url"))
+        .or_else(|| payload.get("input"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::from(AppError::validation(
+                "添加 YouTube 主播需要频道 ID、handle 或频道 URL",
+            ))
+        })?;
+    let channel = youtube_runtime()
+        .resolve_channel_input(state.service.store(), &state.secret_vault, input)
+        .await?;
+    let object = payload.as_object_mut().ok_or_else(|| {
+        ApiError::from(AppError::validation("添加主播请求必须是 JSON 对象"))
+    })?;
+    object.insert("platform".to_owned(), json!("youtube"));
+    object.insert(
+        "mid".to_owned(),
+        channel.get("mid").cloned().unwrap_or_default(),
+    );
+    object.insert(
+        "name".to_owned(),
+        channel.get("name").cloned().unwrap_or_default(),
+    );
+    object.insert(
+        "avatarUrl".to_owned(),
+        channel.get("avatarUrl").cloned().unwrap_or_default(),
+    );
+    object.insert(
+        "profileUrl".to_owned(),
+        channel.get("profileUrl").cloned().unwrap_or_default(),
+    );
+    object.insert(
+        "handle".to_owned(),
+        channel.get("handle").cloned().unwrap_or_default(),
+    );
+    object.insert(
+        "uploadsPlaylistId".to_owned(),
+        channel
+            .get("uploadsPlaylistId")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    object.insert("roomId".to_owned(), Value::Null);
+    apply_youtube_subscription_defaults(object);
+    Ok(payload)
+}
+
+fn apply_youtube_subscription_defaults(object: &mut serde_json::Map<String, Value>) {
+    object
+        .entry("scheduleEnabled".to_owned())
+        .or_insert_with(|| json!(true));
+    object
+        .entry("liveNotifyEnabled".to_owned())
+        .or_insert_with(|| json!(true));
+    // Keep the server aligned with the model and desktop default. A newly added
+    // YouTube streamer starts with live statistics disabled until the user opts in.
+    object
+        .entry("liveStatsEnabled".to_owned())
+        .or_insert_with(|| json!(false));
 }
 
 async fn update_subscription(
@@ -421,20 +707,147 @@ async fn delete_subscription(State(state): State<AppState>, Path(id): Path<i64>)
 #[derive(Debug, Deserialize)]
 struct AddLinkInput {
     mid: String,
+    #[serde(default)]
+    platform: Option<String>,
 }
 
 async fn add_linked_account(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(input): Json<AddLinkInput>,
+    Json(payload): Json<Value>,
 ) -> ApiResult {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("bilibili")
+        .to_ascii_lowercase();
+    if platform == "youtube" {
+        require_youtube_enabled(&state).await?;
+        return add_youtube_linked_account(state, id, payload).await;
+    }
+    if platform != "bilibili" {
+        return Err(ApiError::from(AppError::validation(
+            "platform 只支持 bilibili 或 youtube",
+        )));
+    }
+    let input: AddLinkInput = serde_json::from_value(payload)?;
     ok(state.service.add_linked_account(id, &input.mid).await?)
+}
+
+async fn add_youtube_linked_account_route(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<Value>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    add_youtube_linked_account(state, id, payload).await
+}
+
+async fn add_youtube_linked_account(
+    state: AppState,
+    id: i64,
+    payload: Value,
+) -> ApiResult {
+    let input = payload
+        .get("mid")
+        .or_else(|| payload.get("channel"))
+        .or_else(|| payload.get("handle"))
+        .or_else(|| payload.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::from(AppError::validation(
+                "关联 YouTube 账号需要频道 ID、handle 或频道 URL",
+            ))
+        })?;
+    let parent = state
+        .service
+        .list_subscriptions()
+        .await?
+        .into_iter()
+        .find(|streamer| streamer.id == id)
+        .ok_or_else(|| ApiError::from(AppError::not_found(format!("主播 {id}"))))?;
+    if parent.platform != oshical_core::models::Platform::Youtube {
+        return Err(ApiError::from(AppError::validation(
+            "只能为 YouTube 主播关联 YouTube 频道",
+        )));
+    }
+    let channel = youtube_runtime()
+        .resolve_channel_input(state.service.store(), &state.secret_vault, input)
+        .await?;
+    let mid = channel
+        .get("mid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::from(AppError::validation("YouTube 频道 ID 缺失")))?;
+    let name = channel.get("name").and_then(Value::as_str).unwrap_or_default();
+    let avatar = channel
+        .get("avatarUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let handle = channel.get("handle").and_then(Value::as_str);
+    let profile_url = channel.get("profileUrl").and_then(Value::as_str);
+    let linked = state
+        .service
+        .store()
+        .add_linked_account_for_platform(
+            id,
+            oshical_core::models::Platform::Youtube,
+            mid,
+            name,
+            avatar,
+            handle,
+            profile_url,
+        )
+        .await?;
+    ok(linked)
 }
 
 async fn remove_linked_account(
     State(state): State<AppState>,
     Path((id, mid)): Path<(i64, String)>,
 ) -> ApiResult {
+    let youtube_link = state
+        .service
+        .list_subscriptions()
+        .await?
+        .into_iter()
+        .find(|streamer| streamer.id == id)
+        .is_some_and(|streamer| {
+            streamer.linked_accounts.iter().any(|account| {
+                account.mid == mid
+                    && account.platform == oshical_core::models::Platform::Youtube
+            })
+        });
+    if youtube_link {
+        require_youtube_enabled(&state).await?;
+    }
+    state
+        .service
+        .store()
+        .remove_linked_account(id, &mid)
+        .await?;
+    ok(json!({"streamerId": id, "mid": mid}))
+}
+
+async fn remove_youtube_linked_account(
+    State(state): State<AppState>,
+    Path((id, mid)): Path<(i64, String)>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let parent = state
+        .service
+        .list_subscriptions()
+        .await?
+        .into_iter()
+        .find(|streamer| streamer.id == id)
+        .ok_or_else(|| ApiError::from(AppError::not_found(format!("主播 {id}"))))?;
+    if parent.platform != oshical_core::models::Platform::Youtube {
+        return Err(ApiError::from(AppError::validation(
+            "只能删除 YouTube 主播的 YouTube 关联频道",
+        )));
+    }
     state
         .service
         .store()
@@ -448,6 +861,7 @@ async fn refresh_all(State(state): State<AppState>) -> ApiResult {
 }
 
 async fn refresh_streamer(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    require_streamer_youtube_enabled(&state, id).await?;
     let hub = state.hub.clone();
     let report = state
         .service
@@ -530,6 +944,9 @@ async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
 
 async fn refresh_job_streamer(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
     let streamer = state.service.store().get_streamer(id).await?;
+    if streamer.platform == oshical_core::models::Platform::Youtube {
+        require_youtube_enabled(&state).await?;
+    }
     let prepared = state
         .service
         .prepare_refresh_request(Some(streamer.id))
@@ -724,6 +1141,7 @@ async fn fan_history(
 }
 
 async fn refresh_streamer_fans(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    require_streamer_youtube_enabled(&state, id).await?;
     ok(state.service.refresh_streamer_fans(id).await?)
 }
 
@@ -897,6 +1315,7 @@ fn changed_setting_values(
     changed!("notifications_enabled", notifications_enabled);
     changed!("live_stats_enabled", live_stats_enabled);
     changed!("fertility_enabled", fertility_enabled);
+    changed!("youtube_enabled", youtube_enabled);
     changed!("llm_base_url", llm_base_url);
     changed!("llm_model", llm_model);
     changed!("llm_prompt_version", llm_prompt_version);
@@ -1148,6 +1567,260 @@ async fn put_llm_secret(
         api_key: None,
         bound_base_url: persisted.bound_base_url,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YoutubeApiKeyInput {
+    api_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YoutubeWebSessionInput {
+    cookie: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct YoutubeSecretsView {
+    api_key: YoutubeSecretStatus,
+    oauth: YouTubeOAuthStatus,
+    web_session: YoutubeSecretStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+async fn youtube_secrets_view(state: &AppState) -> Result<YoutubeSecretsView, ApiError> {
+    let oauth = youtube_runtime()
+        .oauth_status(state.service.store(), &state.secret_vault)
+        .await?;
+    let last_error = oauth.last_error.clone();
+    Ok(YoutubeSecretsView {
+        api_key: youtube_api_key_status(state.service.store(), &state.secret_vault).await?,
+        oauth,
+        web_session: youtube_web_session_status(
+            state.service.store(),
+            &state.secret_vault,
+        )
+        .await?,
+        last_error,
+    })
+}
+
+async fn get_youtube_secrets(State(state): State<AppState>) -> Result<Response, ApiError> {
+    require_youtube_enabled(&state).await?;
+    let response = ok(youtube_secrets_view(&state).await?)?;
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        response,
+    )
+        .into_response())
+}
+
+async fn put_youtube_api_key(
+    State(state): State<AppState>,
+    Json(input): Json<YoutubeApiKeyInput>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let api_key = input.api_key.trim();
+    if api_key.is_empty() || api_key.chars().count() > 4096 {
+        return Err(ApiError::from(AppError::validation(
+            "YouTube API Key 长度必须在 1 到 4096 字符之间",
+        )));
+    }
+    if api_key.chars().any(char::is_control) {
+        return Err(ApiError::from(AppError::validation(
+            "YouTube API Key 不能包含控制字符",
+        )));
+    }
+    let persisted = save_persisted_youtube_api_key(
+        state.service.store(),
+        &state.secret_vault,
+        api_key,
+    )
+    .await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    state
+        .service
+        .store()
+        .append_sync_change(
+            "server_secret",
+            "youtube_api_key",
+            "upsert",
+            persisted.revision,
+            Some(json!({"id": "youtube_api_key", "configured": true})),
+        )
+        .await?;
+    ok(youtube_api_key_status(state.service.store(), &state.secret_vault).await?)
+}
+
+async fn delete_youtube_api_key(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let previous = youtube_api_key_status(state.service.store(), &state.secret_vault).await?;
+    let deleted = clear_persisted_youtube_api_key(state.service.store()).await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    state
+        .service
+        .store()
+        .append_sync_change(
+            "server_secret",
+            "youtube_api_key",
+            "delete",
+            previous.revision.saturating_add(1).max(1),
+            Some(json!({"id": "youtube_api_key", "configured": false})),
+        )
+        .await?;
+    ok(json!({"deleted": deleted, "configured": false}))
+}
+
+async fn start_youtube_oauth(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    ok(youtube_runtime().start_oauth().await?)
+}
+
+#[derive(Deserialize)]
+struct YoutubeOAuthCompleteInput {
+    code: String,
+    state: String,
+}
+
+async fn complete_youtube_oauth(
+    State(state): State<AppState>,
+    Json(input): Json<YoutubeOAuthCompleteInput>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let code = input.code.trim();
+    let oauth_state = input.state.trim();
+    if code.is_empty() || oauth_state.is_empty() {
+        return Err(ApiError::from(AppError::validation(
+            "YouTube OAuth code 和 state 不能为空",
+        )));
+    }
+    let status = youtube_runtime()
+        .complete_oauth(
+            state.service.store(),
+            &state.secret_vault,
+            code,
+            oauth_state,
+        )
+        .await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    ok(status)
+}
+
+async fn refresh_youtube_oauth(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let status = youtube_runtime()
+        .refresh_oauth(state.service.store(), &state.secret_vault)
+        .await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    ok(status)
+}
+
+async fn logout_youtube_oauth(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let status = youtube_runtime()
+        .logout(state.service.store(), &state.secret_vault)
+        .await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    ok(status)
+}
+
+async fn get_youtube_session(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    ok(youtube_web_session_status(
+        state.service.store(),
+        &state.secret_vault,
+    )
+    .await?)
+}
+
+async fn put_youtube_session(
+    State(state): State<AppState>,
+    Json(input): Json<YoutubeWebSessionInput>,
+) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let cookie = input.cookie.trim();
+    if cookie.is_empty() || cookie.chars().count() > 16_384 {
+        return Err(ApiError::from(AppError::validation(
+            "YouTube 网页会话长度必须在 1 到 16384 字符之间",
+        )));
+    }
+    if cookie
+        .chars()
+        .any(|value| value.is_control() && value != '\t')
+    {
+        return Err(ApiError::from(AppError::validation(
+            "YouTube 网页会话不能包含控制字符",
+        )));
+    }
+    let persisted = save_persisted_youtube_web_session(
+        state.service.store(),
+        &state.secret_vault,
+        cookie,
+    )
+    .await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    state
+        .service
+        .store()
+        .append_sync_change(
+            "server_secret",
+            "youtube_web_session",
+            "upsert",
+            persisted.revision,
+            Some(json!({"id": "youtube_web_session", "configured": true})),
+        )
+        .await?;
+    ok(youtube_web_session_status(
+        state.service.store(),
+        &state.secret_vault,
+    )
+    .await?)
+}
+
+async fn delete_youtube_session(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let previous =
+        youtube_web_session_status(state.service.store(), &state.secret_vault).await?;
+    let deleted = clear_persisted_youtube_web_session(state.service.store()).await?;
+    sync_runtime_secrets_from_vault(&state).await?;
+    state
+        .service
+        .store()
+        .append_sync_change(
+            "server_secret",
+            "youtube_web_session",
+            "delete",
+            previous.revision.saturating_add(1).max(1),
+            Some(json!({"id": "youtube_web_session", "configured": false})),
+        )
+        .await?;
+    ok(json!({"deleted": deleted, "configured": false}))
+}
+
+async fn start_youtube_session(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    ok(json!({
+        "started": false,
+        "mode": "manual",
+        "loginUrl": "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F",
+        "importEndpoint": "/api/youtube/session",
+        "note": "服务端无法安全捕获浏览器 Cookie；请在受控浏览器登录后，将会话 Cookie 通过 importEndpoint 导入。"
+    }))
+}
+
+async fn get_youtube_status(State(state): State<AppState>) -> ApiResult {
+    require_youtube_enabled(&state).await?;
+    let secrets = youtube_secrets_view(&state).await?;
+    ok(json!({
+        "enabled": true,
+        "secrets": secrets
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2194,6 +2867,55 @@ mod protocol_tests {
         });
         assert!(forward_hub_message(false, &message));
         assert!(forward_hub_message(true, &message));
+    }
+
+    #[test]
+    fn youtube_subscription_defaults_do_not_enable_live_stats() {
+        let mut payload = json!({});
+        apply_youtube_subscription_defaults(payload.as_object_mut().unwrap());
+        assert_eq!(payload["scheduleEnabled"], true);
+        assert_eq!(payload["liveNotifyEnabled"], true);
+        assert_eq!(payload["liveStatsEnabled"], false);
+    }
+
+    #[test]
+    fn youtube_error_prefix_keeps_exact_code_and_specific_status() {
+        let cases = [
+            ("YOUTUBE_API_KEY_INVALID", StatusCode::BAD_REQUEST),
+            ("YOUTUBE_BAD_REQUEST", StatusCode::BAD_REQUEST),
+            ("YOUTUBE_COMMUNITY_FORMAT", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_FEATURE_DISABLED", StatusCode::FORBIDDEN),
+            ("YOUTUBE_FORBIDDEN", StatusCode::FORBIDDEN),
+            ("YOUTUBE_INVALID_INPUT", StatusCode::BAD_REQUEST),
+            ("YOUTUBE_LIVE_FORMAT", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_NETWORK", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_NON_JSON", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_NOT_CONFIGURED", StatusCode::SERVICE_UNAVAILABLE),
+            ("YOUTUBE_NOT_FOUND", StatusCode::NOT_FOUND),
+            ("YOUTUBE_OAUTH_ACCESS_DENIED", StatusCode::FORBIDDEN),
+            ("YOUTUBE_OAUTH_BAD_RESPONSE", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_OAUTH_BUSY", StatusCode::TOO_MANY_REQUESTS),
+            ("YOUTUBE_OAUTH_EXCHANGE_FAILED", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_OAUTH_REFRESH_TOKEN_MISSING", StatusCode::BAD_REQUEST),
+            ("YOUTUBE_OAUTH_STATE_INVALID", StatusCode::BAD_REQUEST),
+            ("YOUTUBE_QUOTA_EXCEEDED", StatusCode::TOO_MANY_REQUESTS),
+            ("YOUTUBE_RATE_LIMITED", StatusCode::TOO_MANY_REQUESTS),
+            ("YOUTUBE_RESPONSE_SIZE", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_STORAGE_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
+            ("YOUTUBE_SUBSCRIBER_COUNT_MISSING", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_UNAUTHORIZED", StatusCode::UNAUTHORIZED),
+            ("YOUTUBE_UPSTREAM_ERROR", StatusCode::BAD_GATEWAY),
+            ("YOUTUBE_HTTP_404", StatusCode::NOT_FOUND),
+            ("YOUTUBE_HTTP_429", StatusCode::TOO_MANY_REQUESTS),
+        ];
+        for (code, expected_status) in cases {
+            let error = ApiError::from(AppError::External {
+                code: code.to_owned(),
+                message: "fixture".to_owned(),
+            });
+            assert_eq!(error.code, code);
+            assert_eq!(error.status, expected_status);
+        }
     }
 
     #[test]

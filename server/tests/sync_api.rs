@@ -7,7 +7,9 @@ use axum::Router;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use oshical_core::{AddSubscription, AppService, RefreshReport, RuntimeSecrets, SqliteStore};
+use oshical_core::{
+    AddSubscription, AppService, Platform, RefreshReport, RuntimeSecrets, SqliteStore,
+};
 use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault, ServerUpdateManager};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -81,6 +83,10 @@ async fn add_streamer(state: &AppState, mid: &str) -> i64 {
         .service
         .store()
         .add_subscription(&AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: mid.to_owned(),
             name: Some(format!("主播{mid}")),
             avatar_url: None,
@@ -208,11 +214,16 @@ async fn bootstrap_and_changes_expose_sync_feed() {
 
     let (status, bootstrap) = call_json(&app, Method::GET, "/api/sync/bootstrap", None, true).await;
     assert_eq!(status, StatusCode::OK, "{bootstrap}");
-    assert_eq!(bootstrap["data"]["schemaVersion"], 2);
+    assert_eq!(bootstrap["data"]["schemaVersion"], 3);
     assert!(bootstrap["data"]["snapshotRevision"].is_i64());
-    assert!(bootstrap["data"]["subscriptions"]
+    let subscriptions = bootstrap["data"]["subscriptions"]
         .as_array()
-        .is_some_and(|items| !items.is_empty()));
+        .expect("subscriptions");
+    assert!(!subscriptions.is_empty());
+    assert_eq!(subscriptions[0]["platform"], "bilibili");
+    assert!(subscriptions[0].get("handle").is_some());
+    assert!(subscriptions[0].get("profileUrl").is_some());
+    assert!(subscriptions[0].get("uploadsPlaylistId").is_some());
     assert!(bootstrap["data"]["weeklyExceptions"].is_array());
     assert!(bootstrap["data"]["scheduleSources"].is_array());
 
@@ -225,11 +236,20 @@ async fn bootstrap_and_changes_expose_sync_feed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{changes}");
-    assert_eq!(changes["data"]["schemaVersion"], 2);
+    assert_eq!(changes["data"]["schemaVersion"], 3);
     assert!(changes["data"]["latestSeq"].as_i64().unwrap_or(0) > 0);
-    assert!(changes["data"]["changes"]
+    let changes = changes["data"]["changes"]
         .as_array()
-        .is_some_and(|items| !items.is_empty()));
+        .expect("changes");
+    assert!(!changes.is_empty());
+    let subscription_change = changes
+        .iter()
+        .find(|change| change["entityType"] == "subscription")
+        .expect("subscription change");
+    assert_eq!(subscription_change["payload"]["platform"], "bilibili");
+    assert!(subscription_change["payload"].get("handle").is_some());
+    assert!(subscription_change["payload"].get("profileUrl").is_some());
+    assert!(subscription_change["payload"].get("uploadsPlaylistId").is_some());
 }
 
 #[tokio::test]

@@ -89,6 +89,7 @@ import type {
   LiveStatus,
   NewScheduleInput,
   NewWeeklyScheduleRuleInput,
+  Platform,
   ProxyTestReport,
   RefreshProgress,
   RefreshReport,
@@ -211,6 +212,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   notificationsEnabled: true,
   liveStatsEnabled: false,
   fertilityEnabled: false,
+  youtubeEnabled: false,
   llmBaseUrl: "https://api.openai.com/v1",
   llmModel: "",
   llmPromptVersion: "schedule-v1",
@@ -317,6 +319,30 @@ export default function App() {
   const orderedSubscriptions = useMemo(
     () => [...subscriptions].sort(compareStreamers),
     [subscriptions],
+  );
+  const visibleSubscriptions = useMemo(
+    () => settings.youtubeEnabled
+      ? orderedSubscriptions
+      : orderedSubscriptions.filter((streamer) => streamer.platform !== "youtube"),
+    [orderedSubscriptions, settings.youtubeEnabled],
+  );
+  const hiddenStreamerIds = useMemo(
+    () => settings.youtubeEnabled
+      ? new Set<number>()
+      : new Set(
+        subscriptions
+          .filter((streamer) => streamer.platform === "youtube")
+          .map((streamer) => streamer.id),
+      ),
+    [settings.youtubeEnabled, subscriptions],
+  );
+  const visibleLiveStatuses = useMemo(
+    () => settings.youtubeEnabled
+      ? liveStatuses
+      : liveStatuses.filter((status) => (
+        status.platform !== "youtube" && !hiddenStreamerIds.has(status.streamerId)
+      )),
+    [hiddenStreamerIds, liveStatuses, settings.youtubeEnabled],
   );
 
   // Remote monitor commands have backend-side generations. Serializing them in
@@ -427,6 +453,12 @@ export default function App() {
     };
   }, [creatorMenu]);
 
+  useEffect(() => {
+    if (!settings.youtubeEnabled && creatorMenu?.streamer.platform === "youtube") {
+      setCreatorMenu(null);
+    }
+  }, [creatorMenu, settings.youtubeEnabled]);
+
   const showToast = useCallback((message: string) => {
     setToast(message);
     if (toastTimer.current) {
@@ -434,6 +466,12 @@ export default function App() {
     }
     toastTimer.current = setTimeout(() => setToast(null), 5500);
   }, []);
+
+  const requireYoutubeEnabled = useCallback(() => {
+    if (!settings.youtubeEnabled) {
+      throw new Error("YouTube 功能未开启");
+    }
+  }, [settings.youtubeEnabled]);
 
   useEffect(() => {
     if (!isTauri) {
@@ -1645,7 +1683,10 @@ export default function App() {
       const savedServerSettings = await validationApi.saveSettings(
         serverSettingsForSave(draft, remoteSettings),
       );
-      const merged = mergeServerSettings({ ...draft, dataMode: "server" }, savedServerSettings);
+      const merged = mergeServerSettings(
+        { ...draft, dataMode: "server" },
+        savedServerSettings,
+      );
       const nextSecrets = await localApi.saveSecrets(secretInput);
       await localApi.saveSettings(merged);
       settingsRequestSeq.current += 1;
@@ -1666,6 +1707,7 @@ export default function App() {
       return merged;
     }
 
+    const committedDraft = { ...draft, youtubeEnabled: draft.youtubeEnabled ?? false };
     await applyAutostart(autoLaunch);
     setAutostart(autoLaunch);
     const localEpoch = ++connectionEpochRef.current;
@@ -1676,7 +1718,7 @@ export default function App() {
     if (localEpoch !== connectionEpochRef.current) {
       return draft;
     }
-    await localApi.saveSettings(draft);
+    await localApi.saveSettings(committedDraft);
     if (localEpoch !== connectionEpochRef.current) {
       return draft;
     }
@@ -1694,13 +1736,13 @@ export default function App() {
       return draft;
     }
     settingsRequestSeq.current += 1;
-    settingsRef.current = draft;
+    settingsRef.current = committedDraft;
     setSecrets(nextSecrets);
-    setSettings(draft);
+    setSettings(committedDraft);
     setSubscriptions(boot.subscriptions);
     setLiveStatuses(boot.liveStatuses);
     seenLiveSeq.current = 0;
-    return draft;
+    return committedDraft;
   }
 
   function useServerDataForSetup() {
@@ -1938,6 +1980,11 @@ export default function App() {
 
   const scheduleActions = useMemo(() => {
     const serverMode = !isTauri || settings.dataMode === "server";
+    const filterVisibleSchedules = (items: Schedule[]): Schedule[] => (
+      hiddenStreamerIds.size
+        ? items.filter((schedule) => !hiddenStreamerIds.has(schedule.streamerId))
+        : items
+    );
 
     function remoteScheduleId(schedule: Schedule): number | null {
       const id = schedule.remoteId ?? schedule.id;
@@ -2002,7 +2049,7 @@ export default function App() {
               try {
                 const meta = await localApi.syncMeta(settings.serverUrl);
                 if (!meta.initialized) return null;
-                return await localApi.cachedSchedules(from, to);
+                return filterVisibleSchedules(await localApi.cachedSchedules(from, to));
               } catch {
                 return null;
               }
@@ -2019,14 +2066,14 @@ export default function App() {
                   .filter((streamer) => streamer.scheduleEnabled)
                   .map((streamer) => streamer.id),
               );
-              return cached.cache.snapshot.schedules.filter((schedule) => {
+              return filterVisibleSchedules(cached.cache.snapshot.schedules.filter((schedule) => {
                 const startMs = Date.parse(schedule.startAt);
                 return Number.isFinite(startMs) &&
                   startMs >= fromMs &&
                   startMs < toMs &&
                   !schedule.cancelled &&
                   (enabledStreamers.has(schedule.streamerId) || schedule.sourceKind === "manual");
-              });
+              }));
             } catch {
               return null;
             }
@@ -2035,17 +2082,17 @@ export default function App() {
       load: async (from: string, to: string) => {
         if (serverMode && serverApi) {
           try {
-            return await serverApi.schedules(from, to);
+            return filterVisibleSchedules(await serverApi.schedules(from, to));
           } catch (error) {
             if (isTauri && localApi && isRemoteUncertain(error)) {
               setConnection("offline");
-              return localApi.cachedSchedules(from, to);
+              return filterVisibleSchedules(await localApi.cachedSchedules(from, to));
             }
             throw error;
           }
         }
         if (localApi) {
-          return localApi.schedules(from, to);
+          return filterVisibleSchedules(await localApi.schedules(from, to));
         }
         return [];
       },
@@ -2204,28 +2251,39 @@ export default function App() {
         }
       },
     };
-  }, [refreshActiveData, serverApi, settings.dataMode, settings.serverUrl, showToast]);
+  }, [hiddenStreamerIds, refreshActiveData, serverApi, settings.dataMode, settings.serverUrl, showToast]);
 
   const creatorActions = useMemo(() => {
     const serverMode = !isTauri || settings.dataMode === "server";
     return {
-      search: async (keyword: string): Promise<AccountSearchResult[]> => {
+      search: async (keyword: string, platform: Platform): Promise<AccountSearchResult[]> => {
+        if (platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) {
             throw new Error("服务器未连接");
           }
-          return serverApi.search(keyword);
+          return serverApi.search(keyword, platform);
         }
         if (!localApi) {
           throw new Error("本地 API 不可用");
         }
-        return localApi.search(keyword);
+        return localApi.search(keyword, platform);
       },
       add: async (account: AccountSearchResult): Promise<Streamer> => {
+        const platform = account.platform === "youtube" ? "youtube" : "bilibili";
+        if (platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         const input = {
+          platform,
           mid: account.mid,
           name: account.name,
           avatarUrl: account.avatarUrl,
+          handle: account.handle ?? null,
+          profileUrl: account.profileUrl ?? null,
+          uploadsPlaylistId: account.uploadsPlaylistId ?? null,
           roomId: account.roomId,
           aliases: [account.name],
           scheduleEnabled: true,
@@ -2279,33 +2337,42 @@ export default function App() {
         }
         return localApi.deleteSubscription(id);
       },
-      addLink: async (id: number, mid: string): Promise<unknown> => {
+      addLink: async (id: number, platform: Platform, mid: string): Promise<unknown> => {
+        if (platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) {
             throw new Error("服务器未连接");
           }
-          return serverApi.addLinkedAccount(id, mid);
+          return serverApi.addLinkedAccount(id, mid, platform);
         }
         if (!localApi) {
           throw new Error("本地 API 不可用");
         }
-        return localApi.addLinkedAccount(id, mid);
+        return localApi.addLinkedAccount(id, mid, platform);
       },
-      removeLink: async (id: number, mid: string): Promise<void> => {
+      removeLink: async (id: number, platform: Platform, mid: string): Promise<void> => {
+        if (platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) {
             throw new Error("服务器未连接");
           }
-          await serverApi.removeLinkedAccount(id, mid);
+          await serverApi.removeLinkedAccount(id, mid, platform);
           return;
         }
         if (!localApi) {
           throw new Error("本地 API 不可用");
         }
-        return localApi.removeLinkedAccount(id, mid);
+        return localApi.removeLinkedAccount(id, mid, platform);
       },
       refresh: async (id: number): Promise<RefreshReport> => {
         const streamer = subscriptions.find((item) => item.id === id);
+        if (streamer?.platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         const streamerName = streamer?.name ?? `主播 ${id}`;
         applyRefreshProgress({
           streamerId: id,
@@ -2347,6 +2414,10 @@ export default function App() {
         }
       },
       fanHistory: async (streamerId: number, days = 30): Promise<FanHistory> => {
+        const streamer = subscriptions.find((item) => item.id === streamerId);
+        if (streamer?.platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) {
             throw new Error("服务器未连接");
@@ -2359,6 +2430,10 @@ export default function App() {
         return localApi.fanHistory(streamerId, days);
       },
       refreshFans: async (streamerId: number): Promise<FanHistory> => {
+        const streamer = subscriptions.find((item) => item.id === streamerId);
+        if (streamer?.platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) {
             throw new Error("服务器未连接");
@@ -2371,6 +2446,10 @@ export default function App() {
         return localApi.refreshFans(streamerId);
       },
       liveSessions: async (streamerId: number, limit: number) => {
+        const streamer = subscriptions.find((item) => item.id === streamerId);
+        if (streamer?.platform === "youtube" && !settings.youtubeEnabled) {
+          throw new Error("YouTube 功能未开启");
+        }
         if (serverMode) {
           if (!serverApi) throw new Error("服务器未连接");
           return serverApi.liveSessions(streamerId, limit);
@@ -2446,7 +2525,7 @@ export default function App() {
         await localApi.deleteWeeklyRule(id);
       },
     };
-  }, [scheduleActions.liveOnlineSamples, applyRefreshProgress, serverApi, settings.dataMode, subscriptions]);
+  }, [scheduleActions.liveOnlineSamples, applyRefreshProgress, serverApi, settings.dataMode, settings.youtubeEnabled, subscriptions]);
 
   async function handleCreatorChanged() {
     try {
@@ -2481,14 +2560,34 @@ export default function App() {
 
   async function openCreatorLiveRoom(streamer: Streamer) {
     setCreatorMenu(null);
-    const liveUrl = streamer.liveUrl
-      ?? (streamer.roomId ? `https://live.bilibili.com/${streamer.roomId}` : null);
-    if (!liveUrl) {
-      showToast(`「${streamer.name}」暂未配置直播间地址`);
+    const platform = streamer.platform === "youtube" ? "youtube" : "bilibili";
+    if (platform === "youtube" && !settings.youtubeEnabled) {
+      showToast("YouTube 功能未开启");
+      return;
+    }
+    const youtubeLiveUrl = streamer.liveUrl
+      || (streamer.liveVideoId
+        ? `https://www.youtube.com/watch?v=${encodeURIComponent(streamer.liveVideoId)}`
+        : null);
+    const targetUrl = platform === "youtube"
+      ? streamer.isLive && youtubeLiveUrl
+        ? youtubeLiveUrl
+        : streamer.profileUrl
+          || (streamer.handle
+            ? `https://www.youtube.com/${streamer.handle.startsWith("@") ? streamer.handle : `@${streamer.handle}`}`
+            : streamer.mid
+              ? `https://www.youtube.com/channel/${encodeURIComponent(streamer.mid)}`
+              : null)
+      : streamer.liveUrl
+        ?? (streamer.roomId ? `https://live.bilibili.com/${streamer.roomId}` : null);
+    if (!targetUrl) {
+      showToast(platform === "youtube"
+        ? `「${streamer.name}」缺少频道地址`
+        : `「${streamer.name}」暂未配置直播间地址`);
       return;
     }
     try {
-      await openExternalUrl(liveUrl);
+      await openExternalUrl(targetUrl);
     } catch (error) {
       showToast(explainError(error));
     }
@@ -2497,6 +2596,28 @@ export default function App() {
   async function openCreatorHomepage(streamer: Streamer) {
     setCreatorMenu(null);
     const mid = streamer.mid.trim();
+    if (streamer.platform === "youtube") {
+      if (!settings.youtubeEnabled) {
+        showToast("YouTube 功能未开启");
+        return;
+      }
+      const profileUrl = streamer.profileUrl
+        || (streamer.handle
+          ? `https://www.youtube.com/${streamer.handle.startsWith("@") ? streamer.handle : `@${streamer.handle}`}`
+          : mid
+            ? `https://www.youtube.com/channel/${encodeURIComponent(mid)}`
+            : null);
+      if (!profileUrl) {
+        showToast(`「${streamer.name}」缺少频道地址`);
+        return;
+      }
+      try {
+        await openExternalUrl(profileUrl);
+      } catch (error) {
+        showToast(explainError(error));
+      }
+      return;
+    }
     if (!mid) {
       showToast(`「${streamer.name}」缺少 UID，无法打开个人主页`);
       return;
@@ -2673,22 +2794,26 @@ export default function App() {
           <div><strong>推历</strong><span>OshiCal · 直播日程</span></div>
         </div>
         <nav className="nav-list">
-          <button className={page === "schedule" ? "active" : ""} onClick={() => void navigateToPage("schedule")}><CalendarRange size={19} />日程<span>{subscriptions.length}</span></button>
+          <button className={page === "schedule" ? "active" : ""} onClick={() => void navigateToPage("schedule")}><CalendarRange size={19} />日程<span>{visibleSubscriptions.length}</span></button>
           <button className={page === "creators" ? "active" : ""} onClick={() => void navigateToPage("creators")}><UsersRound size={19} />主播库</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => void navigateToPage("settings")}><SettingsIcon size={19} />设置</button>
         </nav>
         <div className="sidebar-creators">
           <p>我的主播</p>
-          {orderedSubscriptions.map((streamer) => {
+          {visibleSubscriptions.map((streamer) => {
             const menuOpen = creatorMenu?.streamer.id === streamer.id;
             const refreshing = sidebarRefreshingId === streamer.id;
+            const platform = streamer.platform === "youtube" ? "youtube" : "bilibili";
+            const openLabel = platform === "youtube"
+              ? streamer.isLive && streamer.liveUrl ? "双击进入直播间" : "双击打开频道"
+              : "双击进入直播间";
             return (
               <div
                 className={`mini-creator ${menuOpen ? "is-menu-open" : ""}`}
                 key={streamer.id}
-                title={`${streamer.name} · 双击进入直播间 · 右键打开操作菜单`}
+                title={`${streamer.name} · ${openLabel} · 右键打开操作菜单`}
                 tabIndex={0}
-                aria-label={`${streamer.name}，双击或按 Enter 进入直播间，右键或按 Shift+F10 打开操作菜单`}
+                aria-label={`${streamer.name}，${openLabel}，右键或按 Shift+F10 打开操作菜单`}
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
                 onDoubleClick={(event) => {
@@ -2716,7 +2841,7 @@ export default function App() {
               </div>
             );
           })}
-          {!subscriptions.length ? <span className="muted">暂无订阅</span> : null}
+          {!visibleSubscriptions.length ? <span className="muted">暂无订阅</span> : null}
         </div>
         <div className={`connection-chip ${connection}`}>
           {connection === "connected" || connection === "local" ? <Wifi size={15} /> : <WifiOff size={15} />}
@@ -2742,7 +2867,7 @@ export default function App() {
         />
       </aside>
 
-      {creatorMenu ? (
+      {creatorMenu && (settings.youtubeEnabled || creatorMenu.streamer.platform !== "youtube") ? (
         <div
           className="context-menu creator-context-menu"
           role="menu"
@@ -2796,15 +2921,15 @@ export default function App() {
           <ScheduleView
             key={`schedule-source:${isTauri ? settings.dataMode : "server"}:${isTauri ? settings.serverUrl : window.location.origin}`}
             active={page === "schedule"}
-            subscriptions={orderedSubscriptions}
-            liveStatuses={liveStatuses}
+            subscriptions={visibleSubscriptions}
+            liveStatuses={visibleLiveStatuses}
             actions={scheduleActions}
             revision={scheduleRevision}
             onError={showToast}
           />
         </div>
         {page === "creators" ? (
-          <CreatorsView subscriptions={orderedSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} fertilityEnabled={settings.fertilityEnabled} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onError={showToast} />
+          <CreatorsView subscriptions={visibleSubscriptions} refreshProgress={refreshProgress} liveStatsEnabled={settings.liveStatsEnabled} fertilityEnabled={settings.fertilityEnabled} youtubeEnabled={settings.youtubeEnabled ?? false} actions={creatorActions} onChanged={handleCreatorChanged} onOpenLiveRoom={openCreatorLiveRoom} onError={showToast} />
         ) : page === "settings" ? (
           <SettingsView
             ref={settingsViewRef}
@@ -2904,6 +3029,87 @@ export default function App() {
               testLlm,
               listLlmModels,
               testNotification: sendTestNotification,
+              status: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.youtubeStatus();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.youtubeStatus();
+              },
+              saveApiKey: async (apiKey: string) => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.saveYoutubeApiKey(apiKey);
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.setYoutubeApiKey(apiKey);
+              },
+              testApiKey: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.testYoutubeApiKey();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.testYoutubeApiKey();
+              },
+              clearApiKey: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.clearYoutubeApiKey();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.clearYoutubeApiKey();
+              },
+              startOAuth: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.startYoutubeOAuth();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.startYoutubeOAuth();
+              },
+              clearOAuth: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.clearYoutubeOAuth();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.clearYoutubeOAuth();
+              },
+              startWebLogin: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.startYoutubeWebLogin();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.startYoutubeWebLogin();
+              },
+              saveWebSession: async (cookie: string) => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.saveYoutubeWebSession(cookie);
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.saveYoutubeWebSession(cookie);
+              },
+              clearWebSession: async () => {
+                requireYoutubeEnabled();
+                if (!isTauri || settings.dataMode === "server") {
+                  if (!serverApi) throw new Error("服务器未连接");
+                  return serverApi.clearYoutubeWebSession();
+                }
+                if (!localApi) throw new Error("桌面 API 未初始化");
+                return localApi.clearYoutubeWebSession();
+              },
               openBiliBrowserLogin: async () => {
                 if (!localApi) {
                   throw new Error("桌面 API 未初始化");
@@ -3124,4 +3330,3 @@ function LoginGate({
     </div>
   );
 }
-

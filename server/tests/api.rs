@@ -6,7 +6,8 @@ use chrono::{Duration, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use oshical_core::{
-    AddSubscription, AppService, NewSchedule, NewWeeklyScheduleRule, RuntimeSecrets, SqliteStore,
+    AddSubscription, AppService, NewSchedule, NewWeeklyScheduleRule, Platform, RuntimeSecrets,
+    SqliteStore,
 };
 use oshical_server::{build_router, AppState, RefreshJobManager, SecretVault, ServerUpdateManager};
 use serde_json::{json, Value};
@@ -190,6 +191,10 @@ async fn subscription_and_manual_schedule_round_trip_over_http() {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&AddSubscription {
+                        platform: Platform::Bilibili,
+                        handle: None,
+                        profile_url: None,
+                        uploads_playlist_id: None,
                         mid: "100".to_owned(),
                         name: Some("测试主播".to_owned()),
                         avatar_url: None,
@@ -275,6 +280,10 @@ async fn fan_history_route_returns_current_count_and_recent_snapshots() {
     let streamer = state
         .service
         .add_subscription(AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: "99101".to_owned(),
             name: Some("粉丝历史主播".to_owned()),
             avatar_url: None,
@@ -338,6 +347,10 @@ async fn weekly_rule_round_trip_generates_weekly_schedule() {
     let streamer = state
         .service
         .add_subscription(AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: "99100".to_owned(),
             name: Some("周表主播".to_owned()),
             avatar_url: None,
@@ -474,6 +487,10 @@ async fn delete_mutation_replay_is_idempotent() {
     let store = state.service.store();
     let streamer = store
         .add_subscription(&AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: "1001".to_owned(),
             name: Some("回归主播".to_owned()),
             avatar_url: None,

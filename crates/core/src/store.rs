@@ -23,8 +23,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     AddSubscription, ClientSyncState, DynamicPost, FanSnapshot, HealthState, LinkedAccount,
     LiveSession, LiveSessionStats, LiveSnapshot, LiveStatus, NewSchedule, NewWeeklyScheduleRule,
-    Schedule, SourceSuppression, Streamer, SyncMutation, UpdateSchedule, UpdateSubscription,
-    UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    Platform, Schedule, SourceSuppression, Streamer, SyncMutation, UpdateSchedule,
+    UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::settings::SETTING_KEYS;
 
@@ -36,9 +36,13 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS streamers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'bilibili',
     mid TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     avatar_url TEXT NOT NULL DEFAULT '',
+    handle TEXT,
+    profile_url TEXT,
+    uploads_playlist_id TEXT,
     room_id TEXT,
     live_url TEXT,
     schedule_enabled INTEGER NOT NULL DEFAULT 1,
@@ -51,6 +55,7 @@ CREATE TABLE IF NOT EXISTS streamers (
     live_is_live INTEGER NOT NULL DEFAULT 0,
     live_title TEXT,
     live_cover TEXT,
+    live_video_id TEXT,
     live_started_at TEXT,
     live_checked_at TEXT,
     sort_order INTEGER NOT NULL DEFAULT 0,
@@ -110,6 +115,8 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     gift_count INTEGER NOT NULL DEFAULT 0,
     super_chat_count INTEGER NOT NULL DEFAULT 0,
     guard_count INTEGER NOT NULL DEFAULT 0,
+    membership_count INTEGER,
+    youtube_stats_available INTEGER,
     reconnect_count INTEGER NOT NULL DEFAULT 0,
     segment_count INTEGER NOT NULL DEFAULT 1,
     last_segment_started_at TEXT NOT NULL DEFAULT '',
@@ -143,9 +150,12 @@ ON live_online_samples(session_id, id);
 CREATE TABLE IF NOT EXISTS linked_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL DEFAULT 'bilibili',
     mid TEXT NOT NULL,
     name TEXT NOT NULL,
     avatar_url TEXT NOT NULL DEFAULT '',
+    handle TEXT,
+    profile_url TEXT,
     created_at TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 1,
     UNIQUE(streamer_id, mid)
@@ -275,6 +285,7 @@ CREATE TABLE IF NOT EXISTS weekly_schedule_exceptions (
 CREATE TABLE IF NOT EXISTS schedule_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL DEFAULT 'bilibili',
     source_kind TEXT NOT NULL,
     source_post_id TEXT,
     source_image_url TEXT,
@@ -289,6 +300,7 @@ CREATE TABLE IF NOT EXISTS schedule_sources (
 CREATE TABLE IF NOT EXISTS source_suppressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL DEFAULT 'bilibili',
     source_post_id TEXT NOT NULL,
     source_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -359,9 +371,13 @@ pub struct FertilityCache {
 #[derive(Debug, sqlx::FromRow)]
 struct StreamerRow {
     id: i64,
+    platform: String,
     mid: String,
     name: String,
     avatar_url: String,
+    handle: Option<String>,
+    profile_url: Option<String>,
+    uploads_playlist_id: Option<String>,
     room_id: Option<String>,
     live_url: Option<String>,
     schedule_enabled: i64,
@@ -374,6 +390,7 @@ struct StreamerRow {
     live_is_live: i64,
     live_title: Option<String>,
     live_cover: Option<String>,
+    live_video_id: Option<String>,
     live_started_at: Option<String>,
     live_checked_at: Option<String>,
     sort_order: i64,
@@ -385,9 +402,12 @@ struct StreamerRow {
 struct LinkedAccountRow {
     id: i64,
     streamer_id: i64,
+    platform: String,
     mid: String,
     name: String,
     avatar_url: String,
+    handle: Option<String>,
+    profile_url: Option<String>,
     revision: i64,
     created_at: String,
 }
@@ -447,6 +467,7 @@ struct LiveStatusRow {
     live_schedule_id: Option<i64>,
     live_schedule_known: i64,
     streamer_id: i64,
+    platform: String,
     mid: String,
     streamer_name: String,
     avatar_url: String,
@@ -454,6 +475,7 @@ struct LiveStatusRow {
     live_title: Option<String>,
     live_cover: Option<String>,
     live_url: Option<String>,
+    live_video_id: Option<String>,
     live_checked_at: Option<String>,
     live_started_at: Option<String>,
     live_notify_enabled: i64,
@@ -487,6 +509,8 @@ struct LiveSessionRow {
     gift_count: i64,
     super_chat_count: i64,
     guard_count: i64,
+    membership_count: Option<i64>,
+    youtube_stats_available: Option<i64>,
     reconnect_count: i64,
     segment_count: i64,
     data_quality: String,
@@ -534,6 +558,7 @@ impl SqliteStore {
             .max_connections(5)
             .connect_with(options)
             .await?;
+        backup_before_youtube_schema_migration(&pool, path).await?;
         Self::initialize(pool).await
     }
 
@@ -560,6 +585,56 @@ impl SqliteStore {
                 "ALTER TABLE streamers ADD COLUMN live_schedule_known INTEGER NOT NULL DEFAULT 0",
             ),
             ("live_sessions", "schedule_id", "ALTER TABLE live_sessions ADD COLUMN schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL"),
+            (
+                "streamers",
+                "platform",
+                "ALTER TABLE streamers ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili'",
+            ),
+            (
+                "streamers",
+                "handle",
+                "ALTER TABLE streamers ADD COLUMN handle TEXT",
+            ),
+            (
+                "streamers",
+                "profile_url",
+                "ALTER TABLE streamers ADD COLUMN profile_url TEXT",
+            ),
+            (
+                "streamers",
+                "uploads_playlist_id",
+                "ALTER TABLE streamers ADD COLUMN uploads_playlist_id TEXT",
+            ),
+            (
+                "streamers",
+                "live_video_id",
+                "ALTER TABLE streamers ADD COLUMN live_video_id TEXT",
+            ),
+            (
+                "linked_accounts",
+                "platform",
+                "ALTER TABLE linked_accounts ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili'",
+            ),
+            (
+                "linked_accounts",
+                "handle",
+                "ALTER TABLE linked_accounts ADD COLUMN handle TEXT",
+            ),
+            (
+                "linked_accounts",
+                "profile_url",
+                "ALTER TABLE linked_accounts ADD COLUMN profile_url TEXT",
+            ),
+            (
+                "schedule_sources",
+                "platform",
+                "ALTER TABLE schedule_sources ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili'",
+            ),
+            (
+                "source_suppressions",
+                "platform",
+                "ALTER TABLE source_suppressions ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili'",
+            ),
         ] {
             let columns = sqlx::query(&format!("PRAGMA table_info({table})")).fetch_all(&mut *tx).await?;
             if !columns.iter().any(|row| row.get::<String, _>("name") == column) {
@@ -726,9 +801,10 @@ impl SqliteStore {
 
     pub async fn list_streamers(&self) -> AppResult<Vec<Streamer>> {
         let rows = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
+            "SELECT id, platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                    room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
-                    live_started_at, live_checked_at, sort_order, created_at, revision
+                    live_video_id, live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers ORDER BY sort_order, name COLLATE NOCASE, id",
         )
         .fetch_all(&self.pool)
@@ -738,9 +814,10 @@ impl SqliteStore {
 
     pub async fn get_streamer(&self, id: i64) -> AppResult<Streamer> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
+            "SELECT id, platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                    room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
-                    live_started_at, live_checked_at, sort_order, created_at, revision
+                    live_video_id, live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE id = ?",
         )
         .bind(id)
@@ -755,9 +832,10 @@ impl SqliteStore {
 
     pub async fn get_streamer_by_mid(&self, mid: &str) -> AppResult<Option<Streamer>> {
         let row = sqlx::query_as::<_, StreamerRow>(
-            "SELECT id, mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
+            "SELECT id, platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                    room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled, fans,
                     aliases_json, last_error, last_refresh_at, live_is_live, live_title, live_cover,
-                    live_started_at, live_checked_at, sort_order, created_at, revision
+                    live_video_id, live_started_at, live_checked_at, sort_order, created_at, revision
              FROM streamers WHERE mid = ?",
         )
         .bind(mid)
@@ -771,7 +849,7 @@ impl SqliteStore {
 
     async fn map_streamers(&self, rows: Vec<StreamerRow>) -> AppResult<Vec<Streamer>> {
         let link_rows = sqlx::query(
-            "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+            "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url, revision, created_at
              FROM linked_accounts ORDER BY name COLLATE NOCASE",
         )
         .fetch_all(&self.pool)
@@ -786,9 +864,12 @@ impl SqliteStore {
                 .push(LinkedAccount {
                     id: row.try_get("id")?,
                     streamer_id,
+                    platform: parse_platform(&row.try_get::<String, _>("platform")?)?,
                     mid: row.try_get("mid")?,
                     name: row.try_get("name")?,
                     avatar_url: row.try_get("avatar_url")?,
+                    handle: row.try_get("handle")?,
+                    profile_url: row.try_get("profile_url")?,
                     revision: row.try_get("revision")?,
                     created_at: parse_ts(row.try_get::<String, _>("created_at")?.as_str())?,
                 });
@@ -799,9 +880,13 @@ impl SqliteStore {
                     .map_err(|_| AppError::validation("主播别名数据损坏"))?;
                 Ok(Streamer {
                     id: row.id,
+                    platform: parse_platform(&row.platform)?,
                     mid: row.mid,
                     name: row.name,
                     avatar_url: row.avatar_url,
+                    handle: row.handle,
+                    profile_url: row.profile_url,
+                    uploads_playlist_id: row.uploads_playlist_id,
                     room_id: row.room_id,
                     live_url: row.live_url,
                     aliases,
@@ -814,6 +899,7 @@ impl SqliteStore {
                     is_live: row.live_is_live != 0,
                     live_title: row.live_title,
                     live_cover: row.live_cover,
+                    live_video_id: row.live_video_id,
                     live_started_at: parse_opt_ts(row.live_started_at.as_deref())?,
                     live_checked_at: parse_opt_ts(row.live_checked_at.as_deref())?,
                     linked_accounts: by_streamer.remove(&row.id).unwrap_or_default(),
@@ -826,7 +912,7 @@ impl SqliteStore {
     }
 
     pub async fn add_subscription(&self, input: &AddSubscription) -> AppResult<Streamer> {
-        validate_mid(&input.mid)?;
+        validate_platform_mid(input.platform, &input.mid)?;
         let name = input
             .name
             .as_deref()
@@ -837,6 +923,21 @@ impl SqliteStore {
             return Err(AppError::validation("主播昵称不能超过 80 字"));
         }
         let avatar = input.avatar_url.as_deref().unwrap_or_default();
+        let handle = input
+            .handle
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let profile_url = input
+            .profile_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let uploads_playlist_id = input
+            .uploads_playlist_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let room_id = input
             .room_id
             .as_deref()
@@ -859,25 +960,34 @@ impl SqliteStore {
                 .await?;
         sqlx::query(
             "INSERT INTO streamers
-                (mid, name, avatar_url, room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
+                (platform, mid, name, avatar_url, handle, profile_url, uploads_playlist_id,
+                 room_id, live_url, schedule_enabled, live_notify_enabled, live_stats_enabled,
                  aliases_json, sort_order, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mid) DO UPDATE SET
+                platform = excluded.platform,
                 name = excluded.name,
                 avatar_url = CASE
                     WHEN excluded.avatar_url LIKE 'data:image/%' THEN excluded.avatar_url
                     WHEN streamers.avatar_url LIKE 'data:image/%' THEN streamers.avatar_url
                     WHEN excluded.avatar_url <> '' THEN excluded.avatar_url
                     ELSE streamers.avatar_url END,
+                handle = COALESCE(excluded.handle, streamers.handle),
+                profile_url = COALESCE(excluded.profile_url, streamers.profile_url),
+                uploads_playlist_id = COALESCE(excluded.uploads_playlist_id, streamers.uploads_playlist_id),
                 room_id = COALESCE(excluded.room_id, streamers.room_id),
                 live_url = COALESCE(excluded.live_url, streamers.live_url),
                 aliases_json = excluded.aliases_json,
                 updated_at = excluded.updated_at,
                 revision = streamers.revision + 1",
         )
+        .bind(input.platform.as_str())
         .bind(&input.mid)
         .bind(name)
         .bind(avatar)
+        .bind(handle)
+        .bind(profile_url)
+        .bind(uploads_playlist_id)
         .bind(room_id)
         .bind(&live_url)
         .bind(input.schedule_enabled)
@@ -1209,34 +1319,68 @@ impl SqliteStore {
         name: &str,
         avatar_url: &str,
     ) -> AppResult<LinkedAccount> {
-        validate_mid(mid)?;
+        self.add_linked_account_for_platform(
+            streamer_id,
+            Platform::Bilibili,
+            mid,
+            name,
+            avatar_url,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_linked_account_for_platform(
+        &self,
+        streamer_id: i64,
+        platform: Platform,
+        mid: &str,
+        name: &str,
+        avatar_url: &str,
+        handle: Option<&str>,
+        profile_url: Option<&str>,
+    ) -> AppResult<LinkedAccount> {
+        validate_platform_mid(platform, mid)?;
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 80 {
             return Err(AppError::validation("官号昵称长度必须为 1 到 80 字"));
         }
+        let handle = handle.map(str::trim).filter(|value| !value.is_empty());
+        let profile_url = profile_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
-            "INSERT INTO linked_accounts (streamer_id, mid, name, avatar_url, created_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO linked_accounts
+                (streamer_id, platform, mid, name, avatar_url, handle, profile_url, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(streamer_id, mid) DO UPDATE SET
+                platform = excluded.platform,
                 name = excluded.name,
                 avatar_url = CASE
                     WHEN excluded.avatar_url LIKE 'data:image/%' THEN excluded.avatar_url
                     WHEN linked_accounts.avatar_url LIKE 'data:image/%' THEN linked_accounts.avatar_url
                     WHEN excluded.avatar_url <> '' THEN excluded.avatar_url
                     ELSE linked_accounts.avatar_url END,
+                handle = COALESCE(excluded.handle, linked_accounts.handle),
+                profile_url = COALESCE(excluded.profile_url, linked_accounts.profile_url),
                 revision = linked_accounts.revision + 1",
         )
         .bind(streamer_id)
+        .bind(platform.as_str())
         .bind(mid)
         .bind(name)
         .bind(avatar_url)
+        .bind(handle)
+        .bind(profile_url)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
         let row = sqlx::query_as::<_, LinkedAccountRow>(
-            "SELECT id, streamer_id, mid, name, avatar_url, revision, created_at
+            "SELECT id, streamer_id, platform, mid, name, avatar_url, handle, profile_url, revision, created_at
              FROM linked_accounts WHERE streamer_id = ? AND mid = ?",
         )
         .bind(streamer_id)
@@ -1249,9 +1393,12 @@ impl SqliteStore {
         Ok(LinkedAccount {
             id: row.id,
             streamer_id: row.streamer_id,
+            platform: parse_platform(&row.platform)?,
             mid: row.mid,
             name: row.name,
             avatar_url: row.avatar_url,
+            handle: row.handle,
+            profile_url: row.profile_url,
             revision: row.revision,
             created_at: parse_ts(&row.created_at)?,
         })
@@ -1860,9 +2007,9 @@ impl SqliteStore {
         .await?;
         sqlx::query(
             "INSERT INTO schedule_sources
-                (schedule_id, source_kind, source_post_id, source_image_url,
+                (schedule_id, platform, source_kind, source_post_id, source_image_url,
                  source_fingerprint, source_identity, confidence, created_at, revision)
-             SELECT ?, source_kind, source_post_id, source_image_url,
+             SELECT ?, platform, source_kind, source_post_id, source_image_url,
                     source_fingerprint, source_identity, confidence, created_at, revision
              FROM schedule_sources WHERE schedule_id = ?
              ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
@@ -2895,7 +3042,8 @@ impl SqliteStore {
         // 动态 id，按序号解析会把它误判成过期。
         let rows = sqlx::query(
             "SELECT id, source_identity, schedule_id FROM schedule_sources
-             WHERE source_post_id = ? AND source_kind IN ('text', 'image')
+             WHERE source_post_id = ?
+               AND source_kind IN ('text', 'image', 'youtube_community', 'youtube_live')
              ORDER BY id",
         )
         .bind(post_id)
@@ -2974,7 +3122,7 @@ impl SqliteStore {
 
     pub async fn list_source_suppressions(&self) -> AppResult<Vec<SourceSuppression>> {
         let rows = sqlx::query(
-            "SELECT id, streamer_id, source_post_id, source_fingerprint, revision, created_at
+            "SELECT id, streamer_id, platform, source_post_id, source_fingerprint, revision, created_at
              FROM source_suppressions ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -2984,6 +3132,7 @@ impl SqliteStore {
                 Ok(SourceSuppression {
                     id: row.try_get("id")?,
                     streamer_id: row.try_get("streamer_id")?,
+                    platform: parse_platform(&row.try_get::<String, _>("platform")?)?,
                     source_post_id: row.try_get("source_post_id")?,
                     source_fingerprint: row.try_get("source_fingerprint")?,
                     revision: row.try_get("revision")?,
@@ -3025,17 +3174,26 @@ impl SqliteStore {
     ) -> AppResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous = sqlx::query(
-            "SELECT live_is_live, live_title, live_cover, live_url, live_started_at, live_checked_at, live_schedule_id, live_schedule_known
+            "SELECT platform, live_is_live, live_title, live_cover, live_url, live_video_id,
+                    live_started_at, live_checked_at, live_schedule_id, live_schedule_known
              FROM streamers WHERE id = ?",
         )
         .bind(streamer_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::not_found(format!("主播 {streamer_id}")))?;
+        let streamer_platform = parse_platform(&previous.try_get::<String, _>("platform")?)?;
+        if streamer_platform != snapshot.platform {
+            return Err(AppError::validation(format!(
+                "直播状态平台不匹配：主播为 {streamer_platform}，快照为 {}",
+                snapshot.platform
+            )));
+        }
         let previous_is_live: i64 = previous.try_get("live_is_live")?;
         let previous_title: Option<String> = previous.try_get("live_title")?;
         let previous_cover: Option<String> = previous.try_get("live_cover")?;
         let previous_live_url: Option<String> = previous.try_get("live_url")?;
+        let previous_live_video_id: Option<String> = previous.try_get("live_video_id")?;
         let previous_started_at: Option<String> = previous.try_get("live_started_at")?;
         let previous_checked: Option<String> = previous.try_get("live_checked_at")?;
         if parse_opt_ts(previous_checked.as_deref())?.is_some_and(|time| time > snapshot.checked_at)
@@ -3078,21 +3236,96 @@ impl SqliteStore {
                 .live_url
                 .as_deref()
                 .is_some_and(|url| previous_live_url.as_deref() != Some(url))
+            || previous_live_video_id.as_deref() != snapshot.live_video_id.as_deref()
             || previous_started_at.as_deref() != snapshot_started_at.as_deref()
             || previous_schedule_id != schedule_id
             || previous_schedule_known == 0;
         sqlx::query(
             "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
-                    live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?, live_schedule_known = 1,
+                    live_url = COALESCE(?, live_url), live_video_id = ?, live_started_at = ?,
+                    live_checked_at = ?, live_schedule_id = ?, live_schedule_known = 1,
                     updated_at = ?, live_revision = live_revision + ? WHERE id = ?",
         )
         .bind(snapshot.is_live)
         .bind(&snapshot.title)
         .bind(&snapshot.cover_url)
         .bind(&snapshot.live_url)
+        .bind(&snapshot.live_video_id)
         .bind(snapshot_started_at)
         .bind(snapshot.checked_at.to_rfc3339())
         .bind(schedule_id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(if changed { 1_i64 } else { 0_i64 })
+        .bind(streamer_id)
+        .execute(&mut *tx)
+        .await?;
+        if changed {
+            self.emit_live_status_change(&mut tx, streamer_id, SyncActor::collector())
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(previous_is_live != 0)
+    }
+
+    pub async fn set_youtube_live_status(
+        &self,
+        streamer_id: i64,
+        snapshot: &LiveSnapshot,
+    ) -> AppResult<bool> {
+        if snapshot.platform != Platform::Youtube {
+            return Err(AppError::validation("YouTube 直播状态平台不匹配"));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous = sqlx::query(
+            "SELECT platform, live_is_live, live_title, live_cover, live_url, live_video_id,
+                    live_started_at, live_checked_at
+             FROM streamers WHERE id = ?",
+        )
+        .bind(streamer_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("主播 {streamer_id}")))?;
+        let platform = parse_platform(&previous.try_get::<String, _>("platform")?)?;
+        if platform != Platform::Youtube {
+            return Err(AppError::validation("主播不是 YouTube 频道"));
+        }
+        let previous_is_live: i64 = previous.try_get("live_is_live")?;
+        let previous_title: Option<String> = previous.try_get("live_title")?;
+        let previous_cover: Option<String> = previous.try_get("live_cover")?;
+        let previous_live_url: Option<String> = previous.try_get("live_url")?;
+        let previous_live_video_id: Option<String> = previous.try_get("live_video_id")?;
+        let previous_started_at: Option<String> = previous.try_get("live_started_at")?;
+        let previous_checked: Option<String> = previous.try_get("live_checked_at")?;
+        if parse_opt_ts(previous_checked.as_deref())?.is_some_and(|time| time > snapshot.checked_at)
+        {
+            return Ok(previous_is_live != 0);
+        }
+        let started_at = snapshot
+            .started_at
+            .map(|value| value.to_rfc3339())
+            .or_else(|| (previous_is_live != 0).then(|| previous_started_at.clone()).flatten());
+        let changed = previous_is_live != (snapshot.is_live as i64)
+            || previous_title.as_deref().unwrap_or_default() != snapshot.title
+            || previous_cover.as_deref() != snapshot.cover_url.as_deref()
+            || snapshot
+                .live_url
+                .as_deref()
+                .is_some_and(|url| previous_live_url.as_deref() != Some(url))
+            || previous_live_video_id.as_deref() != snapshot.live_video_id.as_deref()
+            || previous_started_at.as_deref() != started_at.as_deref();
+        sqlx::query(
+            "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
+                    live_url = COALESCE(?, live_url), live_video_id = ?, live_started_at = ?,
+                    live_checked_at = ?, live_schedule_id = NULL, live_schedule_known = 1,
+                    updated_at = ?, live_revision = live_revision + ? WHERE id = ?",
+        )
+        .bind(snapshot.is_live)
+        .bind(&snapshot.title)
+        .bind(&snapshot.cover_url)
+        .bind(&snapshot.live_url)
+        .bind(&snapshot.live_video_id)
+        .bind(started_at)
+        .bind(snapshot.checked_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .bind(if changed { 1_i64 } else { 0_i64 })
         .bind(streamer_id)
@@ -3190,9 +3423,9 @@ impl SqliteStore {
 
     pub async fn list_live_statuses(&self) -> AppResult<Vec<LiveStatus>> {
         let rows = sqlx::query_as::<_, LiveStatusRow>(
-            "SELECT id AS streamer_id, mid, name AS streamer_name, avatar_url, live_is_live,
-                    live_title, live_cover, live_url, live_checked_at, live_started_at, live_schedule_id, live_schedule_known,
-                    live_notify_enabled, live_revision AS revision
+            "SELECT id AS streamer_id, platform, mid, name AS streamer_name, avatar_url, live_is_live,
+                    live_title, live_cover, live_url, live_video_id, live_checked_at, live_started_at,
+                    live_schedule_id, live_schedule_known, live_notify_enabled, live_revision AS revision
              FROM streamers ORDER BY name COLLATE NOCASE",
         )
         .fetch_all(&self.pool)
@@ -3203,6 +3436,7 @@ impl SqliteStore {
                     schedule_id: row.live_schedule_id,
                     schedule_known: row.live_schedule_known != 0,
                     streamer_id: row.streamer_id,
+                    platform: parse_platform(&row.platform)?,
                     mid: row.mid,
                     streamer_name: row.streamer_name,
                     avatar_url: row.avatar_url,
@@ -3210,6 +3444,7 @@ impl SqliteStore {
                     title: row.live_title.unwrap_or_default(),
                     cover_url: row.live_cover,
                     live_url: row.live_url,
+                    live_video_id: row.live_video_id,
                     online: 0,
                     started_at: parse_opt_ts(row.live_started_at.as_deref())?,
                     checked_at: parse_opt_ts(row.live_checked_at.as_deref())?
@@ -3453,7 +3688,7 @@ impl SqliteStore {
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                    super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                    super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                     created_at, updated_at, revision
              FROM live_sessions WHERE id = ?",
         )
@@ -3476,7 +3711,7 @@ impl SqliteStore {
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                        super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                        super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                         created_at, updated_at, revision
                  FROM live_sessions WHERE streamer_id = ?
                  ORDER BY started_at DESC LIMIT ?",
@@ -3491,7 +3726,7 @@ impl SqliteStore {
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                        super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                        super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                         created_at, updated_at, revision
                  FROM live_sessions ORDER BY started_at DESC LIMIT ?",
             )
@@ -3512,7 +3747,7 @@ impl SqliteStore {
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
                     ls.interactive_user_count, ls.danmaku_count, ls.gift_count, ls.super_chat_count,
-                    ls.guard_count, ls.reconnect_count, ls.segment_count, ls.data_quality, ls.collector_state,
+                    ls.guard_count, ls.membership_count, ls.youtube_stats_available, ls.reconnect_count, ls.segment_count, ls.data_quality, ls.collector_state,
                     ls.created_at, ls.updated_at, ls.revision
              FROM live_sessions ls
              JOIN schedules s ON s.streamer_id = ls.streamer_id
@@ -3650,7 +3885,7 @@ impl SqliteStore {
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
-                    super_chat_count, guard_count, reconnect_count, segment_count, data_quality, collector_state,
+                    super_chat_count, guard_count, membership_count, youtube_stats_available, reconnect_count, segment_count, data_quality, collector_state,
                     created_at, updated_at, revision
              FROM live_sessions
              WHERE streamer_id = ? AND ended_at IS NULL
@@ -3774,9 +4009,9 @@ impl SqliteStore {
                     "SELECT COALESCE(MAX(revision), 0) + 1 FROM settings
                      WHERE key IN (
                         'live_poll_seconds', 'dynamic_poll_seconds', 'auto_analyze_images',
-                        'live_stats_enabled', 'fertility_enabled', 'llm_base_url',
-                        'llm_model', 'llm_prompt_version', 'llm_reasoning_effort',
-                        'llm_parallelism', 'proxy_port'
+                        'live_stats_enabled', 'youtube_enabled', 'fertility_enabled',
+                        'llm_base_url', 'llm_model', 'llm_prompt_version',
+                        'llm_reasoning_effort', 'llm_parallelism', 'proxy_port'
                      )",
                 )
                 .fetch_one(&mut *tx)
@@ -4079,6 +4314,8 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         gift_count: row.gift_count,
         super_chat_count: row.super_chat_count,
         guard_count: row.guard_count,
+        membership_count: row.membership_count,
+        youtube_stats_available: row.youtube_stats_available.map(|value| value != 0),
         reconnect_count: row.reconnect_count,
         segment_count: row.segment_count.max(0) as u64,
         data_quality: row.data_quality,
@@ -4172,12 +4409,37 @@ fn parse_opt_ts(value: Option<&str>) -> AppResult<Option<DateTime<Utc>>> {
     value.map(parse_ts).transpose()
 }
 
+fn parse_platform(value: &str) -> AppResult<Platform> {
+    Platform::parse(value)
+        .ok_or_else(|| AppError::validation(format!("未知账号平台: {value}")))
+}
+
 fn validate_mid(mid: &str) -> AppResult<()> {
     let mid = mid.trim();
     if mid.is_empty() || mid.len() > 32 || !mid.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(AppError::validation("B 站 MID 必须是数字"));
     }
     Ok(())
+}
+
+fn validate_platform_mid(platform: Platform, mid: &str) -> AppResult<()> {
+    match platform {
+        Platform::Bilibili => validate_mid(mid),
+        Platform::Youtube => {
+            let mid = mid.trim();
+            if mid.is_empty()
+                || mid.len() > 64
+                || !mid
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                return Err(AppError::validation(
+                    "YouTube 频道 ID 必须是 1 到 64 位字母、数字、短横线或下划线",
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn normalize_aliases(mut aliases: Vec<String>, name: &str) -> Vec<String> {
@@ -4250,11 +4512,121 @@ fn validate_schedule_input(input: &NewSchedule) -> AppResult<()> {
 
 fn validate_live_url(url: &str) -> AppResult<()> {
     let parsed = url::Url::parse(url)?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("live.bilibili.com") {
+    let host = parsed.host_str().unwrap_or_default();
+    let allowed = parsed.scheme() == "https"
+        && matches!(
+            host,
+            "live.bilibili.com" | "www.youtube.com" | "youtube.com" | "youtu.be"
+        );
+    if !allowed {
         return Err(AppError::validation(
-            "直播间地址只允许 https://live.bilibili.com/",
+            "直播间地址只允许 B 站或 YouTube 的官方 HTTPS 链接",
         ));
     }
+    Ok(())
+}
+
+async fn needs_youtube_schema_migration(pool: &SqlitePool) -> AppResult<bool> {
+    // `streamers` is the first core table in the application schema. Its
+    // absence means this is a brand-new database, not an intermediate-version
+    // database that needs a pre-migration snapshot.
+    let streamers_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'streamers'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if streamers_exists == 0 {
+        return Ok(false);
+    }
+
+    const REQUIRED_COLUMNS: [(&str, &[&str]); 5] = [
+        (
+            "streamers",
+            &[
+                "platform",
+                "handle",
+                "profile_url",
+                "uploads_playlist_id",
+                "live_video_id",
+            ],
+        ),
+        ("linked_accounts", &["platform", "handle", "profile_url"]),
+        ("schedule_sources", &["platform"]),
+        ("source_suppressions", &["platform"]),
+        (
+            "live_sessions",
+            &["membership_count", "youtube_stats_available"],
+        ),
+    ];
+
+    for (table, required) in REQUIRED_COLUMNS {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        if exists == 0 {
+            return Ok(true);
+        }
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(pool)
+            .await?;
+        let present: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        if required.iter().any(|column| !present.contains(*column)) {
+            return Ok(true);
+        }
+    }
+
+    for (kind, name) in [
+        ("table", "live_super_chat_events"),
+        ("index", "idx_live_super_chat_events_session"),
+    ] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?",
+        )
+        .bind(kind)
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+        if exists == 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// YouTube schema 迁移前用 SQLite 的一致快照写入独立备份文件。
+/// 新库或已经迁移过的库不会生成多余备份；中间 beta schema 也会生成备份。
+async fn backup_before_youtube_schema_migration(
+    pool: &SqlitePool,
+    database_path: &Path,
+) -> AppResult<()> {
+    if !needs_youtube_schema_migration(pool).await? {
+        return Ok(());
+    }
+    let file_name = database_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::validation("数据库路径必须包含有效文件名"))?;
+    let backup_path = database_path.with_file_name(format!(
+        "{file_name}.youtube-v3-backup-{}.bak",
+        uuid::Uuid::new_v4()
+    ));
+    let backup_path_text = backup_path
+        .to_str()
+        .ok_or_else(|| AppError::validation("数据库备份路径必须是有效 UTF-8"))?;
+    sqlx::query("VACUUM INTO ?1")
+        .bind(backup_path_text)
+        .execute(pool)
+        .await?;
+    tracing::info!(
+        path = %backup_path.display(),
+        "已创建 YouTube schema 迁移前数据库备份"
+    );
     Ok(())
 }
 
@@ -4265,6 +4637,7 @@ fn is_server_setting_key(key: &str) -> bool {
             | "dynamic_poll_seconds"
             | "auto_analyze_images"
             | "live_stats_enabled"
+            | "youtube_enabled"
             | "fertility_enabled"
             | "llm_base_url"
             | "llm_model"
@@ -4299,6 +4672,10 @@ mod tests {
 
     fn add_input(mid: &str, name: &str) -> AddSubscription {
         AddSubscription {
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
             mid: mid.to_owned(),
             name: Some(name.to_owned()),
             avatar_url: None,
@@ -4343,6 +4720,59 @@ mod tests {
             }
         }
         panic!("temporary test directory stayed locked: {last_error:?}");
+    }
+
+    #[tokio::test]
+    async fn youtube_schema_backup_detection_covers_intermediate_beta_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        assert!(!needs_youtube_schema_migration(&pool).await.expect("new db"));
+
+        for statement in [
+            "CREATE TABLE streamers (platform TEXT, handle TEXT, profile_url TEXT, uploads_playlist_id TEXT, live_video_id TEXT)",
+            "CREATE TABLE linked_accounts (platform TEXT, handle TEXT, profile_url TEXT)",
+            "CREATE TABLE schedule_sources (platform TEXT)",
+            "CREATE TABLE source_suppressions (platform TEXT)",
+            "CREATE TABLE live_sessions (membership_count INTEGER)",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("intermediate schema");
+        }
+        assert!(
+            needs_youtube_schema_migration(&pool)
+                .await
+                .expect("missing YouTube columns and table")
+        );
+
+        sqlx::query("ALTER TABLE live_sessions ADD COLUMN youtube_stats_available INTEGER")
+            .execute(&pool)
+            .await
+            .expect("youtube stats column");
+        assert!(
+            needs_youtube_schema_migration(&pool)
+                .await
+                .expect("missing super chat table")
+        );
+
+        for statement in [
+            "CREATE TABLE live_super_chat_events (id TEXT PRIMARY KEY)",
+            "CREATE INDEX idx_live_super_chat_events_session ON live_super_chat_events(id)",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("current schema");
+        }
+        assert!(
+            !needs_youtube_schema_migration(&pool)
+                .await
+                .expect("fully migrated schema")
+        );
     }
 
     #[tokio::test]

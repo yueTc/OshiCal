@@ -1,9 +1,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronLeft, LoaderCircle, RefreshCw, TrendingUp } from "lucide-react";
-import type { LiveOnlineSample, LiveSession } from "../types";
+import type { LiveOnlineSample, LiveSession, Platform } from "../types";
 import {
   loadOnlineSamplePages, nearestOnlinePoint, onlinePoints, onlineSegments, onlineTime,
-  thinOnlineSegment,
+  platformFromLiveSession, thinOnlineSegment,
 } from "../lib/live-online";
 import type { OnlinePageLoader } from "../lib/live-online";
 import { EmptyState, ErrorBanner } from "./ui";
@@ -33,6 +33,7 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
   const [hours, setHours] = useState(0);
+  const [platform, setPlatform] = useState<Platform>(() => platformFromLiveSession(session));
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const refreshRef = useRef<(() => void) | null>(null);
   const titleId = useId();
@@ -57,6 +58,7 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
         const page = await loadOnlineSamplePages(loadPage, session.id, cursor, controller.signal);
         if (disposed) return;
         cursor = page.nextAfterId;
+        setPlatform(page.platform);
         setSamples((current) => [...current, ...page.samples]);
         setError("");
       } catch (cause) {
@@ -110,7 +112,7 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
       </div>
       <div className="online-chart-heading">
         <span className="online-chart-icon" aria-hidden="true"><TrendingUp size={21} /></span>
-        <div><h3>{session.streamerName} · 人数走势</h3><p>北京时间 · 约每 30 秒采样{!session.endedAt ? " · 自动更新中" : " · 已结束"}</p></div>
+        <div><h3>{session.streamerName} · 人数走势</h3><p>{platform === "youtube" ? "YouTube 并发观看人数" : "B 站公开高能用户数"} · 北京时间 · 约每 30 秒采样{!session.endedAt ? " · 自动更新中" : " · 已结束"}</p></div>
       </div>
       {error ? <ErrorBanner message={error} onRetry={() => {
         if (samples.length) refreshRef.current?.();
@@ -120,7 +122,9 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
         <div className="live-stats-loading" role="status"><LoaderCircle size={18} className="spin" />正在读取本场人数历史…</div>
       ) : points.length === 0 ? (
         <EmptyState title={error ? "人数历史暂不可用" : "暂无人数变化记录"}
-          description="历史峰值无法还原为曲线。需要升级采集端，并在开启直播统计后保持采集；旧场次不会补造历史。" />
+          description={platform === "youtube"
+            ? "YouTube 并发观看人数需要采集端持续运行；缺失采样不会补造为 0。"
+            : "历史峰值无法还原为曲线。需要升级采集端，并在开启直播统计后保持采集；旧场次不会补造历史。"} />
       ) : (
         <>
           <div className="online-chart-summary">
@@ -148,7 +152,7 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
                 if (index >= 0) setSelectedId(points[index].id);
               }}
               onPointerLeave={() => setSelectedId(null)}>
-              <title id={titleId}>本场公开高能用户数变化曲线</title>
+              <title id={titleId}>{platform === "youtube" ? "本场 YouTube 并发观看人数变化曲线" : "本场公开高能用户数变化曲线"}</title>
               <desc id={descId}>横轴为北京时间，纵轴为人数。缺失数据和长时间未采集区间断开显示；可用下方时间滑块查看每个采样点。</desc>
               {[0, 1, 2, 3, 4].map((tick) => {
                 const value = maxY * tick / 4;

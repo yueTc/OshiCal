@@ -39,9 +39,15 @@ pub fn validate_rule_fields(
     }
     if let Some(url) = room_url {
         let parsed = url::Url::parse(url)?;
-        if parsed.scheme() != "https" || parsed.host_str() != Some("live.bilibili.com") {
+        let host = parsed.host_str().unwrap_or_default();
+        let allowed = parsed.scheme() == "https"
+            && matches!(
+                host,
+                "live.bilibili.com" | "www.youtube.com" | "youtube.com" | "youtu.be"
+            );
+        if !allowed {
             return Err(AppError::validation(
-                "固定周表直播间只允许 https://live.bilibili.com/",
+                "固定周表直播间只允许 B 站或 YouTube 的官方 HTTPS 链接",
             ));
         }
     }

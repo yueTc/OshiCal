@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { BarChart3, ChevronLeft, ChevronRight, LoaderCircle } from "lucide-react";
-import type { LiveOnlineSamplesPage, LiveSession } from "../types";
+import type {
+  LiveOnlineSamplesPage, LiveSession, LiveSuperChatTotal, Platform,
+} from "../types";
+import { platformFromLiveSession } from "../lib/live-online";
 import { LiveOnlineChart } from "./LiveOnlineChart";
 import { Avatar, EmptyState, Modal } from "./ui";
 
@@ -18,6 +21,21 @@ function formatMoney(cents: number): string {
 function formatCount(value: number): string {
   if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
   return value.toLocaleString("zh-CN");
+}
+
+function formatSuperChatTotal(total: LiveSuperChatTotal): string {
+  const amount = total.amountMicros / 1_000_000;
+  if (!Number.isFinite(amount)) return total.currency ?? "—";
+  if (!total.currency) return amount.toLocaleString("zh-CN");
+  try {
+    return new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency: total.currency,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return `${total.currency} ${amount.toLocaleString("zh-CN")}`;
+  }
 }
 
 function formatLiveTime(value: string): string {
@@ -46,8 +64,13 @@ function liveInterruptions(session: LiveSession): number {
   return Math.max(0, (session.segmentCount ?? 1) - 1);
 }
 
-function liveQualityLabel(session: LiveSession): string {
-  if (liveCollectionFailed(session)) return "采集失败";
+function liveQualityLabel(
+  session: LiveSession,
+  platform: Platform,
+  statsUnavailable: boolean,
+): string {
+  if (statsUnavailable || session.collectorState === "degraded") return "采集降级";
+  if (platform === "bilibili" && liveCollectionFailed(session)) return "采集失败";
   if (session.dataQuality === "complete") return "数据完整";
   if (session.dataQuality === "partial") {
     const reasons: string[] = [];
@@ -59,7 +82,21 @@ function liveQualityLabel(session: LiveSession): string {
   return "采集中";
 }
 
-function liveQualityDetail(session: LiveSession): string {
+function liveQualityDetail(
+  session: LiveSession,
+  platform: Platform,
+  youtubeStatsAvailable: boolean | null,
+): string {
+  if (platform === "youtube") {
+    if (session.collectorState === "degraded" || youtubeStatsAvailable === false) {
+      return "YouTube OAuth 授权失效或尚未授权，聊天、Super Chat 和会员统计已降级；并发观看人数和直播时长仍继续采样。";
+    }
+    if (session.dataQuality === "complete") return "YouTube 并发观看、聊天与付费事件统计完整。";
+    if (session.dataQuality === "partial") {
+      return "YouTube 并发观看人数持续采样；Super Chat 金额按原币种保存，不折算为人民币。";
+    }
+    return "YouTube 采集端正在统计，直播结束后给出完整度。";
+  }
   if (liveCollectionFailed(session)) {
     return "弹幕连接始终没有建立：营收、付费人数、互动人数和弹幕不可用，时长仍来自直播状态轮询。";
   }
@@ -81,6 +118,7 @@ function liveQualityDetail(session: LiveSession): string {
   }
   return "采集端正在统计，直播结束后给出完整度。";
 }
+
 // 日程页与主播库共用同一数据口径、完整度提示和同接曲线。
 export function LiveDataModal({
   session, loading = false, streamerAvatar, streamerName, title, loadPage, onClose, onBack,
@@ -95,8 +133,44 @@ export function LiveDataModal({
   onBack?: () => void;
 }) {
   const [onlineChartOpen, setOnlineChartOpen] = useState(false);
+  const [youtubeSummary, setYoutubeSummary] = useState<{
+    membershipCount: number | null;
+    statsAvailable: boolean | null;
+    superChatTotals: LiveSuperChatTotal[];
+  } | null>(null);
   const peakCardRef = useRef<HTMLButtonElement>(null);
-  const liveEventsUnavailable = session ? liveCollectionFailed(session) : false;
+  const loadPageRef = useRef(loadPage);
+  loadPageRef.current = loadPage;
+  const platform = session ? platformFromLiveSession(session) : "bilibili";
+  const isYoutube = platform === "youtube";
+  const liveEventsUnavailable = session && !isYoutube ? liveCollectionFailed(session) : false;
+  const youtubeStatsUnavailable = isYoutube
+    && (session?.collectorState === "degraded" || youtubeSummary?.statsAvailable === false);
+  const youtubeStatsKnown = youtubeSummary?.statsAvailable === true
+    && session?.collectorState !== "degraded";
+
+  useEffect(() => {
+    setYoutubeSummary(null);
+    if (!session || !isYoutube || loading) return;
+    let disposed = false;
+    const controller = new AbortController();
+    void loadPageRef.current(session.id, 0, controller.signal).then((page) => {
+      if (disposed) return;
+      setYoutubeSummary({
+        membershipCount: page.membershipCount ?? null,
+        statsAvailable: page.statsAvailable ?? null,
+        superChatTotals: page.superChatTotals ?? [],
+      });
+    }).catch((error: unknown) => {
+      if (disposed || (error instanceof Error && error.name === "AbortError")) return;
+      setYoutubeSummary(null);
+    });
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [session?.id, isYoutube, loading]);
+
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
@@ -111,6 +185,13 @@ export function LiveDataModal({
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, [onClose, onlineChartOpen]);
+
+  const superChatTotals = youtubeSummary?.superChatTotals ?? [];
+  const historicalSuperChatCount = superChatTotals.reduce((sum, total) => sum + total.eventCount, 0);
+  const membershipCount = youtubeSummary?.membershipCount ?? null;
+  const youtubeSuperChatCount = youtubeStatsKnown
+    ? (session?.superChatCount ?? 0)
+    : (superChatTotals.length > 0 ? historicalSuperChatCount : null);
 
   return (
     <Modal
@@ -141,31 +222,65 @@ export function LiveDataModal({
             </div>
             <em
               className={`live-data-quality ${liveEventsUnavailable ? "failed" : session.dataQuality}`}
-              title={liveQualityDetail(session)}
+              title={liveQualityDetail(session, platform, youtubeSummary?.statsAvailable ?? null)}
             >
-              {liveQualityLabel(session)}
+              {liveQualityLabel(session, platform, youtubeStatsUnavailable)}
             </em>
           </div>
           <div className="live-stat-grid">
             <div><span>时长</span><strong>{formatLiveDuration(session.durationSeconds)}</strong></div>
-            <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(session.revenueCents)}</strong></div>
-            <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.paidUserCount)}</strong></div>
-            <button type="button" ref={peakCardRef} className="live-stat-chart-card"
-              onClick={() => setOnlineChartOpen(true)} aria-label="查看最高同时在线人数变化曲线"
-              title="查看公开高能用户数的采样变化曲线">
-              <span>最高同时在线<ChevronRight size={13} aria-hidden="true" /></span>
-              <strong>{session.peakHighEnergy > 0 ? formatCount(session.peakHighEnergy) : "—"}</strong>
-              <small><BarChart3 size={12} aria-hidden="true" />查看变化曲线</small>
-            </button>
-            <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.interactiveUserCount)}</strong></div>
-            <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.danmakuCount)}</strong></div>
+            {isYoutube ? (
+              <>
+                <div><span>会员</span><strong>{membershipCount === null ? "—" : formatCount(membershipCount)}</strong></div>
+                <button type="button" ref={peakCardRef} className="live-stat-chart-card"
+                  onClick={() => setOnlineChartOpen(true)} aria-label="查看最高并发观看人数变化曲线"
+                  title="查看 YouTube 并发观看人数采样变化曲线">
+                  <span>最高并发观看<ChevronRight size={13} aria-hidden="true" /></span>
+                  <strong>{session.peakOnline > 0 ? formatCount(session.peakOnline) : "—"}</strong>
+                  <small><BarChart3 size={12} aria-hidden="true" />查看变化曲线</small>
+                </button>
+                <div><span>Super Chat</span><strong>{youtubeSuperChatCount === null ? "—" : formatCount(youtubeSuperChatCount)}</strong></div>
+                <div><span>付费用户</span><strong>{youtubeStatsKnown ? formatCount(session.paidUserCount) : "—"}</strong></div>
+                <div><span>互动人数</span><strong>{youtubeStatsKnown ? formatCount(session.interactiveUserCount) : "—"}</strong></div>
+                <div><span>弹幕</span><strong>{youtubeStatsKnown ? formatCount(session.danmakuCount) : "—"}</strong></div>
+              </>
+            ) : (
+              <>
+                <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(session.revenueCents)}</strong></div>
+                <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.paidUserCount)}</strong></div>
+                <button type="button" ref={peakCardRef} className="live-stat-chart-card"
+                  onClick={() => setOnlineChartOpen(true)} aria-label="查看最高同时在线人数变化曲线"
+                  title="查看公开高能用户数的采样变化曲线">
+                  <span>最高同时在线<ChevronRight size={13} aria-hidden="true" /></span>
+                  <strong>{session.peakHighEnergy > 0 ? formatCount(session.peakHighEnergy) : "—"}</strong>
+                  <small><BarChart3 size={12} aria-hidden="true" />查看变化曲线</small>
+                </button>
+                <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.interactiveUserCount)}</strong></div>
+                <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(session.danmakuCount)}</strong></div>
+              </>
+            )}
           </div>
-          <div className="live-revenue-breakdown">
-            <span>礼物 {liveEventsUnavailable ? "—" : formatMoney(session.giftRevenueCents)}</span>
-            <span>SC {liveEventsUnavailable ? "—" : formatMoney(session.superChatRevenueCents)}</span>
-            <span>舰长 {liveEventsUnavailable ? "—" : formatMoney(session.guardRevenueCents)}</span>
-          </div>
-          {liveEventsUnavailable ? (
+          {isYoutube ? (
+            <div className="live-revenue-breakdown">
+              <span>Super Chat 原币种</span>
+              {superChatTotals.length > 0 ? superChatTotals.map((total) => (
+                <span key={total.currency ?? "unknown"}>
+                  {formatSuperChatTotal(total)} · {formatCount(total.eventCount)} 笔
+                </span>
+              )) : <span>—</span>}
+            </div>
+          ) : (
+            <div className="live-revenue-breakdown">
+              <span>礼物 {liveEventsUnavailable ? "—" : formatMoney(session.giftRevenueCents)}</span>
+              <span>SC {liveEventsUnavailable ? "—" : formatMoney(session.superChatRevenueCents)}</span>
+              <span>舰长 {liveEventsUnavailable ? "—" : formatMoney(session.guardRevenueCents)}</span>
+            </div>
+          )}
+          {isYoutube && youtubeStatsUnavailable ? (
+            <p className="form-hint live-stats-error-note">
+              YouTube OAuth 授权失效或尚未授权，聊天、Super Chat 和会员统计已降级；并发观看与时长仍继续采样。
+            </p>
+          ) : !isYoutube && liveEventsUnavailable ? (
             <p className="form-hint live-stats-error-note">
               本次未能建立 B 站弹幕采集连接（重试 {formatCount(session.reconnectCount)} 次），事件类指标不可用；时长仍来自直播状态轮询。
             </p>
