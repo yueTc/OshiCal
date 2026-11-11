@@ -87,6 +87,12 @@ crates/core
 | UNIQUE | (streamer_id, started_at) | 同一场次幂等 |
 
 原始弹幕、礼物和 SC 事件只在采集器内存中聚合，不写入数据库。
+
+### live_online_samples
+
+服务端自 0.3.30-beta.5 起将人数采样独立存表：id、session_id、sampled_at、observed_at、high_energy_count、collector_state。约每 30 秒保存窗口内最新公开高能用户数；没有新观测或断线时为空，不是全体观众真实同接。人数下降和零值有效，旧场次不回填。随场次保留，外键级联删除；不把完整历史嵌入 sync_changes。鉴权分页接口：GET /api/live-sessions/{id}/online-samples?afterId=0&limit=500，最多每页 1000 条，metric=bilibili_high_energy_users。现有客户端不会自动缓存该表。
+
+同步历史默认每小时检查，启动后约 60 秒首轮；保留近 7 天、最新 10000 条及 20 MiB JSON 内容，哪个限制先到即删除连续旧前缀，并在同一事务推进最早有效游标。长期离线客户端通过 resetRequired 重拉当前快照。容量不含索引、空闲页或 WAL，检查之间可短暂超限；不自动 VACUUM。
 ### linked_accounts
 
 | 字段 | 类型 | 说明 |

@@ -211,6 +211,8 @@ pub(crate) async fn initialize_sync_feed(conn: &mut SqliteConnection) -> AppResu
 pub enum SyncPrunePolicy {
     Before(DateTime<Utc>),
     KeepLatest(i64),
+    /// UTF-8 bytes of retained JSON payloads; table/index overhead is excluded.
+    KeepPayloadBytes(i64),
 }
 
 async fn add_column_if_missing(
@@ -390,6 +392,12 @@ impl SqliteStore {
                 .fetch_optional(&self.pool)
                 .await?
             }
+            SyncPrunePolicy::KeepPayloadBytes(max_bytes) => {
+                if max_bytes < 0 {
+                    return Err(AppError::validation("同步日志保留容量不能为负数"));
+                }
+                self.payload_prune_boundary(max_bytes).await?
+            }
         };
         let boundary_ms = started.elapsed().as_millis() as u64;
         if boundary_ms >= 500 {
@@ -462,6 +470,32 @@ impl SqliteStore {
             "同步日志清理完成"
         );
         Ok(deleted)
+    }
+
+    // Walk only the retained tail, in bounded read-only pages. Do not transfer
+    // payloads to Rust or hold SQLite's writer while finding the boundary.
+    async fn payload_prune_boundary(&self, max_bytes: i64) -> AppResult<Option<i64>> {
+        let mut before = i64::MAX;
+        let mut retained_bytes = 0_i64;
+        loop {
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT seq, COALESCE(LENGTH(CAST(payload_json AS BLOB)), 0)
+                 FROM sync_changes WHERE seq <= ? ORDER BY seq DESC LIMIT 256",
+            )
+            .bind(before)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            for (seq, bytes) in &rows {
+                if *bytes > max_bytes.saturating_sub(retained_bytes) {
+                    return Ok(Some(*seq));
+                }
+                retained_bytes += bytes;
+            }
+            before = rows.last().expect("nonempty payload page").0 - 1;
+        }
     }
 
     pub async fn sync_changes_after(&self, after: i64, limit: i64) -> AppResult<SyncChangesPage> {
@@ -1362,7 +1396,7 @@ async fn load_schedules(conn: &mut SqliteConnection) -> AppResult<Vec<Schedule>>
     rows.into_iter().map(map_schedule).collect()
 }
 
-async fn load_schedule(conn: &mut SqliteConnection, id: i64) -> AppResult<Schedule> {
+pub(super) async fn load_schedule(conn: &mut SqliteConnection, id: i64) -> AppResult<Schedule> {
     let row = sqlx::query_as::<_, ScheduleRow>(
         "SELECT s.id, s.streamer_id, st.name AS streamer_name, st.avatar_url AS streamer_avatar,
                 s.participants_json, s.title, s.start_at, s.end_at, s.room_url,
@@ -1659,7 +1693,7 @@ impl SqliteStore {
         let Some(identity) = input.source_identity.as_deref() else {
             return Ok(None);
         };
-        sqlx::query(
+        let changed = sqlx::query(
             "INSERT INTO schedule_sources
                 (schedule_id, source_kind, source_post_id, source_image_url,
                  source_fingerprint, source_identity, confidence, created_at)
@@ -1667,7 +1701,10 @@ impl SqliteStore {
              ON CONFLICT(schedule_id, source_identity) DO UPDATE SET
                 confidence = MAX(schedule_sources.confidence, excluded.confidence),
                 source_fingerprint = COALESCE(excluded.source_fingerprint, schedule_sources.source_fingerprint),
-                revision = schedule_sources.revision + 1",
+                revision = schedule_sources.revision + 1
+             WHERE excluded.confidence > schedule_sources.confidence
+                OR (excluded.source_fingerprint IS NOT NULL
+                    AND excluded.source_fingerprint IS NOT schedule_sources.source_fingerprint)",
         )
         .bind(schedule_id)
         .bind(&input.source_kind)
@@ -1678,7 +1715,8 @@ impl SqliteStore {
         .bind(input.confidence)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *conn)
-        .await?;
+        .await?
+        .rows_affected();
         let id: i64 = sqlx::query_scalar(
             "SELECT id FROM schedule_sources WHERE schedule_id = ? AND source_identity = ?",
         )
@@ -1686,8 +1724,10 @@ impl SqliteStore {
         .bind(identity)
         .fetch_one(&mut *conn)
         .await?;
-        self.emit_schedule_source_change(conn, id, "upsert", actor)
-            .await?;
+        if changed > 0 {
+            self.emit_schedule_source_change(conn, id, "upsert", actor)
+                .await?;
+        }
         Ok(Some(id))
     }
 
@@ -2084,6 +2124,119 @@ mod tests {
             .await
             .expect("re-register");
         assert!(reconnected.online);
+    }
+
+    #[tokio::test]
+    async fn payload_retention_counts_utf8_bytes_and_preserves_reset_boundary() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let first = store
+            .append_sync_change("test", "a", "upsert", 1, Some(json!("中")))
+            .await
+            .unwrap();
+        let second = store
+            .append_sync_change("test", "b", "upsert", 1, Some(json!("文")))
+            .await
+            .unwrap();
+        let third = store
+            .append_sync_change("test", "c", "upsert", 1, Some(json!("字")))
+            .await
+            .unwrap();
+        // Each JSON string is five UTF-8 bytes, not three characters.
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(10))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .sync_changes_after(0, 100)
+                .await
+                .unwrap()
+                .reset_required
+        );
+        let page = store.sync_changes_after(first, 100).await.unwrap();
+        assert!(!page.reset_required);
+        assert_eq!(
+            page.changes.iter().map(|v| v.seq).collect::<Vec<_>>(),
+            vec![second, third]
+        );
+        let appended = store
+            .append_sync_change("test", "d", "upsert", 1, Some(json!("新")))
+            .await
+            .unwrap();
+        assert!(appended > third);
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(0))
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(store.latest_sync_seq().await.unwrap(), appended);
+        assert!(
+            store
+                .sync_changes_after(third, 100)
+                .await
+                .unwrap()
+                .reset_required
+        );
+        assert!(
+            !store
+                .sync_changes_after(appended, 100)
+                .await
+                .unwrap()
+                .reset_required
+        );
+        assert!(store
+            .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(-1))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn payload_retention_crosses_read_pages_and_allows_oversized_latest_to_reset() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        for i in 0..530 {
+            store
+                .append_sync_change("test", &i.to_string(), "upsert", 1, Some(json!("x")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(900))
+                .await
+                .unwrap(),
+            230
+        );
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(900))
+                .await
+                .unwrap(),
+            0
+        );
+        let latest = store
+            .append_sync_change("test", "big", "upsert", 1, Some(json!("z".repeat(1000))))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(900))
+                .await
+                .unwrap(),
+            301
+        );
+        assert_eq!(store.latest_sync_seq().await.unwrap(), latest);
+        assert!(
+            !store
+                .sync_changes_after(latest, 10)
+                .await
+                .unwrap()
+                .reset_required
+        );
     }
 
     #[tokio::test]

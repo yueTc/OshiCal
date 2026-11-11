@@ -206,6 +206,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/schedules/{id}/cancel", post(cancel_schedule))
         .route("/api/live-sessions", get(list_live_sessions))
         .route(
+            "/api/live-sessions/{id}/online-samples",
+            get(list_live_online_samples),
+        )
+        .route(
             "/api/live-sessions/by-schedule/{id}",
             get(live_session_for_schedule),
         )
@@ -737,6 +741,25 @@ async fn list_live_sessions(
     ok(state
         .service
         .list_live_sessions(query.streamer_id, query.limit.unwrap_or(50))
+        .await?)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveOnlineSamplesQuery {
+    after_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn list_live_online_samples(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<LiveOnlineSamplesQuery>,
+) -> ApiResult {
+    ok(state
+        .service
+        .store()
+        .list_live_online_samples(id, query.after_id.unwrap_or(0), query.limit.unwrap_or(500))
         .await?)
 }
 

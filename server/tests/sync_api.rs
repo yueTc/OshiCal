@@ -892,3 +892,66 @@ async fn llm_secret_round_trip_is_encrypted_and_never_enters_sync_payload() {
         .to_string()
         .contains("sk-fixture-super-secret"));
 }
+
+#[tokio::test]
+async fn online_samples_api_is_authenticated_paged_and_not_embedded_in_sync() {
+    let state = state().await;
+    let streamer = add_streamer(&state, "999123").await;
+    let now = Utc::now();
+    let store = state.service.store();
+    let session = store
+        .ensure_live_session(streamer, "999123", "测试", "直播", None, now, now)
+        .await
+        .unwrap();
+    let seq = store.latest_sync_seq().await.unwrap();
+    for (seconds, count) in [(0, Some(123)), (30, Some(50)), (60, None)] {
+        let at = now + ChronoDuration::seconds(seconds);
+        store
+            .record_live_online_sample(session.id, at, count.map(|v| (at, v)), "active")
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.latest_sync_seq().await.unwrap(), seq);
+    let app = build_router(state);
+    let url = format!("/api/live-sessions/{}/online-samples?limit=2", session.id);
+    let (status, _) = call_json(&app, Method::GET, &url, None, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, page) = call_json(&app, Method::GET, &url, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = &page["data"];
+    assert_eq!(page["metric"], "bilibili_high_energy_users");
+    assert_eq!(page["samples"].as_array().unwrap().len(), 2);
+    assert_eq!(page["samples"][0]["highEnergyCount"], 123);
+    assert_eq!(page["samples"][1]["highEnergyCount"], 50);
+    assert_eq!(page["hasMore"], true);
+    let url = format!(
+        "/api/live-sessions/{}/online-samples?afterId={}&limit=2",
+        session.id,
+        page["nextAfterId"].as_i64().unwrap()
+    );
+    let (status, tail) = call_json(&app, Method::GET, &url, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(tail["data"]["samples"][0]["highEnergyCount"].is_null());
+    assert_eq!(tail["data"]["hasMore"], false);
+    let (status, _) = call_json(
+        &app,
+        Method::GET,
+        "/api/live-sessions/999999/online-samples",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/live-sessions/{}/online-samples?limit=1001",
+            session.id
+        ),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

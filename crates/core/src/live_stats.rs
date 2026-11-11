@@ -142,6 +142,8 @@ impl BoundedSet {
 
 struct CollectorStats {
     peak_high_energy: i64,
+    // Latest fresh public observation since the last checkpoint; never restored from peak.
+    online_observation: Option<(DateTime<Utc>, Instant, i64)>,
     danmaku_count: i64,
     gift_count: i64,
     super_chat_count: i64,
@@ -167,6 +169,7 @@ impl Default for CollectorStats {
     fn default() -> Self {
         Self {
             peak_high_energy: 0,
+            online_observation: None,
             danmaku_count: 0,
             gift_count: 0,
             super_chat_count: 0,
@@ -211,6 +214,17 @@ impl CollectorStats {
             has_connected_once: resumed,
             ..Self::default()
         }
+    }
+
+    fn take_online_observation(
+        &mut self,
+        sampled_at: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, i64)> {
+        let (observed_at, received, count) = self.online_observation.take()?;
+        (self.connection_established
+            && received.elapsed() <= LIVE_SOCKET_IDLE_TIMEOUT
+            && observed_at <= sampled_at)
+            .then_some((observed_at, count))
     }
 
     fn snapshot(&self, quality: &str, state: &str) -> LiveSessionStats {
@@ -325,6 +339,23 @@ impl LiveStatsManager {
     }
 }
 
+async fn save_online_checkpoint(
+    store: &SqliteStore,
+    session_id: i64,
+    stats: &mut CollectorStats,
+    sampled_at: DateTime<Utc>,
+    state: &str,
+) {
+    let observation = stats.take_online_observation(sampled_at);
+    if let Err(error) = store
+        .record_live_online_sample(session_id, sampled_at, observation, state)
+        .await
+    {
+        stats.data_degraded = true;
+        tracing::warn!(%error, session_id, "保存直播人数采样失败");
+    }
+}
+
 async fn run_collector(
     store: SqliteStore,
     bili: Arc<BilibiliClient>,
@@ -347,6 +378,8 @@ async fn run_collector(
                     "partial"
                 };
                 if token.is_current() {
+                    save_online_checkpoint(&store, session.id, &mut stats, ended_at, "finished")
+                        .await;
                     if let Err(error) = store
                         .finish_live_session(
                             session.id,
@@ -374,7 +407,16 @@ async fn run_collector(
                     delay
                 };
                 stats.connection_established = false;
+                stats.online_observation = None;
                 if token.is_current() {
+                    save_online_checkpoint(
+                        &store,
+                        session.id,
+                        &mut stats,
+                        Utc::now(),
+                        "reconnecting",
+                    )
+                    .await;
                     if let Err(store_error) = store
                         .update_live_session_stats(
                             session.id,
@@ -403,6 +445,10 @@ async fn run_collector(
                             "partial"
                         };
                         if token.is_current() {
+                            save_online_checkpoint(
+                                &store, session.id, &mut stats, ended_at, "finished",
+                            )
+                            .await;
                             let _ = store
                                 .finish_live_session(
                                     session.id,
@@ -496,6 +542,7 @@ async fn collect_once(
         };
         let (mut writer, mut reader) = socket.split();
         stats.connection_established = false;
+        stats.online_observation = None;
         let mut last_received = Instant::now();
         if bili.cookie_revision() != cookie_revision {
             return CollectResult::Disconnected("B 站登录状态变化，重新认证直播连接".to_owned());
@@ -532,8 +579,8 @@ async fn collect_once(
         let auth_timeout = tokio::time::sleep(LIVE_AUTH_TIMEOUT);
         tokio::pin!(auth_timeout);
         heartbeat.tick().await;
+        checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         checkpoint.tick().await;
-        let mut last_checkpoint = Instant::now();
 
         loop {
             tokio::select! {
@@ -575,17 +622,15 @@ async fn collect_once(
                     if last_received.elapsed() >= LIVE_SOCKET_IDLE_TIMEOUT {
                         { last_error = Some("弹幕服务器长时间无响应".to_owned()); continue 'endpoints; }
                     }
-                    if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
-                        last_checkpoint = Instant::now();
-                        if !collector_token.is_current() {
-                            return CollectResult::Disconnected("直播采集任务已过期".to_owned());
-                        }
-                        if let Err(error) = store.update_live_session_stats(
-                            session.id,
-                            &stats.snapshot("collecting", "active"),
-                        ).await {
-                            tracing::warn!(%error, session_id = session.id, "保存直播统计检查点失败");
-                        }
+                    if !collector_token.is_current() {
+                        return CollectResult::Disconnected("直播采集任务已过期".to_owned());
+                    }
+                    save_online_checkpoint(store, session.id, stats, Utc::now(), "active").await;
+                    if let Err(error) = store.update_live_session_stats(
+                        session.id,
+                        &stats.snapshot("collecting", "active"),
+                    ).await {
+                        tracing::warn!(%error, session_id = session.id, "保存直播统计检查点失败");
                     }
                 }
                 message = reader.next() => {
@@ -971,16 +1016,17 @@ fn parse_live_message(stats: &mut CollectorStats, value: &Value) {
                 Some(value) if value >= 0 => value,
                 Some(_) => {
                     stats.data_degraded = true;
-                    0
+                    return;
                 }
                 None => {
                     if raw.is_some() {
                         stats.data_degraded = true;
                     }
-                    0
+                    return;
                 }
             };
             stats.peak_high_energy = stats.peak_high_energy.max(current);
+            stats.online_observation = Some((Utc::now(), Instant::now(), current));
         }
         "DANMU_MSG" => {
             stats.danmaku_count = stats.danmaku_count.saturating_add(1);
@@ -1553,6 +1599,59 @@ mod tests {
             normalized_websocket_host("BroadcastLV.Chat.Bilibili.com.").as_deref(),
             Some("broadcastlv.chat.bilibili.com")
         );
+    }
+
+    #[test]
+    fn online_samples_use_current_count_not_peak_and_never_repeat_stale_values() {
+        let mut stats = CollectorStats {
+            connection_established: true,
+            ..Default::default()
+        };
+        for count in [100, 70, 0] {
+            parse_live_message(
+                &mut stats,
+                &serde_json::json!({
+                    "cmd": "ONLINE_RANK_COUNT", "data": {"online_count": count}
+                }),
+            );
+            assert_eq!(
+                stats.take_online_observation(Utc::now()).map(|(_, n)| n),
+                Some(count)
+            );
+            assert!(stats.take_online_observation(Utc::now()).is_none());
+        }
+        assert_eq!(stats.peak_high_energy, 100);
+        parse_live_message(
+            &mut stats,
+            &serde_json::json!({
+                "cmd": "ONLINE_RANK_COUNT", "data": {"count": 44}
+            }),
+        );
+        stats.connection_established = false;
+        assert!(stats.take_online_observation(Utc::now()).is_none());
+        stats.connection_established = true;
+        assert!(stats.take_online_observation(Utc::now()).is_none());
+        stats.online_observation = Some((Utc::now(), Instant::now() - Duration::from_secs(96), 8));
+        assert!(stats.take_online_observation(Utc::now()).is_none());
+    }
+
+    #[test]
+    fn invalid_online_messages_are_missing_not_zero() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"online_count": -1}),
+            serde_json::json!({"online_count": "bad"}),
+        ] {
+            let mut stats = CollectorStats {
+                connection_established: true,
+                ..Default::default()
+            };
+            parse_live_message(
+                &mut stats,
+                &serde_json::json!({"cmd": "ONLINE_RANK_COUNT", "data": data}),
+            );
+            assert!(stats.take_online_observation(Utc::now()).is_none());
+        }
     }
 
     #[test]

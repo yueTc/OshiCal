@@ -1,4 +1,5 @@
 mod import;
+mod live_samples;
 pub use import::{
     ImportConflict, ImportPreview, ImportReport, MigrationApplyOutcome, ServerSnapshot,
     SERVER_SNAPSHOT_SCHEMA_VERSION,
@@ -109,6 +110,20 @@ ON live_sessions(streamer_id, started_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_live_sessions_room_started
 ON live_sessions(room_id, started_at DESC);
+-- Independent history: never embedded in repeated sync payloads.
+CREATE TABLE IF NOT EXISTS live_online_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+    sampled_at TEXT NOT NULL,
+    observed_at TEXT,
+    high_energy_count INTEGER CHECK (high_energy_count >= 0),
+    collector_state TEXT NOT NULL,
+    CHECK ((observed_at IS NULL) = (high_energy_count IS NULL)),
+    UNIQUE(session_id, sampled_at)
+);
+CREATE INDEX IF NOT EXISTS idx_live_online_samples_session_id
+ON live_online_samples(session_id, id);
+
 CREATE TABLE IF NOT EXISTS linked_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -1472,6 +1487,18 @@ impl SqliteStore {
         };
 
         if let Some(existing_id) = existing_id {
+            let current = sync_feed::load_schedule(&mut tx, existing_id).await?;
+            let unchanged = if current.manual_locked {
+                locked_schedule_source_matches(&current, input)
+            } else {
+                !current.cancelled && schedule_matches_input(&current, input)
+            };
+            if unchanged {
+                self.attach_schedule_source_on(&mut tx, existing_id, input, SyncActor::collector())
+                    .await?;
+                tx.commit().await?;
+                return Ok((self.get_schedule(existing_id).await?, false));
+            }
             let now = Utc::now().to_rfc3339();
             let manual_locked: i64 =
                 sqlx::query_scalar("SELECT manual_locked FROM schedules WHERE id = ?")
@@ -1669,6 +1696,13 @@ impl SqliteStore {
         input: &NewSchedule,
     ) -> AppResult<Schedule> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = sync_feed::load_schedule(&mut tx, schedule_id).await?;
+        if current.manual_locked || schedule_matches_input(&current, input) {
+            self.attach_schedule_source_on(&mut tx, schedule_id, input, SyncActor::collector())
+                .await?;
+            tx.commit().await?;
+            return self.get_schedule(schedule_id).await;
+        }
         sqlx::query(
             "UPDATE schedules SET participants_json = ?, title = ?, start_at = ?, end_at = ?,
                     room_url = ?, room_owner_mid = ?, room_owner_name = ?, confidence = ?,
@@ -3409,7 +3443,8 @@ impl SqliteStore {
                  danmaku_count = ?, gift_count = ?, super_chat_count = ?, guard_count = ?,
                  reconnect_count = ?, data_quality = ?, collector_state = ?, updated_at = ?,
                  revision = revision + 1
-             WHERE id = ? AND ended_at IS NULL",
+             WHERE id = ? AND ended_at IS NULL
+               AND (peak_high_energy IS NOT ? OR revenue_cents IS NOT ? OR gift_revenue_cents IS NOT ? OR super_chat_revenue_cents IS NOT ? OR guard_revenue_cents IS NOT ? OR paid_user_count IS NOT ? OR interactive_user_count IS NOT ? OR danmaku_count IS NOT ? OR gift_count IS NOT ? OR super_chat_count IS NOT ? OR guard_count IS NOT ? OR reconnect_count IS NOT ? OR data_quality IS NOT ? OR collector_state IS NOT ?)",
         )
         .bind(stats.peak_high_energy)
         .bind(stats.revenue_cents)
@@ -3427,6 +3462,20 @@ impl SqliteStore {
         .bind(&stats.collector_state)
         .bind(Utc::now().to_rfc3339())
         .bind(id)
+        .bind(stats.peak_high_energy)
+        .bind(stats.revenue_cents)
+        .bind(stats.gift_revenue_cents)
+        .bind(stats.super_chat_revenue_cents)
+        .bind(stats.guard_revenue_cents)
+        .bind(stats.paid_user_count)
+        .bind(stats.interactive_user_count)
+        .bind(stats.danmaku_count)
+        .bind(stats.gift_count)
+        .bind(stats.super_chat_count)
+        .bind(stats.guard_count)
+        .bind(stats.reconnect_count)
+        .bind(&stats.data_quality)
+        .bind(&stats.collector_state)
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() > 0 {
@@ -3847,6 +3896,40 @@ impl SqliteStore {
             })
             .collect()
     }
+}
+
+// Compare the fields the automatic UPDATE actually writes, not timestamps or
+// revision metadata. Do not suppress user-visible changes such as cancellation.
+fn schedule_matches_input(current: &Schedule, input: &NewSchedule) -> bool {
+    current.participants == input.participants
+        && current.title == input.title
+        && current.start_at == input.start_at
+        && current.end_at == input.end_at
+        && current.room_url == input.room_url
+        && current.room_owner_mid == input.room_owner_mid
+        && current.room_owner_name == input.room_owner_name
+        && current.confidence == input.confidence
+        && current.source_kind == input.source_kind
+        && current.source_post_id == input.source_post_id
+        && current.source_image_url == input.source_image_url
+        && current.source_author_mid == input.source_author_mid
+        && current.source_fingerprint == input.source_fingerprint
+        && current.source_published_at == input.source_published_at
+}
+
+fn locked_schedule_source_matches(current: &Schedule, input: &NewSchedule) -> bool {
+    input
+        .source_fingerprint
+        .as_ref()
+        .is_none_or(|v| current.source_fingerprint.as_ref() == Some(v))
+        && input
+            .source_image_url
+            .as_ref()
+            .is_none_or(|v| current.source_image_url.as_ref() == Some(v))
+        && input
+            .source_author_mid
+            .as_ref()
+            .is_none_or(|v| current.source_author_mid.as_ref() == Some(v))
 }
 
 fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
@@ -4934,6 +5017,104 @@ mod tests {
         assert_eq!(updated.title, "清理悬空引用");
         assert!(updated.weekly_rule_id.is_none());
         assert!(updated.weekly_occurrence_date.is_none());
+    }
+
+    #[tokio::test]
+    async fn identical_automatic_schedules_and_sources_do_not_emit_sync_changes() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&add_input("300", "测试"))
+            .await
+            .unwrap();
+        let mut input = new_schedule(streamer.id, Utc::now() + Duration::days(1));
+        input.source_identity = Some("image:post:0".to_owned());
+        input.source_fingerprint = Some("digest".to_owned());
+        let (original, _) = store.upsert_schedule(&input).await.unwrap();
+        let seq = store.latest_sync_seq().await.unwrap();
+        let (same, created) = store.upsert_schedule(&input).await.unwrap();
+        assert!(!created);
+        assert_eq!(same.revision, original.revision);
+        assert_eq!(same.updated_at, original.updated_at);
+        store
+            .merge_schedule_auto(original.id, &input)
+            .await
+            .unwrap();
+        store
+            .attach_schedule_source(original.id, &input)
+            .await
+            .unwrap();
+        assert_eq!(store.latest_sync_seq().await.unwrap(), seq);
+        input.title = "真实变更".to_owned();
+        let (changed, _) = store.upsert_schedule(&input).await.unwrap();
+        assert_eq!(changed.title, "真实变更");
+        assert!(changed.revision > original.revision);
+        assert!(store.latest_sync_seq().await.unwrap() > seq);
+        store
+            .update_schedule(
+                original.id,
+                &UpdateSchedule {
+                    title: Some("人工标题".to_owned()),
+                    start_at: None,
+                    end_at: None,
+                    room_url: None,
+                },
+            )
+            .await
+            .unwrap();
+        let locked = store.get_schedule(original.id).await.unwrap();
+        let seq = store.latest_sync_seq().await.unwrap();
+        store.upsert_schedule(&input).await.unwrap();
+        assert_eq!(store.latest_sync_seq().await.unwrap(), seq);
+        assert_eq!(
+            store.get_schedule(original.id).await.unwrap().title,
+            locked.title
+        );
+        input.source_fingerprint = Some("changed-digest".to_owned());
+        let (changed, _) = store.upsert_schedule(&input).await.unwrap();
+        assert!(changed.source_changed);
+        assert_eq!(changed.title, locked.title);
+        assert!(store.latest_sync_seq().await.unwrap() > seq);
+    }
+
+    #[tokio::test]
+    async fn identical_live_summaries_do_not_emit_but_state_changes_do() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&add_input("301", "测试"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let session = store
+            .ensure_live_session(streamer.id, "99", "测试", "直播", None, now, now)
+            .await
+            .unwrap();
+        let mut stats = LiveSessionStats {
+            data_quality: "collecting".to_owned(),
+            collector_state: "active".to_owned(),
+            ..Default::default()
+        };
+        store
+            .update_live_session_stats(session.id, &stats)
+            .await
+            .unwrap();
+        let seq = store.latest_sync_seq().await.unwrap();
+        store
+            .update_live_session_stats(session.id, &stats)
+            .await
+            .unwrap();
+        assert_eq!(store.latest_sync_seq().await.unwrap(), seq);
+        stats.collector_state = "reconnecting".to_owned();
+        store
+            .update_live_session_stats(session.id, &stats)
+            .await
+            .unwrap();
+        assert!(store.latest_sync_seq().await.unwrap() > seq);
+        let seq = store.latest_sync_seq().await.unwrap();
+        store
+            .finish_live_session(session.id, now + Duration::seconds(60), &stats)
+            .await
+            .unwrap();
+        assert!(store.latest_sync_seq().await.unwrap() > seq);
     }
 
     #[tokio::test]

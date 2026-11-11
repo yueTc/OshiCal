@@ -19,6 +19,12 @@ use crate::secrets::{
 use crate::sync_api;
 use crate::update_manager::ServerUpdateManager;
 
+// Retention bounds are checked hourly, so growth between checks is expected.
+const SYNC_RETENTION_DAYS: i64 = 7;
+const SYNC_RETENTION_ROWS: i64 = 10_000;
+const SYNC_RETENTION_PAYLOAD_BYTES: i64 = 20 * 1024 * 1024;
+const SYNC_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let store = SqliteStore::connect(&config.database_path)
         .await
@@ -288,24 +294,32 @@ pub fn spawn_background_tasks(state: AppState) {
 
     let prune_state = state.clone();
     tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
             let store = prune_state.service.store();
             if let Err(error) = store
                 .prune_sync_changes(SyncPrunePolicy::Before(
-                    Utc::now() - ChronoDuration::days(30),
+                    Utc::now() - ChronoDuration::days(SYNC_RETENTION_DAYS),
                 ))
                 .await
             {
                 tracing::warn!(%error, "按时间清理同步日志失败");
             }
             if let Err(error) = store
-                .prune_sync_changes(SyncPrunePolicy::KeepLatest(100_000))
+                .prune_sync_changes(SyncPrunePolicy::KeepLatest(SYNC_RETENTION_ROWS))
                 .await
             {
                 tracing::warn!(%error, "按数量清理同步日志失败");
             }
-            tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            if let Err(error) = store
+                .prune_sync_changes(SyncPrunePolicy::KeepPayloadBytes(
+                    SYNC_RETENTION_PAYLOAD_BYTES,
+                ))
+                .await
+            {
+                tracing::warn!(%error, "按容量清理同步日志失败");
+            }
+            tokio::time::sleep(SYNC_PRUNE_INTERVAL).await;
         }
     });
 }

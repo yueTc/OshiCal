@@ -476,6 +476,30 @@ pub struct LiveSession {
     pub revision: i64,
 }
 
+/// One checkpoint of public high-energy-user observations, not true CCU.
+/// A missing observation is null, never a synthetic zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveOnlineSample {
+    pub id: i64,
+    pub session_id: i64,
+    pub sampled_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub high_energy_count: Option<i64>,
+    pub collector_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveOnlineSamplesPage {
+    pub session_id: i64,
+    pub metric: String,
+    pub sample_interval_seconds: u64,
+    pub samples: Vec<LiveOnlineSample>,
+    pub next_after_id: i64,
+    pub has_more: bool,
+}
+
 pub fn default_segment_count() -> u64 {
     1
 }
