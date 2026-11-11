@@ -1361,6 +1361,29 @@ h3 {
 .modal-header { border-bottom: 1px solid var(--border); }
 .modal-header h2 { font-size: 18px; }
 .modal-body { padding: 20px; }
+
+.modal.online-chart-modal {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal.online-chart-modal .modal-header {
+  flex: 0 0 auto;
+  background: var(--surface);
+}
+
+.modal.online-chart-modal .modal-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.modal.online-chart-modal .modal-body::-webkit-scrollbar {
+  display: none;
+}
 .modal-footer { border-top: 1px solid var(--border); justify-content: flex-end; }
 
 .form-grid {
@@ -2718,7 +2741,6 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .online-chart-heading h3 { margin: 0; color: var(--ink); font-size: 17px; }
 .online-chart-heading p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
 .online-chart-icon { display: grid; place-items: center; width: 42px; height: 42px; flex-shrink: 0; border-radius: 13px; color: var(--primary); background: var(--primary-soft); }
-.online-chart-disclaimer { margin: 0; padding: 10px 12px; border-radius: 9px; color: var(--muted); background: var(--surface-soft); font-size: 11px; line-height: 1.6; }
 .online-chart-summary { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 14px; padding: 4px 0; }
 .online-chart-summary > div { min-width: 0; }
 .online-chart-summary span { display: block; color: var(--muted); font-size: 11px; line-height: 1.5; }
@@ -2740,7 +2762,6 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .online-chart-scrubber { display: grid; gap: 9px; color: var(--ink); font-size: 11px; }
 .online-chart-scrubber small { margin-left: 6px; color: var(--muted); }
 .online-chart-scrubber input { width: 100%; accent-color: var(--primary); cursor: ew-resize; }
-.online-chart-note { margin: 0; min-height: 2.6em; color: var(--muted); font-size: 11px; line-height: 1.7; }
 @media (max-width: 560px) {
   .online-chart-summary { grid-template-columns: 1fr 1.2fr; gap: 12px; }
   .online-chart-summary > div:last-child { grid-column: 1 / -1; }

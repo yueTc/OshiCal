@@ -73,17 +73,19 @@ export function Modal({
   onClose,
   wide = false,
   footer,
+  className,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   wide?: boolean;
   footer?: ReactNode;
+  className?: string;
 }) {
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
-        className={`modal ${wide ? "modal-wide" : ""}`}
+        className={["modal", wide ? "modal-wide" : "", className].filter(Boolean).join(" ")}
         role="dialog"
         aria-modal="true"
         aria-label={title}

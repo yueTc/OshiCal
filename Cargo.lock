@@ -3110,10 +3110,12 @@ dependencies = [
 
 [[package]]
 name = "oshical-desktop"
-version = "0.3.22-beta.5"
+version = "0.3.22"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "futures-util",
+ "image",
  "keyring",
  "oshical-core",
  "reqwest 0.12.28",
@@ -3137,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-server"
-version = "0.3.30-beta.7"
+version = "0.3.30"
 dependencies = [
  "aes-gcm",
  "axum",

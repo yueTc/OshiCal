@@ -112,13 +112,36 @@ const page = await context.newPage();
 const pageErrors = [];
 page.on("pageerror", (error) => pageErrors.push(String(error)));
 const results = [];
+// Observe the actual entrance sequence without replacing app handlers or fixture responses.
+await page.addInitScript(() => {
+  window.__liveChartEntrance = [];
+  const record = (event) => {
+    const target = event.target;
+    const card = document.querySelector('[data-schedule-id="1"]');
+    const rect = card?.getBoundingClientRect();
+    window.__liveChartEntrance.push({ type: event.type, at: performance.now(),
+      button: event.button, target: target instanceof Element ? target.className : String(target),
+      menuPresent: Boolean(document.querySelector('[role="menu"][aria-label="日程操作"]')),
+      cardTop: rect?.top, cardBottom: rect?.bottom,
+      viewportScroll: document.querySelector('.timeline-viewport')?.scrollTop });
+    window.__liveChartEntrance = window.__liveChartEntrance.slice(-300);
+  };
+  for (const type of ["contextmenu", "click", "scroll", "pointerdown", "pointerup"])
+    window.addEventListener(type, record, true);
+});
 try {
   await page.goto("http://127.0.0.1:" + server.address().port);
   await page.getByLabel("访问令牌", { exact: true }).fill("ui-fixture");
   await page.getByRole("button", { name: "连接服务器", exact: true }).click();
   const card = page.locator('[data-schedule-id="1"]').filter({ visible: true });
   await card.waitFor();
+  // A user must finish scrolling the card into view before right-clicking it.
+  // Drain the driver's implicit-scroll frames; do not disable the app's scroll-to-dismiss behavior.
+  await card.scrollIntoViewIfNeeded();
+  await card.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   await card.click({ button: "right" });
+  await page.getByRole("menu", { name: "日程操作", exact: true }).waitFor();
+  await writeFile(join(out, "entrance-first-open.json"), JSON.stringify(await page.evaluate(() => window.__liveChartEntrance), null, 2));
   await page.getByRole("button", { name: "查看直播数据", exact: true }).click();
   await page.getByRole("button", { name: "查看最高同时在线人数变化曲线", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "同接变化", exact: true });
@@ -163,7 +186,9 @@ try {
     await peakCard.click();
     if (mode === "empty") await page.getByText("暂无人数变化记录", { exact: true }).waitFor();
     if (mode === "missing") {
-      await page.getByText(/当前时段尚无有效人数观测/).waitFor();
+      const missingSlider = dialog.getByRole("slider", { name: "查看人数采样时间点", exact: true });
+      await missingSlider.waitFor();
+      assert.match(await missingSlider.getAttribute("aria-valuetext"), /采样缺失/);
       assert.equal(await dialog.locator("polyline").count(), 0);
     }
     if (mode === "old") {
@@ -183,10 +208,12 @@ try {
   assert.ok(bounds && bounds.width <= 480 && bounds.x >= 0, "dialog overflows narrow viewport");
   assert.deepEqual(pageErrors, []);
   results.push("窄屏布局与无页面异常通过");
+  await writeFile(join(out, "entrance-events.json"), JSON.stringify(await page.evaluate(() => window.__liveChartEntrance), null, 2));
   await writeFile(join(out, "result.json"), JSON.stringify({ results, requests, pageErrors }, null, 2));
   console.log(JSON.stringify({ uiChecksPassed: results.length, results }, null, 2));
   console.log("::notice title=Live chart UI::" + results.length + " real App interaction groups passed: " + results.join("; "));
 } catch (error) {
+  await writeFile(join(out, "entrance-events.json"), JSON.stringify(await page.evaluate(() => window.__liveChartEntrance), null, 2)).catch(() => {});
   await page.screenshot({ path: join(out, "failure.png"), fullPage: true }).catch(() => {});
   await writeFile(join(out, "failure.txt"), String(error) + "\n" + await page.locator("body").innerText());
   throw error;

@@ -112,7 +112,6 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
         <span className="online-chart-icon" aria-hidden="true"><TrendingUp size={21} /></span>
         <div><h3>{session.streamerName} · 人数走势</h3><p>北京时间 · 约每 30 秒采样{!session.endedAt ? " · 自动更新中" : " · 已结束"}</p></div>
       </div>
-      <p className="online-chart-disclaimer">统计口径：B 站公开高能用户数，并非全体观众的真实同时在线人数。</p>
       {error ? <ErrorBanner message={error} onRetry={() => {
         if (samples.length) refreshRef.current?.();
         else setRetry((value) => value + 1);
@@ -185,10 +184,7 @@ export function LiveOnlineChart({ session, loadPage, onBack }: {
               aria-label="查看人数采样时间点" aria-valuetext={selected ? onlineTime(selected.time) + "，" + (selected.value === null ? "采样缺失" : selected.value + " 人") : "暂无采样"}
               onChange={(event) => setSelectedId(points[Number(event.target.value)]?.id ?? null)} />
           </label>
-          <p className="online-chart-note" aria-live="polite">
-            {selected?.value === null ? "此时未收到新人数观测或连接中断，不代表人数为 0。" : selected?.observedAt ? "原始观测时间：" + onlineTime(Date.parse(selected.observedAt)) + "。" : ""}
-            {valid.length === 0 ? " 当前时段尚无有效人数观测。" : ""} 空白区间不插值、不补零。
-          </p>
+
         </>
       )}
     </div>

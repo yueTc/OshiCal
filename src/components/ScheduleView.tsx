@@ -1686,7 +1686,7 @@ export default function ScheduleView({
           title={onlineChartOpen ? "同接变化" : "直播数据"}
           onClose={closeLiveData}
           wide
-          footer={<button className="button secondary" onClick={closeLiveData}>关闭</button>}
+          className={onlineChartOpen ? "online-chart-modal" : undefined}
         >
           {liveModal.loading ? (
             <div className="live-stats-loading"><LoaderCircle className="spin" size={24} />正在读取直播数据…</div>
