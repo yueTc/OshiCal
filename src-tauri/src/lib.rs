@@ -1,5 +1,6 @@
 mod local_maintenance;
 mod sync_client;
+mod tray_live;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -19,7 +20,6 @@ use oshical_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -337,11 +337,8 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开推历 OshiCal", true, None::<&str>)?;
-    let refresh = MenuItem::with_id(app, "refresh", "立即刷新", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &refresh, &quit])?;
-    let mut builder = TrayIconBuilder::new()
+    let menu = tray_live::initial_menu(app)?;
+    let mut builder = TrayIconBuilder::with_id(tray_live::TRAY_ID)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip("推历 OshiCal · 直播日程")
@@ -368,12 +365,14 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 });
             }
             "quit" => app.exit(0),
+            id if tray_live::is_live_item(id) => tray_live::open_live_room(app, id),
             _ => {}
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
     builder.build(app)?;
+    tray_live::start(app.clone());
     Ok(())
 }
 

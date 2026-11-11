@@ -1,6 +1,6 @@
 [package]
 name = "oshical-desktop"
-version = "0.3.22-beta.6"
+version = "0.3.22"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,8 +18,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 oshical-core = { path = "../crates/core" }
+base64.workspace = true
 chrono.workspace = true
 futures-util = "0.3"
+image.workspace = true
 keyring = { version = "3", features = ["windows-native"] }
 reqwest.workspace = true
 semver.workspace = true
