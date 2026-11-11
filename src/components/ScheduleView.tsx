@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties } from "react";
 import type { PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent } from "react";
 import { flushSync } from "react-dom";
+import { LiveOnlineChart } from "./LiveOnlineChart";
 import { differenceInCalendarDays } from "date-fns";
 import {
   ChevronLeft,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import type {
   LiveSession,
+  LiveOnlineSamplesPage,
   LiveStatus,
   NewScheduleInput,
   Schedule,
@@ -174,6 +176,7 @@ interface ScheduleActions {
   update: (schedule: Schedule, update: UpdateScheduleInput) => Promise<Schedule>;
   remove: (schedule: Schedule) => Promise<void>;
   liveSession: (scheduleId: number) => Promise<LiveSession | null>;
+  liveOnlineSamples: (sessionId: number, afterId: number, signal?: AbortSignal) => Promise<LiveOnlineSamplesPage>;
   refresh: () => Promise<void>;
 }
 
@@ -271,6 +274,8 @@ export default function ScheduleView({
   const [draft, setDraft] = useState<Draft | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
   const [menu, setMenu] = useState<{ schedule: Schedule; x: number; y: number } | null>(null);
+  const [onlineChartOpen, setOnlineChartOpen] = useState(false);
+  const peakCardRef = useRef<HTMLButtonElement>(null);
   const [liveModal, setLiveModal] = useState<{
     schedule: Schedule;
     session: LiveSession | null;
@@ -1031,11 +1036,13 @@ export default function ScheduleView({
   }
 
   function closeLiveData() {
+    setOnlineChartOpen(false);
     liveRequestRef.current += 1;
     setLiveModal(null);
   }
 
   async function openLiveData(schedule: Schedule) {
+    setOnlineChartOpen(false);
     const requestId = ++liveRequestRef.current;
     setMenu(null);
     setLiveModal({ schedule, session: null, loading: true });
@@ -1674,13 +1681,19 @@ export default function ScheduleView({
 
       {liveModal ? (
         <Modal
-          title="直播数据"
+          title={onlineChartOpen ? "同接变化" : "直播数据"}
           onClose={closeLiveData}
           wide
           footer={<button className="button secondary" onClick={closeLiveData}>关闭</button>}
         >
           {liveModal.loading ? (
             <div className="live-stats-loading"><LoaderCircle className="spin" size={24} />正在读取直播数据…</div>
+          ) : liveModal.session && onlineChartOpen ? (
+            <LiveOnlineChart key={liveModal.session.id} session={liveModal.session}
+              loadPage={actions.liveOnlineSamples} onBack={() => {
+                setOnlineChartOpen(false);
+                requestAnimationFrame(() => peakCardRef.current?.focus());
+              }} />
           ) : liveModal.session ? (
             <div className="live-stats-panel">
               <div className="live-stats-head">
@@ -1703,7 +1716,13 @@ export default function ScheduleView({
                 <div><span>时长</span><strong>{formatLiveDuration(liveModal.session.durationSeconds)}</strong></div>
                 <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(liveModal.session.revenueCents)}</strong></div>
                 <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.paidUserCount)}</strong></div>
-                <div><span>最高同时在线</span><strong>{liveModal.session.peakHighEnergy > 0 ? formatCount(liveModal.session.peakHighEnergy) : "—"}</strong></div>
+                <button type="button" ref={peakCardRef} className="live-stat-chart-card"
+                  onClick={() => setOnlineChartOpen(true)} aria-label="查看最高同时在线人数变化曲线"
+                  title="查看公开高能用户数的采样变化曲线">
+                  <span>最高同时在线<ChevronRight size={13} aria-hidden="true" /></span>
+                  <strong>{liveModal.session.peakHighEnergy > 0 ? formatCount(liveModal.session.peakHighEnergy) : "—"}</strong>
+                  <small><BarChart3 size={12} aria-hidden="true" />查看变化曲线</small>
+                </button>
                 <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.interactiveUserCount)}</strong></div>
                 <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.danmakuCount)}</strong></div>
               </div>

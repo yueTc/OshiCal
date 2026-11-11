@@ -223,6 +223,24 @@ export interface LiveSession {
   createdAt: string;
   updatedAt: string;
 }
+export interface LiveOnlineSample {
+  id: number;
+  sessionId: number;
+  sampledAt: string;
+  observedAt: string | null;
+  highEnergyCount: number | null;
+  collectorState: string;
+}
+
+export interface LiveOnlineSamplesPage {
+  sessionId: number;
+  metric: "bilibili_high_energy_users";
+  sampleIntervalSeconds: number;
+  samples: LiveOnlineSample[];
+  nextAfterId: number;
+  hasMore: boolean;
+}
+
 export interface FanSnapshot {
   capturedAt: string;
   fans: number;

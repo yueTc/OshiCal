@@ -17,6 +17,7 @@ import type {
   ImportPreview,
   ImportReport,
   LiveSession,
+  LiveOnlineSamplesPage,
   LiveStatus,
   LlmDiscoveryInput,
   LlmSecret,
@@ -285,6 +286,14 @@ export class ServerApi {
       params.set("streamerId", String(streamerId));
     }
     return this.request(`/api/live-sessions?${params.toString()}`);
+  }
+
+  liveOnlineSamples(sessionId: number, afterId = 0, limit = 500, signal?: AbortSignal): Promise<LiveOnlineSamplesPage> {
+    const params = new URLSearchParams({ afterId: String(afterId), limit: String(limit) });
+    return this.request(
+      "/api/live-sessions/" + sessionId + "/online-samples?" + params.toString(),
+      { signal },
+    );
   }
 
   liveSessionForSchedule(scheduleId: number): Promise<LiveSession | null> {
@@ -596,6 +605,10 @@ export class LocalApi {
 
   liveSessions(streamerId?: number, limit = 50): Promise<LiveSession[]> {
     return invoke("list_live_sessions", { streamerId, limit });
+  }
+
+  liveOnlineSamples(sessionId: number, afterId = 0, limit = 500): Promise<LiveOnlineSamplesPage> {
+    return invoke("list_live_online_samples", { sessionId, afterId, limit });
   }
 
   liveSessionForSchedule(scheduleId: number): Promise<LiveSession | null> {

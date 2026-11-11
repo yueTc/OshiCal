@@ -1,3 +1,4 @@
+mod local_maintenance;
 mod sync_client;
 
 use std::collections::{BTreeMap, HashMap};
@@ -266,6 +267,7 @@ pub fn run() {
             cancel_schedule,
             list_live_statuses,
             list_live_sessions,
+            list_live_online_samples,
             get_fan_history,
             refresh_streamer_fans,
             live_session_for_schedule,
@@ -969,6 +971,28 @@ async fn list_live_sessions(
 }
 
 #[tauri::command]
+async fn list_live_online_samples(
+    state: State<'_, DesktopState>,
+    session_id: i64,
+    after_id: Option<i64>,
+    limit: Option<i64>,
+) -> Result<oshical_core::LiveOnlineSamplesPage, String> {
+    // Do not read the independent local DB when the caller is in server mode.
+    let settings = load_settings(state.service.store())
+        .await
+        .map_err(map_error)?;
+    if settings.data_mode != DataMode::Local {
+        return Err("服务器模式请从服务器读取本场人数曲线".to_owned());
+    }
+    state
+        .service
+        .store()
+        .list_live_online_samples(session_id, after_id.unwrap_or(0), limit.unwrap_or(500))
+        .await
+        .map_err(map_error)
+}
+
+#[tauri::command]
 async fn get_fan_history(
     state: State<'_, DesktopState>,
     streamer_id: i64,
@@ -1315,6 +1339,29 @@ fn parse_datetime(value: &str) -> Result<DateTime<Utc>, String> {
 }
 
 fn spawn_local_monitor(app: AppHandle) {
+    let prune_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut schedule = local_maintenance::LocalPruneSchedule::default();
+        loop {
+            let state = prune_app.state::<DesktopState>();
+            match load_settings(state.service.store()).await {
+                Ok(settings) => {
+                    if schedule.due(Instant::now(), settings.data_mode == DataMode::Local) {
+                        if let Err(error) =
+                            local_maintenance::prune_local_sync_history(state.service.store()).await
+                        {
+                            let _ = prune_app
+                                .emit("monitor-error", format!("本地同步历史清理失败: {error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = prune_app.emit("monitor-error", error.to_string());
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     let monitor_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut first = true;

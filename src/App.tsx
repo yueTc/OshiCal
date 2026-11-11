@@ -2182,6 +2182,14 @@ export default function App() {
         }
         return localApi.liveSessionForSchedule(scheduleId);
       },
+      liveOnlineSamples: async (sessionId: number, afterId: number, signal?: AbortSignal) => {
+        if (serverMode) {
+          if (!serverApi) throw new Error("服务器未连接");
+          return serverApi.liveOnlineSamples(sessionId, afterId, 500, signal);
+        }
+        if (!localApi) throw new Error("本地 API 不可用");
+        return localApi.liveOnlineSamples(sessionId, afterId, 500);
+      },
       refresh: async () => {
         let report: RefreshReport | undefined;
         if (serverMode) {

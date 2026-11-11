@@ -99,3 +99,12 @@ jobs:
       - name: Frontend production build
         if: ${{ !cancelled() }}
         run: npm run build:web
+
+      - name: Upload web preview for UI verification
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-preview
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
