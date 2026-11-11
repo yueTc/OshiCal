@@ -2130,7 +2130,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <button className="button secondary" onClick={() => void startQrLogin()} disabled={qrLoading}>
                 <RefreshCw size={16} />重新生成
               </button>
-              <button className="button secondary" onClick={closeQrLogin}>关闭</button>
             </>
           }
         >
@@ -2153,7 +2152,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           title="选择模型"
           onClose={() => setModelsOpen(false)}
           wide
-          footer={<button className="button secondary" onClick={() => setModelsOpen(false)}>关闭</button>}
         >
           <div className="model-picker">
             <div className="search-input compact">
