@@ -129,7 +129,6 @@ impl RefreshJobManager {
         Self::default()
     }
 
-    #[cfg(test)]
     pub fn create_all(&self) -> JobRegistration {
         self.register(RefreshJobKind::RefreshAll, None, None, None)
     }
@@ -152,7 +151,6 @@ impl RefreshJobManager {
         )
     }
 
-    #[cfg(test)]
     pub fn create_streamer(
         &self,
         streamer_id: i64,
