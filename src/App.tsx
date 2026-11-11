@@ -43,6 +43,7 @@ import {
   openExternalUrl,
 } from "./lib/api";
 import { applyAutostart, readAutostart } from "./lib/autostart";
+import { refreshCompletionProgress, refreshStreamerJob } from "./lib/refresh-job";
 import {
   ensureNotificationPermission,
   installNotificationActionHandler,
@@ -2296,7 +2297,7 @@ export default function App() {
         applyRefreshProgress({
           streamerId: id,
           streamerName,
-          stage: "准备刷新（后台任务进行中会自动排队）",
+          stage: "准备刷新（有可共享任务时直接加入）",
           completed: 0,
           total: 0,
           percent: 0,
@@ -2309,25 +2310,14 @@ export default function App() {
             if (!serverApi) {
               throw new Error("服务器未连接");
             }
-            report = await serverApi.refreshStreamer(id);
+            return await refreshStreamerJob(serverApi, id, streamerName, applyRefreshProgress);
           } else {
             if (!localApi) {
               throw new Error("本地 API 不可用");
             }
             report = await localApi.refreshStreamer(id);
           }
-          applyRefreshProgress({
-            streamerId: id,
-            streamerName,
-            stage: report.cancelledSchedules > 0
-              ? `刷新完成，删除 ${report.cancelledSchedules} 条取消日程`
-              : "刷新完成",
-            completed: 1,
-            total: 1,
-            percent: 100,
-            done: true,
-            failed: false,
-          });
+          applyRefreshProgress(refreshCompletionProgress(report, id, streamerName));
           return report;
         } catch (error) {
           applyRefreshProgress({
