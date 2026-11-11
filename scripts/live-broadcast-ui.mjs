@@ -254,7 +254,9 @@ try {
   assert.equal(await recentDialog.locator('[data-session-id="8"]').evaluate((el) => el === document.activeElement), true);
   await recentDialog.locator('[data-session-id="7"]').click();
   await stats.getByRole("button", { name: "查看最高同时在线人数变化曲线", exact: true }).click();
-  await page.getByRole("img", { name: "本场公开高能用户数变化曲线", exact: true }).waitFor();
+  // SVG 的 aria-labelledby 同时引用标题与坐标说明，完整无障碍名称不只有标题。
+  await page.getByRole("dialog", { name: "同接变化", exact: true })
+    .getByRole("img", { name: /^本场公开高能用户数变化曲线 横轴为北京时间，纵轴为人数。/ }).waitFor();
   await page.getByRole("button", { name: "返回最近直播", exact: true }).click();
   assert.equal(await recentDialog.locator(".recent-live-card").count(), 2);
   results.push("最近直播仅显示本主播，倒序卡片直接打开对应场次（含无日程绑定场次）；曲线与返回列表有效");
