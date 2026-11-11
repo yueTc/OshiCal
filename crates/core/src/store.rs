@@ -1,9 +1,11 @@
 mod import;
+mod live_broadcasts;
 mod live_samples;
 pub use import::{
     ImportConflict, ImportPreview, ImportReport, MigrationApplyOutcome, ServerSnapshot,
     SERVER_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use live_broadcasts::LiveBroadcast;
 mod sync;
 mod sync_feed;
 use sync_feed::SyncActor;
@@ -27,8 +29,7 @@ use crate::models::{
 use crate::settings::SETTING_KEYS;
 
 /// 断流重开的合并窗口：同一房间在这个间隔内重新开播，算作同一场直播的一段，而不是新的一场。
-/// 观测到的真实断流重开间隔在 45 秒到 3 分钟量级，留 10 分钟余量。
-const LIVE_SESSION_MERGE_MINUTES: i64 = 10;
+const LIVE_SESSION_MERGE_MINUTES: i64 = live_broadcasts::LIVE_RECONNECT_MINUTES;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -58,6 +59,21 @@ CREATE TABLE IF NOT EXISTS streamers (
     revision INTEGER NOT NULL DEFAULT 1,
     live_revision INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS live_broadcasts (
+    id TEXT PRIMARY KEY,
+    streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+    room_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_segment_started_at TEXT,
+    last_seen_at TEXT NOT NULL,
+    offline_since TEXT,
+    schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL,
+    schedule_decided INTEGER NOT NULL DEFAULT 0,
+    segment_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_live_broadcasts_streamer ON live_broadcasts(streamer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_live_broadcasts_schedule ON live_broadcasts(schedule_id) WHERE schedule_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS fan_snapshots (
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -428,6 +444,7 @@ struct WeeklyScheduleRuleRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct LiveStatusRow {
+    live_schedule_id: Option<i64>,
     streamer_id: i64,
     mid: String,
     streamer_name: String,
@@ -444,6 +461,7 @@ struct LiveStatusRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct LiveSessionRow {
+    schedule_id: Option<i64>,
     id: i64,
     streamer_id: i64,
     streamer_name: String,
@@ -533,6 +551,15 @@ impl SqliteStore {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
         sync_feed::initialize_sync_feed(&mut tx).await?;
+        for (table, column, definition) in [
+            ("streamers", "live_schedule_id", "ALTER TABLE streamers ADD COLUMN live_schedule_id INTEGER"),
+            ("live_sessions", "schedule_id", "ALTER TABLE live_sessions ADD COLUMN schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL"),
+        ] {
+            let columns = sqlx::query(&format!("PRAGMA table_info({table})")).fetch_all(&mut *tx).await?;
+            if !columns.iter().any(|row| row.get::<String, _>("name") == column) {
+                sqlx::query(definition).execute(&mut *tx).await?;
+            }
+        }
         let columns = sqlx::query("PRAGMA table_info(sync_queue)")
             .fetch_all(&mut *tx)
             .await?;
@@ -1452,6 +1479,17 @@ impl SqliteStore {
     pub async fn upsert_schedule(&self, input: &NewSchedule) -> AppResult<(Schedule, bool)> {
         validate_schedule_input(input)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (id, inserted) = self.upsert_schedule_on(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok((self.get_schedule(id).await?, inserted))
+    }
+
+    async fn upsert_schedule_on(
+        &self,
+        tx: &mut SqliteConnection,
+        input: &NewSchedule,
+    ) -> AppResult<(i64, bool)> {
+        validate_schedule_input(input)?;
         let existing_id: Option<i64> = if let Some(identity) = input.source_identity.as_deref() {
             // 先按来源 identity 找同一份来源写入过的场次；找不到再退回自然键。
             // 直接 INSERT 会撞 UNIQUE(streamer_id, start_at, title)：同一个场次
@@ -1487,14 +1525,14 @@ impl SqliteStore {
         };
 
         if let Some(existing_id) = existing_id {
-            let current = sync_feed::load_schedule(&mut tx, existing_id).await?;
+            let current = sync_feed::load_schedule(tx, existing_id).await?;
             let unchanged = if current.manual_locked {
                 locked_schedule_source_matches(&current, input)
             } else {
                 !current.cancelled && schedule_matches_input(&current, input)
             };
             if unchanged {
-                self.attach_schedule_source_on(&mut tx, existing_id, input, SyncActor::collector())
+                self.attach_schedule_source_on(tx, existing_id, input, SyncActor::collector())
                     .await?;
                 tx.commit().await?;
                 return Ok((self.get_schedule(existing_id).await?, false));
@@ -1554,12 +1592,11 @@ impl SqliteStore {
                 .execute(&mut *tx)
                 .await?;
             }
-            self.emit_schedule_change(&mut tx, existing_id, "upsert", SyncActor::collector())
+            self.emit_schedule_change(tx, existing_id, "upsert", SyncActor::collector())
                 .await?;
-            self.attach_schedule_source_on(&mut tx, existing_id, input, SyncActor::collector())
+            self.attach_schedule_source_on(tx, existing_id, input, SyncActor::collector())
                 .await?;
-            tx.commit().await?;
-            return Ok((self.get_schedule(existing_id).await?, false));
+            return Ok((existing_id, false));
         }
 
         let now = Utc::now().to_rfc3339();
@@ -1593,12 +1630,11 @@ impl SqliteStore {
         .execute(&mut *tx)
         .await?;
         let id = result.last_insert_rowid();
-        self.emit_schedule_change(&mut tx, id, "upsert", SyncActor::collector())
+        self.emit_schedule_change(tx, id, "upsert", SyncActor::collector())
             .await?;
-        self.attach_schedule_source_on(&mut tx, id, input, SyncActor::collector())
+        self.attach_schedule_source_on(tx, id, input, SyncActor::collector())
             .await?;
-        tx.commit().await?;
-        Ok((self.get_schedule(id).await?, true))
+        Ok((id, true))
     }
 
     pub async fn find_schedule_near(
@@ -2086,6 +2122,8 @@ impl SqliteStore {
             return Err(AppError::not_found(format!("日程 {id}")));
         }
         self.emit_schedule_change(&mut tx, id, "upsert", SyncActor::collector())
+            .await?;
+        self.clear_live_schedule_status_on(&mut tx, id, SyncActor::collector())
             .await?;
         tx.commit().await?;
         self.get_schedule(id).await
@@ -2642,6 +2680,7 @@ impl SqliteStore {
                 .await?;
             }
         }
+        self.clear_live_schedule_status_on(tx, id, actor).await?;
         if source_kind != "manual" {
             let mut suppressions = Vec::new();
             if let (Some(post_id), Some(fingerprint)) =
@@ -2966,7 +3005,7 @@ impl SqliteStore {
     ) -> AppResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous = sqlx::query(
-            "SELECT live_is_live, live_title, live_cover, live_url, live_started_at
+            "SELECT live_is_live, live_title, live_cover, live_url, live_started_at, live_checked_at, live_schedule_id
              FROM streamers WHERE id = ?",
         )
         .bind(streamer_id)
@@ -2978,6 +3017,26 @@ impl SqliteStore {
         let previous_cover: Option<String> = previous.try_get("live_cover")?;
         let previous_live_url: Option<String> = previous.try_get("live_url")?;
         let previous_started_at: Option<String> = previous.try_get("live_started_at")?;
+        let previous_checked: Option<String> = previous.try_get("live_checked_at")?;
+        if parse_opt_ts(previous_checked.as_deref())?.is_some_and(|time| time > snapshot.checked_at)
+        {
+            return Ok(previous_is_live != 0);
+        }
+        let broadcast = self
+            .observe_live_broadcast_on(&mut tx, streamer_id, snapshot)
+            .await?;
+        let bound_id = broadcast
+            .as_ref()
+            .and_then(|broadcast| broadcast.schedule_id);
+        let schedule_id: Option<i64> = if let Some(id) = bound_id {
+            sqlx::query_scalar("SELECT id FROM schedules WHERE id=? AND cancelled=0")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
+        let previous_schedule_id: Option<i64> = previous.try_get("live_schedule_id")?;
         let snapshot_started_at = snapshot.started_at.map(|value| value.to_rfc3339());
         let changed = previous_is_live != (snapshot.is_live as i64)
             || previous_title.as_deref().unwrap_or_default() != snapshot.title
@@ -2986,10 +3045,11 @@ impl SqliteStore {
                 .live_url
                 .as_deref()
                 .is_some_and(|url| previous_live_url.as_deref() != Some(url))
-            || previous_started_at.as_deref() != snapshot_started_at.as_deref();
+            || previous_started_at.as_deref() != snapshot_started_at.as_deref()
+            || previous_schedule_id != schedule_id;
         sqlx::query(
             "UPDATE streamers SET live_is_live = ?, live_title = ?, live_cover = ?,
-                    live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?,
+                    live_url = COALESCE(?, live_url), live_started_at = ?, live_checked_at = ?, live_schedule_id = ?,
                     updated_at = ?, live_revision = live_revision + ? WHERE id = ?",
         )
         .bind(snapshot.is_live)
@@ -2998,6 +3058,7 @@ impl SqliteStore {
         .bind(&snapshot.live_url)
         .bind(snapshot_started_at)
         .bind(snapshot.checked_at.to_rfc3339())
+        .bind(schedule_id)
         .bind(Utc::now().to_rfc3339())
         .bind(if changed { 1_i64 } else { 0_i64 })
         .bind(streamer_id)
@@ -3096,7 +3157,7 @@ impl SqliteStore {
     pub async fn list_live_statuses(&self) -> AppResult<Vec<LiveStatus>> {
         let rows = sqlx::query_as::<_, LiveStatusRow>(
             "SELECT id AS streamer_id, mid, name AS streamer_name, avatar_url, live_is_live,
-                    live_title, live_cover, live_url, live_checked_at, live_started_at,
+                    live_title, live_cover, live_url, live_checked_at, live_started_at, live_schedule_id,
                     live_notify_enabled, live_revision AS revision
              FROM streamers ORDER BY name COLLATE NOCASE",
         )
@@ -3105,6 +3166,7 @@ impl SqliteStore {
         rows.into_iter()
             .map(|row| {
                 Ok(LiveStatus {
+                    schedule_id: row.live_schedule_id,
                     streamer_id: row.streamer_id,
                     mid: row.mid,
                     streamer_name: row.streamer_name,
@@ -3229,12 +3291,13 @@ impl SqliteStore {
                 let resumable = sqlx::query(
                     "SELECT id FROM live_sessions
                      WHERE streamer_id = ? AND room_id = ? AND started_at < ?
-                       AND (ended_at IS NULL OR ended_at >= ?)
+                       AND (ended_at >= ? OR (ended_at IS NULL AND updated_at >= ?))
                      ORDER BY started_at DESC, id DESC LIMIT 1",
                 )
                 .bind(streamer_id)
                 .bind(room_id)
                 .bind(&started)
+                .bind(&merge_floor)
                 .bind(&merge_floor)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -3351,7 +3414,7 @@ impl SqliteStore {
 
     pub async fn get_live_session(&self, id: i64) -> AppResult<LiveSession> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
-            "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+            "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
@@ -3374,7 +3437,7 @@ impl SqliteStore {
         let limit = limit.clamp(1, 200);
         let rows = if let Some(streamer_id) = streamer_id {
             sqlx::query_as::<_, LiveSessionRow>(
-                "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+                "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
@@ -3389,7 +3452,7 @@ impl SqliteStore {
             .await?
         } else {
             sqlx::query_as::<_, LiveSessionRow>(
-                "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+                "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                         duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                         revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                         paid_user_count, interactive_user_count, danmaku_count, gift_count,
@@ -3409,7 +3472,7 @@ impl SqliteStore {
         schedule_id: i64,
     ) -> AppResult<Option<LiveSession>> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
-            "SELECT ls.id, ls.streamer_id, ls.streamer_name, ls.room_id, ls.title, ls.cover_url,
+            "SELECT ls.id, ls.schedule_id, ls.streamer_id, ls.streamer_name, ls.room_id, ls.title, ls.cover_url,
                     ls.started_at, ls.ended_at, ls.duration_seconds, ls.peak_online, ls.peak_high_energy, ls.avg_online,
                     ls.online_samples, ls.online_total, ls.revenue_cents, ls.gift_revenue_cents,
                     ls.super_chat_revenue_cents, ls.guard_revenue_cents, ls.paid_user_count,
@@ -3419,8 +3482,13 @@ impl SqliteStore {
              FROM live_sessions ls
              JOIN schedules s ON s.streamer_id = ls.streamer_id
              WHERE s.id = ?
-               AND ABS(julianday(ls.started_at) - julianday(s.start_at)) <= 0.5
-             ORDER BY ABS(julianday(ls.started_at) - julianday(s.start_at)) ASC,
+               AND (ls.schedule_id = s.id OR (
+                    ls.schedule_id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM live_broadcasts b
+                        WHERE b.streamer_id=ls.streamer_id AND b.started_at=ls.started_at)
+                    AND ABS(unixepoch(ls.started_at) - unixepoch(s.start_at)) <= 7200))
+             ORDER BY (ls.schedule_id = s.id) DESC,
+                      ABS(unixepoch(ls.started_at) - unixepoch(s.start_at)) ASC,
                       ls.started_at DESC
              LIMIT 1",
         )
@@ -3542,7 +3610,7 @@ impl SqliteStore {
         streamer_id: i64,
     ) -> AppResult<Option<LiveSession>> {
         let row = sqlx::query_as::<_, LiveSessionRow>(
-            "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+            "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                     duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                     revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                     paid_user_count, interactive_user_count, danmaku_count, gift_count,
@@ -3950,6 +4018,7 @@ fn map_live_session(row: LiveSessionRow) -> AppResult<LiveSession> {
         row.duration_seconds
     };
     Ok(LiveSession {
+        schedule_id: row.schedule_id,
         id: row.id,
         streamer_id: row.streamer_id,
         streamer_name: row.streamer_name,
@@ -5368,7 +5437,7 @@ mod tests {
                 &streamer.name,
                 "下午场",
                 None,
-                first_start + Duration::minutes(20),
+                first_start + Duration::minutes(36),
                 Utc::now(),
             )
             .await

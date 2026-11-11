@@ -1,6 +1,6 @@
 export type DataMode = "local" | "server";
 export type ViewMode = "timeline" | "grid";
-export type SourceKind = "text" | "reserve" | "image" | "manual" | "editor" | "weekly";
+export type SourceKind = "text" | "reserve" | "image" | "manual" | "editor" | "weekly" | "live";
 
 /** 思考程度：`auto` 表示请求体不发送 `reasoning_effort` 字段。 */
 export type LlmReasoningEffort = "auto" | "low" | "medium" | "high";
@@ -191,6 +191,7 @@ export interface UpdateWeeklyScheduleRuleInput {
 }
 
 export interface LiveSession {
+  scheduleId?: number | null;
   id: number;
   streamerId: number;
   streamerName: string;
@@ -254,6 +255,7 @@ export interface FanHistory {
 }
 
 export interface LiveStatus {
+  scheduleId?: number | null;
   streamerId: number;
   mid: string;
   streamerName: string;
@@ -402,7 +404,21 @@ export interface ServerEvent {
   payload: unknown;
 }
 
+export interface LiveBroadcast {
+  id: string;
+  streamerId: number;
+  roomId: string;
+  startedAt: string;
+  lastSegmentStartedAt: string | null;
+  lastSeenAt: string;
+  offlineSince: string | null;
+  scheduleId: number | null;
+  scheduleDecided: boolean;
+  segmentCount: number;
+}
+
 export interface ServerSnapshot {
+  liveBroadcasts?: LiveBroadcast[];
   schemaVersion: number;
   subscriptions: Streamer[];
   schedules: Schedule[];

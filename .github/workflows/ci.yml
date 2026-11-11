@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - codex/live-broadcast-card
   pull_request:
   workflow_dispatch:
 
@@ -77,6 +78,12 @@ jobs:
           PYTHONUTF8: "1"
         run: python -m unittest discover -s scripts -p test_refresh_timing.py -v
 
+      - name: Live schedule pre-fix regression evidence
+        if: ${{ !cancelled() }}
+        run: |
+          git fetch --no-tags origin fa78d8c44cdca5dfbb81bdc70fc96689a4c35312
+          node scripts/live-schedule-baseline.mjs
+
       - name: Frontend tests
         if: ${{ !cancelled() }}
         run: npm run test:web
@@ -114,6 +121,10 @@ jobs:
       - name: Live online chart browser interactions
         if: success()
         run: node scripts/live-online-ui.mjs
+
+      - name: Live broadcast card browser interactions
+        if: success()
+        run: node scripts/live-broadcast-ui.mjs
 
       - name: Upload UI verification evidence
         if: always()

@@ -1024,21 +1024,24 @@ impl AppService {
             };
             let previous = self.store.set_live_status(streamer.id, &snapshot).await?;
             if stats_enabled && snapshot.is_live {
-                let started_at = snapshot.started_at.unwrap_or(snapshot.checked_at);
+                let old_session = self.store.latest_open_live_session(streamer.id).await?;
                 match self
                     .store
-                    .ensure_live_session(
+                    .ensure_broadcast_live_session(
                         streamer.id,
-                        &room_id,
-                        &streamer.name,
                         &snapshot.title,
                         snapshot.cover_url.as_deref(),
-                        started_at,
                         snapshot.checked_at,
                     )
                     .await
                 {
                     Ok(session) => {
+                        if let Some(old) = old_session.filter(|old| old.id != session.id) {
+                            self.live_stats.stop(streamer.id, snapshot.checked_at).await;
+                            self.store
+                                .finish_open_live_session(old.id, snapshot.checked_at)
+                                .await?;
+                        }
                         self.live_stats
                             .start(self.store.clone(), self.bili_client(), session)
                             .await;
@@ -2649,6 +2652,9 @@ impl AppService {
                 source_published_at: Some(post.published_at),
                 confidence: schedule.confidence,
             };
+            if self.store.merge_late_live_schedule(&input).await? {
+                return Ok(false);
+            }
             if participants.len() > 1 || source_kind == "reserve" {
                 let candidates = self
                     .store

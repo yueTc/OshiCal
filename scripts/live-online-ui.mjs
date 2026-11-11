@@ -38,7 +38,7 @@ const session = { id: 7, streamerId: 1, streamerName: streamer.name, roomId: "45
   interactiveUserCount: 500, danmakuCount: 6000, giftCount: 100, superChatCount: 4,
   guardCount: 1, reconnectCount: 1, segmentCount: 1, dataQuality: "partial",
   collectorState: "active", createdAt: iso(start), updatedAt: iso(now) };
-const live = { streamerId: 1, mid: "123", streamerName: streamer.name, avatarUrl: "",
+const live = { scheduleId: 1, streamerId: 1, mid: "123", streamerName: streamer.name, avatarUrl: "",
   isLive: true, title: session.title, coverUrl: null, liveUrl: streamer.liveUrl,
   online: 0, startedAt: iso(start), checkedAt: iso(now), liveNotifyEnabled: false, revision: 1 };
 let scenario = "normal";

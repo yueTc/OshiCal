@@ -199,6 +199,7 @@ const SOURCE_LABELS: Record<SourceKind, string> = {
   manual: "手动",
   editor: "文本",
   weekly: "固定周表",
+  live: "开播补录",
 };
 
 const SOURCE_CLASS: Record<SourceKind, string> = {
@@ -208,6 +209,7 @@ const SOURCE_CLASS: Record<SourceKind, string> = {
   manual: "source-manual",
   editor: "source-text",
   weekly: "source-weekly",
+  live: "source-reserve",
 };
 
 function createManualSourceIdentity(): string {

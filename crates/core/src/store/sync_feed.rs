@@ -1603,7 +1603,7 @@ async fn load_server_settings(conn: &mut SqliteConnection) -> AppResult<ServerSe
 async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveStatus>> {
     let rows = sqlx::query(
         "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_notify_enabled, live_revision
+                live_checked_at, live_started_at, live_schedule_id, live_notify_enabled, live_revision
          FROM streamers ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&mut *conn)
@@ -1614,7 +1614,7 @@ async fn load_live_statuses(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSt
 async fn load_live_status(conn: &mut SqliteConnection, streamer_id: i64) -> AppResult<LiveStatus> {
     let row = sqlx::query(
         "SELECT id, mid, name, avatar_url, live_is_live, live_title, live_cover, live_url,
-                live_checked_at, live_started_at, live_notify_enabled, live_revision
+                live_checked_at, live_started_at, live_schedule_id, live_notify_enabled, live_revision
          FROM streamers WHERE id = ?",
     )
     .bind(streamer_id)
@@ -1626,6 +1626,7 @@ async fn load_live_status(conn: &mut SqliteConnection, streamer_id: i64) -> AppR
 
 fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
     Ok(LiveStatus {
+        schedule_id: row.try_get("live_schedule_id")?,
         streamer_id: row.try_get("id")?,
         mid: row.try_get("mid")?,
         streamer_name: row.try_get("name")?,
@@ -1653,7 +1654,7 @@ fn map_live_status_row(row: sqlx::sqlite::SqliteRow) -> AppResult<LiveStatus> {
 
 async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSession>> {
     let rows = sqlx::query_as::<_, LiveSessionRow>(
-        "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+        "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,
@@ -1668,7 +1669,7 @@ async fn load_live_sessions(conn: &mut SqliteConnection) -> AppResult<Vec<LiveSe
 
 async fn load_live_session_by_id(conn: &mut SqliteConnection, id: i64) -> AppResult<LiveSession> {
     let row = sqlx::query_as::<_, LiveSessionRow>(
-        "SELECT id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
+        "SELECT id, schedule_id, streamer_id, streamer_name, room_id, title, cover_url, started_at, ended_at,
                 duration_seconds, peak_online, peak_high_energy, avg_online, online_samples, online_total,
                 revenue_cents, gift_revenue_cents, super_chat_revenue_cents, guard_revenue_cents,
                 paid_user_count, interactive_user_count, danmaku_count, gift_count,

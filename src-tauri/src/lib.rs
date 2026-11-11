@@ -3051,6 +3051,7 @@ async fn export_client_snapshot(
         weekly_exceptions: bootstrap.weekly_exceptions,
         schedule_sources: bootstrap.schedule_sources,
         source_suppressions: bootstrap.source_suppressions,
+        live_broadcasts: store.list_live_broadcasts().await.map_err(map_error)?,
         latest_event_seq: store.latest_event_seq().await.map_err(map_error)?,
         exported_at: Utc::now(),
     })

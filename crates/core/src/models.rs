@@ -438,6 +438,8 @@ pub struct SyncMutation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSession {
+    #[serde(default)]
+    pub schedule_id: Option<i64>,
     pub id: i64,
     pub streamer_id: i64,
     pub streamer_name: String,
@@ -548,6 +550,8 @@ pub struct FanRefreshReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveStatus {
+    #[serde(default)]
+    pub schedule_id: Option<i64>,
     pub streamer_id: i64,
     pub mid: String,
     pub streamer_name: String,

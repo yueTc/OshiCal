@@ -21,6 +21,8 @@ pub struct ServerSnapshot {
     pub schedule_sources: Vec<ScheduleSource>,
     #[serde(default)]
     pub source_suppressions: Vec<SourceSuppression>,
+    #[serde(default)]
+    pub live_broadcasts: Vec<LiveBroadcast>,
     pub latest_event_seq: i64,
     pub exported_at: DateTime<Utc>,
 }
@@ -77,6 +79,7 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
         || snapshot.weekly_exceptions.len() > 20_000
         || snapshot.schedule_sources.len() > 20_000
         || snapshot.source_suppressions.len() > 20_000
+        || snapshot.live_broadcasts.len() > 20_000
     {
         return Err(AppError::validation("快照超过导入大小限制"));
     }
@@ -149,6 +152,36 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
         schedule_owners.insert(schedule.id, schedule.streamer_id);
     }
 
+    let mut broadcast_ids = HashSet::new();
+    let mut broadcast_schedules = HashSet::new();
+    for broadcast in &snapshot.live_broadcasts {
+        if !ids.contains(&broadcast.streamer_id)
+            || uuid::Uuid::parse_str(&broadcast.id).is_err()
+            || !broadcast_ids.insert(&broadcast.id)
+            || broadcast.segment_count < 1
+            || broadcast.room_id.is_empty()
+            || !broadcast.room_id.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Err(AppError::validation("直播场次身份、归属或推流段数无效"));
+        }
+        let started = parse_ts(&broadcast.started_at)?;
+        let seen = parse_ts(&broadcast.last_seen_at)?;
+        if seen < started
+            || parse_opt_ts(broadcast.offline_since.as_deref())?.is_some_and(|time| time < seen)
+            || parse_opt_ts(broadcast.last_segment_started_at.as_deref())?
+                .is_some_and(|time| time > seen)
+        {
+            return Err(AppError::validation("直播场次观测时间无效"));
+        }
+        if let Some(id) = broadcast.schedule_id {
+            if schedule_owners.get(&id) != Some(&broadcast.streamer_id)
+                || !broadcast_schedules.insert(id)
+                || !broadcast.schedule_decided
+            {
+                return Err(AppError::validation("直播卡片归属缺失或重复绑定"));
+            }
+        }
+    }
     let mut exception_ids = HashSet::new();
     let mut exception_keys = HashSet::new();
     for exception in &snapshot.weekly_exceptions {
@@ -849,7 +882,7 @@ async fn migration_state_digest_on(
     }
     digest_part(&mut hasher, feed_id.as_bytes());
 
-    let tables: [(&str, &[&str], &str); 11] = [
+    let tables: [(&str, &[&str], &str); 12] = [
         (
             "streamers",
             &[
@@ -871,6 +904,7 @@ async fn migration_state_digest_on(
                 "live_cover",
                 "live_started_at",
                 "live_checked_at",
+                "live_schedule_id",
                 "sort_order",
                 "created_at",
                 "updated_at",
@@ -1007,6 +1041,22 @@ async fn migration_state_digest_on(
             "singleton",
         ),
         ("sync_feed_meta", &["key", "value", "updated_at"], "key"),
+        (
+            "live_broadcasts",
+            &[
+                "id",
+                "streamer_id",
+                "room_id",
+                "started_at",
+                "last_segment_started_at",
+                "last_seen_at",
+                "offline_since",
+                "schedule_id",
+                "schedule_decided",
+                "segment_count",
+            ],
+            "id",
+        ),
     ];
     for (table, columns, order_by) in tables {
         hash_migration_table(tx, &mut hasher, table, columns, order_by).await?;
@@ -1505,6 +1555,40 @@ async fn import_snapshot_on(
         save_mapping(tx, server_key, "weekly_exception", remote.id, id, None).await?;
     }
 
+    for remote in &snapshot.live_broadcasts {
+        let owner = mapped_local_id(&ids, remote.streamer_id)?;
+        let schedule = remote
+            .schedule_id
+            .map(|id| mapped_local_id(&schedule_ids, id))
+            .transpose()?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_broadcasts WHERE id=?)")
+                .bind(&remote.id)
+                .fetch_one(&mut **tx)
+                .await?;
+        if exists && strategy != "client" {
+            continue;
+        }
+        let occupied: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM live_broadcasts WHERE schedule_id=? AND id<>?)",
+        )
+        .bind(schedule)
+        .bind(&remote.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if occupied {
+            continue;
+        }
+        sqlx::query("INSERT INTO live_broadcasts (id,streamer_id,room_id,started_at,last_segment_started_at,
+            last_seen_at,offline_since,schedule_id,schedule_decided,segment_count) VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET streamer_id=excluded.streamer_id,room_id=excluded.room_id,
+            started_at=excluded.started_at,last_segment_started_at=excluded.last_segment_started_at,
+            last_seen_at=excluded.last_seen_at,offline_since=excluded.offline_since,
+            schedule_id=excluded.schedule_id,schedule_decided=excluded.schedule_decided,segment_count=excluded.segment_count")
+            .bind(&remote.id).bind(owner).bind(&remote.room_id).bind(&remote.started_at)
+            .bind(&remote.last_segment_started_at).bind(&remote.last_seen_at).bind(&remote.offline_since)
+            .bind(schedule).bind(remote.schedule_decided).bind(remote.segment_count).execute(&mut **tx).await?;
+    }
     Ok(report)
 }
 
@@ -1598,6 +1682,7 @@ mod tests {
             weekly_exceptions: bootstrap.weekly_exceptions,
             schedule_sources: bootstrap.schedule_sources,
             source_suppressions: bootstrap.source_suppressions,
+            live_broadcasts: store.list_live_broadcasts().await.unwrap(),
             latest_event_seq: bootstrap.snapshot_revision,
             exported_at: Utc::now(),
         }
@@ -1619,6 +1704,7 @@ mod tests {
                 weekly_exceptions: Vec::new(),
                 schedule_sources: Vec::new(),
                 source_suppressions: Vec::new(),
+                live_broadcasts: Vec::new(),
                 latest_event_seq: 0,
                 exported_at: Utc::now(),
             };
@@ -1695,6 +1781,7 @@ mod tests {
             weekly_exceptions: Vec::new(),
             schedule_sources: Vec::new(),
             source_suppressions: Vec::new(),
+            live_broadcasts: Vec::new(),
             latest_event_seq: 0,
             exported_at: Utc::now(),
         };
@@ -1733,6 +1820,7 @@ mod tests {
             weekly_exceptions: Vec::new(),
             schedule_sources: Vec::new(),
             source_suppressions: Vec::new(),
+            live_broadcasts: Vec::new(),
             latest_event_seq: 0,
             exported_at: Utc::now(),
         };
@@ -1759,6 +1847,7 @@ mod tests {
             weekly_exceptions: Vec::new(),
             schedule_sources: Vec::new(),
             source_suppressions: Vec::new(),
+            live_broadcasts: Vec::new(),
             latest_event_seq: 0,
             exported_at: Utc::now(),
         };
