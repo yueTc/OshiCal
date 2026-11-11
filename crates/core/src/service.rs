@@ -8546,7 +8546,7 @@ mod tests {
         }
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
-            .add_subscription(&subscription("retry-fixture", "测试主播"))
+            .add_subscription(&subscription("99411", "测试主播"))
             .await
             .unwrap();
         let analyzer = Arc::new(CountFailures(AtomicUsize::new(0)));
