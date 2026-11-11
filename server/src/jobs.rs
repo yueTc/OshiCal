@@ -5,6 +5,7 @@
 //! deliberately process-local: jobs are not restored after a server restart and
 //! clients must treat an unknown job id as expired.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -115,6 +116,7 @@ impl From<&JobRegistration> for RefreshJobAccepted {
 #[derive(Default)]
 struct JobStore {
     jobs: Vec<RefreshJob>,
+    request_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -127,10 +129,30 @@ impl RefreshJobManager {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn create_all(&self) -> JobRegistration {
-        self.register(RefreshJobKind::RefreshAll, None, None)
+        self.register(RefreshJobKind::RefreshAll, None, None, None)
     }
 
+    pub fn create_all_with_key(&self, key: String) -> JobRegistration {
+        self.register(RefreshJobKind::RefreshAll, None, None, Some(key))
+    }
+
+    pub fn create_streamer_with_key(
+        &self,
+        streamer_id: i64,
+        streamer_name: impl Into<String>,
+        key: String,
+    ) -> JobRegistration {
+        self.register(
+            RefreshJobKind::RefreshStreamer,
+            Some(streamer_id),
+            Some(streamer_name.into()),
+            Some(key),
+        )
+    }
+
+    #[cfg(test)]
     pub fn create_streamer(
         &self,
         streamer_id: i64,
@@ -140,6 +162,7 @@ impl RefreshJobManager {
             RefreshJobKind::RefreshStreamer,
             Some(streamer_id),
             Some(streamer_name.into()),
+            None,
         )
     }
 
@@ -178,8 +201,14 @@ impl RefreshJobManager {
             job.status = RefreshJobStatus::Running;
             job.started_at = Some(now);
         }
-        job.streamer_id = Some(progress.streamer_id);
-        job.streamer_name = Some(progress.streamer_name.clone());
+        // Keep immutable request identity: a full-refresh progress target is
+        // id=0, and a single caller can follow a full task. Neither should turn
+        // this job into a different request or break active-job deduplication.
+        if job.kind == RefreshJobKind::RefreshAll {
+            job.streamer_name = Some("全部主播".to_owned());
+        } else if job.streamer_id == Some(progress.streamer_id) {
+            job.streamer_name = Some(progress.streamer_name.clone());
+        }
         job.progress = RefreshJobProgress {
             stage: progress.stage.clone(),
             completed: progress.completed,
@@ -291,6 +320,7 @@ impl RefreshJobManager {
         kind: RefreshJobKind,
         streamer_id: Option<i64>,
         streamer_name: Option<String>,
+        request_key: Option<String>,
     ) -> JobRegistration {
         let now = Utc::now();
         let mut store = self.lock();
@@ -300,7 +330,10 @@ impl RefreshJobManager {
             .jobs
             .iter()
             .find(|job| {
-                job.status.is_active() && job.kind == kind && job.streamer_id == streamer_id
+                job.status.is_active()
+                    && job.kind == kind
+                    && job.streamer_id == streamer_id
+                    && store.request_keys.get(&job.job_id) == request_key.as_ref()
             })
             .cloned()
         {
@@ -329,6 +362,9 @@ impl RefreshJobManager {
             report: None,
             error: None,
         };
+        if let Some(key) = request_key {
+            store.request_keys.insert(job.job_id.clone(), key);
+        }
         store.jobs.push(job.clone());
         prune_jobs(&mut store, now);
         JobRegistration { job, created: true }
@@ -382,6 +418,9 @@ fn prune_jobs(store: &mut JobStore, now: DateTime<Utc>) {
         };
         store.jobs.remove(index);
     }
+    let remaining: std::collections::HashSet<_> =
+        store.jobs.iter().map(|job| job.job_id.clone()).collect();
+    store.request_keys.retain(|id, _| remaining.contains(id));
 }
 
 #[cfg(test)]
@@ -419,6 +458,67 @@ mod tests {
         let after_finish = manager.create_streamer(7, "主播七");
         assert!(after_finish.created);
         assert_ne!(first.job.job_id, after_finish.job.job_id);
+    }
+
+    #[test]
+    fn shared_progress_does_not_change_the_requested_job_identity() {
+        let manager = RefreshJobManager::new();
+        let all = manager.create_all_with_key("all".to_owned());
+        let single = manager.create_streamer_with_key(7, "主播七", "one".to_owned());
+        let progress = RefreshProgress {
+            streamer_id: 0,
+            streamer_name: "全部主播".to_owned(),
+            stage: "已加入全量刷新".to_owned(),
+            completed: 1,
+            total: 3,
+            percent: 33,
+            done: false,
+            failed: false,
+        };
+        manager
+            .update_streamer_progress(&all.job.job_id, &progress)
+            .unwrap();
+        manager
+            .update_streamer_progress(&single.job.job_id, &progress)
+            .unwrap();
+        assert!(!manager.create_all_with_key("all".to_owned()).created);
+        assert!(
+            !manager
+                .create_streamer_with_key(7, "主播七", "one".to_owned())
+                .created
+        );
+        assert_eq!(
+            manager.get(&single.job.job_id).unwrap().streamer_id,
+            Some(7)
+        );
+        assert_eq!(manager.get(&all.job.job_id).unwrap().streamer_id, None);
+    }
+
+    #[test]
+    fn changed_request_snapshot_is_not_deduplicated_into_an_old_job() {
+        let manager = RefreshJobManager::new();
+        let first = manager.create_all_with_key("config-a".to_owned());
+        assert!(!manager.create_all_with_key("config-a".to_owned()).created);
+        let changed = manager.create_all_with_key("config-b".to_owned());
+        assert!(changed.created);
+        assert_ne!(first.job.job_id, changed.job.job_id);
+        let one = manager.create_streamer_with_key(1, "甲", "target-a".to_owned());
+        assert!(
+            !manager
+                .create_streamer_with_key(1, "甲", "target-a".to_owned())
+                .created
+        );
+        assert!(
+            manager
+                .create_streamer_with_key(1, "甲", "target-b".to_owned())
+                .created
+        );
+        manager.finish(&one.job.job_id, report(&[]), "done");
+        assert!(
+            manager
+                .create_streamer_with_key(1, "甲", "target-a".to_owned())
+                .created
+        );
     }
 
     #[test]

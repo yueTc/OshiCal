@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tracing::Instrument;
 
+use crate::analysis_retry;
 use crate::bilibili::{BilibiliClient, QrLoginPoll, QrLoginStart};
 use crate::error::{AppError, AppResult};
 use crate::fertility::{
@@ -26,6 +27,7 @@ use crate::models::{
     Streamer, UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
 };
 use crate::network::{test_google, ProxyTestReport};
+use crate::refresh_coordinator::{ProgressSink, RefreshCoordinator, RefreshScope};
 use crate::schedule::{parse_reserve_schedule, parse_text_schedule, ParsedSchedule};
 use crate::settings::{load_settings, AppSettings, RuntimeSecrets};
 use crate::store::{FertilityCache, SqliteStore};
@@ -82,6 +84,7 @@ pub struct AppService {
     llm_key_binding: Arc<RwLock<Option<(String, String)>>>,
     live_stats: LiveStatsManager,
     refresh_lock: Arc<Mutex<()>>,
+    refresh_coordinator: RefreshCoordinator,
     // Protect the cross-streamer find/merge/insert sequence for joint streams.
     // This is never held during fetching, image preparation, or model requests.
     auto_schedule_write_lock: Arc<Mutex<()>>,
@@ -114,6 +117,7 @@ impl AppService {
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            refresh_coordinator: RefreshCoordinator::default(),
             auto_schedule_write_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -134,6 +138,7 @@ impl AppService {
             llm_key_binding: Arc::new(RwLock::new(None)),
             live_stats: LiveStatsManager::default(),
             refresh_lock: Arc::new(Mutex::new(())),
+            refresh_coordinator: RefreshCoordinator::default(),
             auto_schedule_write_lock: Arc::new(Mutex::new(())),
             live_check_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1067,31 +1072,111 @@ impl AppService {
     where
         P: Fn(RefreshProgress) + Send + Sync,
     {
-        let refresh_id = uuid::Uuid::new_v4().to_string();
-        let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = "all");
-        measure("refresh_round", async {
-            // A manual refresh may arrive while the periodic monitor is running.
-            // Queue it instead of failing and discarding the caller's progress UI.
-            let target = ProgressTarget::all();
-            let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
-            self.repair_reserve_room_urls().await;
-            let settings = load_settings(&self.store).await?;
-            let llm = self.post_analyzer(&settings).await;
-            let streamers = self.store.list_streamers().await?;
-            self.backfill_avatar_captures(&streamers).await;
-            let sources = sources_for_streamers(&streamers);
-            // 全量刷新没有“当前主播”，用合成条目播报整体进度。
-            self.refresh_sources(
-                &sources,
-                &settings,
-                llm.as_ref(),
-                Some(&target),
-                &on_progress,
-            )
+        self.coordinate_refresh(None, &on_progress).await
+    }
+
+    /// Opaque snapshot used by the HTTP job registry too. Runtime fields such
+    /// as last_refresh_at must not invalidate a still-running refresh.
+    pub async fn refresh_request_key(&self, streamer_id: Option<i64>) -> AppResult<String> {
+        let (_, _, _, scope) = self.prepare_refresh(streamer_id).await?;
+        Ok(text_digest(&serde_json::to_string(&json!({
+            "config": scope.config_key, "targets": scope.targets, "all": scope.all,
+        }))?))
+    }
+
+    async fn prepare_refresh(
+        &self,
+        streamer_id: Option<i64>,
+    ) -> AppResult<(AppSettings, Vec<Streamer>, Option<LlmConfig>, RefreshScope)> {
+        let settings = load_settings(&self.store).await?;
+        let streamers = match streamer_id {
+            Some(id) => vec![self.store.get_streamer(id).await?],
+            None => self.store.list_streamers().await?,
+        };
+        let config = self.current_llm_config(&settings).await;
+        let binding = self.llm_key_binding.read().await.clone();
+        let cookie_fingerprint = self
+            .secrets
+            .read()
             .await
-        })
-        .instrument(span)
-        .await
+            .bili_cookie
+            .as_deref()
+            .map(text_digest);
+        // Only hashes enter the scope. Do not retain or log raw credentials.
+        let config_key = text_digest(&serde_json::to_string(&json!({
+            "settings": &settings,
+            "model_key": config.as_ref().map(|config| text_digest(&config.api_key)),
+            "binding": binding.as_ref().map(|(key, url)| (text_digest(key), url)),
+            "cookie": cookie_fingerprint,
+        }))?);
+        let targets = streamers
+            .iter()
+            .map(|streamer| {
+                let linked: Vec<_> = streamer
+                    .linked_accounts
+                    .iter()
+                    .map(|account| (&account.mid, &account.name))
+                    .collect();
+                let fingerprint = text_digest(
+                    &json!({
+                        "mid": streamer.mid, "name": streamer.name, "room_id": streamer.room_id,
+                        "live_url": streamer.live_url, "aliases": streamer.aliases,
+                        "enabled": streamer.schedule_enabled, "linked": linked,
+                    })
+                    .to_string(),
+                );
+                (streamer.id, fingerprint)
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok((
+            settings,
+            streamers,
+            config,
+            RefreshScope {
+                config_key,
+                targets,
+                all: streamer_id.is_none(),
+            },
+        ))
+    }
+
+    async fn coordinate_refresh(
+        &self,
+        streamer_id: Option<i64>,
+        on_progress: &(dyn Fn(RefreshProgress) + Send + Sync),
+    ) -> AppResult<RefreshReport> {
+        let (settings, streamers, config, scope) = self.prepare_refresh(streamer_id).await?;
+        let target = match streamers.first().filter(|_| streamer_id.is_some()) {
+            Some(streamer) => ProgressTarget::for_streamer(streamer),
+            None => ProgressTarget::all(),
+        };
+        let mut service = self.clone();
+        // Freeze the selected clients along with the request scope. A setting
+        // change creates a different task instead of silently mutating this one.
+        service.bili = Arc::new(StdRwLock::new(self.bili_client()));
+        service.llm = Arc::new(StdRwLock::new(self.llm_analyzer()));
+        self.refresh_coordinator.run(scope, on_progress, move |sink: ProgressSink| async move {
+            let refresh_id = uuid::Uuid::new_v4().to_string();
+            let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = if streamer_id.is_none() { "all" } else { "streamer" });
+            measure("refresh_round", async {
+                let _guard = service.wait_for_refresh_lock(&target, sink.as_ref()).await;
+                if streamer_id.is_none() { service.repair_reserve_room_urls().await; }
+                service.backfill_avatar_captures(&streamers).await;
+                let llm = config.map(|config| PostAnalyzer {
+                    config, pool: LlmPool::new(settings.llm_parallelism),
+                });
+                let sources = sources_for_streamers(&streamers);
+                let result = service.refresh_sources(&sources, &settings, llm.as_ref(), Some(&target), sink.as_ref()).await;
+                let failed = result.as_ref().map_or(true, |report| !report.failed_streamers.is_empty());
+                let stage = match &result {
+                    Ok(_) if failed => "刷新完成，但部分来源失败".to_owned(),
+                    Ok(_) => "刷新完成".to_owned(),
+                    Err(error) => format!("刷新失败: {error}"),
+                };
+                emit_progress(&target, &stage, 1, 1, 100, true, failed, sink.as_ref());
+                result
+            }).instrument(span).await
+        }).await
     }
 
     /// 拿刷新锁。锁被后台轮询占着的时候（一次全量刷新可能十几分钟），
@@ -1154,75 +1239,8 @@ impl AppService {
     where
         P: Fn(RefreshProgress) + Send + Sync,
     {
-        let refresh_id = uuid::Uuid::new_v4().to_string();
-        let span = tracing::info_span!("refresh_round", refresh_id = %refresh_id, scope = "streamer", streamer_id);
-        measure("refresh_round", async {
-            // Keep one refresh in flight, but let a requested refresh wait for the
-            // current background run instead of returning an immediate validation error.
-            let streamer = self.store.get_streamer(streamer_id).await?;
-            let target = ProgressTarget::for_streamer(&streamer);
-            let _guard = self.wait_for_refresh_lock(&target, &on_progress).await;
-            self.backfill_avatar_captures(std::slice::from_ref(&streamer))
-                .await;
-            emit_progress(
-                &target,
-                "准备抓取主播与官号动态",
-                0,
-                0,
-                3,
-                false,
-                false,
-                &on_progress,
-            );
-            let result = async {
-                let settings = load_settings(&self.store).await?;
-                let llm = self.post_analyzer(&settings).await;
-                let sources = sources_for_streamers(std::slice::from_ref(&streamer));
-                self.refresh_sources(
-                    &sources,
-                    &settings,
-                    llm.as_ref(),
-                    Some(&target),
-                    &on_progress,
-                )
-                .await
-            }
-            .await;
-            match &result {
-                Ok(report) => {
-                    let failed = !report.failed_streamers.is_empty();
-                    emit_progress(
-                        &target,
-                        if failed {
-                            "刷新完成，但部分来源失败"
-                        } else {
-                            "刷新完成"
-                        },
-                        1,
-                        1,
-                        100,
-                        true,
-                        failed,
-                        &on_progress,
-                    );
-                }
-                Err(error) => {
-                    emit_progress(
-                        &target,
-                        &format!("刷新失败: {error}"),
-                        1,
-                        1,
-                        100,
-                        true,
-                        true,
-                        &on_progress,
-                    );
-                }
-            }
-            result
-        })
-        .instrument(span)
-        .await
+        self.coordinate_refresh(Some(streamer_id), &on_progress)
+            .await
     }
 
     async fn current_llm_config(&self, settings: &AppSettings) -> Option<LlmConfig> {
@@ -1236,19 +1254,6 @@ impl AppService {
             model: settings.llm_model.clone(),
             prompt_version: settings.llm_prompt_version.clone(),
             reasoning_effort: settings.llm_reasoning_effort,
-        })
-    }
-
-    /// 组装这次刷新用的模型通道：配置来自设置，并发上限来自 `llm_parallelism`。
-    /// 没有开启图片分析或没配好模型地址时返回 `None`，整轮跳过模型调用。
-    async fn post_analyzer(&self, settings: &AppSettings) -> Option<PostAnalyzer> {
-        if !settings.auto_analyze_images {
-            return None;
-        }
-        let config = self.current_llm_config(settings).await?;
-        Some(PostAnalyzer {
-            config,
-            pool: LlmPool::new(settings.llm_parallelism),
         })
     }
 
@@ -1315,6 +1320,7 @@ impl AppService {
         let mut attempted_streamer_ids = HashSet::new();
         let mut successfully_analyzed_streamer_ids = HashSet::new();
         let mut streamer_errors: HashMap<i64, String> = HashMap::new();
+        let mut deferred_analyses = 0usize;
         let outcomes = self
             .process_sources_concurrently(
                 sources,
@@ -1332,6 +1338,7 @@ impl AppService {
             let (source_mid, targets) = &sources[index];
             match outcome {
                 SourceRefreshResult::Processed(stats) => {
+                    deferred_analyses += stats.deferred_analyses;
                     report.new_schedules += stats.new_schedules;
                     report.cancelled_schedules += stats.cancelled_schedules;
                     report.llm_calls += stats.llm_calls;
@@ -1437,6 +1444,7 @@ impl AppService {
             Err(error) => tracing::warn!(%error, "deduplicate schedules failed"),
         }
         report.refreshed_streamers = refreshed_streamer_ids.len();
+        tracing::info!(deferred_analyses, "本轮动态失败退避汇总");
         if report.new_schedules > 0 || report.cancelled_schedules > 0 {
             self.store
                 .append_event(
@@ -1741,9 +1749,6 @@ impl AppService {
                 // v4 只识别前两图，不复用旧多图结果；历史日程继续保留。
                 let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
-                let slot_timer = PhaseTimer::start("model_slot_wait");
-                let _permit = analyzer.pool.acquire().await;
-                slot_timer.finish(true);
                 let config = LlmConfig {
                     base_url: analyzer.config.base_url.clone(),
                     api_key: analyzer.config.api_key.clone(),
@@ -1799,49 +1804,93 @@ impl AppService {
                     },
                     None => None,
                 };
+                let retry_content = text_digest(
+                    &json!({
+                        "digest": content_digest, "published": post.published_at,
+                        "author": post.author_mid, "author_name": post.author_name,
+                    })
+                    .to_string(),
+                );
+                let retry_config = text_digest(
+                    &json!({
+                        "model": config.model, "base_url": config.base_url,
+                        "prompt": config.prompt_version, "reasoning": config.reasoning_effort,
+                        "credential": text_digest(&config.api_key),
+                    })
+                    .to_string(),
+                );
+                let retry_key =
+                    analysis_retry::retry_state_key(&post.id, &retry_content, &retry_config);
                 let events = match cached_events {
-                    Some(events) => Some(events),
-                    None => match self
-                        .llm_analyzer()
-                        .analyze_post(&config, &analysis_input)
-                        .instrument(tracing::info_span!("post", post_id = %post.id))
-                        .await
-                    {
-                        Ok(analysis) => {
-                            stats.llm_calls += 1;
-                            // 成功就入缓存，空结果也一样；空结果的过期重试由
-                            // `empty_analysis_is_fresh` 按写入时间判断。
-                            measure(
-                                "cache_store",
-                                self.store.save_post_analysis(
-                                    &cache_key,
-                                    &post.id,
-                                    &content_digest,
-                                    &config.model,
-                                    &prompt_version,
-                                    &analysis.raw,
-                                ),
-                            )
-                            .instrument(tracing::info_span!("post", post_id = %post.id))
-                            .await?;
-                            Some(analysis.events)
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, post_id = %post.id, "post analysis failed");
-                            let message = format!("动态日程分析失败: {error}");
-                            stats
-                                .analysis_outcomes
-                                .insert(format!("post:{}", post.id), Some(message.clone()));
-                            for target in targets {
-                                let _ = self.store.record_streamer_error(target.id, &message).await;
-                                stats
-                                    .analysis_errors
-                                    .entry(target.id)
-                                    .or_insert_with(|| message.clone());
-                            }
+                    Some(events) => {
+                        analysis_retry::clear(&self.store, &retry_key).await?;
+                        Some(events)
+                    }
+                    None => {
+                        let waiting = analysis_retry::load(&self.store, &retry_key)
+                            .await?
+                            .filter(|state| !state.is_due(Utc::now()));
+                        if let Some(state) = waiting {
+                            let message = format!("识别暂缓重试：{}", state.retry_message());
+                            tracing::info!(post_id = %post.id, next_retry_at = %state.next_retry_at, "动态分析处于失败退避，未调用模型");
+                            stats.deferred_analyses += 1;
+                            self.record_post_analysis_error(targets, post, &message, &mut stats)
+                                .await?;
                             None
+                        } else {
+                            let slot_timer = PhaseTimer::start("model_slot_wait");
+                            let permit = analyzer.pool.acquire().await;
+                            slot_timer.finish(true);
+                            let analysis = self
+                                .llm_analyzer()
+                                .analyze_post(&config, &analysis_input)
+                                .instrument(tracing::info_span!("post", post_id = %post.id))
+                                .await;
+                            drop(permit);
+                            match analysis {
+                                Ok(analysis) => {
+                                    stats.llm_calls += 1;
+                                    measure(
+                                        "cache_store",
+                                        self.store.save_post_analysis(
+                                            &cache_key,
+                                            &post.id,
+                                            &content_digest,
+                                            &config.model,
+                                            &prompt_version,
+                                            &analysis.raw,
+                                        ),
+                                    )
+                                    .instrument(tracing::info_span!("post", post_id = %post.id))
+                                    .await?;
+                                    analysis_retry::clear(&self.store, &retry_key).await?;
+                                    Some(analysis.events)
+                                }
+                                Err(error) => {
+                                    // Never persist credential-bearing upstream messages.
+                                    let detail = if config.api_key.is_empty() {
+                                        error.to_string()
+                                    } else {
+                                        error.to_string().replace(&config.api_key, "[REDACTED]")
+                                    };
+                                    let state = analysis_retry::failure(
+                                        &self.store,
+                                        &retry_key,
+                                        Utc::now(),
+                                        &format!("动态日程分析失败: {detail}"),
+                                    )
+                                    .await?;
+                                    let message = state.retry_message();
+                                    tracing::warn!(post_id = %post.id, error_code = error.code(), next_retry_at = %state.next_retry_at, "动态日程分析失败，已安排退避重试");
+                                    self.record_post_analysis_error(
+                                        targets, post, &message, &mut stats,
+                                    )
+                                    .await?;
+                                    None
+                                }
+                            }
                         }
-                    },
+                    }
                 };
                 event_count = events.as_ref().map_or(0, Vec::len);
                 analysis_succeeded = events.is_some();
@@ -2027,6 +2076,26 @@ impl AppService {
             report_step("写入日程结果", completed_steps, total_steps, false);
         }
         Ok(stats)
+    }
+
+    async fn record_post_analysis_error(
+        &self,
+        targets: &[Streamer],
+        post: &DynamicPost,
+        message: &str,
+        stats: &mut ProcessStats,
+    ) -> AppResult<()> {
+        stats
+            .analysis_outcomes
+            .insert(format!("post:{}", post.id), Some(message.to_owned()));
+        for target in targets {
+            self.store.record_streamer_error(target.id, message).await?;
+            stats
+                .analysis_errors
+                .entry(target.id)
+                .or_insert_with(|| message.to_owned());
+        }
+        Ok(())
     }
 
     async fn dedupe_schedule_duplicates(&self) -> AppResult<usize> {
@@ -2739,6 +2808,7 @@ fn next_ready_source(
 
 #[derive(Debug, Default)]
 struct ProcessStats {
+    deferred_analyses: usize,
     new_schedules: usize,
     cancelled_schedules: usize,
     llm_calls: usize,
@@ -8525,6 +8595,229 @@ mod tests {
             store.list_all_schedules().await.expect("schedules").len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn public_refresh_joins_background_progress_and_survives_caller_disconnect() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut input = subscription("99414", "共享主播");
+        input.schedule_enabled = false; // No external API requests in this integration fixture.
+        input.avatar_url = Some(String::new());
+        let streamer = store.add_subscription(&input).await.unwrap();
+        let service = AppService::with_analyzer(
+            store,
+            RuntimeSecrets::default(),
+            Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new())),
+        )
+        .unwrap();
+        let held = service.refresh_lock.lock().await;
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .refresh_all_with_progress(move |progress| {
+                    let _ = first_tx.send(progress);
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(progress) = first_rx.recv().await {
+                if progress.stage.contains("等待上一轮刷新") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+        let second_service = service.clone();
+        let second = tokio::spawn(async move {
+            second_service
+                .refresh_streamer_with_progress(streamer.id, move |progress| {
+                    let _ = second_tx.send(progress);
+                })
+                .await
+        });
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let progress = second_rx.recv().await.expect("progress stream open");
+                if progress.stage.contains("已加入") {
+                    break progress;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(joined.stage.contains("全量"));
+        first.abort();
+        let _ = first.await;
+        drop(held);
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(report.failed_streamers.is_empty());
+        let mut saw_completion = false;
+        while let Ok(progress) = second_rx.try_recv() {
+            saw_completion |= progress.done;
+        }
+        assert!(
+            saw_completion,
+            "remaining waiter receives actual completion after leader disconnects"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_request_fingerprint_ignores_runtime_state_but_tracks_inputs() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&subscription("99412", "指纹主播"))
+            .await
+            .unwrap();
+        let service = AppService::with_analyzer(
+            store.clone(),
+            RuntimeSecrets::default(),
+            Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new())),
+        )
+        .unwrap();
+        let key = service.refresh_request_key(None).await.unwrap();
+        store
+            .record_refresh_result(streamer.id, None)
+            .await
+            .unwrap();
+        assert_eq!(service.refresh_request_key(None).await.unwrap(), key);
+        sqlx::query("UPDATE streamers SET name='新名字' WHERE id=?")
+            .bind(streamer.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let renamed = service.refresh_request_key(None).await.unwrap();
+        assert_ne!(renamed, key);
+        service
+            .llm_key_binding
+            .write()
+            .await
+            .replace(("new-secret".to_owned(), "https://example.com/v1".to_owned()));
+        let changed_key = service.refresh_request_key(None).await.unwrap();
+        assert_ne!(changed_key, renamed);
+        assert!(!changed_key.contains("new-secret"));
+    }
+
+    #[tokio::test]
+    async fn retry_is_persistent_and_success_clears_it_without_losing_old_sources() {
+        struct RecoveringAnalyzer(AtomicBool);
+        #[async_trait]
+        impl ContentAnalyzer for RecoveringAnalyzer {
+            async fn analyze_post(
+                &self,
+                _config: &LlmConfig,
+                input: &PostAnalysisInput,
+            ) -> AppResult<LlmAnalysis> {
+                if self.0.load(Ordering::SeqCst) {
+                    return Err(AppError::External {
+                        code: "LLM_503".to_owned(),
+                        message: "temporary fixture-key failure".to_owned(),
+                    });
+                }
+                let events = vec![schedule_event(
+                    "恢复歌回",
+                    Some(input.published_at + Duration::days(1)),
+                    &input.author,
+                )];
+                Ok(LlmAnalysis {
+                    raw: events_to_model_json(&events),
+                    events,
+                    source_digest: "fixture".to_owned(),
+                })
+            }
+        }
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&subscription("99413", "恢复主播"))
+            .await
+            .unwrap();
+        let analyzer = Arc::new(RecoveringAnalyzer(AtomicBool::new(true)));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let post = dynamic_post(
+            "recover-post",
+            &streamer.mid,
+            &streamer.name,
+            Utc::now(),
+            "明天歌回",
+            Vec::new(),
+        );
+        let mut pool = test_pool("recover-model");
+        pool.config.api_key = "fixture-key".to_owned();
+        let settings = AppSettings::default();
+        let first = service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&pool),
+            )
+            .await
+            .unwrap();
+        assert!(!first.analysis_errors.is_empty());
+        let (key, raw): (String, String) = sqlx::query_as(
+            "SELECT key,value FROM client_sync_state WHERE key LIKE 'analysis_retry:%'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            !raw.contains("fixture-key"),
+            "credentials must be redacted from persisted errors"
+        );
+        analyzer.0.store(false, Ordering::SeqCst);
+        // A fresh service object still observes the persisted deadline.
+        let second_service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer).unwrap();
+        let waiting = second_service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.deferred_analyses, 1);
+        assert_eq!(waiting.llm_calls, 0);
+        assert!(waiting
+            .analysis_errors
+            .values()
+            .all(|message| message.contains("暂缓重试")));
+        assert_eq!(
+            store.get_client_sync_state(&key).await.unwrap().unwrap(),
+            raw,
+            "skip does not extend deadline"
+        );
+        let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        state["next_retry_at"] = json!((Utc::now() - Duration::seconds(1)).to_rfc3339());
+        store
+            .set_client_sync_state(&key, &state.to_string())
+            .await
+            .unwrap();
+        let recovered = second_service
+            .process_source_posts(
+                &streamer.mid,
+                std::slice::from_ref(&streamer),
+                std::slice::from_ref(&post),
+                &settings,
+                Some(&pool),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.llm_calls, 1);
+        assert!(recovered.analysis_errors.is_empty());
+        assert!(store.get_client_sync_state(&key).await.unwrap().is_none());
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

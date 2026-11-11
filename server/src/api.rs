@@ -67,6 +67,14 @@ pub(crate) struct ApiError {
 impl From<AppError> for ApiError {
     fn from(value: AppError) -> Self {
         let status = match &value {
+            AppError::Shared { code, .. } => match *code {
+                "VALIDATION_ERROR" | "URL_ERROR" => StatusCode::BAD_REQUEST,
+                "REMOTE_UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
+                "NOT_FOUND" => StatusCode::NOT_FOUND,
+                "NOT_CONFIGURED" => StatusCode::SERVICE_UNAVAILABLE,
+                "DATABASE_ERROR" | "IO_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_GATEWAY,
+            },
             AppError::Validation(_) | AppError::Url(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -455,7 +463,8 @@ fn publish_job_progress(state: &AppState, job: &RefreshJob) {
 }
 
 async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
-    let registration = state.jobs.create_all();
+    let request_key = state.service.refresh_request_key(None).await?;
+    let registration = state.jobs.create_all_with_key(request_key);
     let accepted = RefreshJobAccepted::from(&registration);
     if registration.created {
         publish_job_progress(&state, &registration.job);
@@ -515,9 +524,11 @@ async fn refresh_job_all(State(state): State<AppState>) -> ApiResult {
 
 async fn refresh_job_streamer(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
     let streamer = state.service.store().get_streamer(id).await?;
-    let registration = state
-        .jobs
-        .create_streamer(streamer.id, streamer.name.clone());
+    let request_key = state.service.refresh_request_key(Some(streamer.id)).await?;
+    let registration =
+        state
+            .jobs
+            .create_streamer_with_key(streamer.id, streamer.name.clone(), request_key);
     let accepted = RefreshJobAccepted::from(&registration);
     if registration.created {
         publish_job_progress(&state, &registration.job);

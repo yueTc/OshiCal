@@ -4,6 +4,10 @@ pub type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// A refresh result shared across waiters retains the original API code.
+    #[error("{message}")]
+    Shared { code: &'static str, message: String },
+
     #[error("数据库错误: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -38,6 +42,7 @@ pub enum AppError {
 impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Shared { code, .. } => code,
             Self::Database(_) => "DATABASE_ERROR",
             Self::Http(_) => "NETWORK_ERROR",
             Self::Json(_) => "JSON_ERROR",
