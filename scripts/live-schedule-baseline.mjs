@@ -21,4 +21,5 @@ try {
   assert.match(output, /AssertionError/);
   assert.match(output, /# fail [1-9]/);
   console.log("Confirmed original code fails the same retained regression suite.");
+  console.log("::notice title=Pre-fix regression evidence::Same retained suite reproduced " + output.match(/# fail (\d+)/)[1] + " assertion failures on shipped pre-fix source.");
 } finally { rmSync(dir, { recursive: true, force: true }); }

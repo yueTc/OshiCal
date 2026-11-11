@@ -94,6 +94,8 @@ jobs:
         run: |
           cargo test --workspace --locked --no-fail-fast 2>&1 | Tee-Object -Variable testOutput
           $testExit = $LASTEXITCODE
+          $summaries = @($testOutput | Where-Object { $_ -match '^test result:' }) -join '; '
+          if ($summaries) { Write-Host "::notice title=Rust test totals::$summaries" }
           if ($testExit -ne 0) {
             $failures = $testOutput | Select-String -Pattern 'FAILED|panicked at|assertion|error\[E[0-9]+\]' -Context 0,6
             foreach ($failure in $failures) {

@@ -195,6 +195,7 @@ try {
   results.push("绑定卡片删除/未加载时不高亮昨天或其他卡片；页面无异常");
   await writeFile(join(out, "result.json"), JSON.stringify({ results, pageErrors, requests }, null, 2));
   console.log(JSON.stringify({ uiChecksPassed: results.length, results }, null, 2));
+  console.log("::notice title=Broadcast card UI::" + results.length + " real App interaction groups passed: " + results.join("; "));
 } catch (error) {
   await page.screenshot({ path: join(out, "failure.png"), fullPage: true }).catch(() => {});
   await writeFile(join(out, "failure.txt"), String(error) + "\n" + await page.locator("body").innerText());

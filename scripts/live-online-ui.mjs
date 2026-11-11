@@ -185,6 +185,7 @@ try {
   results.push("窄屏布局与无页面异常通过");
   await writeFile(join(out, "result.json"), JSON.stringify({ results, requests, pageErrors }, null, 2));
   console.log(JSON.stringify({ uiChecksPassed: results.length, results }, null, 2));
+  console.log("::notice title=Live chart UI::" + results.length + " real App interaction groups passed: " + results.join("; "));
 } catch (error) {
   await page.screenshot({ path: join(out, "failure.png"), fullPage: true }).catch(() => {});
   await writeFile(join(out, "failure.txt"), String(error) + "\n" + await page.locator("body").innerText());
