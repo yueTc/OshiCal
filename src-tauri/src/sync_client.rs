@@ -3166,4 +3166,68 @@ mod tests {
         delete_offline_schedule(&store, removable.id).await.unwrap();
         assert!(store.get_schedule(removable.id).await.is_err());
     }
+    #[tokio::test]
+    async fn live_schedule_binding_survives_bootstrap_and_incremental_deletion() {
+        let source = SqliteStore::in_memory().await.unwrap();
+        let input: oshical_core::models::AddSubscription = serde_json::from_value(json!({
+            "mid":"100","name":"直播绑定主播","roomId":"12345" }))
+        .unwrap();
+        let owner = source.add_subscription(&input).await.unwrap();
+        let now = Utc::now();
+        let snapshot = oshical_core::models::LiveSnapshot {
+            is_live: true,
+            title: "无预告直播".into(),
+            cover_url: None,
+            live_url: Some("https://live.bilibili.com/12345".into()),
+            online: 0,
+            started_at: Some(now),
+            checked_at: now,
+        };
+        source.set_live_status(owner.id, &snapshot).await.unwrap();
+        let session = source
+            .ensure_broadcast_live_session(owner.id, "直播", None, now)
+            .await
+            .unwrap();
+        let schedule_id = session.schedule_id.unwrap();
+        let bootstrap = source.sync_bootstrap().await.unwrap();
+        let cursor = bootstrap.snapshot_revision;
+        let bootstrap: SyncBootstrap =
+            serde_json::from_value(serde_json::to_value(bootstrap).unwrap()).unwrap();
+        let mirror = store().await;
+        apply_bootstrap(&mirror, "https://broadcast.example.com", &bootstrap)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirror.list_live_statuses().await.unwrap()[0].schedule_id,
+            Some(schedule_id)
+        );
+        assert_eq!(
+            mirror
+                .get_live_session(session.id)
+                .await
+                .unwrap()
+                .schedule_id,
+            Some(schedule_id)
+        );
+        source.delete_schedule(schedule_id).await.unwrap();
+        let changes = source.sync_changes_after(cursor, 200).await.unwrap();
+        let batch: SyncBatch =
+            serde_json::from_value(serde_json::to_value(changes).unwrap()).unwrap();
+        apply_batch(&mirror, "https://broadcast.example.com", &batch)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirror.list_live_statuses().await.unwrap()[0].schedule_id,
+            None
+        );
+        assert_eq!(
+            mirror
+                .get_live_session(session.id)
+                .await
+                .unwrap()
+                .schedule_id,
+            None
+        );
+        assert!(mirror.get_schedule(schedule_id).await.is_err());
+    }
 }

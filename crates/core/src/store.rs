@@ -1534,8 +1534,7 @@ impl SqliteStore {
             if unchanged {
                 self.attach_schedule_source_on(tx, existing_id, input, SyncActor::collector())
                     .await?;
-                tx.commit().await?;
-                return Ok((self.get_schedule(existing_id).await?, false));
+                return Ok((existing_id, false));
             }
             let now = Utc::now().to_rfc3339();
             let manual_locked: i64 =
@@ -2681,6 +2680,21 @@ impl SqliteStore {
             }
         }
         self.clear_live_schedule_status_on(tx, id, actor).await?;
+        let sessions: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM live_sessions WHERE schedule_id=?")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        sqlx::query(
+            "UPDATE live_sessions SET schedule_id=NULL, revision=revision+1 WHERE schedule_id=?",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        for session in sessions {
+            self.emit_live_session_change(tx, session, "upsert", actor)
+                .await?;
+        }
         if source_kind != "manual" {
             let mut suppressions = Vec::new();
             if let (Some(post_id), Some(fingerprint)) =

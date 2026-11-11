@@ -45,7 +45,7 @@ impl SqliteStore {
         snapshot: &LiveSnapshot,
     ) -> AppResult<Option<LiveBroadcast>> {
         let prior: Option<LiveBroadcast> = sqlx::query_as(
-            "SELECT * FROM live_broadcasts WHERE streamer_id = ? ORDER BY rowid DESC LIMIT 1",
+            "SELECT * FROM live_broadcasts WHERE streamer_id = ? ORDER BY julianday(last_seen_at) DESC, julianday(started_at) DESC, rowid DESC LIMIT 1",
         )
         .bind(streamer_id)
         .fetch_optional(&mut *tx)
@@ -269,7 +269,7 @@ impl SqliteStore {
         checked: DateTime<Utc>,
     ) -> AppResult<LiveSession> {
         let broadcast: LiveBroadcast = sqlx::query_as(
-            "SELECT * FROM live_broadcasts WHERE streamer_id=? ORDER BY rowid DESC LIMIT 1",
+            "SELECT * FROM live_broadcasts WHERE streamer_id=? ORDER BY julianday(last_seen_at) DESC, julianday(started_at) DESC, rowid DESC LIMIT 1",
         )
         .bind(streamer_id)
         .fetch_one(&self.pool)
@@ -837,5 +837,316 @@ mod tests {
         store.pool.close().await;
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn same_platform_start_and_network_failures_do_not_split_a_long_broadcast() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let first = status(&store).await.schedule_id;
+        store
+            .record_streamer_error(owner.id, "请求超时")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_live_broadcasts().await.unwrap()[0].offline_since,
+            None
+        );
+        store
+            .set_live_status(
+                owner.id,
+                &snapshot(None, time() + Duration::hours(1), false),
+            )
+            .await
+            .unwrap();
+        store
+            .set_live_status(
+                owner.id,
+                &snapshot(Some(time()), time() + Duration::hours(2), true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status(&store).await.schedule_id, first);
+        assert_eq!(store.list_live_broadcasts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transaction_rolls_back_state_card_sources_and_events_together() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        let before = store.latest_event_seq().await.unwrap();
+        let mut event = snapshot(Some(time()), time(), true);
+        event.live_url = Some("javascript:alert(1)".into());
+        assert!(store.set_live_status(owner.id, &event).await.is_err());
+        assert!(store.list_all_schedules().await.unwrap().is_empty());
+        assert!(store.list_live_broadcasts().await.unwrap().is_empty());
+        assert!(!status(&store).await.is_live);
+        assert_eq!(store.latest_event_seq().await.unwrap(), before);
+        let sources: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_sources")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(sources, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_natural_key_is_not_resurrected_and_owned_cards_are_not_reused() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        let mut input = schedule(owner.id, time());
+        input.title = "无预告直播".into();
+        let cancelled = store.upsert_schedule(&input).await.unwrap().0;
+        store.cancel_schedule(cancelled.id).await.unwrap();
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let first = status(&store).await.schedule_id.unwrap();
+        assert_ne!(first, cancelled.id);
+        assert!(store.get_schedule(cancelled.id).await.unwrap().cancelled);
+        store
+            .set_live_status(
+                owner.id,
+                &snapshot(None, time() + Duration::minutes(1), false),
+            )
+            .await
+            .unwrap();
+        let next = time() + Duration::minutes(32);
+        store
+            .set_live_status(owner.id, &snapshot(Some(next), next, true))
+            .await
+            .unwrap();
+        let second = status(&store).await.schedule_id.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(store.list_live_broadcasts().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reused_previews_are_selected_by_distance_then_time_then_id() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        let later = store
+            .upsert_schedule(&schedule(owner.id, time() + Duration::minutes(10)))
+            .await
+            .unwrap()
+            .0;
+        let earlier = store
+            .upsert_schedule(&schedule(owner.id, time() - Duration::minutes(10)))
+            .await
+            .unwrap()
+            .0;
+        let mut duplicate = schedule(owner.id, earlier.start_at);
+        duplicate.title = "同一时间另一预告".into();
+        let duplicate = store.upsert_schedule(&duplicate).await.unwrap().0;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        assert!(earlier.id < duplicate.id);
+        assert_ne!(earlier.id, later.id);
+        assert_eq!(status(&store).await.schedule_id, Some(earlier.id));
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn statistics_reconnect_preserves_counters_and_emits_schedule_ownership() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let first = store
+            .ensure_broadcast_live_session(owner.id, "直播", None, time())
+            .await
+            .unwrap();
+        store
+            .update_live_session_stats(
+                first.id,
+                &LiveSessionStats {
+                    danmaku_count: 786,
+                    revenue_cents: 21670,
+                    data_quality: "partial".into(),
+                    collector_state: "active".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ended = time() + Duration::minutes(5);
+        store
+            .set_live_status(owner.id, &snapshot(None, ended, false))
+            .await
+            .unwrap();
+        store
+            .finish_open_live_session(first.id, ended)
+            .await
+            .unwrap();
+        let resumed = ended + Duration::minutes(29);
+        store
+            .set_live_status(owner.id, &snapshot(Some(resumed), resumed, true))
+            .await
+            .unwrap();
+        let second = store
+            .ensure_broadcast_live_session(owner.id, "直播", None, resumed)
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.danmaku_count, 786);
+        assert_eq!(second.revenue_cents, 21670);
+        let bootstrap = store.sync_bootstrap().await.unwrap();
+        assert_eq!(bootstrap.live_statuses[0].schedule_id, second.schedule_id);
+        assert_eq!(bootstrap.live_sessions[0].schedule_id, second.schedule_id);
+    }
+
+    async fn exported(store: &SqliteStore) -> ServerSnapshot {
+        let bootstrap = store.sync_bootstrap().await.unwrap();
+        ServerSnapshot {
+            schema_version: SERVER_SNAPSHOT_SCHEMA_VERSION,
+            subscriptions: bootstrap.subscriptions,
+            schedules: bootstrap.schedules,
+            weekly_rules: bootstrap.weekly_rules,
+            weekly_exceptions: bootstrap.weekly_exceptions,
+            schedule_sources: bootstrap.schedule_sources,
+            source_suppressions: bootstrap.source_suppressions,
+            live_broadcasts: store.list_live_broadcasts().await.unwrap(),
+            latest_event_seq: store.latest_event_seq().await.unwrap(),
+            exported_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip_remaps_ids_and_retains_deleted_card_suppression() {
+        for deleted in [false, true] {
+            let source = SqliteStore::in_memory().await.unwrap();
+            let owner = owner(&source).await;
+            source
+                .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+                .await
+                .unwrap();
+            let original = status(&source).await.schedule_id.unwrap();
+            if deleted {
+                source.delete_schedule(original).await.unwrap();
+            }
+            let snapshot_data = exported(&source).await;
+            let target = SqliteStore::in_memory().await.unwrap();
+            let filler: AddSubscription =
+                serde_json::from_value(json!({"mid":"999","name":"占位主播"})).unwrap();
+            let filler = target.add_subscription(&filler).await.unwrap();
+            target
+                .upsert_schedule(&schedule(filler.id, time()))
+                .await
+                .unwrap();
+            target
+                .import_snapshot(&snapshot_data, "server", "https://fixture.invalid")
+                .await
+                .unwrap();
+            let imported = target
+                .list_streamers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.mid == "100")
+                .unwrap();
+            assert_ne!(imported.id, owner.id);
+            let states = target.list_live_broadcasts().await.unwrap();
+            assert_eq!(states[0].id, snapshot_data.live_broadcasts[0].id);
+            assert_eq!(states[0].streamer_id, imported.id);
+            if deleted {
+                assert_eq!(states[0].schedule_id, None);
+            } else {
+                assert_ne!(states[0].schedule_id, Some(original));
+            }
+            target
+                .set_live_status(
+                    imported.id,
+                    &snapshot(Some(time()), time() + Duration::minutes(1), true),
+                )
+                .await
+                .unwrap();
+            let rows = target.list_all_schedules().await.unwrap();
+            assert_eq!(rows.len(), if deleted { 1 } else { 2 });
+            assert_eq!(target.list_live_broadcasts().await.unwrap().len(), 1);
+            assert_eq!(
+                target
+                    .list_live_statuses()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.streamer_id == imported.id)
+                    .unwrap()
+                    .schedule_id,
+                states[0].schedule_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_validation_legacy_defaults_and_state_digest_cover_broadcasts() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let snapshot_data = exported(&store).await;
+        let mut legacy = serde_json::to_value(&snapshot_data).unwrap();
+        legacy.as_object_mut().unwrap().remove("liveBroadcasts");
+        assert!(serde_json::from_value::<ServerSnapshot>(legacy)
+            .unwrap()
+            .live_broadcasts
+            .is_empty());
+        let before = store.migration_state_digest().await.unwrap();
+        sqlx::query("UPDATE live_broadcasts SET segment_count=2")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_ne!(before, store.migration_state_digest().await.unwrap());
+        let mut invalid = snapshot_data;
+        invalid.live_broadcasts[0].schedule_id = Some(99999);
+        let target = SqliteStore::in_memory().await.unwrap();
+        assert!(target
+            .import_snapshot(&invalid, "server", "https://fixture.invalid")
+            .await
+            .is_err());
+        assert!(target.list_streamers().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_conflict_policy_matches_existing_server_client_semantics() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let mut snapshot_data = exported(&store).await;
+        snapshot_data.live_broadcasts[0].segment_count = 9;
+        assert!(store
+            .preview_snapshot(&snapshot_data)
+            .await
+            .unwrap()
+            .conflicts
+            .iter()
+            .any(|c| c.entity == "live_broadcast"));
+        store
+            .import_snapshot(&snapshot_data, "client", "https://fixture.invalid")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_live_broadcasts().await.unwrap()[0].segment_count,
+            1
+        );
+        store
+            .import_snapshot(&snapshot_data, "server", "https://fixture.invalid")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_live_broadcasts().await.unwrap()[0].segment_count,
+            9
+        );
     }
 }

@@ -661,6 +661,36 @@ impl SqliteStore {
             }
         }
 
+        let broadcasts = self.list_live_broadcasts().await?;
+        for remote in &snapshot.live_broadcasts {
+            if let Some(local) = broadcasts.iter().find(|local| local.id == remote.id) {
+                let mut local_value = serde_json::to_value(local)?;
+                let mut remote_value = serde_json::to_value(remote)?;
+                // Database-local references are deliberately compared through their content below.
+                local_value.as_object_mut().unwrap().remove("streamerId");
+                remote_value.as_object_mut().unwrap().remove("streamerId");
+                local_value["scheduleId"] = schedule_reference(
+                    local
+                        .schedule_id
+                        .and_then(|id| schedules.iter().find(|s| s.id == id)),
+                );
+                remote_value["scheduleId"] = schedule_reference(
+                    remote
+                        .schedule_id
+                        .and_then(|id| snapshot.schedules.iter().find(|s| s.id == id)),
+                );
+                if local_value != remote_value {
+                    conflicts.push(ImportConflict {
+                        entity: "live_broadcast".into(),
+                        label: format!("直播场次 {}", remote.id),
+                        local_id: local.streamer_id,
+                        remote_id: remote.streamer_id,
+                        local: local_value,
+                        remote: remote_value,
+                    });
+                }
+            }
+        }
         Ok(ImportPreview {
             subscriptions: snapshot.subscriptions.len(),
             schedules: snapshot.schedules.len(),
@@ -1566,7 +1596,7 @@ async fn import_snapshot_on(
                 .bind(&remote.id)
                 .fetch_one(&mut **tx)
                 .await?;
-        if exists && strategy != "client" {
+        if exists && strategy != "server" {
             continue;
         }
         let occupied: bool = sqlx::query_scalar(
@@ -1577,6 +1607,7 @@ async fn import_snapshot_on(
         .fetch_one(&mut **tx)
         .await?;
         if occupied {
+            report.skipped += 1;
             continue;
         }
         sqlx::query("INSERT INTO live_broadcasts (id,streamer_id,room_id,started_at,last_segment_started_at,
