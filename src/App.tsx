@@ -2370,6 +2370,15 @@ export default function App() {
         }
         return localApi.refreshFans(streamerId);
       },
+      liveSessions: async (streamerId: number, limit: number) => {
+        if (serverMode) {
+          if (!serverApi) throw new Error("服务器未连接");
+          return serverApi.liveSessions(streamerId, limit);
+        }
+        if (!localApi) throw new Error("本地 API 不可用");
+        return localApi.liveSessions(streamerId, limit);
+      },
+      liveOnlineSamples: scheduleActions.liveOnlineSamples,
       fertility: async (refresh: boolean): Promise<FertilitySnapshot> => {
         if (serverMode) {
           if (!serverApi) {
@@ -2437,7 +2446,7 @@ export default function App() {
         await localApi.deleteWeeklyRule(id);
       },
     };
-  }, [applyRefreshProgress, serverApi, settings.dataMode, subscriptions]);
+  }, [scheduleActions.liveOnlineSamples, applyRefreshProgress, serverApi, settings.dataMode, subscriptions]);
 
   async function handleCreatorChanged() {
     try {

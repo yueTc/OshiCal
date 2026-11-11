@@ -2770,3 +2770,22 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .online-chart-heading h3 { font-size: 15px; }
   .online-chart-panel { gap: 12px; }
 }
+
+/* 主播库：更多菜单与真实直播场次卡片，沿用日程卡片和主题变量。 */
+.creator-more-menu { min-width: min(200px, calc(100vw - 16px)); }
+.recent-lives-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.recent-lives-head .form-hint { flex: 1; margin: 0; }
+.recent-lives-head .icon-button { flex-shrink: 0; }
+.recent-lives-list { display: grid; gap: 12px; }
+.recent-live-card { width: 100%; grid-template-columns: 86px 42px minmax(0, 1fr) 20px; color: var(--text); text-align: left; cursor: pointer; }
+.recent-live-card:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.recent-live-content { display: grid; gap: 5px; }
+.recent-live-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 1.4; }
+.recent-live-ended { color: var(--faint); white-space: nowrap; }
+.recent-live-link { display: inline-flex; align-items: center; gap: 5px; color: var(--primary-strong); font-size: 11px; }
+.recent-live-arrow { color: var(--faint); }
+@media (max-width: 540px) {
+  .recent-live-card { grid-template-columns: 70px 32px minmax(0, 1fr) 16px; gap: 8px; padding: 12px 9px; }
+  .recent-live-card .avatar-md { width: 32px; height: 32px; }
+  .recent-live-card .schedule-time { font-size: 15px; }
+}

@@ -45,6 +45,8 @@ const yesterday = { ...schedule, id: 2, title: "昨天的直播", startAt: iso(s
 let schedules = [yesterday];
 let currentLive = { ...live, isLive: false, scheduleId: null };
 let sessions = [];
+let recentScenario = "normal";
+let recentDelay = 0;
 let sequence = 1;
 const changes = [];
 let scenario = "normal";
@@ -73,6 +75,13 @@ const server = createServer(async (req, res) => {
       if (url.pathname === "/api/settings") return send(settings);
       if (url.pathname === "/api/secrets/llm") return send({ apiKey: "", configured: false });
       if (url.pathname === "/api/bilibili/status") return send({ configured: false });
+      if (url.pathname === "/api/live-sessions") {
+        requests.push({ recentStreamer: url.searchParams.get("streamerId"), recentLimit: url.searchParams.get("limit") });
+        const result = recentScenario === "empty" ? [] : sessions;
+        const failed = recentScenario === "error";
+        if (recentDelay) await new Promise((done) => setTimeout(done, recentDelay));
+        return failed ? send("模拟最近直播读取失败", 503) : send(result);
+      }
       if (url.pathname.startsWith("/api/live-sessions/by-schedule/")) {
         requests.push({ scheduleLookup: url.pathname });
         return send(url.pathname.endsWith("/1") ? session : null);
@@ -197,6 +206,87 @@ try {
   assert.equal(await page.locator(".schedule-card.is-live").count(), 0);
   assert.deepEqual(pageErrors, []);
   results.push("绑定卡片删除/未加载时不高亮昨天或其他卡片；页面无异常");
+  // The creator-library entry must use the real session, not a nearby schedule lookup.
+  await page.getByRole("button", { name: "主播库", exact: true }).click();
+  const more = page.getByRole("button", { name: `${streamer.name} 的更多操作`, exact: true });
+  const moreMenu = page.getByRole("menu", { name: `${streamer.name} 的更多操作`, exact: true });
+  await more.waitFor();
+  assert.equal(await page.getByRole("button", { name: `设置 ${streamer.name} 的固定周表`, exact: true }).count(), 0);
+  await more.click();
+  await moreMenu.waitFor();
+  assert.deepEqual(await moreMenu.getByRole("menuitem").allTextContents(), ["设定周表", "设置别名", "查看最近直播"]);
+  await more.click();
+  await moreMenu.waitFor({ state: "hidden" });
+  await more.click();
+  await page.keyboard.press("End");
+  assert.equal(await moreMenu.getByRole("menuitem", { name: "查看最近直播", exact: true }).evaluate((el) => el === document.activeElement), true);
+  await page.keyboard.press("Escape");
+  assert.equal(await more.evaluate((el) => el === document.activeElement), true);
+  for (const [entry, title] of [["设定周表", `${streamer.name} 的固定周表`], ["设置别名", `${streamer.name} 的识别别名`]]) {
+    await more.click();
+    await moreMenu.getByRole("menuitem", { name: entry, exact: true }).click();
+    const modal = page.getByRole("dialog", { name: title, exact: true });
+    await modal.waitFor();
+    await modal.getByRole("button", { name: "关闭", exact: true }).click();
+  }
+  results.push("主播库周表与别名移入三点菜单，原对话框保留；重复点击、键盘导航与 Escape 还焦有效");
+  const older = { ...session, id: 8, scheduleId: null, title: "历史直播无日程绑定", startedAt: iso(start - 86400_000),
+    endedAt: iso(start - 80000_000), dataQuality: "complete", reconnectCount: 0, revenueCents: 55500 };
+  sessions = [older, { ...session, streamerId: 999, id: 99 }, session];
+  const openRecent = async () => {
+    await more.click();
+    await moreMenu.getByRole("menuitem", { name: "查看最近直播", exact: true }).click();
+  };
+  await openRecent();
+  const recentDialog = page.getByRole("dialog", { name: `${streamer.name} · 最近直播`, exact: true });
+  await recentDialog.locator(".recent-live-card").first().waitFor();
+  assert.equal(await recentDialog.locator(".recent-live-card").count(), 2);
+  assert.deepEqual(await recentDialog.locator(".recent-live-card").evaluateAll((els) => els.map((el) => el.dataset.sessionId)), ["7", "8"]);
+  const recentRequest = requests.filter((request) => request.recentStreamer).at(-1);
+  assert.equal(recentRequest.recentStreamer, "1");
+  assert.equal(recentRequest.recentLimit, "50");
+  await page.screenshot({ path: join(out, "creator-recent-lives.png"), fullPage: true });
+  await recentDialog.locator('[data-session-id="8"]').click();
+  const stats = page.getByRole("dialog", { name: "直播数据", exact: true });
+  assert.match(await stats.innerText(), /历史直播无日程绑定/);
+  assert.match(await stats.innerText(), /555\.0/);
+  await stats.getByRole("button", { name: "返回最近直播", exact: true }).click();
+  assert.equal(await recentDialog.locator('[data-session-id="8"]').evaluate((el) => el === document.activeElement), true);
+  await recentDialog.locator('[data-session-id="7"]').click();
+  await stats.getByRole("button", { name: "查看最高同时在线人数变化曲线", exact: true }).click();
+  await page.getByRole("img", { name: "本场公开高能用户数变化曲线", exact: true }).waitFor();
+  await page.getByRole("button", { name: "返回最近直播", exact: true }).click();
+  assert.equal(await recentDialog.locator(".recent-live-card").count(), 2);
+  results.push("最近直播仅显示本主播，倒序卡片直接打开对应场次（含无日程绑定场次）；曲线与返回列表有效");
+  recentScenario = "error";
+  await recentDialog.getByRole("button", { name: "刷新最近直播", exact: true }).click();
+  await recentDialog.getByRole("alert").waitFor();
+  recentScenario = "empty";
+  await recentDialog.getByRole("button", { name: "重试", exact: true }).click();
+  await recentDialog.getByRole("heading", { name: "还没有最近直播记录", exact: true }).waitFor();
+  assert.equal(await recentDialog.locator(".recent-live-card").count(), 0);
+  await recentDialog.getByRole("button", { name: "关闭", exact: true }).click();
+  recentScenario = "normal";
+  recentDelay = 250;
+  const delayed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/live-sessions");
+  await openRecent();
+  await recentDialog.getByRole("status").waitFor();
+  await recentDialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await delayed;
+  assert.equal(await page.getByRole("dialog").count(), 0);
+  recentDelay = 0;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await more.click();
+  const menuBounds = await moreMenu.boundingBox();
+  assert.ok(menuBounds.x >= 0 && menuBounds.x + menuBounds.width <= 390);
+  assert.ok(menuBounds.y >= 0 && menuBounds.y + menuBounds.height <= 844);
+  await moreMenu.getByRole("menuitem", { name: "查看最近直播", exact: true }).click();
+  await recentDialog.locator(".recent-live-card").first().waitFor();
+  await page.screenshot({ path: join(out, "creator-recent-lives-mobile.png"), fullPage: true });
+  await page.keyboard.press("Escape");
+  await recentDialog.waitFor({ state: "hidden" });
+  assert.deepEqual(pageErrors, []);
+  results.push("最近直播错误可重试、空态无旧卡片、关闭后延迟响应不重开；窄屏菜单和卡片验收");
   await writeFile(join(out, "result.json"), JSON.stringify({ results, pageErrors, requests }, null, 2));
   console.log(JSON.stringify({ uiChecksPassed: results.length, results }, null, 2));
   console.log("::notice title=Broadcast card UI::" + results.length + " real App interaction groups passed: " + results.join("; "));

@@ -9,6 +9,8 @@ import {
   ExternalLink,
   GripVertical,
   Link2,
+  MoreHorizontal,
+  History,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -47,6 +49,7 @@ import {
 } from "../lib/fertility";
 import { localDateKey } from "../lib/dates";
 import { Avatar, EmptyState, ErrorBanner, Modal, Toggle } from "./ui";
+import { CreatorRecentLives, type RecentLiveActions } from "./CreatorRecentLives";
 
 const A_SOUL_OFFICIAL_MID = "703007996";
 const A_SOUL_MEMBER_MIDS = new Set(["672342685", "672328094", "672353429"]);
@@ -60,7 +63,7 @@ const WEEKDAYS = [
   { bit: 64, label: "日", full: "周日" },
 ];
 
-interface CreatorActions {
+interface CreatorActions extends RecentLiveActions {
   search: (keyword: string) => Promise<AccountSearchResult[]>;
   add: (account: AccountSearchResult) => Promise<Streamer>;
   update: (id: number, update: UpdateSubscriptionInput) => Promise<Streamer>;
@@ -306,6 +309,10 @@ export default function CreatorsView({
   const linkTargetIdRef = useRef<number | null>(null);
   const linkQueryRef = useRef("");
   const linkActionBusyRef = useRef(false);
+  const [moreMenu, setMoreMenu] = useState<{ streamer: Streamer; x: number; y: number } | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const [recentTarget, setRecentTarget] = useState<Streamer | null>(null);
   const [aliasTarget, setAliasTarget] = useState<Streamer | null>(null);
   const [aliasText, setAliasText] = useState("");
   const [aliasSaving, setAliasSaving] = useState(false);
@@ -381,6 +388,44 @@ export default function CreatorsView({
       }
     })();
   }, [actions, fertilityEnabled]);
+
+  function closeMoreMenu(returnFocus = false) {
+    setMoreMenu(null);
+    if (returnFocus) moreTriggerRef.current?.focus();
+  }
+
+  useEffect(() => {
+    if (!moreMenu) return;
+    const menu = moreMenuRef.current;
+    if (menu) {
+      const bounds = menu.getBoundingClientRect();
+      menu.style.left = `${Math.max(8, Math.min(moreMenu.x, window.innerWidth - bounds.width - 8))}px`;
+      menu.style.top = `${Math.max(8, Math.min(moreMenu.y, window.innerHeight - bounds.height - 8))}px`;
+      menu.querySelector<HTMLButtonElement>("button")?.focus();
+    }
+    const dismiss = (event: PointerEvent) => {
+      if (event.target instanceof Node && (menu?.contains(event.target) || moreTriggerRef.current?.contains(event.target))) return;
+      setMoreMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMoreMenu(null);
+        moreTriggerRef.current?.focus();
+      }
+    };
+    const dismissOnMove = () => setMoreMenu(null);
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("keydown", escape);
+    window.addEventListener("resize", dismissOnMove);
+    window.addEventListener("scroll", dismissOnMove, true);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("keydown", escape);
+      window.removeEventListener("resize", dismissOnMove);
+      window.removeEventListener("scroll", dismissOnMove, true);
+    };
+  }, [moreMenu]);
 
   const orderedSubscriptions = useMemo(() => {
     if (!optimisticOrder) {
@@ -1304,6 +1349,47 @@ export default function CreatorsView({
         </div>
       ) : null}
 
+      {moreMenu ? (
+        <div id="creator-more-menu" className="context-menu creator-more-menu" ref={moreMenuRef}
+          role="menu" aria-label={`${moreMenu.streamer.name} 的更多操作`}
+          style={{ left: moreMenu.x, top: moreMenu.y }}
+          onBlur={(event) => {
+            if (event.relatedTarget !== moreTriggerRef.current && !event.currentTarget.contains(event.relatedTarget as Node | null)) closeMoreMenu();
+          }}
+          onKeyDown={(event) => {
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button"));
+            const index = items.indexOf(document.activeElement as HTMLButtonElement);
+            const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+              : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+            items[next]?.focus();
+          }}>
+          <button type="button" role="menuitem" onClick={() => {
+            const target = moreMenu.streamer;
+            closeMoreMenu(true);
+            void openWeeklyRules(target);
+          }}><CalendarClock size={16} />设定周表</button>
+          <button type="button" role="menuitem" onClick={() => {
+            const target = moreMenu.streamer;
+            closeMoreMenu(true);
+            openAlias(target);
+          }}><Settings2 size={16} />设置别名</button>
+          <button type="button" role="menuitem" onClick={() => {
+            const target = moreMenu.streamer;
+            closeMoreMenu(true);
+            setRecentTarget(target);
+          }}><History size={16} />查看最近直播</button>
+        </div>
+      ) : null}
+      {recentTarget ? (
+        <CreatorRecentLives key={recentTarget.id} streamer={recentTarget} actions={actions}
+          onClose={() => {
+            setRecentTarget(null);
+            moreTriggerRef.current?.focus();
+          }} />
+      ) : null}
+
       {subscriptions.length === 0 ? (
         <EmptyState title="还没有订阅主播" description="在上方搜索 B 站账号并添加。" />
       ) : (
@@ -1415,14 +1501,6 @@ export default function CreatorsView({
                   </button>
                   <button
                     className="icon-button"
-                    title={`设置 ${streamer.name} 的固定周表`}
-                    aria-label={`设置 ${streamer.name} 的固定周表`}
-                    onClick={() => void openWeeklyRules(streamer)}
-                  >
-                    <CalendarClock size={17} />
-                  </button>
-                  <button
-                    className="icon-button"
                     title={`重新拉取 ${streamer.name} 的日程`}
                     aria-label={`重新拉取 ${streamer.name} 的日程`}
                     onClick={() => void refreshStreamer(streamer)}
@@ -1430,7 +1508,24 @@ export default function CreatorsView({
                   >
                     <RefreshCw className={refreshBusy === streamer.id ? "spin" : ""} size={17} />
                   </button>
-                  <button className="icon-button" title="编辑别名" onClick={() => openAlias(streamer)}><Settings2 size={17} /></button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    title={`${streamer.name} 的更多操作`}
+                    aria-label={`${streamer.name} 的更多操作`}
+                    aria-haspopup="menu"
+                    aria-expanded={moreMenu?.streamer.id === streamer.id}
+                    aria-controls={moreMenu?.streamer.id === streamer.id ? "creator-more-menu" : undefined}
+                    onClick={(event) => {
+                      if (moreMenu?.streamer.id === streamer.id) {
+                        closeMoreMenu(true);
+                        return;
+                      }
+                      const bounds = event.currentTarget.getBoundingClientRect();
+                      moreTriggerRef.current = event.currentTarget;
+                      setMoreMenu({ streamer, x: bounds.right - 200, y: bounds.bottom + 6 });
+                    }}
+                  ><MoreHorizontal size={17} /></button>
                   <button className="icon-button danger" title="删除主播" onClick={() => void removeStreamer(streamer)}><Trash2 size={17} /></button>
                 </div>
                 {streamer.lastError ? <p className="inline-error">{streamer.lastError}</p> : null}

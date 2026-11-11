@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties } from "react";
 import type { PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent } from "react";
 import { flushSync } from "react-dom";
-import { LiveOnlineChart } from "./LiveOnlineChart";
+import { LiveDataModal } from "./LiveDataModal";
 import { differenceInCalendarDays } from "date-fns";
 import {
   ChevronLeft,
@@ -13,7 +13,6 @@ import {
   Grid3X3,
   GripVertical,
   List,
-  LoaderCircle,
   Minus,
   MonitorPlay,
   MoreHorizontal,
@@ -41,83 +40,6 @@ import { useStickyHeader } from "../lib/sticky-header";
 import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
 import { Avatar, EmptyState, ErrorBanner, Modal, SubscriptionSelect } from "./ui";
 
-function formatLiveDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.max(0, seconds)}s`;
-  const hours = seconds / 3600;
-  if (hours >= 1) return `${hours.toFixed(1)}h`;
-  return `${Math.max(1, Math.round(seconds / 60))}m`;
-}
-
-function formatMoney(cents: number): string {
-  return `¥${(cents / 100).toFixed(1)}`;
-}
-
-function formatCount(value: number): string {
-  if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
-  return value.toLocaleString("zh-CN");
-}
-
-function formatLiveTime(value: string): string {
-  return new Date(value).toLocaleString("zh-CN", {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function liveCollectionFailed(session: LiveSession): boolean {
-  return session.reconnectCount > 0
-    && session.peakHighEnergy === 0
-    && session.danmakuCount === 0
-    && session.giftCount === 0
-    && session.superChatCount === 0
-    && session.guardCount === 0;
-}
-
-// @decision LIVE-QUALITY-1 “部分缺失”是整场标记：任意一次掉线重连、任意一个无法解析的
-// 弹幕包、任意一条缺少 UID 的礼物都会把整场降级，所以徽标必须带上原因，否则用户只会看到
-// 一堆正常数字旁边挂着一个没有解释的“部分缺失”。
-// 断流重开现在会并回同一场（segmentCount > 1），这同样是一次真实的数据空洞，要一起报出来。
-function liveInterruptions(session: LiveSession): number {
-  return Math.max(0, (session.segmentCount ?? 1) - 1);
-}
-
-function liveQualityLabel(session: LiveSession): string {
-  if (liveCollectionFailed(session)) return "采集失败";
-  if (session.dataQuality === "complete") return "数据完整";
-  if (session.dataQuality === "partial") {
-    const reasons: string[] = [];
-    if (session.reconnectCount > 0) reasons.push(`重连 ${session.reconnectCount} 次`);
-    const interruptions = liveInterruptions(session);
-    if (interruptions > 0) reasons.push(`断流 ${interruptions} 次`);
-    return reasons.length > 0 ? `部分缺失 · ${reasons.join(" · ")}` : "部分缺失";
-  }
-  return "采集中";
-}
-
-function liveQualityDetail(session: LiveSession): string {
-  if (liveCollectionFailed(session)) {
-    return "弹幕连接始终没有建立：营收、付费人数、互动人数和弹幕不可用，时长仍来自直播状态轮询。";
-  }
-  if (session.dataQuality === "complete") return "弹幕采集全程在线，事件类指标完整。";
-  if (session.dataQuality === "partial") {
-    const reasons: string[] = [];
-    if (session.reconnectCount > 0) reasons.push(`重连 ${session.reconnectCount} 次`);
-    const interruptions = liveInterruptions(session);
-    if (interruptions > 0) {
-      reasons.push(`断流重开 ${interruptions} 次（已合并为同一场，共 ${session.segmentCount} 段）`);
-    }
-    if (reasons.length > 0) {
-      return `采集期间${reasons.join("、")}，断线窗口内的弹幕和礼物可能没有被计入，数值偏保守。`;
-    }
-    if (session.collectorState === "active" || session.collectorState === "reconnecting") {
-      return "采集端仍在统计这场直播，数字会继续增长。";
-    }
-    return "采集过程中出现过无法解析的数据包或缺少 UID 的事件，个别指标可能偏低。";
-  }
-  return "采集端正在统计，直播结束后给出完整度。";
-}
 type ViewMode = "timeline" | "grid";
 
 const CALENDAR_BUFFER_BEFORE = 14;
@@ -276,8 +198,6 @@ export default function ScheduleView({
   const [draft, setDraft] = useState<Draft | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
   const [menu, setMenu] = useState<{ schedule: Schedule; x: number; y: number } | null>(null);
-  const [onlineChartOpen, setOnlineChartOpen] = useState(false);
-  const peakCardRef = useRef<HTMLButtonElement>(null);
   const [liveModal, setLiveModal] = useState<{
     schedule: Schedule;
     session: LiveSession | null;
@@ -1038,13 +958,11 @@ export default function ScheduleView({
   }
 
   function closeLiveData() {
-    setOnlineChartOpen(false);
     liveRequestRef.current += 1;
     setLiveModal(null);
   }
 
   async function openLiveData(schedule: Schedule) {
-    setOnlineChartOpen(false);
     const requestId = ++liveRequestRef.current;
     setMenu(null);
     setLiveModal({ schedule, session: null, loading: true });
@@ -1401,7 +1319,6 @@ export default function ScheduleView({
   const rangeText = rangeDays.length === 1
     ? `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日`
     : `${rangeDays[0].getMonth() + 1}月${rangeDays[0].getDate()}日 - ${rangeDays[rangeDays.length - 1].getMonth() + 1}月${rangeDays[rangeDays.length - 1].getDate()}日`;
-  const liveEventsUnavailable = liveModal?.session ? liveCollectionFailed(liveModal.session) : false;
   const menuProfileMid = menu ? resolveProfileMid(menu.schedule) : null;
 
   return (
@@ -1682,70 +1599,16 @@ export default function ScheduleView({
       ) : null}
 
       {liveModal ? (
-        <Modal
-          title={onlineChartOpen ? "同接变化" : "直播数据"}
+        <LiveDataModal
+          key={liveModal.schedule.id}
+          session={liveModal.session}
+          loading={liveModal.loading}
+          streamerAvatar={liveModal.schedule.streamerAvatar}
+          streamerName={liveModal.schedule.streamerName}
+          title={liveModal.schedule.title}
+          loadPage={actions.liveOnlineSamples}
           onClose={closeLiveData}
-          wide
-          className={onlineChartOpen ? "online-chart-modal" : undefined}
-        >
-          {liveModal.loading ? (
-            <div className="live-stats-loading"><LoaderCircle className="spin" size={24} />正在读取直播数据…</div>
-          ) : liveModal.session && onlineChartOpen ? (
-            <LiveOnlineChart key={liveModal.session.id} session={liveModal.session}
-              loadPage={actions.liveOnlineSamples} onBack={() => {
-                setOnlineChartOpen(false);
-                requestAnimationFrame(() => peakCardRef.current?.focus());
-              }} />
-          ) : liveModal.session ? (
-            <div className="live-stats-panel">
-              <div className="live-stats-head">
-                <Avatar url={liveModal.schedule.streamerAvatar} name={liveModal.schedule.streamerName} size="md" />
-                <div>
-                  <strong>{liveModal.session.title || liveModal.schedule.title}</strong>
-                  <span>
-                    {formatLiveTime(liveModal.session.startedAt)}
-                    {liveModal.session.endedAt ? ` - ${formatLiveTime(liveModal.session.endedAt)}` : " · 直播中"}
-                  </span>
-                </div>
-                <em
-                  className={`live-data-quality ${liveEventsUnavailable ? "failed" : liveModal.session.dataQuality}`}
-                  title={liveQualityDetail(liveModal.session)}
-                >
-                  {liveQualityLabel(liveModal.session)}
-                </em>
-              </div>
-              <div className="live-stat-grid">
-                <div><span>时长</span><strong>{formatLiveDuration(liveModal.session.durationSeconds)}</strong></div>
-                <div><span>营收(估)</span><strong>{liveEventsUnavailable ? "—" : formatMoney(liveModal.session.revenueCents)}</strong></div>
-                <div><span>付费人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.paidUserCount)}</strong></div>
-                <button type="button" ref={peakCardRef} className="live-stat-chart-card"
-                  onClick={() => setOnlineChartOpen(true)} aria-label="查看最高同时在线人数变化曲线"
-                  title="查看公开高能用户数的采样变化曲线">
-                  <span>最高同时在线<ChevronRight size={13} aria-hidden="true" /></span>
-                  <strong>{liveModal.session.peakHighEnergy > 0 ? formatCount(liveModal.session.peakHighEnergy) : "—"}</strong>
-                  <small><BarChart3 size={12} aria-hidden="true" />查看变化曲线</small>
-                </button>
-                <div><span>互动人数(估)</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.interactiveUserCount)}</strong></div>
-                <div><span>弹幕</span><strong>{liveEventsUnavailable ? "—" : formatCount(liveModal.session.danmakuCount)}</strong></div>
-              </div>
-              <div className="live-revenue-breakdown">
-                <span>礼物 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.giftRevenueCents)}</span>
-                <span>SC {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.superChatRevenueCents)}</span>
-                <span>舰长 {liveEventsUnavailable ? "—" : formatMoney(liveModal.session.guardRevenueCents)}</span>
-              </div>
-              {liveEventsUnavailable ? (
-                <p className="form-hint live-stats-error-note">
-                  本次未能建立 B 站弹幕采集连接（重试 {formatCount(liveModal.session.reconnectCount)} 次），事件类指标不可用；时长仍来自直播状态轮询。
-                </p>
-              ) : null}
-            </div>
-          ) : (
-            <EmptyState
-              title="还没有这场直播的数据"
-              description="需要先在设置中开启直播数据统计，并在主播库为对应主播订阅直播数据，直播期间保持采集端运行。"
-            />
-          )}
-        </Modal>
+        />
       ) : null}
       {draft ? (
         <Modal
