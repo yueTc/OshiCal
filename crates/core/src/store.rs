@@ -3498,9 +3498,10 @@ impl SqliteStore {
              WHERE s.id = ?
                AND (ls.schedule_id = s.id OR (
                     ls.schedule_id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM live_broadcasts owned WHERE owned.schedule_id=s.id)
                     AND NOT EXISTS (SELECT 1 FROM live_broadcasts b
                         WHERE b.streamer_id=ls.streamer_id AND b.started_at=ls.started_at)
-                    AND ABS(unixepoch(ls.started_at) - unixepoch(s.start_at)) <= 7200))
+                    AND ABS((julianday(ls.started_at) - julianday(s.start_at)) * 86400.0) <= 7200.0001))
              ORDER BY (ls.schedule_id = s.id) DESC,
                       ABS(unixepoch(ls.started_at) - unixepoch(s.start_at)) ASC,
                       ls.started_at DESC

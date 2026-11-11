@@ -133,9 +133,9 @@ impl SqliteStore {
             let rows = sqlx::query(
                 "SELECT id, room_url, room_owner_mid FROM schedules s
                  WHERE streamer_id = ? AND cancelled = 0
-                   AND ABS(unixepoch(start_at) - unixepoch(?)) <= ?
+                   AND ABS((julianday(start_at) - julianday(?)) * 86400.0) <= ? + 0.0001
                    AND NOT EXISTS (SELECT 1 FROM live_broadcasts b WHERE b.schedule_id = s.id)
-                 ORDER BY ABS(unixepoch(start_at) - unixepoch(?)), unixepoch(start_at), id",
+                 ORDER BY ABS(julianday(start_at) - julianday(?)), julianday(start_at), id",
             )
             .bind(streamer_id)
             .bind(&broadcast.started_at)
@@ -232,8 +232,8 @@ impl SqliteStore {
             "SELECT s.id, st.mid, b.room_id FROM live_broadcasts b
              JOIN schedules s ON s.id=b.schedule_id JOIN streamers st ON st.id=b.streamer_id
              WHERE b.streamer_id=? AND s.source_kind='live' AND s.cancelled=0
-               AND ABS(unixepoch(b.started_at)-unixepoch(?)) <= ?
-             ORDER BY ABS(unixepoch(b.started_at)-unixepoch(?)), unixepoch(b.started_at), s.id",
+               AND ABS((julianday(b.started_at)-julianday(?)) * 86400.0) <= ? + 0.0001
+             ORDER BY ABS(julianday(b.started_at)-julianday(?)), julianday(b.started_at), s.id",
         )
         .bind(input.streamer_id)
         .bind(input.start_at.to_rfc3339())
@@ -1148,5 +1148,74 @@ mod tests {
             store.list_live_broadcasts().await.unwrap()[0].segment_count,
             9
         );
+    }
+    #[tokio::test]
+    async fn two_hour_window_rejects_one_millisecond_outside_on_both_sides() {
+        for millis in [-7200001, -7200000, 7200000, 7200001] {
+            let store = SqliteStore::in_memory().await.unwrap();
+            let owner = owner(&store).await;
+            let card = store
+                .upsert_schedule(&schedule(owner.id, time() + Duration::milliseconds(millis)))
+                .await
+                .unwrap()
+                .0;
+            store
+                .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+                .await
+                .unwrap();
+            assert_eq!(
+                status(&store).await.schedule_id == Some(card.id),
+                millis.abs() <= 7200000,
+                "{millis}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn statistics_disabled_current_card_does_not_open_nearby_legacy_statistics() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .ensure_live_session(
+                owner.id,
+                "12345",
+                "主播",
+                "上一场",
+                None,
+                time() - Duration::hours(1),
+                time() - Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let id = status(&store).await.schedule_id.unwrap();
+        assert!(store
+            .find_live_session_for_schedule(id)
+            .await
+            .unwrap()
+            .is_none());
+        let legacy = store
+            .upsert_schedule(&schedule(owner.id, time() - Duration::hours(1)))
+            .await
+            .unwrap()
+            .0;
+        assert!(store
+            .find_live_session_for_schedule(legacy.id)
+            .await
+            .unwrap()
+            .is_some());
+        let far = store
+            .upsert_schedule(&schedule(owner.id, time() - Duration::hours(4)))
+            .await
+            .unwrap()
+            .0;
+        assert!(store
+            .find_live_session_for_schedule(far.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
