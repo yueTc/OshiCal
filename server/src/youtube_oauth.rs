@@ -84,7 +84,7 @@ impl From<AppError> for YouTubeError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
             },
             AppError::Shared { code, message } if code.starts_with("YOUTUBE_") => Self {
-                code: code.to_owned(),
+                code: code.to_string(),
                 message: message.clone(),
                 status: youtube_status_from_code(code),
             },
@@ -1057,7 +1057,7 @@ mod tests {
             "YOUTUBE_HTTP_429",
         ] {
             let source = AppError::External {
-                code: code.to_owned(),
+                code: code.to_string(),
                 message: "fixture".to_owned(),
             };
             let converted = YouTubeError::from(source);

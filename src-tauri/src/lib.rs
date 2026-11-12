@@ -4339,9 +4339,8 @@ mod tests {
         empty_changes_page_requires_rebuild, map_error, normalize_mirror_base,
         parse_oauth_callback_target, prepare_forwarded_event, validate_external_url,
         youtube_background_refresh_should_run, youtube_cookie_names_from_header,
-        youtube_cookie_should_be_removed, youtube_oauth_authorization_url,
-        AppUpdateChannel, RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT,
-        APP_UPDATE_STABLE_ENDPOINT,
+        youtube_cookie_should_be_removed, youtube_oauth_authorization_url, AppUpdateChannel,
+        RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
     };
     use crate::sync_client::SyncChange;
     use oshical_core::{AppError, AppSettings};
