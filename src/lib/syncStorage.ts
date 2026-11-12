@@ -195,10 +195,16 @@ function linkedAccountIdentityFromPayload(payload: unknown) {
 function linkedAccountIdentityFromEntityId(entityId: string) {
   const parts = entityId.split(":");
   if (parts.length === 2) {
+    // Historical link tombstones used `streamerId:mid`; those IDs predate
+    // platform-aware entities and can only be interpreted as Bilibili.
     return linkedAccountIdentity(parts[0], parts[1], "bilibili");
   }
   if (parts.length >= 3) {
-    return linkedAccountIdentity(parts[0], parts.slice(2).join(":"), parts[1]);
+    const platform = parts[1].trim().toLowerCase();
+    if (platform !== "bilibili" && platform !== "youtube") {
+      return null;
+    }
+    return linkedAccountIdentity(parts[0], parts.slice(2).join(":"), platform);
   }
   return null;
 }

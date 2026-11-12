@@ -824,8 +824,11 @@ impl SqliteStore {
         } else {
             None
         };
-        // Keep linked-account entity IDs stable across mirror rebuilds.
-        let entity_id = format!("{}:{}", row.streamer_id, row.mid);
+        // Keep linked-account entity IDs stable across mirror rebuilds and
+        // include the platform so a payload-free tombstone cannot be assigned
+        // to the wrong platform by clients.
+        let platform = parse_platform(&row.platform)?;
+        let entity_id = format!("{}:{}:{}", row.streamer_id, platform.as_str(), row.mid);
         append_sync_change_on(
             conn,
             "linked_account",
@@ -2020,32 +2023,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linked_account_changes_use_stable_entity_ids() {
+    async fn linked_account_changes_use_platform_aware_stable_entity_ids() {
         let store = SqliteStore::in_memory().await.expect("store");
-        let streamer = add_streamer(&store, "100", "官号同步主播").await;
-        store
-            .add_linked_account(streamer.id, "200", "官号", "")
+        let bilibili = add_streamer(&store, "100", "B 站官号同步主播").await;
+        let youtube_mid = "UC_youtube-200";
+        let youtube = store
+            .add_subscription(&AddSubscription {
+                platform: Platform::Youtube,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
+                mid: youtube_mid.to_owned(),
+                name: Some("YouTube 官号同步主播".to_owned()),
+                avatar_url: None,
+                room_id: None,
+                aliases: None,
+                schedule_enabled: true,
+                live_notify_enabled: true,
+                live_stats_enabled: false,
+            })
             .await
-            .expect("link");
+            .expect("YouTube streamer");
+
         store
-            .remove_linked_account(streamer.id, "200")
+            .add_linked_account(bilibili.id, "200", "B 站官号", "")
             .await
-            .expect("delete link");
+            .expect("Bilibili link");
+        store
+            .remove_linked_account(bilibili.id, "200")
+            .await
+            .expect("Bilibili delete link");
+        store
+            .add_linked_account_for_platform(
+                youtube.id,
+                Platform::Youtube,
+                youtube_mid,
+                "YouTube 官号",
+                "",
+                None,
+                None,
+            )
+            .await
+            .expect("YouTube link");
+        store
+            .remove_linked_account(youtube.id, youtube_mid)
+            .await
+            .expect("YouTube delete link");
 
         let page = store.sync_changes_after(0, 100).await.expect("changes");
-        let changes: Vec<_> = page
+        let bilibili_changes: Vec<_> = page
             .changes
             .iter()
-            .filter(|change| change.entity_type == "linked_account")
+            .filter(|change| {
+                change.entity_type == "linked_account"
+                    && change
+                        .entity_id
+                        .starts_with(&format!("{}:", bilibili.id))
+            })
             .collect();
-        assert_eq!(changes.len(), 2);
-        let expected = format!("{}:200", streamer.id);
-        assert_eq!(changes[0].entity_id, expected);
-        assert_eq!(changes[0].operation, "upsert");
-        assert!(changes[0].payload.is_some());
-        assert_eq!(changes[1].entity_id, expected);
-        assert_eq!(changes[1].operation, "delete");
-        assert!(changes[1].payload.is_none());
+        let youtube_changes: Vec<_> = page
+            .changes
+            .iter()
+            .filter(|change| {
+                change.entity_type == "linked_account"
+                    && change
+                        .entity_id
+                        .starts_with(&format!("{}:", youtube.id))
+            })
+            .collect();
+
+        let bilibili_expected = format!("{}:bilibili:200", bilibili.id);
+        assert_eq!(bilibili_changes.len(), 2);
+        assert_eq!(bilibili_changes[0].entity_id, bilibili_expected);
+        assert_eq!(bilibili_changes[0].operation, "upsert");
+        assert_eq!(
+            bilibili_changes[0].payload.as_ref().unwrap()["platform"],
+            "bilibili"
+        );
+        assert_eq!(bilibili_changes[1].entity_id, bilibili_expected);
+        assert_eq!(bilibili_changes[1].operation, "delete");
+        assert!(bilibili_changes[1].payload.is_none());
+
+        let youtube_expected = format!("{}:youtube:{youtube_mid}", youtube.id);
+        assert_eq!(youtube_changes.len(), 2);
+        assert_eq!(youtube_changes[0].entity_id, youtube_expected);
+        assert_eq!(youtube_changes[0].operation, "upsert");
+        assert_eq!(
+            youtube_changes[0].payload.as_ref().unwrap()["platform"],
+            "youtube"
+        );
+        assert_eq!(youtube_changes[1].entity_id, youtube_expected);
+        assert_eq!(youtube_changes[1].operation, "delete");
+        assert!(youtube_changes[1].payload.is_none());
     }
 
     #[tokio::test]
