@@ -2,8 +2,8 @@
 
 - 状态：只读静态审查、P1 修复和 CI 收口完成；真实 OAuth、Data API、会员 Cookie、SQLite 迁移回滚、Windows ACL、真实 UI 和 B 站完整回归尚未执行
 - 分支：`youtube`
-- 当前审查基准：`e7fa3c9`；历史基准：`f93012b`、`3cd76bc`
-- CI：run `43153298753` 已全绿（提交 `e7fa3c96e3c8af5b94363b2a84703916709e1394`）
+- 当前审查基准：`a2febbe`；历史基准：`f93012b`、`3cd76bc`
+- CI：run `43154607251` 已全绿（提交 `a2febbe6e3c8af5b94363b2a84703916709e1394`）
 - 对应实施计划：`docs/78-youtube-feature-implementation-plan.md`
 - 当前发布结论：CI 门禁通过，stable 仍阻断；beta 可作为外部验收载体，但发布说明与版本门禁仍须完成
 
@@ -23,7 +23,7 @@
 |---|---|
 | 静态实现 | 当前源码中存在对应路径，但未运行 |
 | 测试入口 | 仓库中存在单元/集成测试或 fixture 断言，但未执行 |
-| CI 执行 | 当前 HEAD 已有可核验的 GitHub Actions 运行结果；只证明自动化步骤通过 |
+| CI 执行 | CI 证据提交已有可核验的 GitHub Actions 运行结果；只证明自动化步骤通过 |
 | 真实环境 | 必须连接真实操作系统、浏览器、Google、YouTube 或 SQLite 文件 |
 | 已执行 | 只有拿到可核验的运行链接或日志后才能使用 |
 
@@ -40,7 +40,7 @@
 
 1. **已关闭：账号输入及其他源码 P1 已由 CI 复核。**
    - 生产解析器将显式非 YouTube URL 安全降级为关键词搜索，不访问该 URL，也不把它作为上游请求目标。
-   - `scripts/youtube-fixtures/account-inputs.json`、`scripts/youtube-fixtures/validate-fixtures.mjs` 和 Rust 回归测试已在 run `43153298753` 同时通过。
+   - `scripts/youtube-fixtures/account-inputs.json`、`scripts/youtube-fixtures/validate-fixtures.mjs` 和 Rust 回归测试已在 run `43154607251` 同时通过。
    - 同一轮已修复：带平台的关联账号同步删除事件、桌面 OAuth 刷新/退出竞态、YouTube 社区帖稳定指纹、会员预览图片过滤、YouTube 聊天事件持久去重。
 
 2. **当前桌面版本已有一份与 YouTube 无关的发布说明。**
@@ -58,7 +58,7 @@
 | GAP-ZERO-01 | 总开关关闭后的“全局零外部请求”未验证 | 无入口/未实测 | 路由短路测试和 collector 分页门闩测试不能证明所有后台任务/浏览器路径为零 | 第 8 节代理或请求计数验收通过 |
 | GAP-FIX-01 | 除账号输入外，其余 fixture 未被生产 Rust 测试消费 | 无入口 | 静态 rg 只发现 `account-inputs.json` 被 Rust 读取；Data API、社区、直播、OAuth、legacy 仅由 JS 自检 | 生产解析器读取同一 fixture，或等价的 Rust golden tests 存在并在 CI 执行 |
 | GAP-UI-01 | 没有 YouTube 专用真实 UI 自动化 | 无入口/未实测 | 现有浏览器脚本是既有直播图表和卡片回归，不覆盖 YouTube 设置、凭据和独立卡片全流程 | 第 9 节 UI-001 至 UI-016 在安装包/构建产物上通过 |
-| GAP-CI-01（已关闭） | `youtube` 分支 CI 已触发并通过 | 已执行 | run `43153298753`，提交 `e7fa3c9`，全部步骤成功 | 保持后续提交同样全绿 |
+| GAP-CI-01（已关闭） | `youtube` 分支 CI 已触发并通过 | 已执行 | run `43154607251`，提交 `a2febbe`，全部步骤成功 | 保持后续提交同样全绿 |
 | GAP-COOKIE-01 | 会员社区帖只验证合成 fixture | 无数据/环境不可达 | 真实 YouTube 页面结构与会员登录态未测试 | 有权限/无权限账号各完成一次真实会员帖验收 |
 | GAP-API-01 | 真实 Data API 配额、分页、429、Super Chat continuation 未验收 | 无数据/环境不可达 | 现只有解析器测试和本地统计门闩测试 | 使用专用测试项目和配额预算完成第 7、10 节 |
 | GAP-WIN-01 | Windows 主密钥 ACL、系统浏览器回环回调、WebView Cookie 捕获未验收 | 环境不可达 | 仅有源码路径和局部单元测试 | Windows 构建产物上完成凭据与 OAuth smoke test |
@@ -110,7 +110,7 @@
 | `live-page.json` | 直播/离线/已结束/未知态 | `validate-fixtures.mjs` | 需补 Rust production-parser golden test |
 | `oauth-contract.json` | OAuth 能力矩阵 | `validate-fixtures.mjs` | 不是服务端 OAuth 集成测试 |
 | `legacy-bilibili.json` | 旧列集默认平台契约 | `validate-fixtures.mjs` | 不是 SQLite 迁移测试 |
-| `validate-fixtures.mjs` | 只读 fixture 自检 | CI 的 YouTube fixture contracts 步骤 | 当前 HEAD CI 已通过；不能替代生产测试 |
+| `validate-fixtures.mjs` | 只读 fixture 自检 | CI 的 YouTube fixture contracts 步骤 | CI 证据提交已通过；不能替代生产测试 |
 
 `validate-fixtures.mjs` 本次增强的静态规则：
 
@@ -174,7 +174,7 @@
 - API Key 加密槽位、响应不回显、同步 payload 不含明文。
 - 动态 `YOUTUBE_HTTP_<status>` 不折叠。
 - 解析器覆盖聊天文本、Super Chat、Super Sticker 和会员事件。
-- 当前 HEAD 的 CI 已执行服务端、fixture、前端和 Rust 测试并通过；真实 Google OAuth 和真实页面仍未执行。
+- CI 证据提交的 CI 已执行服务端、fixture、前端和 Rust 测试并通过；真实 Google OAuth 和真实页面仍未执行。
 
 ### 7.2 真实 OAuth 验收
 
@@ -276,8 +276,8 @@ npm run build:web
 
 注意：
 
-- `ci.yml` 已加入 `youtube` push 触发；run `43153298753` 对提交 `e7fa3c9` 全部步骤成功。
-- YouTube fixture 步骤和 UI fixture schema 3 已随当前 HEAD 提交；剩余问题不是“未提交”，而是真实环境验收和 UI-001 至 UI-016。
+- `ci.yml` 已加入 `youtube` push 触发；run `43154607251` 对提交 `a2febbe` 全部步骤成功。
+- YouTube fixture 步骤和 UI fixture schema 3 已随 CI 证据提交；剩余问题不是“未提交”，而是真实环境验收和 UI-001 至 UI-016。
 - `cargo check` 没有单独步骤；clippy 会编译，但不能把 `cargo check` 写成“已执行”。
 - `npm run check` 出现在 Release 工作流。它包含 `cargo fmt`、clippy 和 TypeScript，不是 CI 当前步骤名。
 - 本文件没有在本机执行命令；上述 CI 证据来自 GitHub Actions。
@@ -310,7 +310,7 @@ node scripts/youtube-fixtures/validate-fixtures.mjs
 
 ### 11.1 Beta 发布前最低门禁
 
-- [x] 当前提交对应 GitHub Actions 全绿（`e7fa3c9`，run `43153298753`）。
+- [x] CI 证据提交对应 GitHub Actions 全绿（`a2febbe`，run `43154607251`）。
 - [x] 无已知 P0/P1 源码缺陷；本轮 P1 修复已由 CI 编译和测试。
 - [ ] 通过 `npm run version:next-beta -- <desktop|server>` 生成版本号，并核对远端标签。
 - [ ] 对应产品 beta 发布说明已定稿，包含功能、迁移、已知限制和回滚方式。
@@ -420,6 +420,6 @@ B 站回归：
 
 - 测试矩阵已覆盖主要用户需求，但静态覆盖不等于外部验收通过。
 - 静态审查未发现新的 P0；账号输入契约已对齐。仍有迁移、OAuth、零请求、真实 UI 和真实页面等 P1 运行验证缺口。
-- 当前 HEAD 的 CI run `43153298753` 已通过；剩余阻断项是真实外部环境验收，而不是 CI。
+- CI 证据提交的 CI run `43154607251` 已通过；剩余阻断项是真实外部环境验收，而不是 CI。
 - P1 源码修复已完成；真实迁移/OAuth/零请求/真实 UI/B 站回归证据齐备前只能是 beta 候选，stable 仍阻断。
 - 本文件没有在本机执行 Node fixture 校验、cargo、npm、npx、docker、构建、测试或格式化；CI 证据另见上述运行链接。

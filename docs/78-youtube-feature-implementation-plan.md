@@ -2,8 +2,8 @@
 
 - 状态：Wave 3 并行审查、P1 修复和 CI 收口完成；真实环境验收仍待执行
 - 分支：`youtube`
-- 当前实现基准：`e7fa3c9`
-- CI：run `43153298753` 已全绿（提交 `e7fa3c96e3c8af5b94363b2a84703916709e1394`）
+- 当前实现基准：`a2febbe`
+- CI：run `43154607251` 已全绿（提交 `a2febbe6e3c8af5b94363b2a84703916709e1394`）
 - 历史审查基准：`f93012b`、`3cd76bc`
 - 工作区：`D:\work\guanrenchi`
 - 约束：禁止在当前工作区执行任何构建、测试、编译命令；只做源码编辑和静态分析，验证统一走 CI。
@@ -563,7 +563,7 @@ node scripts/live-broadcast-ui.mjs
 - 同一主播的 B 站和 YouTube 记录保持独立。
 ## 16. 第二轮并行修复波次（2026-11-12）
 
-当前状态：第二轮并行修复、Wave 3 审查及后续 P1 修复均已完成；当前 HEAD 的 GitHub Actions 已通过，真实环境验收仍待执行。
+当前状态：第二轮并行修复、Wave 3 审查及后续 P1 修复均已完成；CI 证据提交的 GitHub Actions 已通过，真实环境验收仍待执行。
 
 ### Wave 2.1：LiveSession 同步闭环
 
@@ -866,7 +866,7 @@ scripts/youtube-fixtures/validate-fixtures.mjs
 - 代码层 P1：本轮发现并修复；真实环境验证缺口仍存在。
 - 必须披露的 P2：continuation token 不跨进程持久化（已由持久消息 ID 去重兜底）、聊天事件表暂无独立清理策略、社区页首屏限制、预约只查最近 20 个上传、`streamers.mid` 全局唯一、Super Chat 明细本地优先、无统一搜索 TTL 缓存、相对发布时间锚点仍按本次抓取估算。
 - `scripts/youtube-fixtures/validate-fixtures.mjs`、Rust 测试、TypeScript 类型检查、构建和两个既有 UI 脚本已在 GitHub Actions 执行；本机仍未执行。
-- `ci.yml` 已包含 `youtube` push 触发；当前 HEAD `e7fa3c9` 已触发并通过 run `43153298753`。剩余门禁是外部迁移/OAuth/零请求/真实 UI/B 站回归证据。
+- `ci.yml` 已包含 `youtube` push 触发；CI 证据提交 `a2febbe` 已触发并通过 run `43154607251`。剩余门禁是外部迁移/OAuth/零请求/真实 UI/B 站回归证据。
 - 本轮额外修复：带平台的关联账号同步删除事件、桌面 OAuth 刷新/退出竞态、社区帖稳定指纹、会员预览图片过滤、YouTube 聊天事件持久去重。
 - beta 发布前必须取得 CI 链接和外部验证结果；stable 必须等待用户明确确认。
 
@@ -876,7 +876,7 @@ scripts/youtube-fixtures/validate-fixtures.mjs
 - [x] 计划、验证矩阵和并行 Agent 结果已落盘。
 - [x] 账号输入 fixture、生产解析器和 Rust 回归契约静态对齐。
 - [x] `git diff --check` 通过（提交前执行）。
-- [x] GitHub Actions 全绿（`e7fa3c9`，run `43153298753`）。
+- [x] GitHub Actions 全绿（`a2febbe`，run `43154607251`）。
 - [ ] SQLite 迁移/备份/回滚演练（待外部执行）。
 - [x] P1 源码修复已完成：同步删除平台、OAuth 凭据竞态、社区帖稳定指纹、聊天统计持久去重。
 - [ ] 真实 Google OAuth、Data API、会员 Cookie 和 Windows ACL（待外部执行）。
