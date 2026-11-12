@@ -4859,8 +4859,10 @@ mod tests {
     #[tokio::test]
     async fn youtube_switch_off_stops_before_next_channel_request() {
         let store = SqliteStore::in_memory().await.expect("db");
-        let mut settings = AppSettings::default();
-        settings.youtube_enabled = true;
+        let mut settings = AppSettings {
+            youtube_enabled: true,
+            ..AppSettings::default()
+        };
         save_settings(&store, &settings)
             .await
             .expect("enable youtube");

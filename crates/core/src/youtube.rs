@@ -1623,12 +1623,9 @@ fn parse_live_chat_message(item: &Value) -> Option<YouTubeLiveChatMessage> {
 }
 
 fn parse_chat_monetary_event(snippet: &Value, _kind: &str) -> Option<YouTubeMonetaryEvent> {
-    let (details, event_kind) = if let Some(details) = snippet.get("superChatDetails") {
-        (details, "superChatEvent")
-    } else if let Some(details) = snippet.get("superStickerDetails") {
-        (details, "superStickerEvent")
-    } else {
-        return None;
+    let (details, event_kind) = match snippet.get("superChatDetails") {
+        Some(details) => (details, "superChatEvent"),
+        None => (snippet.get("superStickerDetails")?, "superStickerEvent"),
     };
 
     Some(YouTubeMonetaryEvent {
@@ -1727,35 +1724,9 @@ fn parse_super_chat_event(item: &Value) -> Option<YouTubeSuperChatEvent> {
     if id.is_empty() {
         return None;
     }
-    let (details, event_kind) = if let Some(details) = snippet.get("superChatDetails") {
-        (details, "superChatEvent")
-    } else if let Some(details) = snippet.get("superStickerDetails") {
-        (details, "superStickerEvent")
-    } else {
-        // Compatibility for legacy flattened superChatEvents.list payloads. The
-        // public API can omit `type`, so default that shape to Super Chat while
-        // still rejecting explicit unknown types and zero-value items.
-        let event_kind = match snippet.get("type").and_then(Value::as_str) {
-            Some("superChatEvent") => "superChatEvent",
-            Some("superStickerEvent") => "superStickerEvent",
-            Some(_) => return None,
-            None => "superChatEvent",
-        };
-        let has_monetary_field = [
-            "amountMicros",
-            "currency",
-            "amountDisplayString",
-            "displayString",
-            "commentText",
-            "userComment",
-            "tier",
-        ]
-        .iter()
-        .any(|key| snippet.get(*key).is_some());
-        if !has_monetary_field {
-            return None;
-        }
-        (snippet, event_kind)
+    let (details, event_kind) = match snippet.get("superChatDetails") {
+        Some(details) => (details, "superChatEvent"),
+        None => (snippet.get("superStickerDetails")?, "superStickerEvent"),
     };
     Some(YouTubeSuperChatEvent {
         id: id.to_owned(),
@@ -2073,18 +2044,14 @@ fn extract_json_assignment(html: &str, key: &str) -> Option<Value> {
         let key_start = offset + relative;
         let key_end = key_start + key.len();
         let tail = &html[key_end..];
-        let Some(eq_relative) = tail.find('=') else {
-            return None;
-        };
+        let eq_relative = tail.find('=')?;
         if eq_relative > 256 || tail[..eq_relative].contains(';') {
             offset = key_end;
             continue;
         }
         let after_equal = key_end + eq_relative + 1;
         let after = &html[after_equal..];
-        let Some(brace_relative) = after.find('{') else {
-            return None;
-        };
+        let brace_relative = after.find('{')?;
         if brace_relative > 64 || after[..brace_relative].contains(';') {
             offset = key_end;
             continue;

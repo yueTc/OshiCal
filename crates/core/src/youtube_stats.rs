@@ -164,7 +164,7 @@ impl YouTubeStatsManager {
             let reusable = resume_states
                 .get(&streamer_id)
                 .filter(|state| {
-                    resume_state_matches(&lock_resume(*state), session.id, video_id.as_deref())
+                    resume_state_matches(lock_resume(state), session.id, video_id.as_deref())
                 })
                 .cloned();
             match reusable {
@@ -928,11 +928,10 @@ async fn persist_metrics(
     collector_state: &str,
     metrics: &CollectorMetrics,
 ) {
-    let avg_online = if metrics.online_samples == 0 {
-        0
-    } else {
-        metrics.online_total / metrics.online_samples
-    };
+    let avg_online = metrics
+        .online_total
+        .checked_div(metrics.online_samples)
+        .unwrap_or(0);
     let duration_seconds = observed_at
         .signed_duration_since(started_at)
         .num_seconds()
@@ -1019,8 +1018,10 @@ mod tests {
     #[tokio::test]
     async fn youtube_switch_off_blocks_the_next_chat_page_request() {
         let store = SqliteStore::in_memory().await.expect("db");
-        let mut settings = AppSettings::default();
-        settings.youtube_enabled = true;
+        let mut settings = AppSettings {
+            youtube_enabled: true,
+            ..AppSettings::default()
+        };
         save_settings(&store, &settings)
             .await
             .expect("enable youtube");
@@ -1043,8 +1044,10 @@ mod tests {
     #[tokio::test]
     async fn youtube_switch_off_cancels_an_in_flight_paginated_request() {
         let store = SqliteStore::in_memory().await.expect("db");
-        let mut settings = AppSettings::default();
-        settings.youtube_enabled = true;
+        let mut settings = AppSettings {
+            youtube_enabled: true,
+            ..AppSettings::default()
+        };
         save_settings(&store, &settings)
             .await
             .expect("enable youtube");
@@ -1052,8 +1055,10 @@ mod tests {
         let request_store = store.clone();
         let paginated_request = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut settings = AppSettings::default();
-            settings.youtube_enabled = false;
+            let settings = AppSettings {
+                youtube_enabled: false,
+                ..AppSettings::default()
+            };
             save_settings(&request_store, &settings)
                 .await
                 .expect("disable youtube");
