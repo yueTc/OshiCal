@@ -82,11 +82,11 @@ const server = createServer(async (req, res) => {
         return send({ sessionId: 7, metric: "bilibili_high_energy_users", sampleIntervalSeconds: 30,
           samples, nextAfterId: samples.at(-1)?.id ?? after, hasMore: candidates.length > samples.length });
       }
-      if (url.pathname === "/api/sync/bootstrap") return send({ schemaVersion: 2,
+      if (url.pathname === "/api/sync/bootstrap") return send({ schemaVersion: 3,
         feedId: "ui-fixture", snapshotRevision: 1, minRetainedSeq: 0, serverTime: iso(now),
         subscriptions: [streamer], schedules: [schedule], weeklyRules: [], weeklyExceptions: [],
         scheduleSources: [], sourceSuppressions: [], serverSettings: settings, liveStatuses: [live], liveSessions: [session] });
-      if (url.pathname === "/api/sync/changes") return send({ schemaVersion: 2, feedId: "ui-fixture",
+      if (url.pathname === "/api/sync/changes") return send({ schemaVersion: 3, feedId: "ui-fixture",
         fromSeq: 2, toSeq: 1, latestSeq: 1, minRetainedSeq: 0, hasMore: false, resetRequired: false, changes: [] });
       if (url.pathname === "/api/devices/register") return send({ deviceId: "ui", name: "验收", platform: "web", appVersion: "test", online: true });
       if (url.pathname === "/api/devices") return send([]);

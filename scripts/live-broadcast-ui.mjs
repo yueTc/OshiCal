@@ -100,14 +100,14 @@ const server = createServer(async (req, res) => {
         return send({ sessionId: 7, metric: "bilibili_high_energy_users", sampleIntervalSeconds: 30,
           samples, nextAfterId: samples.at(-1)?.id ?? after, hasMore: candidates.length > samples.length });
       }
-      if (url.pathname === "/api/sync/bootstrap") return send({ schemaVersion: 2,
+      if (url.pathname === "/api/sync/bootstrap") return send({ schemaVersion: 3,
         feedId: "ui-fixture", snapshotRevision: sequence, minRetainedSeq: 0, serverTime: iso(now),
         subscriptions: [streamer], schedules, weeklyRules: [], weeklyExceptions: [],
         scheduleSources: [], sourceSuppressions: [], serverSettings: settings, liveStatuses: [currentLive], liveSessions: sessions });
       if (url.pathname === "/api/sync/changes") {
         const after = Number(url.searchParams.get("after") ?? 0);
         const rows = changes.filter((change) => change.seq > after);
-        return send({ schemaVersion: 2, feedId: "ui-fixture", fromSeq: after+1,
+        return send({ schemaVersion: 3, feedId: "ui-fixture", fromSeq: after+1,
           toSeq: sequence, latestSeq: sequence, minRetainedSeq: 0, hasMore: false, resetRequired: false, changes: rows });
       }
       if (url.pathname === "/api/devices/register") return send({ deviceId: "ui", name: "验收", platform: "web", appVersion: "test", online: true });
