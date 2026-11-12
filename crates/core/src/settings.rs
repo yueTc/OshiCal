@@ -294,7 +294,10 @@ impl std::fmt::Debug for RuntimeSecrets {
         f.debug_struct("RuntimeSecrets")
             .field("bili_cookie_configured", &self.bili_cookie.is_some())
             .field("llm_api_key_configured", &self.llm_api_key.is_some())
-            .field("youtube_api_key_configured", &self.youtube_api_key.is_some())
+            .field(
+                "youtube_api_key_configured",
+                &self.youtube_api_key.is_some(),
+            )
             .field(
                 "youtube_oauth_access_token_configured",
                 &self.youtube_oauth_access_token.is_some(),

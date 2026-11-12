@@ -286,13 +286,12 @@ impl SqliteStore {
             return Err(AppError::validation("YouTube 直播标识不能为空"));
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM live_sessions WHERE streamer_id=? AND started_at=?",
-        )
-        .bind(streamer_id)
-        .bind(&started)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM live_sessions WHERE streamer_id=? AND started_at=?")
+                .bind(streamer_id)
+                .bind(&started)
+                .fetch_optional(&mut *tx)
+                .await?;
         let (id, changed) = if let Some(id) = existing {
             let updated = sqlx::query(
                 "UPDATE live_sessions SET streamer_name=?, room_id=?, title=?,
@@ -463,10 +462,10 @@ mod tests {
     async fn owner(store: &SqliteStore) -> Streamer {
         store
             .add_subscription(&AddSubscription {
-                    platform: Platform::Bilibili,
-                    handle: None,
-                    profile_url: None,
-                    uploads_playlist_id: None,
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "100".into(),
                 name: Some("直播主播".into()),
                 avatar_url: None,

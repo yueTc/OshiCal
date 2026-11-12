@@ -10,7 +10,9 @@ use oshical_core::{
 };
 use tokio::sync::broadcast;
 
-use crate::api::{build_router, persist_changed_settings, sync_runtime_secrets_from_vault, AppState};
+use crate::api::{
+    build_router, persist_changed_settings, sync_runtime_secrets_from_vault, AppState,
+};
 use crate::config::ServerConfig;
 use crate::jobs::RefreshJobManager;
 use crate::secrets::{
@@ -102,14 +104,13 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         }
         // Reload even after an error: invalid_grant removes the dead grant and
         // must not leave the pre-refresh token in the runtime snapshot.
-        persisted_youtube_oauth =
-            match load_persisted_youtube_oauth(&store, &secret_vault).await {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(%error, "刷新后重新读取 YouTube OAuth 凭据失败");
-                    None
-                }
-            };
+        persisted_youtube_oauth = match load_persisted_youtube_oauth(&store, &secret_vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "刷新后重新读取 YouTube OAuth 凭据失败");
+                None
+            }
+        };
     }
     let persisted_youtube_web_session =
         match load_persisted_youtube_web_session(&store, &secret_vault).await {

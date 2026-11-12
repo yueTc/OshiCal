@@ -1,9 +1,9 @@
 use super::*;
-use sqlx::Row;
 use crate::models::{
     LiveOnlineSample, LiveOnlineSamplesPage, LiveSuperChatEvent, LiveSuperChatTotal,
     SuperChatEventInput,
 };
+use sqlx::Row;
 
 #[derive(sqlx::FromRow)]
 struct SampleRow {
@@ -344,7 +344,10 @@ impl SqliteStore {
         data_quality: &str,
         collector_state: &str,
     ) -> AppResult<()> {
-        if !matches!(collector_state, "active" | "degraded" | "reconnecting" | "finished") {
+        if !matches!(
+            collector_state,
+            "active" | "degraded" | "reconnecting" | "finished"
+        ) {
             return Err(AppError::validation("YouTube 采集状态非法"));
         }
         self.get_live_session(session_id).await?;
@@ -356,7 +359,9 @@ impl SqliteStore {
         .fetch_one(&self.pool)
         .await?;
         if parse_platform(&platform)? != Platform::Youtube {
-            return Err(AppError::validation("YouTube 指标只能写入 YouTube 直播场次"));
+            return Err(AppError::validation(
+                "YouTube 指标只能写入 YouTube 直播场次",
+            ));
         }
         let peak_online = i64::try_from(peak_online)
             .map_err(|_| AppError::validation("YouTube 峰值观看人数超出范围"))?;
@@ -462,10 +467,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
-                    platform: Platform::Bilibili,
-                    handle: None,
-                    profile_url: None,
-                    uploads_playlist_id: None,
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "123".to_owned(),
                 name: Some("测试".to_owned()),
                 avatar_url: None,
@@ -669,13 +674,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let membership_after_restart: Option<i64> = sqlx::query_scalar(
-            "SELECT membership_count FROM live_sessions WHERE id = ?",
-        )
-        .bind(session.id)
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
+        let membership_after_restart: Option<i64> =
+            sqlx::query_scalar("SELECT membership_count FROM live_sessions WHERE id = ?")
+                .bind(session.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(membership_after_restart, Some(7));
         let page = store
             .list_live_online_samples(session.id, 0, 10)

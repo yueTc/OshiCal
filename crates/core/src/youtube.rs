@@ -265,10 +265,7 @@ impl YouTubeClient {
         Self::new_optional(Some(api_key.into()), None)
     }
 
-    pub fn new_with_proxy(
-        api_key: impl Into<String>,
-        proxy_port: Option<u16>,
-    ) -> AppResult<Self> {
+    pub fn new_with_proxy(api_key: impl Into<String>, proxy_port: Option<u16>) -> AppResult<Self> {
         Self::new_optional(Some(api_key.into()), proxy_port)
     }
 
@@ -304,11 +301,7 @@ impl YouTubeClient {
             .ok_or_else(|| AppError::NotConfigured("YouTube API Key".to_owned()))
     }
 
-    async fn data_api_get(
-        &self,
-        path: &str,
-        params: &[(&str, String)],
-    ) -> AppResult<Value> {
+    async fn data_api_get(&self, path: &str, params: &[(&str, String)]) -> AppResult<Value> {
         let api_key = self.required_api_key().await?;
         let mut url = Url::parse(&format!("{API_BASE}/{path}"))?;
         {
@@ -360,11 +353,10 @@ impl YouTubeClient {
         if !status.is_success() {
             return Err(youtube_http_error(status, &body));
         }
-        let value =
-            serde_json::from_slice::<Value>(&body).map_err(|_| AppError::External {
-                code: "YOUTUBE_NON_JSON".to_owned(),
-                message: "YouTube API 返回了非 JSON 内容".to_owned(),
-            })?;
+        let value = serde_json::from_slice::<Value>(&body).map_err(|_| AppError::External {
+            code: "YOUTUBE_NON_JSON".to_owned(),
+            message: "YouTube API 返回了非 JSON 内容".to_owned(),
+        })?;
         validate_api_list_response(&value)?;
         Ok(value)
     }
@@ -393,7 +385,9 @@ impl YouTubeClient {
     ) -> AppResult<Vec<YouTubeChannel>> {
         let query = query.trim();
         if query.is_empty() || query.chars().count() > 100 {
-            return Err(AppError::validation("YouTube 搜索关键词长度必须为 1 到 100 字"));
+            return Err(AppError::validation(
+                "YouTube 搜索关键词长度必须为 1 到 100 字",
+            ));
         }
         let value = self
             .data_api_get(
@@ -434,7 +428,7 @@ impl YouTubeClient {
                 self.fetch_channel_by_id(&channel_id).await
             }
             YouTubeAccountInput::Search(query) => {
-                let mut channels = self.search_channels(&query, 1).await?;
+                let channels = self.search_channels(&query, 1).await?;
                 channels
                     .into_iter()
                     .next()
@@ -443,10 +437,7 @@ impl YouTubeClient {
         }
     }
 
-    pub async fn fetch_channel_metadata(
-        &self,
-        channel_id: &str,
-    ) -> AppResult<YouTubeChannel> {
+    pub async fn fetch_channel_metadata(&self, channel_id: &str) -> AppResult<YouTubeChannel> {
         self.fetch_channel_by_id(channel_id).await
     }
 
@@ -457,11 +448,7 @@ impl YouTubeClient {
         self.fetch_channel_by_param("id", channel_id).await
     }
 
-    async fn fetch_channel_by_param(
-        &self,
-        param: &str,
-        value: &str,
-    ) -> AppResult<YouTubeChannel> {
+    async fn fetch_channel_by_param(&self, param: &str, value: &str) -> AppResult<YouTubeChannel> {
         let value = self
             .data_api_get(
                 "channels",
@@ -664,7 +651,11 @@ impl YouTubeClient {
                 message: "YouTube 社区页重定向到了无法识别的页面".to_owned(),
             });
         }
-        if !final_url.path().trim_end_matches('/').ends_with("/community") {
+        if !final_url
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/community")
+        {
             return Ok(YouTubeCommunityFetch {
                 page_found: false,
                 membership_restricted: false,
@@ -912,7 +903,8 @@ pub fn parse_youtube_account_input(input: &str) -> AppResult<YouTubeAccountInput
         ["c", name, ..] if !name.is_empty() => Ok(YouTubeAccountInput::Search((*name).to_owned())),
         [kind, video_id, ..]
             if matches!(*kind, "live" | "embed" | "shorts" | "v")
-                && is_youtube_video_id(video_id) => {
+                && is_youtube_video_id(video_id) =>
+        {
             Ok(YouTubeAccountInput::VideoId((*video_id).to_owned()))
         }
         _ => Ok(YouTubeAccountInput::Search(input.to_owned())),
@@ -921,9 +913,7 @@ pub fn parse_youtube_account_input(input: &str) -> AppResult<YouTubeAccountInput
 
 fn is_youtube_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "youtu.be"
-        || host == "youtube.com"
-        || host.ends_with(".youtube.com")
+    host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 fn is_youtube_channel_id(value: &str) -> bool {
@@ -1049,7 +1039,10 @@ fn parse_playlist_items(value: &Value) -> Vec<YouTubePlaylistItem> {
             let video_id = item
                 .pointer("/contentDetails/videoId")
                 .and_then(Value::as_str)
-                .or_else(|| item.pointer("/snippet/resourceId/videoId").and_then(Value::as_str))
+                .or_else(|| {
+                    item.pointer("/snippet/resourceId/videoId")
+                        .and_then(Value::as_str)
+                })
                 .filter(|value| is_youtube_video_id(value))?;
             let snippet = item.get("snippet");
             Some(YouTubePlaylistItem {
@@ -1062,7 +1055,11 @@ fn parse_playlist_items(value: &Value) -> Vec<YouTubePlaylistItem> {
                 published_at: item
                     .pointer("/contentDetails/videoPublishedAt")
                     .and_then(Value::as_str)
-                    .or_else(|| snippet.and_then(|value| value.get("publishedAt")).and_then(Value::as_str))
+                    .or_else(|| {
+                        snippet
+                            .and_then(|value| value.get("publishedAt"))
+                            .and_then(Value::as_str)
+                    })
                     .and_then(parse_rfc3339),
                 thumbnail_url: snippet
                     .and_then(|value| value.get("thumbnails"))
@@ -1267,7 +1264,11 @@ fn parse_community_page(
 fn collect_community_renderers(value: &Value, out: &mut Vec<(String, Value)>) {
     match value {
         Value::Object(object) => {
-            for key in ["backstagePostRenderer", "postRenderer", "sharedPostRenderer"] {
+            for key in [
+                "backstagePostRenderer",
+                "postRenderer",
+                "sharedPostRenderer",
+            ] {
                 if let Some(renderer) = object.get(key) {
                     out.push((key.to_owned(), renderer.clone()));
                 }
@@ -1360,10 +1361,7 @@ fn collect_attachment_images(
 ) {
     match value {
         Value::Object(object) => {
-            let has_thumbnail_source = object
-                .get("thumbnails")
-                .and_then(Value::as_array)
-                .is_some()
+            let has_thumbnail_source = object.get("thumbnails").and_then(Value::as_array).is_some()
                 || object.get("url").and_then(Value::as_str).is_some();
             if inside_attachment && has_thumbnail_source {
                 if let Some(url) = best_thumbnail(value) {
@@ -1420,9 +1418,7 @@ fn parse_live_page(
     // `ytInitialData` contains recommendations and other unrelated videos. Only
     // the current player may establish that the target channel is live.
     let is_live = player_video_id.is_some()
-        && player
-            .as_ref()
-            .is_some_and(player_has_explicit_live_signal)
+        && player.as_ref().is_some_and(player_has_explicit_live_signal)
         && !player
             .as_ref()
             .is_some_and(player_has_explicit_offline_signal);
@@ -1539,11 +1535,14 @@ fn player_has_explicit_offline_signal(player: &Value) -> bool {
 }
 
 fn is_recognizable_channel_page_data(initial: &Value) -> bool {
-    ["channelMetadataRenderer", "c4TabbedHeaderRenderer", "pageHeaderRenderer"]
-        .iter()
-        .any(|key| contains_key_recursive(initial, key))
+    [
+        "channelMetadataRenderer",
+        "c4TabbedHeaderRenderer",
+        "pageHeaderRenderer",
+    ]
+    .iter()
+    .any(|key| contains_key_recursive(initial, key))
 }
-
 
 fn is_channel_route_url(url: &Url) -> bool {
     is_youtube_host(url.host_str().unwrap_or_default())
@@ -1665,9 +1664,7 @@ fn parse_chat_membership_event(snippet: &Value, kind: &str) -> Option<YouTubeMem
     if details.is_none()
         && !matches!(
             kind,
-            "memberMilestoneChatEvent"
-                | "newSponsorEvent"
-                | "membershipGiftingEvent"
+            "memberMilestoneChatEvent" | "newSponsorEvent" | "membershipGiftingEvent"
         )
     {
         return None;
@@ -1707,6 +1704,7 @@ fn parse_super_chat_page(value: &Value) -> YouTubeSuperChatPage {
     }
 }
 
+#[cfg(test)]
 fn parse_super_chat_events(value: &Value) -> Vec<YouTubeSuperChatEvent> {
     parse_super_chat_page(value).events
 }
@@ -1896,9 +1894,7 @@ fn contains_key_recursive(value: &Value, key: &str) -> bool {
                     .values()
                     .any(|child| contains_key_recursive(child, key))
         }
-        Value::Array(items) => items
-            .iter()
-            .any(|child| contains_key_recursive(child, key)),
+        Value::Array(items) => items.iter().any(|child| contains_key_recursive(child, key)),
         _ => false,
     }
 }
@@ -1911,9 +1907,7 @@ fn contains_true_for_key(value: &Value, key: &str) -> bool {
                     .values()
                     .any(|child| contains_true_for_key(child, key))
         }
-        Value::Array(items) => items
-            .iter()
-            .any(|child| contains_true_for_key(child, key)),
+        Value::Array(items) => items.iter().any(|child| contains_true_for_key(child, key)),
         _ => false,
     }
 }
@@ -1949,9 +1943,7 @@ fn find_u64_for_key(value: &Value, key: &str) -> Option<u64> {
                 .values()
                 .find_map(|child| find_u64_for_key(child, key))
         }
-        Value::Array(items) => items
-            .iter()
-            .find_map(|child| find_u64_for_key(child, key)),
+        Value::Array(items) => items.iter().find_map(|child| find_u64_for_key(child, key)),
         _ => None,
     }
 }
@@ -2176,7 +2168,11 @@ fn youtube_http_error(status: StatusCode, body: &[u8]) -> AppError {
     let reason = error
         .and_then(|value| value.pointer("/errors/0/reason"))
         .and_then(Value::as_str)
-        .or_else(|| error.and_then(|value| value.get("status")).and_then(Value::as_str))
+        .or_else(|| {
+            error
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or_default()
         .to_owned();
     let message = error
@@ -2185,29 +2181,24 @@ fn youtube_http_error(status: StatusCode, body: &[u8]) -> AppError {
         .map(|value| value.chars().take(512).collect::<String>())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("YouTube API 返回 HTTP {status}"));
-    let code = if reason == "keyInvalid"
-        || message
-            .to_ascii_lowercase()
-            .contains("api key not valid")
-    {
-        "YOUTUBE_API_KEY_INVALID".to_owned()
-    } else {
-        match (status, reason.as_str()) {
-            (StatusCode::UNAUTHORIZED, _) => "YOUTUBE_UNAUTHORIZED".to_owned(),
-            (StatusCode::FORBIDDEN, "quotaExceeded")
-            | (StatusCode::FORBIDDEN, "dailyLimitExceeded")
-            | (StatusCode::FORBIDDEN, "limitExceeded") => {
-                "YOUTUBE_QUOTA_EXCEEDED".to_owned()
+    let code =
+        if reason == "keyInvalid" || message.to_ascii_lowercase().contains("api key not valid") {
+            "YOUTUBE_API_KEY_INVALID".to_owned()
+        } else {
+            match (status, reason.as_str()) {
+                (StatusCode::UNAUTHORIZED, _) => "YOUTUBE_UNAUTHORIZED".to_owned(),
+                (StatusCode::FORBIDDEN, "quotaExceeded")
+                | (StatusCode::FORBIDDEN, "dailyLimitExceeded")
+                | (StatusCode::FORBIDDEN, "limitExceeded") => "YOUTUBE_QUOTA_EXCEEDED".to_owned(),
+                (StatusCode::FORBIDDEN, "rateLimitExceeded") => "YOUTUBE_RATE_LIMITED".to_owned(),
+                (StatusCode::FORBIDDEN, _) => "YOUTUBE_FORBIDDEN".to_owned(),
+                (StatusCode::TOO_MANY_REQUESTS, _) => "YOUTUBE_RATE_LIMITED".to_owned(),
+                (StatusCode::NOT_FOUND, _) => "YOUTUBE_NOT_FOUND".to_owned(),
+                (StatusCode::BAD_REQUEST, _) => "YOUTUBE_BAD_REQUEST".to_owned(),
+                (status, _) if status.is_server_error() => "YOUTUBE_UPSTREAM_ERROR".to_owned(),
+                (status, _) => format!("YOUTUBE_HTTP_{}", status.as_u16()),
             }
-            (StatusCode::FORBIDDEN, "rateLimitExceeded") => "YOUTUBE_RATE_LIMITED".to_owned(),
-            (StatusCode::FORBIDDEN, _) => "YOUTUBE_FORBIDDEN".to_owned(),
-            (StatusCode::TOO_MANY_REQUESTS, _) => "YOUTUBE_RATE_LIMITED".to_owned(),
-            (StatusCode::NOT_FOUND, _) => "YOUTUBE_NOT_FOUND".to_owned(),
-            (StatusCode::BAD_REQUEST, _) => "YOUTUBE_BAD_REQUEST".to_owned(),
-            (status, _) if status.is_server_error() => "YOUTUBE_UPSTREAM_ERROR".to_owned(),
-            (status, _) => format!("YOUTUBE_HTTP_{}", status.as_u16()),
-        }
-    };
+        };
     AppError::External { code, message }
 }
 
@@ -2399,7 +2390,10 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].video_id, VIDEO_ID);
         assert_eq!(
-            items[0].published_at.as_ref().map(|value| value.to_rfc3339()),
+            items[0]
+                .published_at
+                .as_ref()
+                .map(|value| value.to_rfc3339()),
             Some("2026-11-12T10:00:00+00:00".to_owned())
         );
 
@@ -2493,7 +2487,10 @@ mod tests {
             Some("2026-11-12T11:00:00+00:00".to_owned())
         );
         assert_eq!(
-            probe.scheduled_start_at.as_ref().map(|value| value.to_rfc3339()),
+            probe
+                .scheduled_start_at
+                .as_ref()
+                .map(|value| value.to_rfc3339()),
             Some("2026-11-12T10:30:00+00:00".to_owned())
         );
         assert_eq!(probe.concurrent_viewers, Some(4321));
@@ -2545,8 +2542,9 @@ mod tests {
             "https://www.youtube.com/channel/{CHANNEL_ID}/live"
         ))
         .expect("url");
-        let error = parse_live_page(&html, &url, checked_at)
-            .expect_err("recommendation live state without a target player state must remain unknown");
+        let error = parse_live_page(&html, &url, checked_at).expect_err(
+            "recommendation live state without a target player state must remain unknown",
+        );
         assert!(matches!(
             error,
             AppError::External { ref code, .. } if code == "YOUTUBE_LIVE_FORMAT"
@@ -2586,8 +2584,8 @@ mod tests {
     #[test]
     fn channel_page_without_initial_data_returns_format_error() {
         let checked_at = Utc::now();
-        let url = Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}"))
-            .expect("url");
+        let url =
+            Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}")).expect("url");
         let error = parse_live_page("<html>consent or login page</html>", &url, checked_at)
             .expect_err("unrecognized page must not be treated as offline");
         assert!(matches!(
@@ -2599,8 +2597,8 @@ mod tests {
     #[test]
     fn recognized_channel_page_without_live_is_offline() {
         let checked_at = Utc::now();
-        let url = Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}"))
-            .expect("url");
+        let url =
+            Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}")).expect("url");
         let initial = json!({
             "metadata": {
                 "channelMetadataRenderer": {
@@ -2618,8 +2616,8 @@ mod tests {
     #[test]
     fn parsed_page_without_explicit_live_state_returns_format_error() {
         let checked_at = Utc::now();
-        let url = Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}"))
-            .expect("url");
+        let url =
+            Url::parse(&format!("https://www.youtube.com/channel/{CHANNEL_ID}")).expect("url");
         let initial = json!({"alerts": [{"text": "Before you continue"}]});
         let html = format!("<script>var ytInitialData = {initial};</script>");
         let error = parse_live_page(&html, &url, checked_at)
@@ -2663,15 +2661,17 @@ mod tests {
         let observed_at = DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
             .expect("time")
             .with_timezone(&Utc);
-        let page =
-            parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
+        let page = parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
         assert!(page.page_found);
         assert!(page.membership_restricted);
         assert_eq!(page.posts.len(), 1);
         let post = &page.posts[0];
         assert_eq!(post.id, "Ugk_post_1");
         assert_eq!(post.text, "周五 20:00 直播");
-        assert_eq!(post.images, vec!["https://yt3.ggpht.com/large.jpg".to_owned()]);
+        assert_eq!(
+            post.images,
+            vec!["https://yt3.ggpht.com/large.jpg".to_owned()]
+        );
         assert!(post.membership_only);
         assert_eq!(post.source_url, "https://www.youtube.com/post/Ugk_post_1");
         assert_eq!(
@@ -2747,13 +2747,15 @@ mod tests {
             }
         });
         let html = format!("<script>var ytInitialData = {initial};</script>");
-        let page =
-            parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
+        let page = parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
         let post = |id: &str| page.posts.iter().find(|post| post.id == id).expect(id);
 
         let english = post("relative-en");
         assert_eq!(
-            english.published_at.as_ref().map(|value| value.to_rfc3339()),
+            english
+                .published_at
+                .as_ref()
+                .map(|value| value.to_rfc3339()),
             Some((observed_at - chrono::Duration::days(2)).to_rfc3339())
         );
         assert!(english.published_at_estimated);
@@ -2761,14 +2763,20 @@ mod tests {
 
         let chinese = post("relative-zh");
         assert_eq!(
-            chinese.published_at.as_ref().map(|value| value.to_rfc3339()),
+            chinese
+                .published_at
+                .as_ref()
+                .map(|value| value.to_rfc3339()),
             Some((observed_at - chrono::Duration::days(2)).to_rfc3339())
         );
         assert!(chinese.published_at_estimated);
 
         let yesterday = post("relative-yesterday");
         assert_eq!(
-            yesterday.published_at.as_ref().map(|value| value.to_rfc3339()),
+            yesterday
+                .published_at
+                .as_ref()
+                .map(|value| value.to_rfc3339()),
             Some((observed_at - chrono::Duration::days(1)).to_rfc3339())
         );
         assert!(yesterday.published_at_estimated);
@@ -2802,8 +2810,7 @@ mod tests {
             }
         });
         let html = format!("<script>var ytInitialData = {initial};</script>");
-        let page =
-            parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
+        let page = parse_community_page(&html, CHANNEL_ID, observed_at).expect("community page");
         assert_eq!(page.posts.len(), 1);
         assert!(!page.membership_restricted);
         assert!(!page.posts[0].membership_only);
@@ -2854,7 +2861,10 @@ mod tests {
         append_unique_super_chat_events(&mut events, &mut seen_event_ids, first.events);
         append_unique_super_chat_events(&mut events, &mut seen_event_ids, second.events);
         assert_eq!(
-            events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["sc-1", "sc-2"]
         );
     }
@@ -2916,7 +2926,9 @@ mod tests {
             Some("literal } = { in text")
         );
         assert_eq!(
-            parsed.pointer("/contents/nested/ok").and_then(Value::as_bool),
+            parsed
+                .pointer("/contents/nested/ok")
+                .and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -2975,7 +2987,10 @@ mod tests {
         assert_eq!(page.polling_interval_millis, Some(1500));
         assert_eq!(page.active_live_chat_id.as_deref(), Some("chat-id"));
         assert_eq!(page.messages[0].display_message.as_deref(), Some("hello"));
-        let monetary = page.messages[1].monetary_event.as_ref().expect("super chat");
+        let monetary = page.messages[1]
+            .monetary_event
+            .as_ref()
+            .expect("super chat");
         assert_eq!(monetary.kind, "superChatEvent");
         assert_eq!(monetary.amount_micros, Some(5_000_000));
         assert_eq!(monetary.currency.as_deref(), Some("USD"));
@@ -3061,10 +3076,7 @@ mod tests {
         assert_eq!(events[0].kind, "superStickerEvent");
         assert_eq!(events[0].amount_micros, Some(2_500_000));
         assert_eq!(events[0].currency.as_deref(), Some("USD"));
-        assert_eq!(
-            events[0].amount_display_string.as_deref(),
-            Some("$2.50")
-        );
+        assert_eq!(events[0].amount_display_string.as_deref(), Some("$2.50"));
         assert_eq!(events[0].user_display_name.as_deref(), Some("Sticker Fan"));
     }
 
@@ -3079,7 +3091,8 @@ mod tests {
 
     #[test]
     fn youtube_quota_error_has_stable_code() {
-        let body = br#"{"error":{"message":"quota exceeded","errors":[{"reason":"quotaExceeded"}]}}"#;
+        let body =
+            br#"{"error":{"message":"quota exceeded","errors":[{"reason":"quotaExceeded"}]}}"#;
         let error = youtube_http_error(StatusCode::FORBIDDEN, body);
         assert!(matches!(
             error,

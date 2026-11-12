@@ -957,9 +957,8 @@ async fn apply_delete(
                     .await
                     .map_err(db_error)?
                     {
-                        target.platform = Platform::parse(&platform).ok_or_else(|| {
-                            format!("官号平台数据无效: {platform}")
-                        })?;
+                        target.platform = Platform::parse(&platform)
+                            .ok_or_else(|| format!("官号平台数据无效: {platform}"))?;
                     }
                 }
             }
@@ -1380,9 +1379,8 @@ fn parse_link_target(entity_id: &str) -> Result<Option<LinkTarget>, String> {
         .parse::<i64>()
         .map_err(|_| "link tombstone 的 streamerId 无效".to_owned())?;
     if let Some(mid) = parts.next().filter(|value| !value.trim().is_empty()) {
-        let platform = Platform::parse(second).ok_or_else(|| {
-            format!("link tombstone 的 platform 无效: {}", second.trim())
-        })?;
+        let platform = Platform::parse(second)
+            .ok_or_else(|| format!("link tombstone 的 platform 无效: {}", second.trim()))?;
         return Ok(Some(LinkTarget {
             streamer_id,
             platform,
@@ -1984,12 +1982,13 @@ fn entity_id_from_payload(entity_type: &str, payload: &Value) -> Result<String, 
         "link" | "linked_account" => {
             let streamer_id = payload.get("streamerId").and_then(Value::as_i64);
             let mid = payload.get("mid").and_then(Value::as_str);
-            let platform = match payload.get("platform").and_then(Value::as_str) {
-                Some(value) => Some(Platform::parse(value).ok_or_else(|| {
-                    format!("{entity_type} payload 的 platform 无效: {value}")
-                })?),
-                None => Some(Platform::Bilibili),
-            };
+            let platform =
+                match payload.get("platform").and_then(Value::as_str) {
+                    Some(value) => Some(Platform::parse(value).ok_or_else(|| {
+                        format!("{entity_type} payload 的 platform 无效: {value}")
+                    })?),
+                    None => Some(Platform::Bilibili),
+                };
             streamer_id
                 .zip(mid)
                 .zip(platform)

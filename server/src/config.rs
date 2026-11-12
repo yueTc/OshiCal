@@ -35,7 +35,10 @@ impl fmt::Debug for YouTubeConfig {
                 "oauth_access_token_configured",
                 &self.oauth_access_token.is_some(),
             )
-            .field("oauth_client_id_configured", &self.oauth_client_id.is_some())
+            .field(
+                "oauth_client_id_configured",
+                &self.oauth_client_id.is_some(),
+            )
             .field(
                 "oauth_client_secret_configured",
                 &self.oauth_client_secret.is_some(),
@@ -209,14 +212,10 @@ pub(crate) fn validate_oauth_redirect_uri(value: &str) -> Result<(), String> {
     let url = url::Url::parse(value)
         .map_err(|error| format!("OSHICAL_YOUTUBE_OAUTH_REDIRECT_URI 无效: {error}"))?;
     if url.fragment().is_some() {
-        return Err(
-            "OSHICAL_YOUTUBE_OAUTH_REDIRECT_URI 不能包含 fragment".to_owned(),
-        );
+        return Err("OSHICAL_YOUTUBE_OAUTH_REDIRECT_URI 不能包含 fragment".to_owned());
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "OSHICAL_YOUTUBE_OAUTH_REDIRECT_URI 不能包含用户名或密码".to_owned(),
-        );
+        return Err("OSHICAL_YOUTUBE_OAUTH_REDIRECT_URI 不能包含用户名或密码".to_owned());
     }
     let host = url
         .host_str()

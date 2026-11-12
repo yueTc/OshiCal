@@ -6,11 +6,11 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
+use oshical_core::youtube::{parse_youtube_account_input, YouTubeAccountInput};
 use oshical_core::{
     AddSubscription, AppError, AppService, Platform, RuntimeSecrets, SqliteStore,
     SYNC_SCHEMA_VERSION,
 };
-use oshical_core::youtube::{parse_youtube_account_input, YouTubeAccountInput};
 use oshical_server::secrets::{save_persisted_youtube_oauth, YoutubeOAuthToken};
 use oshical_server::{
     build_router, AppState, RefreshJobManager, SecretVault, ServerConfig, ServerUpdateManager,
@@ -122,8 +122,7 @@ async fn call_text(app: &Router, uri: &str) -> (StatusCode, String) {
 }
 
 async fn enable_youtube(app: &Router) {
-    let (status, mut settings) =
-        call_json(app, Method::GET, "/api/settings", None, true).await;
+    let (status, mut settings) = call_json(app, Method::GET, "/api/settings", None, true).await;
     assert_eq!(status, StatusCode::OK, "{settings}");
     assert_eq!(settings["data"]["youtubeEnabled"], false);
     settings["data"]["youtubeEnabled"] = json!(true);
@@ -209,16 +208,8 @@ async fn youtube_routes_require_auth_and_are_disabled_by_default() {
             "/api/youtube/oauth/complete",
             Some(json!({"code": "fixture-code", "state": "fixture-state"})),
         ),
-        (
-            Method::POST,
-            "/api/youtube/oauth/refresh",
-            Some(json!({})),
-        ),
-        (
-            Method::POST,
-            "/api/youtube/oauth/logout",
-            Some(json!({})),
-        ),
+        (Method::POST, "/api/youtube/oauth/refresh", Some(json!({}))),
+        (Method::POST, "/api/youtube/oauth/logout", Some(json!({}))),
         (Method::GET, "/api/youtube/session", None),
         (
             Method::PUT,
@@ -227,11 +218,7 @@ async fn youtube_routes_require_auth_and_are_disabled_by_default() {
         ),
         (Method::DELETE, "/api/youtube/session", None),
         (Method::GET, "/api/youtube/session/status", None),
-        (
-            Method::POST,
-            "/api/youtube/session/start",
-            Some(json!({})),
-        ),
+        (Method::POST, "/api/youtube/session/start", Some(json!({}))),
     ];
 
     for (method, uri, body) in probes {
@@ -349,7 +336,10 @@ async fn youtube_api_key_is_encrypted_and_never_returned_or_synced_in_plaintext(
     let (status, initial) = call_json(&app, Method::GET, "/api/secrets/youtube", None, true).await;
     assert_eq!(status, StatusCode::OK, "{initial}");
     assert_eq!(initial["data"]["apiKey"]["configured"], false);
-    assert!(initial["data"]["apiKey"].get("apiKey").is_none(), "{initial}");
+    assert!(
+        initial["data"]["apiKey"].get("apiKey").is_none(),
+        "{initial}"
+    );
 
     let secret = "AIza-fixture-youtube-secret";
     let (status, saved) = call_json(
@@ -399,14 +389,8 @@ async fn youtube_api_key_is_encrypted_and_never_returned_or_synced_in_plaintext(
         }
     }
 
-    let (status, cleared) = call_json(
-        &app,
-        Method::DELETE,
-        "/api/secrets/youtube",
-        None,
-        true,
-    )
-    .await;
+    let (status, cleared) =
+        call_json(&app, Method::DELETE, "/api/secrets/youtube", None, true).await;
     assert_eq!(status, StatusCode::OK, "{cleared}");
     assert_eq!(cleared["data"]["configured"], false);
     assert!(!state.service.youtube_api_key_configured().await);
@@ -440,14 +424,7 @@ async fn youtube_api_key_can_be_cleared_when_its_ciphertext_is_corrupt() {
         .await
         .unwrap();
 
-    let (status, body) = call_json(
-        &app,
-        Method::DELETE,
-        "/api/secrets/youtube",
-        None,
-        true,
-    )
-    .await;
+    let (status, body) = call_json(&app, Method::DELETE, "/api/secrets/youtube", None, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["configured"], false);
     assert!(store
@@ -526,14 +503,8 @@ async fn youtube_oauth_and_web_session_status_never_expose_credentials() {
     let app = build_router(state().await);
     enable_youtube(&app).await;
 
-    let (status, body) = call_json(
-        &app,
-        Method::GET,
-        "/api/youtube/session/status",
-        None,
-        true,
-    )
-    .await;
+    let (status, body) =
+        call_json(&app, Method::GET, "/api/youtube/session/status", None, true).await;
     assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
     for forbidden in ["refreshToken", "accessToken", "cookie", "clientSecret"] {
         assert!(
@@ -583,14 +554,7 @@ async fn youtube_oauth_missing_required_scope_requires_reauth_without_echoing_to
     let app = build_router(state);
     enable_youtube(&app).await;
 
-    let (status, body) = call_json(
-        &app,
-        Method::GET,
-        "/api/secrets/youtube",
-        None,
-        true,
-    )
-    .await;
+    let (status, body) = call_json(&app, Method::GET, "/api/secrets/youtube", None, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["oauth"]["configured"], true);
     assert_eq!(body["data"]["oauth"]["expired"], true);
@@ -666,10 +630,9 @@ async fn sync_schema_is_three_and_legacy_bilibili_rows_default_to_bilibili() {
 async fn account_input_fixture_matches_public_parser() {
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../scripts/youtube-fixtures/account-inputs.json");
-    let fixture: Value = serde_json::from_slice(
-        &std::fs::read(&fixture_path).expect("read account input fixture"),
-    )
-    .expect("parse account input fixture");
+    let fixture: Value =
+        serde_json::from_slice(&std::fs::read(&fixture_path).expect("read account input fixture"))
+            .expect("parse account input fixture");
 
     for case in fixture["validCases"].as_array().expect("valid cases") {
         let input = case["input"].as_str().expect("input");

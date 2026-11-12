@@ -8,8 +8,8 @@ use axum::response::{Html, IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use oshical_core::{load_settings, AppError, SqliteStore};
 use oshical_core::youtube::{YouTubeChannel, YouTubeClient};
+use oshical_core::{load_settings, AppError, SqliteStore};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -114,9 +114,9 @@ fn youtube_status_from_code(code: &str) -> StatusCode {
         | "YOUTUBE_OAUTH_REFRESH_TOKEN_MISSING"
         | "YOUTUBE_OAUTH_STATE_INVALID" => StatusCode::BAD_REQUEST,
         "YOUTUBE_UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
-        "YOUTUBE_FEATURE_DISABLED"
-        | "YOUTUBE_FORBIDDEN"
-        | "YOUTUBE_OAUTH_ACCESS_DENIED" => StatusCode::FORBIDDEN,
+        "YOUTUBE_FEATURE_DISABLED" | "YOUTUBE_FORBIDDEN" | "YOUTUBE_OAUTH_ACCESS_DENIED" => {
+            StatusCode::FORBIDDEN
+        }
         "YOUTUBE_NOT_FOUND" => StatusCode::NOT_FOUND,
         "YOUTUBE_QUOTA_EXCEEDED" | "YOUTUBE_RATE_LIMITED" | "YOUTUBE_OAUTH_BUSY" => {
             StatusCode::TOO_MANY_REQUESTS
@@ -259,9 +259,7 @@ fn youtube_feature_disabled() -> YouTubeError {
     }
 }
 
-pub(crate) fn init_youtube_runtime(
-    config: YouTubeConfig,
-) -> Result<Arc<YouTubeServer>, String> {
+pub(crate) fn init_youtube_runtime(config: YouTubeConfig) -> Result<Arc<YouTubeServer>, String> {
     if let Some(existing) = YOUTUBE_RUNTIME.get() {
         return Ok(existing.clone());
     }
@@ -455,7 +453,10 @@ impl YouTubeServer {
         let previous_refresh = match load_persisted_youtube_oauth(store, vault).await {
             Ok(value) => value.map(|persisted| persisted.token.refresh_token),
             Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
-                tracing::warn!(code = error.code(), "旧 YouTube OAuth 密文损坏，将用新授权覆盖");
+                tracing::warn!(
+                    code = error.code(),
+                    "旧 YouTube OAuth 密文损坏，将用新授权覆盖"
+                );
                 None
             }
             Err(error) => return Err(error.into()),
@@ -582,7 +583,10 @@ impl YouTubeServer {
         let token = match self
             .token_request(vec![
                 ("grant_type".to_owned(), "refresh_token".to_owned()),
-                ("refresh_token".to_owned(), saved.token.refresh_token.clone()),
+                (
+                    "refresh_token".to_owned(),
+                    saved.token.refresh_token.clone(),
+                ),
                 ("client_id".to_owned(), client_id.to_owned()),
                 ("client_secret".to_owned(), client_secret.to_owned()),
             ])
@@ -684,7 +688,10 @@ impl YouTubeServer {
             Err(error) => {
                 // Clearing the local slot does not require decrypting it. Always
                 // attempt removal so logout also works with a lost master key.
-                tracing::warn!(code = error.code(), "读取 YouTube OAuth 失败；仍尝试清除本地授权槽位");
+                tracing::warn!(
+                    code = error.code(),
+                    "读取 YouTube OAuth 失败；仍尝试清除本地授权槽位"
+                );
                 None
             }
         };
@@ -719,34 +726,6 @@ impl YouTubeServer {
         clear_persisted_youtube_oauth(store).await?;
         *self.last_oauth_error.lock().await = None;
         Ok(YouTubeOAuthStatus::missing())
-    }
-
-    pub async fn access_token(
-        &self,
-        store: &SqliteStore,
-        vault: &SecretVault,
-    ) -> Result<String, YouTubeError> {
-        self.refresh_oauth_if_needed(store, vault).await?;
-        let saved = load_persisted_youtube_oauth(store, vault)
-            .await?
-            .ok_or_else(|| YouTubeError::not_configured("YouTube OAuth 尚未授权"))?;
-        if !has_required_youtube_scope(&saved.token.scopes) {
-            return Err(oauth_scope_missing());
-        }
-        if saved
-            .token
-            .access_token_expires_at
-            .is_some_and(|expires_at| expires_at <= Utc::now())
-        {
-            return Err(YouTubeError {
-                code: "YOUTUBE_UNAUTHORIZED".to_owned(),
-                message: "YouTube OAuth access token 已过期，请重新授权".to_owned(),
-                status: StatusCode::UNAUTHORIZED,
-            });
-        }
-        stored_access_token(&saved.token).ok_or_else(|| {
-            YouTubeError::not_configured("YouTube OAuth access token 不可用")
-        })
     }
 
     async fn clean_pending_oauth(&self) {
@@ -803,21 +782,18 @@ pub async fn set_youtube_feature_enabled(
     enabled: bool,
 ) -> Result<(), AppError> {
     store
-        .set_settings(&[(
-            "youtube_enabled",
-            serde_json::to_string(&enabled)?,
-        )])
+        .set_settings(&[("youtube_enabled", serde_json::to_string(&enabled)?)])
         .await
 }
 
 #[derive(Deserialize)]
-struct OAuthCallbackQuery {
+pub(crate) struct OAuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
 }
 
-pub async fn oauth_callback(
+pub(crate) async fn oauth_callback(
     State(state): State<AppState>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
@@ -852,7 +828,8 @@ pub async fn oauth_callback(
             Some("YOUTUBE_OAUTH_ACCESS_DENIED"),
         );
     }
-    let (Some(code), Some(validated_state)) = (query.code.as_deref(), query.state.as_deref()) else {
+    let (Some(code), Some(validated_state)) = (query.code.as_deref(), query.state.as_deref())
+    else {
         discard_callback_oauth_state(callback_state).await;
         return callback_page_with_code(
             StatusCode::BAD_REQUEST,
@@ -918,12 +895,7 @@ fn callback_page_with_code(
     let body = format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>body{{font-family:system-ui,sans-serif;max-width:560px;margin:12vh auto;padding:24px;line-height:1.6;color:#1f2937}}h1{{font-size:24px}}.card{{border:1px solid #e5e7eb;border-radius:16px;padding:28px;box-shadow:0 12px 40px rgba(15,23,42,.08)}}</style></head><body><main class=\"card\"{error_code_attr}><h1>{title}</h1><p>{message}</p></main></body></html>"
     );
-    let mut response = (
-        status,
-        [(header::CACHE_CONTROL, "no-store")],
-        Html(body),
-    )
-        .into_response();
+    let mut response = (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response();
     if let Some(code) = error_code {
         if let Ok(value) = HeaderValue::from_bytes(code.as_bytes()) {
             response.headers_mut().insert("x-oshical-error-code", value);
@@ -951,9 +923,7 @@ mod tests {
         YouTubeServer::new(YouTubeConfig {
             oauth_client_id: Some("client-id".to_owned()),
             oauth_client_secret: Some("client-secret".to_owned()),
-            oauth_redirect_uri: Some(
-                "http://127.0.0.1:8787/api/youtube/oauth/callback".to_owned(),
-            ),
+            oauth_redirect_uri: Some("http://127.0.0.1:8787/api/youtube/oauth/callback".to_owned()),
             ..YouTubeConfig::default()
         })
         .unwrap()
@@ -1019,14 +989,8 @@ mod tests {
     async fn oauth_state_is_single_use() {
         let server = configured_server();
         let started = server.start_oauth().await.unwrap();
-        assert!(server
-            .take_pending_oauth(&started.state)
-            .await
-            .is_ok());
-        assert!(server
-            .take_pending_oauth(&started.state)
-            .await
-            .is_err());
+        assert!(server.take_pending_oauth(&started.state).await.is_ok());
+        assert!(server.take_pending_oauth(&started.state).await.is_err());
     }
 
     #[tokio::test]
@@ -1038,10 +1002,7 @@ mod tests {
 
         server.logout(&store, &vault).await.unwrap();
 
-        assert!(server
-            .take_pending_oauth(&started.state)
-            .await
-            .is_err());
+        assert!(server.take_pending_oauth(&started.state).await.is_err());
     }
 
     #[tokio::test]

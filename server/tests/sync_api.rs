@@ -238,9 +238,7 @@ async fn bootstrap_and_changes_expose_sync_feed() {
     assert_eq!(status, StatusCode::OK, "{changes}");
     assert_eq!(changes["data"]["schemaVersion"], 3);
     assert!(changes["data"]["latestSeq"].as_i64().unwrap_or(0) > 0);
-    let changes = changes["data"]["changes"]
-        .as_array()
-        .expect("changes");
+    let changes = changes["data"]["changes"].as_array().expect("changes");
     assert!(!changes.is_empty());
     let subscription_change = changes
         .iter()
@@ -249,7 +247,9 @@ async fn bootstrap_and_changes_expose_sync_feed() {
     assert_eq!(subscription_change["payload"]["platform"], "bilibili");
     assert!(subscription_change["payload"].get("handle").is_some());
     assert!(subscription_change["payload"].get("profileUrl").is_some());
-    assert!(subscription_change["payload"].get("uploadsPlaylistId").is_some());
+    assert!(subscription_change["payload"]
+        .get("uploadsPlaylistId")
+        .is_some());
 }
 
 #[tokio::test]

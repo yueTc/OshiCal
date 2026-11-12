@@ -44,8 +44,7 @@ impl EventIdWindow {
 
     fn forget(&mut self, id: &str) {
         self.ids.remove(id);
-        self.order
-            .retain(|candidate| candidate.as_ref() != id);
+        self.order.retain(|candidate| candidate.as_ref() != id);
     }
 }
 
@@ -77,9 +76,7 @@ impl CollectorResumeState {
     }
 }
 
-fn lock_resume(
-    resume: &SharedCollectorResume,
-) -> std::sync::MutexGuard<'_, CollectorResumeState> {
+fn lock_resume(resume: &SharedCollectorResume) -> std::sync::MutexGuard<'_, CollectorResumeState> {
     resume
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -102,11 +99,7 @@ fn bind_chat_id(resume: &SharedCollectorResume, chat_id: &str) {
     }
 }
 
-fn set_chat_page_token(
-    resume: &SharedCollectorResume,
-    chat_id: &str,
-    page_token: Option<String>,
-) {
+fn set_chat_page_token(resume: &SharedCollectorResume, chat_id: &str, page_token: Option<String>) {
     let mut state = lock_resume(resume);
     if state.chat_id.as_deref() == Some(chat_id) {
         state.chat_page_token = page_token;
@@ -171,11 +164,7 @@ impl YouTubeStatsManager {
             let reusable = resume_states
                 .get(&streamer_id)
                 .filter(|state| {
-                    resume_state_matches(
-                        &lock_resume(*state),
-                        session.id,
-                        video_id.as_deref(),
-                    )
+                    resume_state_matches(&lock_resume(*state), session.id, video_id.as_deref())
                 })
                 .cloned();
             match reusable {
@@ -266,21 +255,15 @@ impl CollectorMetrics {
     }
 
     fn remember_chat_message_id(&self, id: &str) -> bool {
-        lock_resume(&self.resume)
-            .seen_chat_message_ids
-            .remember(id)
+        lock_resume(&self.resume).seen_chat_message_ids.remember(id)
     }
 
     fn remember_paid_event_id(&self, id: &str) -> bool {
-        lock_resume(&self.resume)
-            .seen_paid_event_ids
-            .remember(id)
+        lock_resume(&self.resume).seen_paid_event_ids.remember(id)
     }
 
     fn forget_chat_message_id(&self, id: &str) {
-        lock_resume(&self.resume)
-            .seen_chat_message_ids
-            .forget(id);
+        lock_resume(&self.resume).seen_chat_message_ids.forget(id);
     }
 
     fn forget_paid_event_id(&self, id: &str) {
@@ -396,8 +379,7 @@ impl CollectorMetrics {
             SuperChatEventInput {
                 id: event.id,
                 kind: event.kind.clone(),
-                live_chat_id: Some(event.live_chat_id)
-                    .filter(|value| !value.trim().is_empty()),
+                live_chat_id: Some(event.live_chat_id).filter(|value| !value.trim().is_empty()),
                 created_at: event.created_at,
                 user_channel_id: event.user_channel_id,
                 user_display_name: event.user_display_name,
@@ -434,11 +416,7 @@ fn degrade_chat(
     *last_failed_token = token.map(str::to_owned);
 }
 
-fn chat_is_available(
-    token: Option<&str>,
-    live_chat_id: Option<&str>,
-    chat_degraded: bool,
-) -> bool {
+fn chat_is_available(token: Option<&str>, live_chat_id: Option<&str>, chat_degraded: bool) -> bool {
     token.is_some() && live_chat_id.is_some() && !chat_degraded
 }
 
@@ -1007,11 +985,7 @@ mod tests {
         )));
         bind_chat_id(&resume, "chat-1");
         set_chat_page_token(&resume, "chat-1", Some("chat-page-2".to_owned()));
-        set_super_chat_page_token(
-            &resume,
-            "chat-1",
-            Some("super-chat-page-3".to_owned()),
-        );
+        set_super_chat_page_token(&resume, "chat-1", Some("super-chat-page-3".to_owned()));
 
         assert_eq!(
             resume_page_tokens(&resume, "chat-1"),
@@ -1047,7 +1021,9 @@ mod tests {
         let store = SqliteStore::in_memory().await.expect("db");
         let mut settings = AppSettings::default();
         settings.youtube_enabled = true;
-        save_settings(&store, &settings).await.expect("enable youtube");
+        save_settings(&store, &settings)
+            .await
+            .expect("enable youtube");
 
         let mut pages_started = 0;
         for _ in 0..2 {
@@ -1069,7 +1045,9 @@ mod tests {
         let store = SqliteStore::in_memory().await.expect("db");
         let mut settings = AppSettings::default();
         settings.youtube_enabled = true;
-        save_settings(&store, &settings).await.expect("enable youtube");
+        save_settings(&store, &settings)
+            .await
+            .expect("enable youtube");
 
         let request_store = store.clone();
         let paginated_request = async move {

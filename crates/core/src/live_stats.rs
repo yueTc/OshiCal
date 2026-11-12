@@ -24,9 +24,9 @@ use tokio_tungstenite::{
 
 use crate::bilibili::BilibiliClient;
 use crate::error::{AppError, AppResult};
-use crate::models::{LiveSession, LiveSessionStats};
 #[cfg(test)]
 use crate::models::Platform;
+use crate::models::{LiveSession, LiveSessionStats};
 use crate::store::SqliteStore;
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
@@ -1642,10 +1642,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let streamer = store
             .add_subscription(&AddSubscription {
-                    platform: Platform::Bilibili,
-                    handle: None,
-                    profile_url: None,
-                    uploads_playlist_id: None,
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "345".to_owned(),
                 name: Some("测试".to_owned()),
                 avatar_url: None,
@@ -2038,10 +2038,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = store
             .add_subscription(&AddSubscription {
-                    platform: Platform::Bilibili,
-                    handle: None,
-                    profile_url: None,
-                    uploads_playlist_id: None,
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "672328094".to_owned(),
                 name: Some("直播完整度测试".to_owned()),
                 avatar_url: None,
@@ -2118,10 +2118,10 @@ mod tests {
         let store = SqliteStore::in_memory().await.expect("store");
         let streamer = store
             .add_subscription(&AddSubscription {
-                    platform: Platform::Bilibili,
-                    handle: None,
-                    profile_url: None,
-                    uploads_playlist_id: None,
+                platform: Platform::Bilibili,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
                 mid: "672342685".to_owned(),
                 name: Some("直播统计冒烟测试".to_owned()),
                 avatar_url: None,

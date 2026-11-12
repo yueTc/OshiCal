@@ -14,15 +14,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
-use oshical_core::{
-    load_settings, save_settings as save_settings_to_store, AccountSearchResult, AppError, AppService,
-    AppSettings, DataMode, FanHistory, FertilitySnapshot, LinkedAccount, LlmConfig,
-    LlmDiscoveryConfig, LlmTestReport, NewSchedule, NewWeeklyScheduleRule, Platform, ProxyTestInput,
-    ProxyTestReport, RuntimeSecrets, Schedule, Streamer, SyncMutation, UpdateSchedule,
-    UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule, FAN_POLL_INTERVAL_SECONDS,
-    FERTILITY_POLL_INTERVAL_SECONDS,
-};
 use oshical_core::youtube::{YouTubeChannel, YouTubeClient};
+use oshical_core::{
+    load_settings, save_settings as save_settings_to_store, AccountSearchResult, AppError,
+    AppService, AppSettings, DataMode, FanHistory, FertilitySnapshot, LinkedAccount, LlmConfig,
+    LlmDiscoveryConfig, LlmTestReport, NewSchedule, NewWeeklyScheduleRule, Platform,
+    ProxyTestInput, ProxyTestReport, RuntimeSecrets, Schedule, Streamer, SyncMutation,
+    UpdateSchedule, UpdateSubscription, UpdateWeeklyScheduleRule, WeeklyScheduleRule,
+    FAN_POLL_INTERVAL_SECONDS, FERTILITY_POLL_INTERVAL_SECONDS,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -275,8 +275,7 @@ struct GoogleOAuthTokenResponse {
 
 static YOUTUBE_OAUTH_PENDING: std::sync::Mutex<Option<PendingDesktopYoutubeOAuth>> =
     std::sync::Mutex::new(None);
-static YOUTUBE_OAUTH_LAST_ERROR: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+static YOUTUBE_OAUTH_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static YOUTUBE_OAUTH_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn default_oauth_token_type() -> String {
@@ -859,11 +858,14 @@ fn youtube_oauth_configured() -> bool {
 }
 
 fn desktop_youtube_oauth_client_id() -> Result<String, String> {
-    let compile_time = option_env!("OSHICAL_YOUTUBE_CLIENT_ID")
-        .or(option_env!("OSHICAL_YOUTUBE_OAUTH_CLIENT_ID"));
-    let runtime = ["OSHICAL_YOUTUBE_CLIENT_ID", "OSHICAL_YOUTUBE_OAUTH_CLIENT_ID"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok());
+    let compile_time =
+        option_env!("OSHICAL_YOUTUBE_CLIENT_ID").or(option_env!("OSHICAL_YOUTUBE_OAUTH_CLIENT_ID"));
+    let runtime = [
+        "OSHICAL_YOUTUBE_CLIENT_ID",
+        "OSHICAL_YOUTUBE_OAUTH_CLIENT_ID",
+    ]
+    .iter()
+    .find_map(|name| std::env::var(name).ok());
     let value = compile_time
         .map(str::to_owned)
         .or(runtime)
@@ -973,7 +975,8 @@ fn token_response_to_desktop_token(
         .or(previous_refresh_token)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            "YOUTUBE_OAUTH_REFRESH_TOKEN_MISSING: Google 未返回 refresh token，请退出授权后重新授权".to_owned()
+            "YOUTUBE_OAUTH_REFRESH_TOKEN_MISSING: Google 未返回 refresh token，请退出授权后重新授权"
+                .to_owned()
         })?;
     let scopes = response
         .scope
@@ -1081,9 +1084,8 @@ async fn exchange_desktop_youtube_oauth_code(
             "YOUTUBE_OAUTH_EXCHANGE_FAILED: Google OAuth 授权失败或已过期，请重新授权".to_owned(),
         );
     }
-    serde_json::from_slice(&bytes).map_err(|_| {
-        "YOUTUBE_OAUTH_BAD_RESPONSE: Google OAuth 返回了无效响应".to_owned()
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "YOUTUBE_OAUTH_BAD_RESPONSE: Google OAuth 返回了无效响应".to_owned())
 }
 
 async fn refresh_desktop_youtube_oauth_if_needed() -> Result<bool, String> {
@@ -1132,9 +1134,7 @@ async fn refresh_desktop_youtube_oauth_if_needed() -> Result<bool, String> {
         .await
         .map_err(|_| "YOUTUBE_OAUTH_REFRESH_FAILED: 读取 Google OAuth 刷新响应失败".to_owned())?;
     if !status.is_success() {
-        return Err(
-            "YOUTUBE_OAUTH_REFRESH_FAILED: Google OAuth 已失效，请重新授权".to_owned(),
-        );
+        return Err("YOUTUBE_OAUTH_REFRESH_FAILED: Google OAuth 已失效，请重新授权".to_owned());
     }
     let response: GoogleOAuthTokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| "YOUTUBE_OAUTH_BAD_RESPONSE: Google OAuth 刷新返回了无效响应".to_owned())?;
@@ -1188,8 +1188,7 @@ async fn complete_pending_youtube_oauth(
             .map_err(|_| "YOUTUBE_OAUTH_STATE_INVALID: OAuth state 锁不可用".to_owned())?;
         let Some(current) = guard.as_ref() else {
             return Err(
-                "YOUTUBE_OAUTH_STATE_INVALID: 没有待完成的 YouTube 授权，请重新发起授权"
-                    .to_owned(),
+                "YOUTUBE_OAUTH_STATE_INVALID: 没有待完成的 YouTube 授权，请重新发起授权".to_owned(),
             );
         };
         if current.state != oauth_state {
@@ -1200,7 +1199,9 @@ async fn complete_pending_youtube_oauth(
         }
         if current.expires_at <= Utc::now() {
             *guard = None;
-            return Err("YOUTUBE_OAUTH_STATE_INVALID: YouTube OAuth state 已过期，请重新授权".to_owned());
+            return Err(
+                "YOUTUBE_OAUTH_STATE_INVALID: YouTube OAuth state 已过期，请重新授权".to_owned(),
+            );
         }
         guard
             .take()
@@ -1216,8 +1217,8 @@ async fn complete_pending_youtube_oauth(
     )
     .await?;
     ensure_youtube_enabled_for_service(service).await?;
-    let previous_refresh = load_desktop_youtube_oauth_token()?
-        .and_then(|token| token.refresh_token);
+    let previous_refresh =
+        load_desktop_youtube_oauth_token()?.and_then(|token| token.refresh_token);
     let token = token_response_to_desktop_token(response, previous_refresh)?;
     save_desktop_youtube_oauth_token(&token)?;
     sync_runtime_secrets(service).await?;
@@ -1383,9 +1384,7 @@ fn wait_for_youtube_oauth_callback(
                         "YouTube 授权未完成",
                         "Google 返回了授权取消或拒绝，请返回 OshiCal 重试。",
                     );
-                    return Err(
-                        "YOUTUBE_OAUTH_ACCESS_DENIED: Google 授权被取消或拒绝".to_owned(),
-                    );
+                    return Err("YOUTUBE_OAUTH_ACCESS_DENIED: Google 授权被取消或拒绝".to_owned());
                 }
                 let Some(code) = params.get("code").filter(|value| !value.is_empty()) else {
                     let _ = write_oauth_callback_page(
@@ -1418,10 +1417,7 @@ fn youtube_runtime_gate_open(settings: &AppSettings) -> bool {
     settings.youtube_enabled
 }
 
-fn youtube_background_refresh_should_run(
-    settings: &AppSettings,
-    oauth_configured: bool,
-) -> bool {
+fn youtube_background_refresh_should_run(settings: &AppSettings, oauth_configured: bool) -> bool {
     youtube_runtime_gate_open(settings) && oauth_configured
 }
 
@@ -1471,11 +1467,13 @@ fn youtube_oauth_expired() -> bool {
     };
     let access_expired = token.access_token.is_none()
         || token.access_token_expires_at.is_none_or(|expires_at| {
-            expires_at
-                <= Utc::now() + ChronoDuration::seconds(YOUTUBE_OAUTH_REFRESH_SKEW_SECONDS)
+            expires_at <= Utc::now() + ChronoDuration::seconds(YOUTUBE_OAUTH_REFRESH_SKEW_SECONDS)
         });
     let required_scope_missing = !token.scopes.is_empty()
-        && !token.scopes.iter().any(|scope| scope == YOUTUBE_OAUTH_SCOPE);
+        && !token
+            .scopes
+            .iter()
+            .any(|scope| scope == YOUTUBE_OAUTH_SCOPE);
     access_expired || required_scope_missing
 }
 
@@ -2183,7 +2181,9 @@ async fn start_youtube_oauth(
         .open_url(authorization_url.as_str(), None::<&str>)
     {
         clear_pending_youtube_oauth_if_state_matches(&oauth_state);
-        return Err(format!("YOUTUBE_OAUTH_BROWSER_FAILED: 打开系统浏览器失败: {error}"));
+        return Err(format!(
+            "YOUTUBE_OAUTH_BROWSER_FAILED: 打开系统浏览器失败: {error}"
+        ));
     }
 
     let listener_state = oauth_state.clone();
@@ -2198,9 +2198,7 @@ async fn start_youtube_oauth(
         .await;
         let callback = match callback {
             Ok(value) => value,
-            Err(_) => Err(
-                "YOUTUBE_OAUTH_CALLBACK_FAILED: OAuth 回调后台任务异常结束".to_owned(),
-            ),
+            Err(_) => Err("YOUTUBE_OAUTH_CALLBACK_FAILED: OAuth 回调后台任务异常结束".to_owned()),
         };
         match callback {
             Ok(code) => {
@@ -2208,12 +2206,8 @@ async fn start_youtube_oauth(
                     clear_pending_youtube_oauth_if_state_matches(&completion_state);
                     return;
                 }
-                let completion = complete_pending_youtube_oauth(
-                    &task_service,
-                    &code,
-                    &completion_state,
-                )
-                .await;
+                let completion =
+                    complete_pending_youtube_oauth(&task_service, &code, &completion_state).await;
                 match completion {
                     Ok(status) => {
                         let _ = task_app.emit("youtube-oauth-updated", status);
@@ -2491,7 +2485,9 @@ async fn clear_youtube_web_session(
             let cookies = window.cookies().map_err(|error| error.to_string())?;
             for cookie in cookies {
                 if youtube_cookie_should_be_removed(&cookie, &saved_cookie_names) {
-                    window.delete_cookie(cookie).map_err(|error| error.to_string())?;
+                    window
+                        .delete_cookie(cookie)
+                        .map_err(|error| error.to_string())?;
                 }
             }
             Ok::<(), String>(())
@@ -4344,8 +4340,8 @@ mod tests {
         parse_oauth_callback_target, prepare_forwarded_event, validate_external_url,
         youtube_background_refresh_should_run, youtube_cookie_names_from_header,
         youtube_cookie_should_be_removed, youtube_oauth_authorization_url,
-        youtube_runtime_gate_open, AppUpdateChannel,
-        RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
+        youtube_runtime_gate_open, AppUpdateChannel, RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT,
+        APP_UPDATE_STABLE_ENDPOINT,
     };
     use crate::sync_client::SyncChange;
     use oshical_core::{AppError, AppSettings};
@@ -4501,7 +4497,10 @@ mod tests {
         let saved_google_cookie = Cookie::build(("SID", "secret"))
             .domain(".google.com")
             .build();
-        assert!(!youtube_cookie_should_be_removed(&saved_google_cookie, &saved_names));
+        assert!(!youtube_cookie_should_be_removed(
+            &saved_google_cookie,
+            &saved_names
+        ));
 
         let unrelated_google_cookie = Cookie::build(("EMAIL", "private"))
             .domain(".google.com")
@@ -4516,9 +4515,8 @@ mod tests {
             .build();
         assert!(!youtube_cookie_should_be_removed(&youtube_cookie, &[]));
 
-        let google_cookie_without_saved_header = Cookie::build(("NID", "nid"))
-            .domain(".google.com")
-            .build();
+        let google_cookie_without_saved_header =
+            Cookie::build(("NID", "nid")).domain(".google.com").build();
         assert!(!youtube_cookie_should_be_removed(
             &google_cookie_without_saved_header,
             &[]

@@ -1363,9 +1363,7 @@ impl SqliteStore {
             return Err(AppError::validation("官号昵称长度必须为 1 到 80 字"));
         }
         let handle = handle.map(str::trim).filter(|value| !value.is_empty());
-        let profile_url = profile_url
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let profile_url = profile_url.map(str::trim).filter(|value| !value.is_empty());
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let streamer_platform: String =
@@ -3327,7 +3325,11 @@ impl SqliteStore {
         let started_at = snapshot
             .started_at
             .map(|value| value.to_rfc3339())
-            .or_else(|| (previous_is_live != 0).then(|| previous_started_at.clone()).flatten());
+            .or_else(|| {
+                (previous_is_live != 0)
+                    .then(|| previous_started_at.clone())
+                    .flatten()
+            });
         let changed = previous_is_live != (snapshot.is_live as i64)
             || previous_title.as_deref().unwrap_or_default() != snapshot.title
             || previous_cover.as_deref() != snapshot.cover_url.as_deref()
@@ -4434,8 +4436,7 @@ fn parse_opt_ts(value: Option<&str>) -> AppResult<Option<DateTime<Utc>>> {
 }
 
 fn parse_platform(value: &str) -> AppResult<Platform> {
-    Platform::parse(value)
-        .ok_or_else(|| AppError::validation(format!("未知账号平台: {value}")))
+    Platform::parse(value).ok_or_else(|| AppError::validation(format!("未知账号平台: {value}")))
 }
 
 fn validate_mid(mid: &str) -> AppResult<()> {
@@ -4609,13 +4610,12 @@ async fn needs_youtube_schema_migration(pool: &SqlitePool) -> AppResult<bool> {
         ("table", "live_super_chat_events"),
         ("index", "idx_live_super_chat_events_session"),
     ] {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?",
-        )
-        .bind(kind)
-        .bind(name)
-        .fetch_one(pool)
-        .await?;
+        let exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?")
+                .bind(kind)
+                .bind(name)
+                .fetch_one(pool)
+                .await?;
         if exists == 0 {
             return Ok(true);
         }
@@ -4788,21 +4788,17 @@ mod tests {
                 .await
                 .expect("intermediate schema");
         }
-        assert!(
-            needs_youtube_schema_migration(&pool)
-                .await
-                .expect("missing YouTube columns and table")
-        );
+        assert!(needs_youtube_schema_migration(&pool)
+            .await
+            .expect("missing YouTube columns and table"));
 
         sqlx::query("ALTER TABLE live_sessions ADD COLUMN youtube_stats_available INTEGER")
             .execute(&pool)
             .await
             .expect("youtube stats column");
-        assert!(
-            needs_youtube_schema_migration(&pool)
-                .await
-                .expect("missing super chat table")
-        );
+        assert!(needs_youtube_schema_migration(&pool)
+            .await
+            .expect("missing super chat table"));
 
         for statement in [
             "CREATE TABLE live_super_chat_events (id TEXT PRIMARY KEY)",
@@ -4817,20 +4813,16 @@ mod tests {
             .execute(&pool)
             .await
             .expect("nullable platform row");
-        assert!(
-            needs_youtube_schema_migration(&pool)
-                .await
-                .expect("legacy platform value needs a backup")
-        );
+        assert!(needs_youtube_schema_migration(&pool)
+            .await
+            .expect("legacy platform value needs a backup"));
         sqlx::query("UPDATE streamers SET platform = 'bilibili'")
             .execute(&pool)
             .await
             .expect("backfilled platform row");
-        assert!(
-            !needs_youtube_schema_migration(&pool)
-                .await
-                .expect("fully migrated schema")
-        );
+        assert!(!needs_youtube_schema_migration(&pool)
+            .await
+            .expect("fully migrated schema"));
     }
 
     #[tokio::test]

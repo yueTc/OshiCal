@@ -244,17 +244,11 @@ impl SecretVault {
         self.decrypt_with_aad(encoded, LLM_AAD)
     }
 
-    fn decrypt_youtube_api_key_detailed(
-        &self,
-        encoded: &str,
-    ) -> Result<(String, bool), AppError> {
+    fn decrypt_youtube_api_key_detailed(&self, encoded: &str) -> Result<(String, bool), AppError> {
         self.decrypt_with_aad_detailed(encoded, YOUTUBE_API_KEY_AAD)
     }
 
-    fn decrypt_youtube_oauth_detailed(
-        &self,
-        encoded: &str,
-    ) -> Result<(String, bool), AppError> {
+    fn decrypt_youtube_oauth_detailed(&self, encoded: &str) -> Result<(String, bool), AppError> {
         self.decrypt_with_aad_detailed(encoded, YOUTUBE_OAUTH_AAD)
     }
 
@@ -277,17 +271,13 @@ impl SecretVault {
         self.encrypt_with_aad(api_key, YOUTUBE_API_KEY_AAD)
     }
 
-
     fn encrypt_youtube_oauth(&self, token: &str) -> Result<String, AppError> {
         self.encrypt_with_aad(token, YOUTUBE_OAUTH_AAD)
     }
 
-
     fn encrypt_youtube_web_session(&self, cookie: &str) -> Result<String, AppError> {
         self.encrypt_with_aad(cookie, YOUTUBE_WEB_SESSION_AAD)
     }
-
-
 }
 
 fn derive_key(material: &str) -> [u8; 32] {
@@ -339,12 +329,8 @@ fn load_or_create_master_key(path: &Path) -> Result<[u8; 32], String> {
     }
 
     if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "创建主密钥目录 {} 失败: {error}",
-                parent.display()
-            )
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建主密钥目录 {} 失败: {error}", parent.display()))?;
     }
 
     let key = random_master_key();
@@ -372,10 +358,7 @@ fn load_or_create_master_key(path: &Path) -> Result<[u8; 32], String> {
         }
         Err(error) => {
             let _ = fs::remove_file(&temp_path);
-            return Err(format!(
-                "发布主密钥文件 {} 失败: {error}",
-                path.display()
-            ));
+            return Err(format!("发布主密钥文件 {} 失败: {error}", path.display()));
         }
     }
     restrict_key_file_permissions(path)?;
@@ -450,12 +433,8 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(unix)]
 fn restrict_key_file_permissions(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        format!(
-            "收紧主密钥文件 {} 权限失败: {error}",
-            path.display()
-        )
-    })?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("收紧主密钥文件 {} 权限失败: {error}", path.display()))?;
     let mode = fs::metadata(path)
         .map_err(|error| format!("读取主密钥文件 {} 权限失败: {error}", path.display()))?
         .permissions()
@@ -942,7 +921,10 @@ pub async fn save_persisted_youtube_api_key(
     let previous = match load_persisted_youtube_api_key_unlocked(store, vault).await {
         Ok(value) => value,
         Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
-            tracing::warn!(code = error.code(), "现有 YouTube API Key 密文损坏，将允许显式覆盖");
+            tracing::warn!(
+                code = error.code(),
+                "现有 YouTube API Key 密文损坏，将允许显式覆盖"
+            );
             None
         }
         Err(error) => return Err(error),
@@ -979,7 +961,9 @@ pub async fn save_persisted_youtube_api_key(
 
 pub async fn clear_persisted_youtube_api_key(store: &SqliteStore) -> Result<bool, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    store.delete_client_sync_state(YOUTUBE_API_KEY_STATE_KEY).await
+    store
+        .delete_client_sync_state(YOUTUBE_API_KEY_STATE_KEY)
+        .await
 }
 
 pub async fn load_persisted_youtube_oauth(
@@ -1042,7 +1026,9 @@ pub async fn save_persisted_youtube_oauth(
 
 pub async fn clear_persisted_youtube_oauth(store: &SqliteStore) -> Result<bool, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
-    store.delete_client_sync_state(YOUTUBE_OAUTH_STATE_KEY).await
+    store
+        .delete_client_sync_state(YOUTUBE_OAUTH_STATE_KEY)
+        .await
 }
 
 pub async fn load_persisted_youtube_web_session(
@@ -1057,8 +1043,7 @@ async fn load_persisted_youtube_web_session_unlocked(
     store: &SqliteStore,
     vault: &SecretVault,
 ) -> Result<Option<PersistedYoutubeWebSession>, AppError> {
-    let Some(mut stored) =
-        load_stored_youtube_secret(store, YOUTUBE_WEB_SESSION_STATE_KEY).await?
+    let Some(mut stored) = load_stored_youtube_secret(store, YOUTUBE_WEB_SESSION_STATE_KEY).await?
     else {
         return Ok(None);
     };
@@ -1102,7 +1087,10 @@ pub async fn save_persisted_youtube_web_session(
     let previous = match load_persisted_youtube_web_session_unlocked(store, vault).await {
         Ok(value) => value,
         Err(error) if is_recoverable_youtube_secret_read_error(&error) => {
-            tracing::warn!(code = error.code(), "现有 YouTube 网页会话密文损坏，将允许显式覆盖");
+            tracing::warn!(
+                code = error.code(),
+                "现有 YouTube 网页会话密文损坏，将允许显式覆盖"
+            );
             None
         }
         Err(error) => return Err(error),
@@ -1137,9 +1125,7 @@ pub async fn save_persisted_youtube_web_session(
     })
 }
 
-pub async fn clear_persisted_youtube_web_session(
-    store: &SqliteStore,
-) -> Result<bool, AppError> {
+pub async fn clear_persisted_youtube_web_session(store: &SqliteStore) -> Result<bool, AppError> {
     let _guard = SECRET_WRITE_LOCK.lock().await;
     store
         .delete_client_sync_state(YOUTUBE_WEB_SESSION_STATE_KEY)
@@ -1369,10 +1355,7 @@ mod tests {
     }
 
     fn temporary_test_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "oshical-{label}-{}",
-            Uuid::new_v4()
-        ));
+        let path = std::env::temp_dir().join(format!("oshical-{label}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -1511,9 +1494,7 @@ mod tests {
             refresh_token: "replacement-refresh".to_owned(),
             access_token: Some("replacement-access".to_owned()),
             access_token_expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
-            scopes: vec![
-                "https://www.googleapis.com/auth/youtube.readonly".to_owned(),
-            ],
+            scopes: vec!["https://www.googleapis.com/auth/youtube.readonly".to_owned()],
             token_type: "Bearer".to_owned(),
         };
         let oauth = save_persisted_youtube_oauth(&store, &vault, &token)
@@ -1562,7 +1543,9 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
 
         let youtube_stored = StoredSecret {
-            ciphertext: legacy.encrypt_youtube_api_key("AIza-legacy-youtube").unwrap(),
+            ciphertext: legacy
+                .encrypt_youtube_api_key("AIza-legacy-youtube")
+                .unwrap(),
             revision: 4,
             updated_at: Utc::now().to_rfc3339(),
             bound_base_url: None,
@@ -1600,12 +1583,7 @@ mod tests {
             .await
             .unwrap();
 
-        let safe = SecretVault::from_config_material(
-            None,
-            &database_path,
-            None,
-            Some(&key_file),
-        );
+        let safe = SecretVault::from_config_material(None, &database_path, None, Some(&key_file));
         assert_eq!(safe.key_source, SecretKeySource::GeneratedFile);
 
         let youtube = load_persisted_youtube_api_key(&store, &safe)
@@ -1679,7 +1657,9 @@ mod tests {
             .await
             .unwrap();
         let bili_stored = StoredSecret {
-            ciphertext: legacy.encrypt_bili_cookie("SESSDATA=still-readable").unwrap(),
+            ciphertext: legacy
+                .encrypt_bili_cookie("SESSDATA=still-readable")
+                .unwrap(),
             revision: 1,
             updated_at: Utc::now().to_rfc3339(),
             bound_base_url: None,
