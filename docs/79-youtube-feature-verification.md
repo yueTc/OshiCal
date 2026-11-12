@@ -1,17 +1,17 @@
 # YouTube 功能验证、CI 与发布门禁
 
-- 状态：静态审查完成；未执行任何构建、测试、Node fixture 校验或真实环境验收
+- 状态：只读静态审查、P1 修复和 CI 收口完成；真实 OAuth、Data API、会员 Cookie、SQLite 迁移回滚、Windows ACL、真实 UI 和 B 站完整回归尚未执行
 - 分支：`youtube`
-- 审查基准：`f93012b`、`3cd76bc`，并以当前工作树中的并行修改作静态参考
+- 当前审查基准：`e7fa3c9`；历史基准：`f93012b`、`3cd76bc`
+- CI：run `43153298753` 已全绿（提交 `e7fa3c96e3c8af5b94363b2a84703916709e1394`）
 - 对应实施计划：`docs/78-youtube-feature-implementation-plan.md`
-- 当前发布结论：**阻断**
-- 阻断解除后的建议：**仅 beta**；在 beta 验收及用户明确确认前，不得发布 stable
+- 当前发布结论：CI 门禁通过，stable 仍阻断；beta 可作为外部验收载体，但发布说明与版本门禁仍须完成
 
-> 本文件记录验证设计、静态证据和缺口。它不代表 CI 已通过，也不把源码中存在测试函数视为测试已经执行。
+> 本文件区分 GitHub Actions 已执行证据与真实外部环境证据。CI 通过不代表迁移、账号授权、真实会员页面、安装包或 B 站端到端回归已经通过。
 
 ## 1. 强制边界
 
-- 只允许在 `youtube` 分支工作；不得切换分支、提交、推送、发布或合并。
+- 本只读审查 Wave 内不提交、不推送、不发布；主代理可按用户授权处理提交。功能发布不能直接从 `youtube` 分支执行，必须先完成审核和合并流程。
 - 当前主机不得运行 `cargo`、`npm`、`npx`、`docker`、格式化、lint、构建、测试或 Node fixture 校验。
 - 构建、测试、lint、fixture 校验、安装升级、OAuth、真实页面和真实 UI 验收必须在 GitHub Actions 或用户明确指定的外部环境执行。
 - 本文档和 `scripts/youtube-fixtures/validate-fixtures.mjs` 的修改不得被解释为业务代码已通过验证。
@@ -23,7 +23,7 @@
 |---|---|
 | 静态实现 | 当前源码中存在对应路径，但未运行 |
 | 测试入口 | 仓库中存在单元/集成测试或 fixture 断言，但未执行 |
-| CI 配置 | 工作流中存在对应命令，但本次审查没有 CI 运行结果 |
+| CI 执行 | 当前 HEAD 已有可核验的 GitHub Actions 运行结果；只证明自动化步骤通过 |
 | 真实环境 | 必须连接真实操作系统、浏览器、Google、YouTube 或 SQLite 文件 |
 | 已执行 | 只有拿到可核验的运行链接或日志后才能使用 |
 
@@ -34,14 +34,14 @@
 - **环境不可达**：当前静态审查环境不能访问 Google、YouTube、Windows WebView 或真实发布清单。
 - **未实测**：已有入口，但本次未执行，不能声明通过。
 
-## 3. 当前静态结论
+## 3. 当前验证结论
 
-### 3.1 当前阻断
+### 3.1 当前发布阻断
 
-1. **账号输入契约已收口，仍需由 CI 复核。**
+1. **已关闭：账号输入及其他源码 P1 已由 CI 复核。**
    - 生产解析器将显式非 YouTube URL 安全降级为关键词搜索，不访问该 URL，也不把它作为上游请求目标。
-   - `scripts/youtube-fixtures/account-inputs.json`、`scripts/youtube-fixtures/validate-fixtures.mjs` 和 Rust 回归测试已按同一契约对齐。
-   - `server/tests/youtube_api.rs::account_input_fixture_matches_public_parser` 仍需在外部 CI 实际运行后才能证明测试通过；静态审查不能替代执行。
+   - `scripts/youtube-fixtures/account-inputs.json`、`scripts/youtube-fixtures/validate-fixtures.mjs` 和 Rust 回归测试已在 run `43153298753` 同时通过。
+   - 同一轮已修复：带平台的关联账号同步删除事件、桌面 OAuth 刷新/退出竞态、YouTube 社区帖稳定指纹、会员预览图片过滤、YouTube 聊天事件持久去重。
 
 2. **当前桌面版本已有一份与 YouTube 无关的发布说明。**
    - `package.json` 和 `src-tauri/tauri.conf.json` 当前为 `0.3.23-beta.1`。
@@ -49,7 +49,7 @@
    - 若直接使用当前版本发布 YouTube，Release 工作流会读取这份错误正文。
    - 必须生成新的桌面 beta 版本号和全新发布说明；不可复用或覆盖旧的已发布说明。具体版本以实际正式版/测试版清单计算，当前静态建议为 `0.3.23-beta.2` 或下一可用 beta，仍需发布前核对。
 
-### 3.2 P1 beta 阻断
+### 3.2 P1 beta 外部验证阻断
 
 | ID | 缺口 | 类型 | 当前证据 | 关闭条件 |
 |---|---|---|---|---|
@@ -58,7 +58,7 @@
 | GAP-ZERO-01 | 总开关关闭后的“全局零外部请求”未验证 | 无入口/未实测 | 路由短路测试和 collector 分页门闩测试不能证明所有后台任务/浏览器路径为零 | 第 8 节代理或请求计数验收通过 |
 | GAP-FIX-01 | 除账号输入外，其余 fixture 未被生产 Rust 测试消费 | 无入口 | 静态 rg 只发现 `account-inputs.json` 被 Rust 读取；Data API、社区、直播、OAuth、legacy 仅由 JS 自检 | 生产解析器读取同一 fixture，或等价的 Rust golden tests 存在并在 CI 执行 |
 | GAP-UI-01 | 没有 YouTube 专用真实 UI 自动化 | 无入口/未实测 | 现有浏览器脚本是既有直播图表和卡片回归，不覆盖 YouTube 设置、凭据和独立卡片全流程 | 第 9 节 UI-001 至 UI-016 在安装包/构建产物上通过 |
-| GAP-CI-01 | `youtube` 分支尚未在远端实际触发 CI | 未实测 | `ci.yml` 已加入 `youtube` push 触发和 fixture 校验步骤，但本地提交不能证明远端运行成功 | 推送后取得该提交对应的 CI 运行链接 |
+| GAP-CI-01（已关闭） | `youtube` 分支 CI 已触发并通过 | 已执行 | run `43153298753`，提交 `e7fa3c9`，全部步骤成功 | 保持后续提交同样全绿 |
 | GAP-COOKIE-01 | 会员社区帖只验证合成 fixture | 无数据/环境不可达 | 真实 YouTube 页面结构与会员登录态未测试 | 有权限/无权限账号各完成一次真实会员帖验收 |
 | GAP-API-01 | 真实 Data API 配额、分页、429、Super Chat continuation 未验收 | 无数据/环境不可达 | 现只有解析器测试和本地统计门闩测试 | 使用专用测试项目和配额预算完成第 7、10 节 |
 | GAP-WIN-01 | Windows 主密钥 ACL、系统浏览器回环回调、WebView Cookie 捕获未验收 | 环境不可达 | 仅有源码路径和局部单元测试 | Windows 构建产物上完成凭据与 OAuth smoke test |
@@ -82,23 +82,23 @@
 | ID | 用户需求 | 静态实现路径 | 当前验证入口 | 状态/缺口 |
 |---|---|---|---|---|
 | REQ-01 | B 站与 YouTube 独立卡片，不合并人物 | `App.tsx`、`CreatorsView.tsx`、平台字段与筛选 | UI-007 | 静态实现；未真实 UI |
-| REQ-02 | 搜索、URL、`@handle`、Channel ID 添加 | `crates/core/src/youtube.rs`、三套客户端 API | 账号 fixture、Rust parser test | 契约已对齐；待 CI 执行 |
+| REQ-02 | 搜索、URL、`@handle`、Channel ID 添加 | `crates/core/src/youtube.rs`、三套客户端 API | 账号 fixture、Rust parser test | 契约与 Rust 测试 CI 通过；真实 API 未验证 |
 | REQ-03 | 关联账号 | 服务端/Tauri 路由和模型 | 服务端 feature gate 合约 | 新增成功路径未端到端验证 |
-| REQ-04 | 每用户填写自己的 API Key | SecretVault/本地密钥存储 | 服务端加密和不回显测试 | 有入口；未执行 |
+| REQ-04 | 每用户填写自己的 API Key | SecretVault/本地密钥存储 | 服务端加密和不回显测试 | 自动化测试 CI 通过；真实用户 Key 未验证 |
 | REQ-05 | OAuth 读取直播聊天、Super Chat、会员事件 | `youtube.rs`、`youtube_oauth.rs`、`youtube_stats.rs` | 解析器/错误码/缺配置测试 | 真实 OAuth 无入口 |
 | REQ-06 | 网页 Cookie 抓取会员帖 | WebView 捕获、凭据槽位、社区解析 | 合成 fixture | 真实 Cookie/页面未测 |
 | REQ-07 | 公开与会员社区帖生成日程 | 社区解析到 LLM/日程链路 | 解析测试、UI-008/009 | 无端到端自动化 |
-| REQ-08 | 无会员权限时跳过，不报整轮错误 | `skipped=membership_session_unavailable` | 社区 fixture | 有入口；未执行 |
+| REQ-08 | 无会员权限时跳过，不报整轮错误 | `skipped=membership_session_unavailable` | 社区 fixture | fixture 契约 CI 通过；真实会员页面未验证 |
 | REQ-09 | 预约直播、开播/下播、最近直播 | `videos.list`、`/live` probe、场次模型 | 视频映射、直播页状态测试 | 真实页面未测 |
 | REQ-10 | 开播通知与直播 URL | 通知与 Tauri URL 构造 | UI-011 | 无 YouTube 专用 UI 自动化 |
 | REQ-11 | 峰值/平均观看、时长、弹幕、Super Chat、会员数 | 统计 collector、场次聚合、LiveDataModal | store 单测、live-online 前端测试 | 真实聊天/分页未测 |
-| REQ-12 | 新主播 `liveStatsEnabled` 默认关闭 | 模型默认值 | `youtube_subscription_defaults_live_stats_to_false` | 有入口；未执行 |
+| REQ-12 | 新主播 `liveStatsEnabled` 默认关闭 | 模型默认值 | `youtube_subscription_defaults_live_stats_to_false` | 自动化测试 CI 通过 |
 | REQ-13 | 设置页最下方总开关，默认关闭 | `SettingsView.tsx`、settings 默认值 | 服务端默认关闭测试、UI-001 | 有入口；未真实 UI |
 | REQ-14 | 关闭后不发起 YouTube 请求 | 路由 gate、collector gate、OAuth 刷新 gate | 路由/分页有限测试 | GAP-ZERO-01 |
 | REQ-15 | 关闭后保留数据和凭据，重新开启可恢复 | settings 切换不删除数据 | 无完整往返测试 | 无入口 |
-| REQ-16 | 数据库自动迁移旧 B 站数据 | `store.rs` 备份与迁移 | 备份条件单测、同步默认值 | GAP-MIG-01 |
-| REQ-17 | 同步 schema 3 和旧客户端升级提示 | `sync_feed.rs`、`sync.ts` | schema 3 服务端测试、前端 schema 检查 | 未执行；无旧客户端矩阵 |
-| REQ-18 | 达到现有 B 站同等核心功能 | 平台分支与共用服务 | CI 全量测试、UI-016 | 未执行 |
+| REQ-16 | 数据库自动迁移旧 B 站数据 | `store.rs` 备份与迁移 | 备份条件单测、同步默认值 | 单元测试 CI 通过；真实 `connect_path` 迁移未验证（GAP-MIG-01） |
+| REQ-17 | 同步协议 schema 3 和旧客户端升级提示 | `sync_feed.rs`、`sync.ts` | schema 3 服务端测试、前端 schema 检查 | 自动化测试 CI 通过；无旧客户端矩阵 |
+| REQ-18 | 达到现有 B 站同等核心功能 | 平台分支与共用服务 | CI 全量测试、UI-016 | 全量 CI 通过；真实 B 站与 YouTube UI 回归未验证 |
 
 ## 5. Fixture 与测试资产契约
 
@@ -110,7 +110,7 @@
 | `live-page.json` | 直播/离线/已结束/未知态 | `validate-fixtures.mjs` | 需补 Rust production-parser golden test |
 | `oauth-contract.json` | OAuth 能力矩阵 | `validate-fixtures.mjs` | 不是服务端 OAuth 集成测试 |
 | `legacy-bilibili.json` | 旧列集默认平台契约 | `validate-fixtures.mjs` | 不是 SQLite 迁移测试 |
-| `validate-fixtures.mjs` | 只读 fixture 自检 | CI 的 YouTube fixture contracts 步骤 | 本次未运行；不能替代生产测试 |
+| `validate-fixtures.mjs` | 只读 fixture 自检 | CI 的 YouTube fixture contracts 步骤 | 当前 HEAD CI 已通过；不能替代生产测试 |
 
 `validate-fixtures.mjs` 本次增强的静态规则：
 
@@ -140,9 +140,9 @@
 必须在外部临时目录执行，保留日志和哈希：
 
 1. 准备三份数据库：
-   - v2 旧库：无任何 YouTube 平台字段。
-   - 中间 beta 库：已有部分平台列，缺 `membership_count`、`youtube_stats_available`、Super Chat 表或索引。
-   - 当前 schema 库：作为“不应重复备份”的对照。
+   - 旧列集库：无任何 YouTube 平台字段。
+   - 中间 beta 列集库：已有部分平台列，缺 `membership_count`、`youtube_stats_available`、Super Chat/聊天事件表或索引。
+   - 完整迁移列集库：作为“不应重复备份”的对照。
 2. 每份库写入代表性数据：B 站 streamer、linked account、schedule source、suppression、live session、设置和 sync change。
 3. 记录迁移前的表清单、列清单、行数、关键行校验和数据库/WAL 路径。
 4. 调用生产入口 `SqliteStore::connect_path`，不得用测试函数替代。
@@ -160,10 +160,10 @@
 
 ### 6.3 升级和回滚注意
 
-- 备份必须包含数据库以及必要的 WAL/SHM；只导出 JSON 快照不能视为完整统计库备份。
+- 应用内迁移备份使用 `VACUUM INTO`，是一致性数据库快照；手工复制数据库作为外部备份时另行包含 WAL/SHM。只导出 JSON 快照不能视为完整统计库备份。
 - 回滚旧服务端前必须备份新的随机主密钥文件。旧版本不读取该密钥文件，已迁移的 YouTube 凭据可能需要重新填写。
 - 不得自动把新密文降级回旧可预测密钥。
-- 回滚旧客户端时同时恢复对应数据库/服务端版本，避免旧客户端误读 schema 3 数据。
+- 回滚旧客户端时同时恢复对应数据库/服务端版本；`SYNC_SCHEMA_VERSION=3` 的同步 payload/cache 不得按 schema 2 客户端解析。`SERVER_SNAPSHOT_SCHEMA_VERSION` 仍为 1。
 
 ## 7. OAuth、Data API 与凭据真实验收
 
@@ -174,7 +174,7 @@
 - API Key 加密槽位、响应不回显、同步 payload 不含明文。
 - 动态 `YOUTUBE_HTTP_<status>` 不折叠。
 - 解析器覆盖聊天文本、Super Chat、Super Sticker 和会员事件。
-- 这些测试均未在本轮执行。
+- 当前 HEAD 的 CI 已执行服务端、fixture、前端和 Rust 测试并通过；真实 Google OAuth 和真实页面仍未执行。
 
 ### 7.2 真实 OAuth 验收
 
@@ -276,11 +276,11 @@ npm run build:web
 
 注意：
 
-- `ci.yml` 已加入 `youtube` push 触发；推送后仍须在结果报告里附上提交 SHA 和实际运行链接。
-- YouTube fixture 步骤必须随工作流修改一起提交；当前未提交的工作树修改不能证明远端 CI 会运行。
+- `ci.yml` 已加入 `youtube` push 触发；run `43153298753` 对提交 `e7fa3c9` 全部步骤成功。
+- YouTube fixture 步骤和 UI fixture schema 3 已随当前 HEAD 提交；剩余问题不是“未提交”，而是真实环境验收和 UI-001 至 UI-016。
 - `cargo check` 没有单独步骤；clippy 会编译，但不能把 `cargo check` 写成“已执行”。
 - `npm run check` 出现在 Release 工作流。它包含 `cargo fmt`、clippy 和 TypeScript，不是 CI 当前步骤名。
-- 所有命令均未在本次静态审查中运行。
+- 本文件没有在本机执行命令；上述 CI 证据来自 GitHub Actions。
 
 ### 10.2 外部验收命令
 
@@ -304,33 +304,46 @@ node scripts/youtube-fixtures/validate-fixtures.mjs
 - Windows 安装包 smoke test。
 - YouTube 专用浏览器/原生 UI 测试。
 
-## 11. Beta 发布门禁
+## 11. Beta 发布与验证门禁
 
-发布 beta 前必须全部满足，且每项有外部运行证据：
+按 `AGENTS.md` 的默认节奏，先发布 beta 作为外部验收载体；真实迁移、OAuth、会员 Cookie、UI 和 B 站回归可在 beta 周期完成，stable 必须等这些验证通过。
 
-- [ ] 账号输入 fixture 与生产解析器的契约已静态对齐，并由 CI 证明 Rust 测试和 fixture 校验同时通过。
-- [ ] 当前提交对应 CI 运行全绿，报告链接包含 SHA。
-- [ ] `cargo fmt/clippy/test`、TypeScript、前端测试、Web build 和 fixture 校验通过。
-- [ ] 生产 Rust 解析器读取 Data API/社区/直播 fixture，或等价 golden tests 已加入 CI。
-- [ ] schema 2/中间 beta 到 schema 3 的真实迁移、备份、二次启动、回滚演练通过。
-- [ ] OAuth PKCE/state/refresh/logout 和真实 Google 聊天链路通过。
-- [ ] 总开关关闭零外部请求通过，并证明数据与凭据保留。
-- [ ] 会员帖有权限/无权限真实页面验证通过。
-- [ ] 桌面端和服务器端 Windows/Linux 目标构建产物可启动。
+### 11.1 Beta 发布前最低门禁
+
+- [x] 当前提交对应 GitHub Actions 全绿（`e7fa3c9`，run `43153298753`）。
+- [x] 无已知 P0/P1 源码缺陷；本轮 P1 修复已由 CI 编译和测试。
+- [ ] 通过 `npm run version:next-beta -- <desktop|server>` 生成版本号，并核对远端标签。
+- [ ] 对应产品 beta 发布说明已定稿，包含功能、迁移、已知限制和回滚方式。
+- [ ] 发布工作流能在默认分支执行；不得直接从 `youtube` 分支发布。
+
+### 11.2 Beta 周期验证门禁
+
+- [ ] SQLite 旧列集/中间 beta 列集迁移、备份、二次启动和回滚。
+- [ ] 真实 OAuth PKCE/state/refresh/logout、Data API、聊天和 Super Chat 分页。
+- [ ] 真实会员 Cookie 和会员帖有权限/无权限页面。
+- [ ] 总开关关闭零外部请求，并证明数据与凭据保留。
+- [ ] Windows 安装包、WebView、OAuth 回调和主密钥 ACL。
 - [ ] UI-001 至 UI-016 在安装包或构建产物上通过。
 - [ ] B 站完整回归无新增失败。
 - [ ] 所有未验证项和 P2 已知限制写入 beta 发布说明。
+
+### 11.3 Stable 发布前门禁
+
+- [ ] 上述 beta 周期验证全部通过。
+- [ ] 同一核心版本从 beta 晋级 stable，例如 `0.3.23-beta.2` 验证通过后晋级 `0.3.23`；不是 beta.N 字符串与正式版完全相同。
+- [ ] 正式版发布说明汇总整个 beta 周期的全部用户可见变化。
+- [ ] 用户明确确认发布 stable。
 
 ## 12. Stable 发布门禁
 
 正式版发布前还必须满足：
 
-- [ ] 同一核心版本的 beta 已完成外部验收，且 beta 版本号与正式版一致。
+- [ ] 同一核心版本的 beta 已完成外部验收；beta 与 stable 的核心版本必须一致，例如 `0.3.23-beta.2` 验证通过后晋级 `0.3.23`。
 - [ ] 候选版本严格高于当前正式版清单；测试版渠道同时读取 beta/stable 清单并按 SemVer 选择更高版本。
 - [ ] 自动检测和定时更新不会把 beta 降级为较低 stable。
 - [ ] 用户主动从 beta 切回较低 stable 时，界面明确提示显式降级并要求二次确认。
 - [ ] 数据库迁移备份、主密钥文件、凭据重录和旧客户端/旧服务端回滚均演练通过。
-- [ ] 旧客户端连接 schema 3 服务端时显示升级提示，不静默解析。
+- [ ] 旧客户端连接 `SYNC_SCHEMA_VERSION=3` 服务端时显示升级提示，不静默解析。
 - [ ] 发布说明已定稿，Release 正文与标签、渠道、产物完全一致。
 - [ ] 用户明确确认发布 stable。
 - [ ] 发布后不再为下一批改动前进 PATCH，直到本版本正式发布完成。
@@ -366,9 +379,10 @@ node scripts/youtube-fixtures/validate-fixtures.mjs
 ### 13.3 渠道与版本
 
 - 桌面候选不能在 `0.3.23-beta.1` 上复用旧说明；以实际发布清单计算新 beta 号。
-- 服务端当前静态版本为 `0.3.30`；候选预计为 `0.3.31-beta.1`，发布前仍须核对正式/测试清单。
+- 服务端当前静态版本为 `0.3.30`；按本地标签计算的候选为 `0.3.31-beta.1`，发布前仍须核对正式/测试清单并用版本脚本生成。
 - 测试版 Release 必须标记 prerelease，并更新固定 `desktop-beta`/`server-beta` 清单；不得移动 `latest` 或正式版 `desktop-v*` 清单。
 - beta 发布不自动意味着可以发布 stable；stable 必须等 beta 验证和用户明确确认。
+- beta 说明写相对上一 beta 的增量；stable 说明汇总同一核心版本的全部用户可见变化。桌面端和服务端发布说明都必须写明更新渠道、适用产物和升级/回滚要求。
 
 ## 14. 回滚检查
 
@@ -406,6 +420,6 @@ B 站回归：
 
 - 测试矩阵已覆盖主要用户需求，但静态覆盖不等于外部验收通过。
 - 静态审查未发现新的 P0；账号输入契约已对齐。仍有迁移、OAuth、零请求、真实 UI 和真实页面等 P1 运行验证缺口。
-- 在 P1 有运行证据、beta 发布说明独立定稿前：**阻断**。
-- P1 关闭后，最多建议先发布 beta；不得直接 stable。
-- 本次没有运行 Node fixture 校验、cargo、npm、npx、docker、构建、测试或格式化，也没有 CI 通过链接。
+- 当前 HEAD 的 CI run `43153298753` 已通过；剩余阻断项是真实外部环境验收，而不是 CI。
+- P1 源码修复已完成；真实迁移/OAuth/零请求/真实 UI/B 站回归证据齐备前只能是 beta 候选，stable 仍阻断。
+- 本文件没有在本机执行 Node fixture 校验、cargo、npm、npx、docker、构建、测试或格式化；CI 证据另见上述运行链接。

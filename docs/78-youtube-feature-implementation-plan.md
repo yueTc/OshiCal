@@ -1,7 +1,10 @@
 # YouTube 平台功能实现计划
 
-- 状态：第二轮并行实现完成，待 CI 与外部环境验收
+- 状态：Wave 3 并行审查、P1 修复和 CI 收口完成；真实环境验收仍待执行
 - 分支：`youtube`
+- 当前实现基准：`e7fa3c9`
+- CI：run `43153298753` 已全绿（提交 `e7fa3c96e3c8af5b94363b2a84703916709e1394`）
+- 历史审查基准：`f93012b`、`3cd76bc`
 - 工作区：`D:\work\guanrenchi`
 - 约束：禁止在当前工作区执行任何构建、测试、编译命令；只做源码编辑和静态分析，验证统一走 CI。
 - 既有无关改动：`video/oshical-promo/**`、`docs/67-*`、`docs/71-*` 等现有改动不得覆盖、回退或纳入本功能。
@@ -79,23 +82,25 @@ LiveStatus.live_video_id
 
 数据库迁移：
 
-```sql
-ALTER TABLE streamers ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili';
-ALTER TABLE streamers ADD COLUMN handle TEXT;
-ALTER TABLE streamers ADD COLUMN profile_url TEXT;
-ALTER TABLE streamers ADD COLUMN uploads_playlist_id TEXT;
-ALTER TABLE linked_accounts ADD COLUMN platform TEXT NOT NULL DEFAULT 'bilibili';
-ALTER TABLE linked_accounts ADD COLUMN handle TEXT;
-ALTER TABLE linked_accounts ADD COLUMN profile_url TEXT;
+实际迁移包含：
+
+```text
+streamers: platform, handle, profile_url, uploads_playlist_id, live_video_id
+linked_accounts: platform, handle, profile_url
+schedule_sources: platform
+source_suppressions: platform
+live_sessions: membership_count, youtube_stats_available
+live_super_chat_events + idx_live_super_chat_events_session
+live_youtube_chat_events + session indexes
 ```
 
 迁移要求：
 
 - 启动时自动执行，事务内完成。
-- 迁移前生成数据库备份。
+- 需要对旧列集或中间 beta 列集迁移时，使用 `VACUUM INTO` 生成一致性数据库备份；完全迁移库和新库不重复生成。
 - 迁移失败回滚并阻止继续启动，保留原库。
-- 旧数据全部默认为 `bilibili`。
-- 同步 schema 从 2 升到 3；新字段使用 `serde(default)` 兼容旧数据读取。
+- 旧数据缺失平台时全部回填为 `bilibili`。
+- 实时同步协议 `SYNC_SCHEMA_VERSION` 从 2 升到 3；SQLite 表结构通过列/表检测向前演进，没有独立的“数据库 schema 3”版本字段。`SERVER_SNAPSHOT_SCHEMA_VERSION` 仍为 1。
 
 ## 4. YouTube 账号与凭据
 
@@ -273,7 +278,7 @@ youtube_live
 - 预约直播：使用 `scheduledStartTime` 生成 `youtube_live` 来源。
 - 已开播但无预约：直播状态生成直播场次，不伪造未来日程。
 - `SourceKind` 扩展对应 labels 和样式。
-- `ScheduleSource` 增加平台字段或通过所属 streamer 的平台推导；优先增加 `source_platform` 保证完整性。
+- `ScheduleSource` 使用实际模型字段 `platform`；来源平台与所属 streamer 必须一致。
 
 ## 8. 服务端与本地接口
 
@@ -295,7 +300,9 @@ POST /api/subscriptions
 
 ```http
 POST /api/subscriptions/{id}/links
-DELETE /api/subscriptions/{id}/links/{platform}/{mid}
+DELETE /api/subscriptions/{id}/links/{mid}
+POST /api/youtube/subscriptions/{id}/links
+DELETE /api/youtube/subscriptions/{id}/links/{mid}
 ```
 
 ### 8.4 凭据
@@ -304,16 +311,20 @@ DELETE /api/subscriptions/{id}/links/{platform}/{mid}
 GET /api/secrets/youtube
 PUT /api/secrets/youtube
 DELETE /api/secrets/youtube
+GET /api/youtube/status
 POST /api/youtube/oauth/start
+POST /api/youtube/oauth/complete
 GET /api/youtube/oauth/callback
 POST /api/youtube/oauth/refresh
 POST /api/youtube/oauth/logout
+GET /api/youtube/session
+PUT /api/youtube/session
+DELETE /api/youtube/session
 GET /api/youtube/session/status
 POST /api/youtube/session/start
-DELETE /api/youtube/session
 ```
 
-所有接口复用现有 API Token 鉴权，并强制检查 `youtube_enabled`。
+除公开的 `GET /api/youtube/oauth/callback` 外，接口复用现有 API Token 鉴权；所有 YouTube 路径仍强制检查 `youtube_enabled`。服务端不自动捕获 WebView Cookie，`/api/youtube/session/start` 返回登录地址并配合 `/api/youtube/session` 导入。
 
 ### 8.5 Tauri 命令
 
@@ -324,10 +335,12 @@ add_linked_account({ id, platform, mid })
 remove_linked_account({ id, platform, mid })
 youtube_status()
 set_youtube_api_key({ apiKey })
+clear_youtube_api_key()
 start_youtube_oauth()
 complete_youtube_oauth({ code, state })
 clear_youtube_oauth()
 start_youtube_web_login()
+set_youtube_web_session({ cookie })
 clear_youtube_web_session()
 ```
 
@@ -504,11 +517,17 @@ scripts/（仅新增 YouTube fixture/probe 脚本）
 禁止本地构建/测试。CI 至少执行：
 
 ```text
-cargo fmt --check
-cargo check --workspace
-cargo test --workspace --no-fail-fast
-npm run check
+npx tsc -b --pretty false
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --message-format=short -- -D warnings
+python -m unittest discover -s scripts -p test_refresh_timing.py -v
+node scripts/live-schedule-baseline.mjs
+npm run test:web
+node scripts/youtube-fixtures/validate-fixtures.mjs
+cargo test --workspace --locked --no-fail-fast
 npm run build:web
+node scripts/live-online-ui.mjs
+node scripts/live-broadcast-ui.mjs
 ```
 
 验证重点：
@@ -526,8 +545,9 @@ npm run build:web
 
 版本与发布：
 
-- 桌面端：`0.3.23-beta.2`（`desktop-v0.3.23-beta.1` 已被当前基线占用）
-- 服务端：`0.3.31-beta.1`
+- 当前按本地标签计算的候选版本：桌面端 `0.3.23-beta.2`、服务端 `0.3.31-beta.1`；尚未执行版本推进。
+- 发布前必须重新核对远端标签，并通过 `npm run version:next-beta -- <desktop|server>` 生成版本，不手工改版本。
+- 发布工作流要求提交位于默认分支；不能直接从 `youtube` 分支发布。
 - 两端发布说明分别写入 `docs/`
 - 正式版必须等用户明确确认后发布
 - 测试版不得移动 stable/latest 清单
@@ -543,7 +563,7 @@ npm run build:web
 - 同一主播的 B 站和 YouTube 记录保持独立。
 ## 16. 第二轮并行修复波次（2026-11-12）
 
-当前状态：主功能已完成第一轮源码实现，尚未构建、测试或发布。本轮只处理交付阻断项和跨模块一致性。
+当前状态：第二轮并行修复、Wave 3 审查及后续 P1 修复均已完成；当前 HEAD 的 GitHub Actions 已通过，真实环境验收仍待执行。
 
 ### Wave 2.1：LiveSession 同步闭环
 
@@ -637,12 +657,17 @@ src/styles.css
 git branch --show-current                 # 必须为 youtube
 git diff --check                          # 空白错误必须为 0
 rg 静态字段扫描                            # 新增字段的模型/SQL/同步/UI 链路完整
-CI: cargo fmt --check
-CI: cargo check --workspace
-CI: cargo test --workspace --no-fail-fast
-CI: npm run check
-CI: npm run build:web
+CI: npx tsc -b --pretty false
+CI: cargo fmt --all -- --check
+CI: cargo clippy --workspace --all-targets --message-format=short -- -D warnings
+CI: python -m unittest discover -s scripts -p test_refresh_timing.py -v
+CI: node scripts/live-schedule-baseline.mjs
+CI: npm run test:web
 CI: node scripts/youtube-fixtures/validate-fixtures.mjs
+CI: cargo test --workspace --locked --no-fail-fast
+CI: npm run build:web
+CI: node scripts/live-online-ui.mjs
+CI: node scripts/live-broadcast-ui.mjs
 ```
 
 本地禁止执行上述 CI 命令。任何未运行项必须列入未验证项，不能声明为已通过。
@@ -725,7 +750,7 @@ crates/core/src/weekly.rs
 审查重点：
 
 - `Platform` 默认值与旧 B 站数据迁移。
-- schema 2 → 3、中间 beta schema、备份、事务回滚。
+- 同步协议 2 → 3、中间 beta 列集、备份、事务回滚。
 - `streamers.mid` 唯一约束、平台过滤、关联账号和跨平台隔离。
 - `LiveSession.membershipCount`、`youtubeStatsAvailable` 在查询、同步 bootstrap/changes、导入导出中的完整性。
 - 关闭总开关后后台刷新/采样不再启动。
@@ -822,7 +847,7 @@ scripts/youtube-fixtures/validate-fixtures.mjs
 - `git status --short` 中除了既有无关改动，不出现未归属范围的临时文件。
 - 每个智能体报告：已完成、相关文件、证据、未完成、阻塞、P0/P1/P2。
 - 所有 P0/P1 均有修复 diff 或明确的阻断说明；P2 全部进入 beta 已知限制。
-- 静态检查通过不代表构建通过；CI 结果未返回前，状态只能是“待外部验证”。
+- CI 通过只代表自动化门禁通过，不代表真实迁移、OAuth、会员 Cookie、Windows ACL 或安装包回归已验收。
 - 发布候选版本按当前标签修正为 desktop `0.3.23-beta.2`、server `0.3.31-beta.1`；未得到用户确认前不得发布 stable。
 
 ## 20. Wave 3 并行审查结果（2026-11-12）
@@ -839,19 +864,21 @@ scripts/youtube-fixtures/validate-fixtures.mjs
 
 - 源码层 P0：未发现。
 - 代码层 P1：本轮发现并修复；真实环境验证缺口仍存在。
-- 必须披露的 P2：进程重启后的聊天/Super Chat 水位不持久化、社区页首屏限制、预约只查最近 20 个上传、`streamers.mid` 全局唯一、Super Chat 明细本地优先、无统一搜索 TTL 缓存。
-- `scripts/youtube-fixtures/validate-fixtures.mjs`、Rust 测试、TypeScript 类型检查和构建均未在本机执行。
-- CI 必须通过 PR 或手动 `workflow_dispatch` 触发；`youtube` 分支的 push 不包含在当前 `ci.yml` push 分支列表中。
-- beta 发布前必须取得 CI 链接、外部迁移/OAuth/零请求/真实 UI/B 站回归证据；stable 必须等待用户明确确认。
+- 必须披露的 P2：continuation token 不跨进程持久化（已由持久消息 ID 去重兜底）、聊天事件表暂无独立清理策略、社区页首屏限制、预约只查最近 20 个上传、`streamers.mid` 全局唯一、Super Chat 明细本地优先、无统一搜索 TTL 缓存、相对发布时间锚点仍按本次抓取估算。
+- `scripts/youtube-fixtures/validate-fixtures.mjs`、Rust 测试、TypeScript 类型检查、构建和两个既有 UI 脚本已在 GitHub Actions 执行；本机仍未执行。
+- `ci.yml` 已包含 `youtube` push 触发；当前 HEAD `e7fa3c9` 已触发并通过 run `43153298753`。剩余门禁是外部迁移/OAuth/零请求/真实 UI/B 站回归证据。
+- 本轮额外修复：带平台的关联账号同步删除事件、桌面 OAuth 刷新/退出竞态、社区帖稳定指纹、会员预览图片过滤、YouTube 聊天事件持久去重。
+- beta 发布前必须取得 CI 链接和外部验证结果；stable 必须等待用户明确确认。
 
 ### 20.3 收口门禁
 
 - [x] 只修改 YouTube 功能相关写集，未触碰既有无关改动。
 - [x] 计划、验证矩阵和并行 Agent 结果已落盘。
 - [x] 账号输入 fixture、生产解析器和 Rust 回归契约静态对齐。
-- [ ] `git diff --check` 通过（提交前执行）。
-- [ ] GitHub Actions 全绿（待外部执行）。
+- [x] `git diff --check` 通过（提交前执行）。
+- [x] GitHub Actions 全绿（`e7fa3c9`，run `43153298753`）。
 - [ ] SQLite 迁移/备份/回滚演练（待外部执行）。
+- [x] P1 源码修复已完成：同步删除平台、OAuth 凭据竞态、社区帖稳定指纹、聊天统计持久去重。
 - [ ] 真实 Google OAuth、Data API、会员 Cookie 和 Windows ACL（待外部执行）。
 - [ ] 总开关关闭零请求（待外部执行）。
 - [ ] YouTube 独立 UI、日程、通知和统计真实验收（待外部执行）。
