@@ -164,7 +164,7 @@ impl YouTubeStatsManager {
             let reusable = resume_states
                 .get(&streamer_id)
                 .filter(|state| {
-                    resume_state_matches(lock_resume(state), session.id, video_id.as_deref())
+                    resume_state_matches(&lock_resume(state), session.id, video_id.as_deref())
                 })
                 .cloned();
             match reusable {
@@ -1044,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn youtube_switch_off_cancels_an_in_flight_paginated_request() {
         let store = SqliteStore::in_memory().await.expect("db");
-        let mut settings = AppSettings {
+        let settings = AppSettings {
             youtube_enabled: true,
             ..AppSettings::default()
         };
