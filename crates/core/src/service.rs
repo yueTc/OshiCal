@@ -1449,9 +1449,10 @@ impl AppService {
                 match videos {
                     Ok(videos) => {
                         if let Some(video) = videos.into_iter().next() {
+                            let live_url = video.live_url();
                             snapshot.title = video.title;
                             snapshot.cover_url = video.thumbnail_url.or(snapshot.cover_url);
-                            snapshot.live_url = video.live_url().or(snapshot.live_url);
+                            snapshot.live_url = live_url.or(snapshot.live_url);
                             snapshot.started_at = video
                                 .actual_start_at
                                 .or(video.scheduled_start_at)

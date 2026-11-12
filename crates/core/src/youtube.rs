@@ -436,7 +436,7 @@ impl YouTubeClient {
             YouTubeAccountInput::Search(query) => {
                 let mut channels = self.search_channels(&query, 1).await?;
                 channels
-                    .drain(..)
+                    .into_iter()
                     .next()
                     .ok_or_else(|| AppError::not_found("YouTube 频道"))
             }
@@ -1301,7 +1301,7 @@ fn parse_community_post(
     let published_text = text_value(object.get("publishedTimeText"));
     let (published_at, published_at_estimated) =
         parse_community_published_time(&published_text, observed_at);
-    let author_channel_id = object
+    let author_channel_id = renderer
         .pointer("/authorEndpoint/browseEndpoint/browseId")
         .and_then(Value::as_str)
         .filter(|value| is_youtube_channel_id(value))
