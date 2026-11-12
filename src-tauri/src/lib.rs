@@ -276,7 +276,13 @@ struct GoogleOAuthTokenResponse {
 static YOUTUBE_OAUTH_PENDING: std::sync::Mutex<Option<PendingDesktopYoutubeOAuth>> =
     std::sync::Mutex::new(None);
 static YOUTUBE_OAUTH_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static YOUTUBE_OAUTH_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Refresh, OAuth completion, and logout must serialize credential writes.
+static YOUTUBE_OAUTH_CREDENTIAL_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+async fn acquire_youtube_oauth_credential_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    YOUTUBE_OAUTH_CREDENTIAL_LOCK.lock().await
+}
 
 fn default_oauth_token_type() -> String {
     "Bearer".to_owned()
@@ -1100,7 +1106,7 @@ async fn refresh_desktop_youtube_oauth_if_needed() -> Result<bool, String> {
         return Ok(false);
     }
 
-    let _guard = YOUTUBE_OAUTH_REFRESH_LOCK.lock().await;
+    let _guard = acquire_youtube_oauth_credential_lock().await;
     let Some(token) = load_desktop_youtube_oauth_token()? else {
         return Ok(false);
     };
@@ -1182,6 +1188,7 @@ async fn complete_pending_youtube_oauth(
     oauth_state: &str,
 ) -> Result<YoutubeCredentialStatus, String> {
     ensure_youtube_enabled_for_service(service).await?;
+    let _guard = acquire_youtube_oauth_credential_lock().await;
     let pending = {
         let mut guard = YOUTUBE_OAUTH_PENDING
             .lock()
@@ -2258,6 +2265,7 @@ async fn clear_youtube_oauth(
     state: State<'_, DesktopState>,
 ) -> Result<YoutubeCredentialStatus, String> {
     ensure_youtube_enabled(&state).await?;
+    let _guard = acquire_youtube_oauth_credential_lock().await;
     revoke_desktop_youtube_oauth_token().await;
     set_secret(KEY_YOUTUBE_OAUTH_ACCESS_TOKEN, None)?;
     set_secret(KEY_YOUTUBE_OAUTH_REFRESH_TOKEN, None)?;
@@ -4562,6 +4570,30 @@ mod tests {
                 .find(|(key, _)| key == "state")
                 .map(|(_, value)| value.into_owned()),
             Some("s/1".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn youtube_oauth_refresh_cannot_write_after_logout_begins() {
+        let order = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let refresh_order = std::sync::Arc::clone(&order);
+        let refresh = async move {
+            let _guard = crate::acquire_youtube_oauth_credential_lock().await;
+            refresh_order.lock().await.push("refresh-start");
+            tokio::task::yield_now().await;
+            refresh_order.lock().await.push("refresh-save");
+        };
+        let logout_order = std::sync::Arc::clone(&order);
+        let logout = async move {
+            let _guard = crate::acquire_youtube_oauth_credential_lock().await;
+            logout_order.lock().await.push("logout-clear");
+        };
+
+        tokio::join!(refresh, logout);
+        assert_eq!(
+            *order.lock().await,
+            vec!["refresh-start", "refresh-save", "logout-clear"]
         );
     }
 
