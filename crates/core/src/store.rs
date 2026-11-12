@@ -147,6 +147,28 @@ CREATE TABLE IF NOT EXISTS live_online_samples (
 CREATE INDEX IF NOT EXISTS idx_live_online_samples_session_id
 ON live_online_samples(session_id, id);
 
+-- One row per observed YouTube chat message. Counters and distinct interactive
+-- users are reconstructed from this table so a collector restart cannot replay
+-- previously counted messages. Super Chat remains in live_super_chat_events.
+CREATE TABLE IF NOT EXISTS live_youtube_chat_events (
+    session_id INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    live_chat_id TEXT,
+    published_at TEXT,
+    author_channel_id TEXT,
+    has_display_message INTEGER NOT NULL DEFAULT 0 CHECK (has_display_message IN (0, 1)),
+    has_membership_event INTEGER NOT NULL DEFAULT 0 CHECK (has_membership_event IN (0, 1)),
+    has_monetary_event INTEGER NOT NULL DEFAULT 0 CHECK (has_monetary_event IN (0, 1)),
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_youtube_chat_events_session_captured
+ON live_youtube_chat_events(session_id, captured_at, message_id);
+
+CREATE INDEX IF NOT EXISTS idx_live_youtube_chat_events_session_author
+ON live_youtube_chat_events(session_id, author_channel_id);
+
 CREATE TABLE IF NOT EXISTS linked_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
@@ -354,6 +376,21 @@ CREATE TABLE IF NOT EXISTS event_journal (
 
 CREATE INDEX IF NOT EXISTS idx_event_journal_type ON event_journal(type, seq);
 "#;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct YouTubeChatEventState {
+    pub danmaku_count: u64,
+    pub membership_count: u64,
+    pub interactive_user_count: u64,
+    pub super_chat_count: u64,
+    pub paid_user_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct YouTubeChatEventRecord {
+    pub inserted: bool,
+    pub new_interactive_user: bool,
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -3951,6 +3988,138 @@ impl SqliteStore {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Return durable Super Chat count and distinct paid-user count.
+    pub(crate) async fn youtube_super_chat_counts(&self, session_id: i64) -> AppResult<(u64, u64)> {
+        let row = sqlx::query(
+            "SELECT
+                COUNT(*) AS super_chat_count,
+                COUNT(DISTINCT COALESCE(user_channel_id, id)) AS paid_user_count
+             FROM live_super_chat_events WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let non_negative = |value: i64| u64::try_from(value).unwrap_or(0);
+        Ok((
+            non_negative(row.try_get("super_chat_count")?),
+            non_negative(row.try_get("paid_user_count")?),
+        ))
+    }
+
+    /// Load the durable YouTube chat/Super Chat counters for one live session.
+    /// Existing databases may predate the event table; callers must combine
+    /// these values with the session counters using a maximum so old counts are
+    /// never rolled back.
+    pub(crate) async fn load_youtube_chat_event_state(
+        &self,
+        session_id: i64,
+    ) -> AppResult<YouTubeChatEventState> {
+        let chat = sqlx::query(
+            "SELECT
+                COALESCE(SUM(has_display_message), 0) AS danmaku_count,
+                COALESCE(SUM(has_membership_event), 0) AS membership_count,
+                COUNT(DISTINCT NULLIF(TRIM(author_channel_id), '')) AS interactive_user_count
+             FROM live_youtube_chat_events WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let (super_chat_count, paid_user_count) = self.youtube_super_chat_counts(session_id).await?;
+
+        let non_negative = |value: i64| u64::try_from(value).unwrap_or(0);
+        Ok(YouTubeChatEventState {
+            danmaku_count: non_negative(chat.try_get("danmaku_count")?),
+            membership_count: non_negative(chat.try_get("membership_count")?),
+            interactive_user_count: non_negative(chat.try_get("interactive_user_count")?),
+            super_chat_count,
+            paid_user_count,
+        })
+    }
+
+    /// Persist one YouTube chat message before applying its counters. The
+    /// composite primary key is the session-scoped idempotency boundary across
+    /// collector restarts and prevents different sessions from suppressing each
+    /// other when a provider reuses a message id.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_youtube_chat_event(
+        &self,
+        session_id: i64,
+        message_id: &str,
+        live_chat_id: Option<&str>,
+        published_at: Option<DateTime<Utc>>,
+        author_channel_id: Option<&str>,
+        has_display_message: bool,
+        has_membership_event: bool,
+        has_monetary_event: bool,
+    ) -> AppResult<YouTubeChatEventRecord> {
+        let message_id = message_id.trim();
+        if message_id.is_empty() {
+            return Err(AppError::validation("YouTube 聊天消息 ID 不能为空"));
+        }
+        let live_chat_id = live_chat_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let author_channel_id = author_channel_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let platform: Option<String> = sqlx::query_scalar(
+            "SELECT st.platform FROM live_sessions ls
+             JOIN streamers st ON st.id = ls.streamer_id WHERE ls.id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(platform) = platform else {
+            return Err(AppError::not_found(format!("直播数据 {session_id}")));
+        };
+        if parse_platform(&platform)? != Platform::Youtube {
+            return Err(AppError::validation("聊天事件只能写入 YouTube 直播场次"));
+        }
+
+        let author_already_seen = if let Some(author_channel_id) = author_channel_id {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM live_youtube_chat_events
+                    WHERE session_id = ? AND author_channel_id = ?
+                )",
+            )
+            .bind(session_id)
+            .bind(author_channel_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            exists != 0
+        } else {
+            false
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO live_youtube_chat_events
+                (session_id, message_id, live_chat_id, published_at, author_channel_id,
+                 has_display_message, has_membership_event, has_monetary_event, captured_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id, message_id) DO NOTHING",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .bind(live_chat_id)
+        .bind(published_at.map(|value| value.to_rfc3339()))
+        .bind(author_channel_id)
+        .bind(if has_display_message { 1_i64 } else { 0_i64 })
+        .bind(if has_membership_event { 1_i64 } else { 0_i64 })
+        .bind(if has_monetary_event { 1_i64 } else { 0_i64 })
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        let inserted = inserted.rows_affected() > 0;
+        tx.commit().await?;
+        Ok(YouTubeChatEventRecord {
+            inserted,
+            new_interactive_user: inserted && author_channel_id.is_some() && !author_already_seen,
+        })
+    }
+
     pub async fn append_event(&self, event_type: &str, payload: &Value) -> AppResult<i64> {
         let result = sqlx::query(
             "INSERT INTO event_journal (type, payload_json, created_at) VALUES (?, ?, ?)",
@@ -4609,6 +4778,9 @@ async fn needs_youtube_schema_migration(pool: &SqlitePool) -> AppResult<bool> {
     for (kind, name) in [
         ("table", "live_super_chat_events"),
         ("index", "idx_live_super_chat_events_session"),
+        ("table", "live_youtube_chat_events"),
+        ("index", "idx_live_youtube_chat_events_session_captured"),
+        ("index", "idx_live_youtube_chat_events_session_author"),
     ] {
         let exists: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?")
@@ -4807,7 +4979,29 @@ mod tests {
             sqlx::query(statement)
                 .execute(&pool)
                 .await
-                .expect("current schema");
+                .expect("current super chat schema");
+        }
+        assert!(needs_youtube_schema_migration(&pool)
+            .await
+            .expect("missing chat event table"));
+
+        for statement in [
+            "CREATE TABLE live_youtube_chat_events (
+                session_id INTEGER,
+                message_id TEXT,
+                author_channel_id TEXT,
+                captured_at TEXT,
+                PRIMARY KEY(session_id, message_id)
+            )",
+            "CREATE INDEX idx_live_youtube_chat_events_session_captured
+             ON live_youtube_chat_events(session_id, captured_at, message_id)",
+            "CREATE INDEX idx_live_youtube_chat_events_session_author
+             ON live_youtube_chat_events(session_id, author_channel_id)",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("current chat event schema");
         }
         sqlx::query("INSERT INTO streamers(platform) VALUES (NULL)")
             .execute(&pool)

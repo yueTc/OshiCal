@@ -54,10 +54,7 @@ struct CollectorResumeState {
     chat_id: Option<String>,
     chat_page_token: Option<String>,
     super_chat_page_token: Option<String>,
-    seen_chat_message_ids: EventIdWindow,
     seen_paid_event_ids: EventIdWindow,
-    paid_users: HashSet<String>,
-    interactive_users: HashSet<String>,
 }
 
 impl CollectorResumeState {
@@ -68,10 +65,7 @@ impl CollectorResumeState {
             chat_id: None,
             chat_page_token: None,
             super_chat_page_token: None,
-            seen_chat_message_ids: EventIdWindow::default(),
             seen_paid_event_ids: EventIdWindow::default(),
-            paid_users: HashSet::new(),
-            interactive_users: HashSet::new(),
         }
     }
 }
@@ -244,52 +238,63 @@ struct CollectorMetrics {
     danmaku_count: u64,
     super_chat_count: u64,
     membership_count: u64,
+    paid_user_count: u64,
+    interactive_user_count: u64,
+    event_danmaku_count: u64,
+    event_membership_count: u64,
+    event_interactive_user_count: u64,
     resume: SharedCollectorResume,
 }
 
 impl CollectorMetrics {
+    async fn from_session(
+        store: &SqliteStore,
+        session: &LiveSession,
+        resume: SharedCollectorResume,
+    ) -> Self {
+        let persisted = match store.load_youtube_chat_event_state(session.id).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    session_id = session.id,
+                    "恢复 YouTube 聊天事件状态失败"
+                );
+                Default::default()
+            }
+        };
+        let count_from_db = |value: i64| u64::try_from(value).unwrap_or(0);
+        Self {
+            peak_online: session.peak_online,
+            online_total: count_from_db(session.online_total),
+            online_samples: count_from_db(session.online_samples),
+            danmaku_count: count_from_db(session.danmaku_count).max(persisted.danmaku_count),
+            super_chat_count: count_from_db(session.super_chat_count)
+                .max(persisted.super_chat_count),
+            membership_count: count_from_db(session.membership_count.unwrap_or(0))
+                .max(persisted.membership_count),
+            paid_user_count: count_from_db(session.paid_user_count).max(persisted.paid_user_count),
+            interactive_user_count: count_from_db(session.interactive_user_count)
+                .max(persisted.interactive_user_count),
+            event_danmaku_count: persisted.danmaku_count,
+            event_membership_count: persisted.membership_count,
+            event_interactive_user_count: persisted.interactive_user_count,
+            resume,
+        }
+    }
+
     fn observe_viewers(&mut self, viewers: u64) {
         self.peak_online = self.peak_online.max(viewers);
         self.online_total = self.online_total.saturating_add(viewers);
         self.online_samples = self.online_samples.saturating_add(1);
     }
 
-    fn remember_chat_message_id(&self, id: &str) -> bool {
-        lock_resume(&self.resume).seen_chat_message_ids.remember(id)
-    }
-
     fn remember_paid_event_id(&self, id: &str) -> bool {
         lock_resume(&self.resume).seen_paid_event_ids.remember(id)
     }
 
-    fn forget_chat_message_id(&self, id: &str) {
-        lock_resume(&self.resume).seen_chat_message_ids.forget(id);
-    }
-
     fn forget_paid_event_id(&self, id: &str) {
         lock_resume(&self.resume).seen_paid_event_ids.forget(id);
-    }
-
-    fn remember_interactive_user(&self, user: &str) {
-        let mut state = lock_resume(&self.resume);
-        if state.interactive_users.len() < MAX_TRACKED_EVENT_IDS {
-            state.interactive_users.insert(user.to_owned());
-        }
-    }
-
-    fn remember_paid_user(&self, user: &str) {
-        let mut state = lock_resume(&self.resume);
-        if state.paid_users.len() < MAX_TRACKED_EVENT_IDS {
-            state.paid_users.insert(user.to_owned());
-        }
-    }
-
-    fn paid_user_count(&self) -> u64 {
-        lock_resume(&self.resume).paid_users.len() as u64
-    }
-
-    fn interactive_user_count(&self) -> u64 {
-        lock_resume(&self.resume).interactive_users.len() as u64
     }
 
     /// Returns false when a Super Chat contained in the chat message could not
@@ -301,9 +306,9 @@ impl CollectorMetrics {
         session_id: i64,
         message: YouTubeLiveChatMessage,
     ) -> bool {
-        if !self.remember_chat_message_id(&message.id) {
-            return true;
-        }
+        // Persist the paid event first. If the generic event insert fails, the
+        // retry sees the paid row as an idempotent duplicate and can still reach
+        // the generic event insert without losing the Super Chat.
         if let Some(event) = message.monetary_event.as_ref() {
             let input = SuperChatEventInput {
                 id: message.id.clone(),
@@ -319,19 +324,50 @@ impl CollectorMetrics {
                 tier: event.tier,
             };
             if !self.observe_super_chat(store, session_id, input).await {
-                self.forget_chat_message_id(&message.id);
                 return false;
             }
         }
-        if message.display_message.is_some() {
-            self.danmaku_count = self.danmaku_count.saturating_add(1);
+        let event = match store
+            .record_youtube_chat_event(
+                session_id,
+                &message.id,
+                Some(message.live_chat_id.as_str()),
+                message.published_at,
+                message.author_channel_id.as_deref(),
+                message.display_message.is_some(),
+                message.membership_event.is_some(),
+                message.monetary_event.is_some(),
+            )
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::debug!(%error, session_id, "保存 YouTube 聊天事件失败");
+                return false;
+            }
+        };
+        if !event.inserted {
+            return true;
         }
-        if let Some(author) = message.author_channel_id.as_ref() {
-            self.remember_interactive_user(author);
+        if message.display_message.is_some() {
+            self.event_danmaku_count = self.event_danmaku_count.saturating_add(1);
         }
         if message.membership_event.is_some() {
-            self.membership_count = self.membership_count.saturating_add(1);
+            self.event_membership_count = self.event_membership_count.saturating_add(1);
         }
+        if event.new_interactive_user {
+            self.event_interactive_user_count = self
+                .event_interactive_user_count
+                .saturating_add(1);
+        }
+        // Event rows are authoritative once they cover the legacy session floor.
+        // Taking max while replaying an upgraded session avoids adding replayed
+        // messages on top of counters that already included them.
+        self.danmaku_count = self.danmaku_count.max(self.event_danmaku_count);
+        self.membership_count = self.membership_count.max(self.event_membership_count);
+        self.interactive_user_count = self
+            .interactive_user_count
+            .max(self.event_interactive_user_count);
         true
     }
 
@@ -346,15 +382,19 @@ impl CollectorMetrics {
         if !self.remember_paid_event_id(&event.id) {
             return true;
         }
-        let user = event.user_channel_id.clone();
         match store
             .record_youtube_super_chat_event(session_id, &event)
             .await
         {
             Ok(true) => {
-                self.super_chat_count = self.super_chat_count.saturating_add(1);
-                if let Some(user) = user {
-                    self.remember_paid_user(&user);
+                match store.youtube_super_chat_counts(session_id).await {
+                    Ok((super_chat_count, paid_user_count)) => {
+                        self.super_chat_count = self.super_chat_count.max(super_chat_count);
+                        self.paid_user_count = self.paid_user_count.max(paid_user_count);
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, session_id, "恢复 YouTube 付费统计失败");
+                    }
                 }
                 true
             }
@@ -522,16 +562,7 @@ async fn run_collector(
         .map(|chat_id| resume_page_tokens(&resume, chat_id))
         .unwrap_or((None, None));
     let mut ticker = interval(Duration::from_secs(SAMPLE_INTERVAL_SECONDS));
-    let count_from_db = |value: i64| u64::try_from(value).unwrap_or(0);
-    let mut metrics = CollectorMetrics {
-        peak_online: session.peak_online,
-        online_total: count_from_db(session.online_total),
-        online_samples: count_from_db(session.online_samples),
-        danmaku_count: count_from_db(session.danmaku_count),
-        super_chat_count: count_from_db(session.super_chat_count),
-        membership_count: count_from_db(session.membership_count.unwrap_or(0)),
-        resume: Arc::clone(&resume),
-    };
+    let mut metrics = CollectorMetrics::from_session(&store, &session, Arc::clone(&resume)).await;
     let mut observed_initial = false;
     let mut chat_degraded = false;
     let mut chat_ever_succeeded = session.youtube_stats_available.unwrap_or(false);
@@ -947,8 +978,8 @@ async fn persist_metrics(
             stats_available.then_some(metrics.danmaku_count),
             stats_available.then_some(metrics.super_chat_count),
             stats_available.then_some(metrics.membership_count),
-            stats_available.then_some(metrics.paid_user_count()),
-            stats_available.then_some(metrics.interactive_user_count()),
+            stats_available.then_some(metrics.paid_user_count),
+            stats_available.then_some(metrics.interactive_user_count),
             stats_available,
             "partial",
             collector_state,
@@ -962,7 +993,9 @@ async fn persist_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{AddSubscription, Platform};
     use crate::settings::{save_settings, AppSettings};
+    use crate::youtube::{YouTubeMembershipEvent, YouTubeMonetaryEvent};
 
     fn empty_metrics(resume: SharedCollectorResume) -> CollectorMetrics {
         CollectorMetrics {
@@ -972,12 +1005,83 @@ mod tests {
             danmaku_count: 0,
             super_chat_count: 0,
             membership_count: 0,
+            paid_user_count: 0,
+            interactive_user_count: 0,
+            event_danmaku_count: 0,
+            event_membership_count: 0,
+            event_interactive_user_count: 0,
             resume,
         }
     }
 
+    async fn youtube_session(store: &SqliteStore, mid: &str, room_id: &str) -> LiveSession {
+        let streamer = store
+            .add_subscription(&AddSubscription {
+                platform: Platform::Youtube,
+                mid: mid.to_owned(),
+                name: Some(format!("测试主播 {mid}")),
+                avatar_url: None,
+                handle: None,
+                profile_url: None,
+                uploads_playlist_id: None,
+                room_id: Some(room_id.to_owned()),
+                aliases: None,
+                schedule_enabled: true,
+                live_notify_enabled: true,
+                live_stats_enabled: true,
+            })
+            .await
+            .expect("youtube streamer");
+        let started_at = Utc::now() - chrono::Duration::minutes(5);
+        store
+            .ensure_live_session(
+                streamer.id,
+                room_id,
+                &format!("测试主播 {mid}"),
+                "YouTube 测试直播",
+                None,
+                started_at,
+                started_at,
+            )
+            .await
+            .expect("youtube session")
+    }
+
+    fn chat_message(id: &str, author_channel_id: &str, paid: bool) -> YouTubeLiveChatMessage {
+        YouTubeLiveChatMessage {
+            id: id.to_owned(),
+            live_chat_id: "chat-1".to_owned(),
+            kind: if paid { "superChatEvent" } else { "textMessageEvent" }.to_owned(),
+            published_at: Some(Utc::now()),
+            display_message: Some("hello".to_owned()),
+            author_channel_id: Some(author_channel_id.to_owned()),
+            author_display_name: Some("观众".to_owned()),
+            monetary_event: paid.then(|| YouTubeMonetaryEvent {
+                kind: "superChatEvent".to_owned(),
+                amount_micros: Some(5_000_000),
+                currency: Some("USD".to_owned()),
+                amount_display_string: Some("$5.00".to_owned()),
+                tier: Some(2),
+                comment: Some("hello".to_owned()),
+            }),
+            membership_event: paid.then(|| YouTubeMembershipEvent {
+                kind: "newSponsorEvent".to_owned(),
+                member_month: Some(1),
+                member_level_name: Some("Member".to_owned()),
+                comment: None,
+            }),
+        }
+    }
+
+    fn resume_for(session_id: i64, video_id: &str) -> SharedCollectorResume {
+        Arc::new(StdMutex::new(CollectorResumeState::new(
+            session_id,
+            Some(video_id.to_owned()),
+        )))
+    }
+
     #[test]
-    fn collector_resume_state_keeps_cursors_and_dedup_window() {
+    fn collector_resume_state_keeps_cursors_and_paid_dedup_window() {
         let resume = Arc::new(StdMutex::new(CollectorResumeState::new(
             42,
             Some("video-1".to_owned()),
@@ -995,16 +1099,10 @@ mod tests {
         );
 
         let first = empty_metrics(Arc::clone(&resume));
-        assert!(first.remember_chat_message_id("message-1"));
-        first.remember_interactive_user("viewer-1");
-        first.remember_paid_user("supporter-1");
-        let resumed = empty_metrics(resume);
-        assert!(!resumed.remember_chat_message_id("message-1"));
-        assert_eq!(resumed.interactive_user_count(), 1);
-        assert_eq!(resumed.paid_user_count(), 1);
-
-        first.forget_chat_message_id("message-1");
-        assert!(resumed.remember_chat_message_id("message-1"));
+        assert!(first.remember_paid_event_id("paid-1"));
+        assert!(!first.remember_paid_event_id("paid-1"));
+        first.forget_paid_event_id("paid-1");
+        assert!(first.remember_paid_event_id("paid-1"));
     }
 
     #[test]
@@ -1013,6 +1111,132 @@ mod tests {
         assert!(resume_state_matches(&state, 42, Some("video-1")));
         assert!(!resume_state_matches(&state, 43, Some("video-1")));
         assert!(!resume_state_matches(&state, 42, Some("video-2")));
+    }
+
+    #[tokio::test]
+    async fn repeated_chat_message_is_idempotent_within_one_collector() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let session = youtube_session(&store, "youtube-channel-1", "video-1").await;
+        let mut metrics =
+            CollectorMetrics::from_session(&store, &session, resume_for(session.id, "video-1"))
+                .await;
+        let message = chat_message("message-1", "viewer-1", true);
+
+        assert!(metrics.observe_chat_message(&store, session.id, message.clone()).await);
+        assert!(metrics.observe_chat_message(&store, session.id, message).await);
+        assert!(
+            metrics
+                .observe_chat_message(
+                    &store,
+                    session.id,
+                    chat_message("message-1b", "viewer-1", false),
+                )
+                .await
+        );
+        assert_eq!(metrics.danmaku_count, 2);
+        assert_eq!(metrics.membership_count, 1);
+        assert_eq!(metrics.interactive_user_count, 1);
+        assert_eq!(metrics.super_chat_count, 1);
+        assert_eq!(metrics.paid_user_count, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_message_dedup_and_counts_survive_collector_restart() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let session = youtube_session(&store, "youtube-channel-2", "video-2").await;
+        let message = chat_message("message-2", "viewer-2", true);
+        let mut first =
+            CollectorMetrics::from_session(&store, &session, resume_for(session.id, "video-2"))
+                .await;
+        assert!(first.observe_chat_message(&store, session.id, message.clone()).await);
+
+        // Simulate a new process: only durable store state is carried over.
+        let refreshed = store.get_live_session(session.id).await.expect("session");
+        let mut restarted =
+            CollectorMetrics::from_session(&store, &refreshed, resume_for(session.id, "video-2"))
+                .await;
+        assert_eq!(restarted.danmaku_count, 1);
+        assert_eq!(restarted.membership_count, 1);
+        assert_eq!(restarted.interactive_user_count, 1);
+        assert_eq!(restarted.super_chat_count, 1);
+        assert_eq!(restarted.paid_user_count, 1);
+
+        assert!(restarted.observe_chat_message(&store, session.id, message).await);
+        assert_eq!(restarted.danmaku_count, 1);
+        assert_eq!(restarted.membership_count, 1);
+        assert_eq!(restarted.interactive_user_count, 1);
+        assert_eq!(restarted.super_chat_count, 1);
+        assert_eq!(restarted.paid_user_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replayed_chat_does_not_add_to_legacy_session_floor() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let mut session = youtube_session(&store, "youtube-channel-legacy", "video-legacy").await;
+        session.danmaku_count = 10;
+        session.membership_count = Some(2);
+        session.interactive_user_count = 3;
+        session.super_chat_count = 4;
+        session.paid_user_count = 2;
+        let mut metrics =
+            CollectorMetrics::from_session(&store, &session, resume_for(session.id, "video-legacy"))
+                .await;
+
+        assert!(
+            metrics
+                .observe_chat_message(
+                    &store,
+                    session.id,
+                    chat_message("legacy-message", "legacy-viewer", true),
+                )
+                .await
+        );
+        assert_eq!(metrics.danmaku_count, 10);
+        assert_eq!(metrics.membership_count, 2);
+        assert_eq!(metrics.interactive_user_count, 3);
+        assert_eq!(metrics.super_chat_count, 4);
+        assert_eq!(metrics.paid_user_count, 2);
+    }
+
+    #[tokio::test]
+    async fn chat_message_dedup_is_scoped_to_each_session() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let first_session = youtube_session(&store, "youtube-channel-3", "video-3").await;
+        let second_session = youtube_session(&store, "youtube-channel-4", "video-4").await;
+        let message = chat_message("shared-message-id", "viewer-3", false);
+        let mut first = CollectorMetrics::from_session(
+            &store,
+            &first_session,
+            resume_for(first_session.id, "video-3"),
+        )
+        .await;
+        let mut second = CollectorMetrics::from_session(
+            &store,
+            &second_session,
+            resume_for(second_session.id, "video-4"),
+        )
+        .await;
+
+        assert!(first.observe_chat_message(&store, first_session.id, message.clone()).await);
+        assert!(second.observe_chat_message(&store, second_session.id, message).await);
+        assert_eq!(first.danmaku_count, 1);
+        assert_eq!(second.danmaku_count, 1);
+        assert_eq!(
+            store
+                .load_youtube_chat_event_state(first_session.id)
+                .await
+                .expect("first state")
+                .danmaku_count,
+            1
+        );
+        assert_eq!(
+            store
+                .load_youtube_chat_event_state(second_session.id)
+                .await
+                .expect("second state")
+                .danmaku_count,
+            1
+        );
     }
 
     #[tokio::test]
