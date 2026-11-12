@@ -3919,16 +3919,16 @@ fn dynamic_post_from_youtube_community(
         .unwrap_or("未提供");
     let time_context = match (post.published_at, post.published_at_estimated) {
         (Some(value), true) => format!(
-            "[YouTube 发布时间原文：{published_text}；按抓取时间 {} 估算为 {}，可能存在误差]",
+            "[YouTube 原始发布时间：{published_text}；按抓取时间 {} 估算为 {}，可能存在误差]",
             observed_at.to_rfc3339(),
             value.to_rfc3339()
         ),
         (Some(value), false) => format!(
-            "[YouTube 发布时间：{published_text}；解析为 {}]",
+            "[YouTube 原始发布时间：{published_text}；解析为 {}]",
             value.to_rfc3339()
         ),
         (None, _) => format!(
-            "[YouTube 发布时间原文：{published_text}；无法可靠解析。以下相对日期只能按抓取时间 {} 近似解释，不能视为原发布时间]",
+            "[YouTube 原始发布时间：{published_text}；无法可靠解析。以下相对日期只能按抓取时间 {} 近似解释，不能视为原发布时间]",
             observed_at.to_rfc3339()
         ),
     };

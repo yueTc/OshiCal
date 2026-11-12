@@ -617,13 +617,13 @@ async fn sync_schema_is_three_and_legacy_bilibili_rows_default_to_bilibili() {
     .await;
     assert_eq!(status, StatusCode::OK, "{changes}");
     assert_eq!(changes["data"]["schemaVersion"], 3);
-    let streamer_change = changes["data"]["changes"]
+    let subscription_change = changes["data"]["changes"]
         .as_array()
         .expect("changes")
         .iter()
-        .find(|change| change["entityType"] == "streamer")
-        .expect("streamer sync change");
-    assert_eq!(streamer_change["payload"]["platform"], "bilibili");
+        .find(|change| change["entityType"] == "subscription")
+        .expect("subscription sync change");
+    assert_eq!(subscription_change["payload"]["platform"], "bilibili");
 }
 
 #[tokio::test]

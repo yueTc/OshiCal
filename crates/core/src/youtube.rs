@@ -1732,13 +1732,15 @@ fn parse_super_chat_event(item: &Value) -> Option<YouTubeSuperChatEvent> {
     } else if let Some(details) = snippet.get("superStickerDetails") {
         (details, "superStickerEvent")
     } else {
-        // Compatibility for legacy flattened superChatEvents.list payloads. Require
-        // a known event type and at least one monetary field so malformed or newly
-        // structured items are skipped instead of becoming zero-value events.
-        let event_kind = snippet
-            .get("type")
-            .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "superChatEvent" | "superStickerEvent"))?;
+        // Compatibility for legacy flattened superChatEvents.list payloads. The
+        // public API can omit `type`, so default that shape to Super Chat while
+        // still rejecting explicit unknown types and zero-value items.
+        let event_kind = match snippet.get("type").and_then(Value::as_str) {
+            Some("superChatEvent") => "superChatEvent",
+            Some("superStickerEvent") => "superStickerEvent",
+            Some(_) => return None,
+            None => "superChatEvent",
+        };
         let has_monetary_field = [
             "amountMicros",
             "currency",
