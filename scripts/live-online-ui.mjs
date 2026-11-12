@@ -12,6 +12,14 @@ const out = resolve("ui-artifacts");
 await mkdir(out, { recursive: true });
 const now = Date.now();
 const iso = (time) => new Date(time).toISOString();
+async function waitForAttribute(locator, name, expected, timeout = 30_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await locator.getAttribute(name) === expected) return;
+    await new Promise((done) => setTimeout(done, 50));
+  }
+  assert.equal(await locator.getAttribute(name), expected);
+}
 const start = now - 5 * 3600_000;
 const settings = { dataMode: "server", serverUrl: "", livePollSeconds: 20,
   dynamicPollSeconds: 300, autoAnalyzeImages: true, notificationsEnabled: false,
@@ -170,7 +178,7 @@ try {
   await page.clock.install();
   extra = true;
   await page.clock.fastForward(31_000);
-  await page.waitForFunction(() => document.querySelector('input[aria-label="查看人数采样时间点"]')?.getAttribute("max") === "503");
+  await waitForAttribute(dialog.getByRole("slider", { name: "查看人数采样时间点", exact: true }), "max", "503");
   assert.ok(requests.some((r) => r.after === 503));
   results.push("30秒自动增量读取新增点通过");
   await dialog.getByRole("button", { name: "返回直播统计", exact: true }).click();
