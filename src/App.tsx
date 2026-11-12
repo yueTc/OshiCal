@@ -2275,7 +2275,7 @@ export default function App() {
         return localApi.search(keyword, platform);
       },
       add: async (account: AccountSearchResult): Promise<Streamer> => {
-        const platform = account.platform === "youtube" ? "youtube" : "bilibili";
+        const platform: Platform = account.platform === "youtube" ? "youtube" : "bilibili";
         if (platform === "youtube" && !settings.youtubeEnabled) {
           throw new Error("YouTube 功能未开启");
         }

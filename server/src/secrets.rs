@@ -234,6 +234,16 @@ impl SecretVault {
             .map(|(plaintext, _)| plaintext)
     }
 
+    /// 模型密钥加密（AAD 绑定单密钥槽位）。
+    pub fn encrypt(&self, plaintext: &str) -> Result<String, AppError> {
+        self.encrypt_with_aad(plaintext, LLM_AAD)
+    }
+
+    /// 模型密钥解密，与 [`SecretVault::encrypt`] 配套。
+    pub fn decrypt(&self, encoded: &str) -> Result<String, AppError> {
+        self.decrypt_with_aad(encoded, LLM_AAD)
+    }
+
     fn decrypt_youtube_api_key_detailed(
         &self,
         encoded: &str,

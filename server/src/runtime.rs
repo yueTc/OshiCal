@@ -319,7 +319,8 @@ pub fn spawn_background_tasks(state: AppState) {
         run_poll_loop(
             || async { Duration::from_secs(300) },
             move |_| {
-                let service = youtube_oauth_state.service.clone();
+                let state = youtube_oauth_state.clone();
+                let service = state.service.clone();
                 async move {
                     match youtube_feature_enabled(service.store()).await {
                         Ok(true) => {}
@@ -334,12 +335,12 @@ pub fn spawn_background_tasks(state: AppState) {
                         return;
                     }
                     match runtime
-                        .refresh_oauth_if_needed(service.store(), &youtube_oauth_state.secret_vault)
+                        .refresh_oauth_if_needed(service.store(), &state.secret_vault)
                         .await
                     {
                         Ok(true) => {
                             if let Err(error) =
-                                sync_runtime_secrets_from_vault(&youtube_oauth_state).await
+                                sync_runtime_secrets_from_vault(&state).await
                             {
                                 tracing::warn!(%error, "YouTube OAuth 刷新后同步运行时凭据失败");
                             }
@@ -348,7 +349,7 @@ pub fn spawn_background_tasks(state: AppState) {
                         Err(error) => {
                             tracing::warn!(code = error.code, "YouTube OAuth 后台刷新失败");
                             if let Err(sync_error) =
-                                sync_runtime_secrets_from_vault(&youtube_oauth_state).await
+                                sync_runtime_secrets_from_vault(&state).await
                             {
                                 tracing::warn!(%sync_error, "YouTube OAuth 后台刷新失败后同步运行时凭据失败");
                             }
