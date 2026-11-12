@@ -97,6 +97,8 @@ jobs:
           if ($LASTEXITCODE -eq 0 -and $tagCommit -ne $env:RELEASE_SHA) {
             throw "标签 $tag 已指向其它提交，拒绝发布"
           }
+          # gh api 在标签不存在时会返回非零；显式复位步骤退出码。
+          exit 0
 
       - name: Reject non-increasing app version
         shell: pwsh
