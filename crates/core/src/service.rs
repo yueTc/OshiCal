@@ -5067,12 +5067,12 @@ mod tests {
             membership_only: false,
         };
         let first = dynamic_post_from_youtube_community(
-            make_post(first_observed.clone(), "3 hours ago"),
+            make_post(first_observed, "3 hours ago"),
             &streamer,
             first_observed,
         );
         let second = dynamic_post_from_youtube_community(
-            make_post(second_observed.clone(), "1 day ago"),
+            make_post(second_observed, "1 day ago"),
             &streamer,
             second_observed,
         );
