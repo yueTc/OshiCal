@@ -356,9 +356,7 @@ impl CollectorMetrics {
             self.event_membership_count = self.event_membership_count.saturating_add(1);
         }
         if event.new_interactive_user {
-            self.event_interactive_user_count = self
-                .event_interactive_user_count
-                .saturating_add(1);
+            self.event_interactive_user_count = self.event_interactive_user_count.saturating_add(1);
         }
         // Event rows are authoritative once they cover the legacy session floor.
         // Taking max while replaying an upgraded session avoids adding replayed
@@ -1051,7 +1049,12 @@ mod tests {
         YouTubeLiveChatMessage {
             id: id.to_owned(),
             live_chat_id: "chat-1".to_owned(),
-            kind: if paid { "superChatEvent" } else { "textMessageEvent" }.to_owned(),
+            kind: if paid {
+                "superChatEvent"
+            } else {
+                "textMessageEvent"
+            }
+            .to_owned(),
             published_at: Some(Utc::now()),
             display_message: Some("hello".to_owned()),
             author_channel_id: Some(author_channel_id.to_owned()),
@@ -1122,8 +1125,16 @@ mod tests {
                 .await;
         let message = chat_message("message-1", "viewer-1", true);
 
-        assert!(metrics.observe_chat_message(&store, session.id, message.clone()).await);
-        assert!(metrics.observe_chat_message(&store, session.id, message).await);
+        assert!(
+            metrics
+                .observe_chat_message(&store, session.id, message.clone())
+                .await
+        );
+        assert!(
+            metrics
+                .observe_chat_message(&store, session.id, message)
+                .await
+        );
         assert!(
             metrics
                 .observe_chat_message(
@@ -1148,7 +1159,11 @@ mod tests {
         let mut first =
             CollectorMetrics::from_session(&store, &session, resume_for(session.id, "video-2"))
                 .await;
-        assert!(first.observe_chat_message(&store, session.id, message.clone()).await);
+        assert!(
+            first
+                .observe_chat_message(&store, session.id, message.clone())
+                .await
+        );
 
         // Simulate a new process: only durable store state is carried over.
         let refreshed = store.get_live_session(session.id).await.expect("session");
@@ -1161,7 +1176,11 @@ mod tests {
         assert_eq!(restarted.super_chat_count, 1);
         assert_eq!(restarted.paid_user_count, 1);
 
-        assert!(restarted.observe_chat_message(&store, session.id, message).await);
+        assert!(
+            restarted
+                .observe_chat_message(&store, session.id, message)
+                .await
+        );
         assert_eq!(restarted.danmaku_count, 1);
         assert_eq!(restarted.membership_count, 1);
         assert_eq!(restarted.interactive_user_count, 1);
@@ -1178,9 +1197,12 @@ mod tests {
         session.interactive_user_count = 3;
         session.super_chat_count = 4;
         session.paid_user_count = 2;
-        let mut metrics =
-            CollectorMetrics::from_session(&store, &session, resume_for(session.id, "video-legacy"))
-                .await;
+        let mut metrics = CollectorMetrics::from_session(
+            &store,
+            &session,
+            resume_for(session.id, "video-legacy"),
+        )
+        .await;
 
         assert!(
             metrics
@@ -1217,8 +1239,16 @@ mod tests {
         )
         .await;
 
-        assert!(first.observe_chat_message(&store, first_session.id, message.clone()).await);
-        assert!(second.observe_chat_message(&store, second_session.id, message).await);
+        assert!(
+            first
+                .observe_chat_message(&store, first_session.id, message.clone())
+                .await
+        );
+        assert!(
+            second
+                .observe_chat_message(&store, second_session.id, message)
+                .await
+        );
         assert_eq!(first.danmaku_count, 1);
         assert_eq!(second.danmaku_count, 1);
         assert_eq!(

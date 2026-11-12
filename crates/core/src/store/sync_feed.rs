@@ -2076,9 +2076,7 @@ mod tests {
             .iter()
             .filter(|change| {
                 change.entity_type == "linked_account"
-                    && change
-                        .entity_id
-                        .starts_with(&format!("{}:", bilibili.id))
+                    && change.entity_id.starts_with(&format!("{}:", bilibili.id))
             })
             .collect();
         let youtube_changes: Vec<_> = page
@@ -2086,9 +2084,7 @@ mod tests {
             .iter()
             .filter(|change| {
                 change.entity_type == "linked_account"
-                    && change
-                        .entity_id
-                        .starts_with(&format!("{}:", youtube.id))
+                    && change.entity_id.starts_with(&format!("{}:", youtube.id))
             })
             .collect();
 

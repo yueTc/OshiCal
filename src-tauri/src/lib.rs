@@ -277,8 +277,7 @@ static YOUTUBE_OAUTH_PENDING: std::sync::Mutex<Option<PendingDesktopYoutubeOAuth
     std::sync::Mutex::new(None);
 static YOUTUBE_OAUTH_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 // Refresh, OAuth completion, and logout must serialize credential writes.
-static YOUTUBE_OAUTH_CREDENTIAL_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+static YOUTUBE_OAUTH_CREDENTIAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn acquire_youtube_oauth_credential_lock() -> tokio::sync::MutexGuard<'static, ()> {
     YOUTUBE_OAUTH_CREDENTIAL_LOCK.lock().await

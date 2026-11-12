@@ -3920,9 +3920,7 @@ fn dynamic_post_from_youtube_community(
                 .to_owned()
         }
         (Some(value), false) => format!("[YouTube 原始发布时间：{}]", value.to_rfc3339()),
-        (None, _) => {
-            "[YouTube 原始发布时间：无法可靠解析，不能视为原发布时间]".to_owned()
-        }
+        (None, _) => "[YouTube 原始发布时间：无法可靠解析，不能视为原发布时间]".to_owned(),
     };
     let mut text = time_context;
     if !post.text.trim().is_empty() {

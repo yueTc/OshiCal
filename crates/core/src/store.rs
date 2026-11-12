@@ -4025,7 +4025,8 @@ impl SqliteStore {
         .bind(session_id)
         .fetch_one(&self.pool)
         .await?;
-        let (super_chat_count, paid_user_count) = self.youtube_super_chat_counts(session_id).await?;
+        let (super_chat_count, paid_user_count) =
+            self.youtube_super_chat_counts(session_id).await?;
 
         let non_negative = |value: i64| u64::try_from(value).unwrap_or(0);
         Ok(YouTubeChatEventState {
