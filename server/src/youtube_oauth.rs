@@ -84,9 +84,9 @@ impl From<AppError> for YouTubeError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
             },
             AppError::Shared { code, message } if code.starts_with("YOUTUBE_") => Self {
-                code: (*code).to_owned(),
+                code: code.to_owned(),
                 message: message.clone(),
-                status: youtube_status_from_code(*code),
+                status: youtube_status_from_code(code),
             },
             AppError::External { code, message } if code.starts_with("YOUTUBE_") => Self {
                 code: code.clone(),

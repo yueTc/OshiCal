@@ -1011,7 +1011,7 @@ fn save_desktop_youtube_oauth_token(token: &DesktopYoutubeOAuthToken) -> Result<
         })?;
     let metadata = DesktopYoutubeOAuthMetadata {
         refresh_token: refresh_token.to_owned(),
-        access_token_expires_at: token.access_token_expires_at.clone(),
+        access_token_expires_at: token.access_token_expires_at,
         scopes: token.scopes.clone(),
         token_type: token.token_type.clone(),
     };
@@ -1313,7 +1313,7 @@ fn write_oauth_callback_page(
     );
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-        body.as_bytes().len(),
+        body.len(),
         body,
     );
     stream
@@ -4340,7 +4340,7 @@ mod tests {
         parse_oauth_callback_target, prepare_forwarded_event, validate_external_url,
         youtube_background_refresh_should_run, youtube_cookie_names_from_header,
         youtube_cookie_should_be_removed, youtube_oauth_authorization_url,
-        youtube_runtime_gate_open, AppUpdateChannel, RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT,
+        AppUpdateChannel, RemoteMonitorState, APP_UPDATE_BETA_ENDPOINT,
         APP_UPDATE_STABLE_ENDPOINT,
     };
     use crate::sync_client::SyncChange;

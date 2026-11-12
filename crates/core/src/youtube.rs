@@ -1724,9 +1724,38 @@ fn parse_super_chat_event(item: &Value) -> Option<YouTubeSuperChatEvent> {
     if id.is_empty() {
         return None;
     }
-    let (details, event_kind) = match snippet.get("superChatDetails") {
-        Some(details) => (details, "superChatEvent"),
-        None => (snippet.get("superStickerDetails")?, "superStickerEvent"),
+    let (details, event_kind) = match (
+        snippet.get("superChatDetails"),
+        snippet.get("superStickerDetails"),
+    ) {
+        (Some(details), _) => (details, "superChatEvent"),
+        (None, Some(details)) => (details, "superStickerEvent"),
+        (None, None) => {
+            // Compatibility for legacy flattened superChatEvents.list payloads. The
+            // public API can omit `type`, so default that shape to Super Chat while
+            // still rejecting explicit unknown types and zero-value items.
+            let event_kind = match snippet.get("type").and_then(Value::as_str) {
+                Some("superChatEvent") => "superChatEvent",
+                Some("superStickerEvent") => "superStickerEvent",
+                Some(_) => return None,
+                None => "superChatEvent",
+            };
+            let has_monetary_field = [
+                "amountMicros",
+                "currency",
+                "amountDisplayString",
+                "displayString",
+                "commentText",
+                "userComment",
+                "tier",
+            ]
+            .iter()
+            .any(|key| snippet.get(*key).is_some());
+            if !has_monetary_field {
+                return None;
+            }
+            (snippet, event_kind)
+        }
     };
     Some(YouTubeSuperChatEvent {
         id: id.to_owned(),
