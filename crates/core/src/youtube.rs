@@ -623,7 +623,9 @@ impl YouTubeClient {
             let body = read_response_bytes_limited(response, MAX_PAGE_RESPONSE_BYTES).await?;
             return Err(youtube_http_error(status, &body));
         }
-        if !is_youtube_host(final_url.host_str().unwrap_or_default()) {
+        if final_url.scheme() != "https"
+            || !is_trusted_youtube_community_host(final_url.host_str().unwrap_or_default())
+        {
             if cookie_supplied {
                 return Ok(YouTubeCommunityFetch {
                     page_found: false,
@@ -916,6 +918,14 @@ fn is_youtube_host(host: &str) -> bool {
     host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
+fn is_trusted_youtube_community_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "youtube.com" | "www.youtube.com" | "m.youtube.com"
+    )
+}
+
 fn is_youtube_channel_id(value: &str) -> bool {
     value.len() == 24
         && value.starts_with("UC")
@@ -1167,7 +1177,8 @@ fn community_page_url(channel_or_handle: &str) -> AppResult<String> {
     }
     if value.starts_with("http://") || value.starts_with("https://") {
         let url = Url::parse(value)?;
-        if !is_youtube_host(url.host_str().unwrap_or_default())
+        if url.scheme() != "https"
+            || !is_trusted_youtube_community_host(url.host_str().unwrap_or_default())
             || !url.username().is_empty()
             || url.password().is_some()
         {
@@ -1233,9 +1244,11 @@ fn parse_community_page(
             continue;
         }
         if post.membership_only
-            && post.images.is_empty()
-            && is_membership_content_placeholder(&post.text)
+            && (post.text.trim().is_empty() || is_membership_content_placeholder(&post.text))
         {
+            // Locked renderers can still expose preview images. If the body is empty or
+            // only a membership placeholder, access is not confirmed, so drop the whole
+            // post before any attachment can reach LLM analysis or schedule storage.
             continue;
         }
         if seen_ids.insert(post.id.clone()) {
@@ -2627,6 +2640,41 @@ mod tests {
     }
 
     #[test]
+    fn membership_only_image_preview_without_visible_body_is_dropped() {
+        let initial = json!({
+            "contents": {
+                "items": [{
+                    "backstagePostRenderer": {
+                        "postId": "locked-members-image",
+                        "contentText": {"simpleText": "Members only"},
+                        "publishedTimeText": {"simpleText": "2 days ago"},
+                        "backstageAttachment": {
+                            "backstageImageRenderer": {
+                                "image": {
+                                    "thumbnails": [
+                                        {"url": "https://yt3.ggpht.com/locked-preview.jpg"}
+                                    ]
+                                }
+                            }
+                        },
+                        "sponsorsOnlyBadge": {
+                            "metadataBadgeRenderer": {"label": "Members only"}
+                        }
+                    }
+                }]
+            }
+        });
+        let html = format!("<script>var ytInitialData = {initial};</script>");
+        let page = parse_community_page(&html, CHANNEL_ID, Utc::now()).expect("community page");
+        assert!(page.membership_restricted);
+        assert_eq!(
+            page.skipped_reason.as_deref(),
+            Some("membership_session_unavailable")
+        );
+        assert!(page.posts.is_empty());
+    }
+
+    #[test]
     fn community_page_parses_text_images_and_membership_posts() {
         let initial = json!({
             "contents": {
@@ -3115,6 +3163,8 @@ mod tests {
             community_page_url("https://www.youtube.com/@Example").expect("url"),
             "https://www.youtube.com/@Example/community"
         );
+        assert!(community_page_url("http://www.youtube.com/@Example").is_err());
         assert!(community_page_url("https://example.com/@Example").is_err());
+        assert!(community_page_url("https://evil.youtube.com/@Example").is_err());
     }
 }

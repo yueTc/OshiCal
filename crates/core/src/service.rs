@@ -3911,26 +3911,18 @@ fn dynamic_post_from_youtube_community(
     streamer: &Streamer,
     observed_at: DateTime<Utc>,
 ) -> DynamicPost {
-    let published_text = post
-        .published_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("未提供");
+    // Relative labels such as "3 hours ago" and crawl-time estimates change between
+    // refreshes. Keep the model-facing text stable so content_digest/source_fingerprint
+    // do not turn the same post into a new source; the time anchor remains published_at.
     let time_context = match (post.published_at, post.published_at_estimated) {
-        (Some(value), true) => format!(
-            "[YouTube 原始发布时间：{published_text}；按抓取时间 {} 估算为 {}，可能存在误差]",
-            observed_at.to_rfc3339(),
-            value.to_rfc3339()
-        ),
-        (Some(value), false) => format!(
-            "[YouTube 原始发布时间：{published_text}；解析为 {}]",
-            value.to_rfc3339()
-        ),
-        (None, _) => format!(
-            "[YouTube 原始发布时间：{published_text}；无法可靠解析。以下相对日期只能按抓取时间 {} 近似解释，不能视为原发布时间]",
-            observed_at.to_rfc3339()
-        ),
+        (Some(_), true) => {
+            "[YouTube 原始发布时间：页面只提供了相对时间；按本次抓取时点估算，可能存在误差]"
+                .to_owned()
+        }
+        (Some(value), false) => format!("[YouTube 原始发布时间：{}]", value.to_rfc3339()),
+        (None, _) => {
+            "[YouTube 原始发布时间：无法可靠解析，不能视为原发布时间]".to_owned()
+        }
     };
     let mut text = time_context;
     if !post.text.trim().is_empty() {
@@ -4648,6 +4640,14 @@ fn source_fingerprint(post: &DynamicPost, title: &str, source_kind: &str) -> Str
     let mut hasher = Sha256::new();
     hasher.update(post.id.as_bytes());
     hasher.update(post.text.as_bytes());
+    if post.raw_kind.trim() == "youtube_community" {
+        hasher.update(b"\ncommunity-source\0");
+        hasher.update(post.source_url.as_bytes());
+        for image_url in &post.images {
+            hasher.update(b"\ncommunity-image\0");
+            hasher.update(image_url.as_bytes());
+        }
+    }
     hasher.update(title.as_bytes());
     hasher.update(source_kind.as_bytes());
     if let Some(reserve) = &post.reserve {
@@ -5017,10 +5017,11 @@ mod tests {
         };
         let mapped = dynamic_post_from_youtube_community(estimated, &streamer, observed_at);
         assert_eq!(mapped.published_at, observed_at - Duration::hours(3));
-        assert!(mapped.text.contains("原始发布时间：3 hours ago"));
+        assert!(mapped.text.contains("相对时间"));
         assert!(mapped.text.contains("估算"));
-        assert!(mapped.text.contains("2026-11-12T09:00:00+00:00"));
         assert!(mapped.text.contains("明天 20:00 直播"));
+        assert!(!mapped.text.contains("3 hours ago"));
+        assert!(!mapped.text.contains("2026-11-12T09:00:00+00:00"));
 
         let unknown = YouTubeCommunityPost {
             id: "unknown".to_owned(),
@@ -5039,7 +5040,71 @@ mod tests {
         assert_eq!(mapped.published_at, observed_at);
         assert!(mapped.text.contains("无法可靠解析"));
         assert!(mapped.text.contains("不能视为原发布时间"));
-        assert!(mapped.text.contains("recently-ish"));
+        assert!(!mapped.text.contains("recently-ish"));
+        assert!(!mapped.text.contains("2026-11-12T12:00:00+00:00"));
+    }
+
+    #[test]
+    fn youtube_community_fingerprints_ignore_observation_time() {
+        let first_observed = DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let second_observed = DateTime::parse_from_rfc3339("2026-11-13T12:00:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let mut streamer = streamer_stub(1, "UC1234567890123456789012", "Example");
+        streamer.platform = Platform::Youtube;
+
+        let make_post = |observed_at: DateTime<Utc>, published_text: &str| YouTubeCommunityPost {
+            id: "stable-post".to_owned(),
+            channel_id: streamer.mid.clone(),
+            author_name: Some(streamer.name.clone()),
+            published_at: Some(observed_at - Duration::hours(3)),
+            published_at_estimated: true,
+            published_text: Some(published_text.to_owned()),
+            text: "周五 20:00 直播".to_owned(),
+            images: vec!["https://yt3.ggpht.com/poster.jpg".to_owned()],
+            source_url: "https://www.youtube.com/post/stable-post".to_owned(),
+            renderer_kind: "backstagePostRenderer".to_owned(),
+            membership_only: false,
+        };
+        let first = dynamic_post_from_youtube_community(
+            make_post(first_observed.clone(), "3 hours ago"),
+            &streamer,
+            first_observed,
+        );
+        let second = dynamic_post_from_youtube_community(
+            make_post(second_observed.clone(), "1 day ago"),
+            &streamer,
+            second_observed,
+        );
+
+        let digest = |post: &DynamicPost| {
+            let reserve = reserve_summary(post);
+            content_digest_of(
+                &text_digest(&text_analysis_context(post)),
+                reserve.as_deref(),
+                &post.images,
+            )
+        };
+        assert_eq!(first.text, second.text);
+        assert_eq!(digest(&first), digest(&second));
+        assert_eq!(
+            source_fingerprint(&first, "周五直播", "youtube_community"),
+            source_fingerprint(&second, "周五直播", "youtube_community")
+        );
+        assert_ne!(
+            source_fingerprint(&first, "周五直播", "youtube_community"),
+            source_fingerprint(&first, "周六直播", "youtube_community")
+        );
+
+        let mut changed_images = second.clone();
+        changed_images.images = vec!["https://yt3.ggpht.com/other.jpg".to_owned()];
+        assert_ne!(digest(&first), digest(&changed_images));
+        assert_ne!(
+            source_fingerprint(&first, "周五直播", "youtube_community"),
+            source_fingerprint(&changed_images, "周五直播", "youtube_community")
+        );
     }
 
     #[tokio::test]
