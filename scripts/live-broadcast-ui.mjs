@@ -130,6 +130,13 @@ const server = createServer(async (req, res) => {
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, timezoneId: "Asia/Shanghai", locale: "zh-CN" });
+// Fulfill profile navigation locally: verify the real external-open action
+// without sending synthetic CI traffic to a production Bilibili account.
+const profileRequests = [];
+await context.route("https://space.bilibili.com/**", async (route) => {
+  profileRequests.push(route.request().url());
+  await route.fulfill({ status: 200, contentType: "text/html", body: "<title>Profile fixture</title>" });
+});
 const page = await context.newPage();
 const pageErrors = [];
 page.on("pageerror", (error) => pageErrors.push(String(error)));
@@ -214,14 +221,26 @@ try {
   assert.equal(await page.getByRole("button", { name: `设置 ${streamer.name} 的固定周表`, exact: true }).count(), 0);
   await more.click();
   await moreMenu.waitFor();
-  assert.deepEqual(await moreMenu.getByRole("menuitem").allTextContents(), ["设定周表", "设置别名", "查看最近直播"]);
+  assert.deepEqual(await moreMenu.getByRole("menuitem").allTextContents(), ["设定周表", "设置别名", "查看最近直播", "进入个人主页"]);
   await more.click();
   await moreMenu.waitFor({ state: "hidden" });
   await more.click();
   await page.keyboard.press("End");
+  assert.equal(await moreMenu.getByRole("menuitem", { name: "进入个人主页", exact: true }).evaluate((el) => el === document.activeElement), true);
+  await page.keyboard.press("ArrowUp");
   assert.equal(await moreMenu.getByRole("menuitem", { name: "查看最近直播", exact: true }).evaluate((el) => el === document.activeElement), true);
   await page.keyboard.press("Escape");
   assert.equal(await more.evaluate((el) => el === document.activeElement), true);
+  await more.click();
+  const [profilePage] = await Promise.all([
+    context.waitForEvent("page"),
+    moreMenu.getByRole("menuitem", { name: "进入个人主页", exact: true }).click(),
+  ]);
+  await profilePage.waitForURL(`https://space.bilibili.com/${streamer.mid}`);
+  assert.deepEqual(profileRequests, [`https://space.bilibili.com/${streamer.mid}`]);
+  await profilePage.close();
+  await moreMenu.waitFor({ state: "hidden" });
+  results.push("主页入口打开对应账号空间；四项菜单的 End、方向键及 Escape 还焦通过");
   for (const [entry, title] of [["设定周表", `${streamer.name} 的固定周表`], ["设置别名", `${streamer.name} 的识别别名`]]) {
     await more.click();
     await moreMenu.getByRole("menuitem", { name: entry, exact: true }).click();
