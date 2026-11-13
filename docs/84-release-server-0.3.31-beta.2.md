@@ -19,12 +19,12 @@
 
 ## 适用产物与渠道
 
-- 版本与标签：`0.3.31-beta.2` / `server-v0.3.31-beta.2`。计划适用 GitHub Actions 生成的 Linux x86_64、Windows x86_64 服务端二进制及 `ghcr.io/yuetc/oshical-server:0.3.31-beta.2` 镜像，实际可用产物以通过验证的 Release 附件为准。
+- 版本与标签：`0.3.31-beta.2` / `server-v0.3.31-beta.2`。适用 GitHub Actions 生成的 Linux x86_64、Windows x86_64 服务端二进制及 `ghcr.io/yuetc/oshical-server:0.3.31-beta.2` 镜像，实际可用产物以通过验证的 Release 附件为准。
 - Release 必须标记为 prerelease，只维护固定 `server-beta` 清单；不得移动 `server-latest`、Docker `latest` 或正式版通道。
 - 构建、测试、镜像生成、产物验证与发布一律通过 GitHub Actions 或用户明确指定的外部构建机。
 
 ## 已知限制与验证状态
 
 - 转发原文不可用时只分析可读取的附言；嵌套转发最多四层，模型仍最多分析每条动态前两张图片。
-- 共享核心已补充房间去重、跨账号绑定、统计引用迁移、快照导入和转发上下文回归用例；本机仅作静态检查，尚未运行 CI、真实采集或升级产物验证。
-- 本文件是发布正文草稿，发布前需按 CI 和实际产物结果定稿并写入同版本 GitHub Release 正文。beta 验证后需另行询问是否发布正式版。
+- GitHub Actions CI 已通过：前端类型检查、Rust 格式与 lint、前端测试、490 项 Rust 测试、前端生产构建及 17 组浏览器交互；其中包括房间去重、跨账号绑定、统计引用迁移、快照导入和转发上下文回归。7 项真实网络/平台测试保持忽略，不宣称已验证真实平台采集或生产升级。CI 记录：`43431958698`。
+- 同一发布说明写入本版本 GitHub Release 正文；发布工作流追加不可变镜像摘要。beta 验证后需另行询问是否发布正式版。
