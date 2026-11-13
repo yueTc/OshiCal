@@ -5334,7 +5334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_and_text_group_events_merge_across_owner_accounts() {
+    async fn image_and_text_group_events_in_distinct_rooms_remain_separate() {
         let store = SqliteStore::in_memory().await.expect("db");
         let xinyi = store
             .add_subscription(&subscription("401", "心宜不是心仪"))
@@ -5396,7 +5396,7 @@ mod tests {
             title: "书梦之旅".to_owned(),
             ..schedule
         };
-        assert!(!service
+        assert!(service
             .upsert_candidate(
                 &sinuo,
                 &short,
@@ -5413,13 +5413,26 @@ mod tests {
             .await
             .expect("upsert candidate"));
         let schedules = store.list_all_schedules().await.expect("schedules");
-        assert_eq!(schedules.len(), 1);
-        assert_eq!(schedules[0].title, "心宜思诺周年纪念直播·《执笔入梦》");
-        assert_eq!(
-            schedules[0].room_owner_name.as_deref(),
-            Some("心宜不是心仪")
-        );
-        assert_eq!(schedules[0].participants, participants);
+        // Explicitly different rooms are separate broadcasts even with the same cast.
+        assert_eq!(schedules.len(), 2);
+        for (room, owner, title) in [
+            (
+                "https://live.bilibili.com/555555",
+                "402",
+                "心宜思诺周年纪念直播·《执笔入梦》",
+            ),
+            ("https://live.bilibili.com/444444", "401", "书梦之旅"),
+        ] {
+            let card = schedules
+                .iter()
+                .find(|card| card.room_url.as_deref() == Some(room))
+                .unwrap();
+            assert_eq!(card.room_owner_mid.as_deref(), Some(owner));
+            assert_eq!(card.title, title);
+            assert_eq!(card.participants, participants);
+        }
+        assert_eq!(service.dedupe_schedule_duplicates().await.unwrap(), 0);
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -6435,7 +6448,7 @@ mod tests {
             live_owner.id,
             "【3D】默契加倍中",
             start,
-            "http://live.bilibili.com/12345/",
+            "https://live.bilibili.com/12345/",
             Vec::new(),
         );
         live_input.source_kind = "live".into();
