@@ -35,9 +35,11 @@ test("legacy payload with missing ownership still uses bounded matching", () => 
 test("an unloaded bound card must not highlight another card", () => {
   assert.deepEqual([...matchLiveSchedules([card(1)], [live(2)])], []);
 });
-test("cancelled or wrong-streamer bindings must not select another card", () => {
+test("cancelled bindings must not select another card", () => {
   assert.deepEqual([...matchLiveSchedules([card(1, 0, true), card(2)], [live(1)])], []);
-  assert.deepEqual([...matchLiveSchedules([card(1, 0, false, 2), card(2)], [live(1)])], []);
+});
+test("explicit room ownership can bind a group announcement under another account", () => {
+  assert.deepEqual([...matchLiveSchedules([card(1, 0, false, 2), card(2)], [live(1)])], [1]);
 });
 test("legacy ties are deterministic by earlier time and then ID", () => {
   assert.deepEqual([...matchLiveSchedules([card(3, -60000), card(2, 60000), card(1, -60000)], [live()])], [1]);

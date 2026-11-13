@@ -23,6 +23,7 @@ export default function AppearanceSettingsPanel({ value, onChange }: AppearanceS
 
   function updateCustom(key: "primary" | "background", color: string) {
     onChange({
+      ...value,
       preset: "custom",
       custom: { ...value.custom, [key]: color },
     });
@@ -116,6 +117,7 @@ export default function AppearanceSettingsPanel({ value, onChange }: AppearanceS
             type="button"
             className="button secondary appearance-reset"
             onClick={() => onChange({
+              ...value,
               preset: DEFAULT_APPEARANCE.preset,
               custom: { ...DEFAULT_APPEARANCE.custom },
             })}

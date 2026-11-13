@@ -1732,6 +1732,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <AppearanceSettingsPanel value={appearance} onChange={onAppearanceChange} />
 
         <section className="settings-card device-local-settings">
+          <header><h2>日程卡片</h2><span className="setting-scope local">仅本设备</span></header>
+          <div className="settings-stack">
+            <Toggle
+              checked={appearance.showScheduleSourceBadge}
+              onChange={(showScheduleSourceBadge) => onAppearanceChange({ ...appearance, showScheduleSourceBadge })}
+              label="显示日程类型胶囊（预约、文本、图文等）"
+            />
+            <Toggle
+              checked={appearance.showScheduleRoomOwnerBadge}
+              onChange={(showScheduleRoomOwnerBadge) => onAppearanceChange({ ...appearance, showScheduleRoomOwnerBadge })}
+              label="显示直播间归属胶囊"
+            />
+            <p className="form-hint">立即生效并自动保存，适用于时间线和日历视图。</p>
+          </div>
+        </section>
+
+        <section className="settings-card device-local-settings">
           <header><h2>提醒与运行</h2><span className="setting-scope local">仅本设备</span></header>
           <div className="settings-stack">
             <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft((current) => ({ ...current, notificationsEnabled: value }))} label="Windows 开播通知" />

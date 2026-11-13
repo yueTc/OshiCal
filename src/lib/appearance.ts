@@ -31,6 +31,8 @@ export interface CustomAppearance {
 export interface AppearanceSettings {
   preset: AppearancePresetId;
   custom: CustomAppearance;
+  showScheduleSourceBadge: boolean;
+  showScheduleRoomOwnerBadge: boolean;
 }
 
 export interface AppearancePreset {
@@ -187,6 +189,8 @@ export const APPEARANCE_PRESETS: AppearancePreset[] = [
 
 export const DEFAULT_APPEARANCE: AppearanceSettings = {
   preset: "sakura",
+  showScheduleSourceBadge: true,
+  showScheduleRoomOwnerBadge: true,
   custom: {
     primary: "#e94f88",
     background: "#fff8fb",
@@ -351,6 +355,12 @@ export function normalizeAppearanceSettings(
     : DEFAULT_APPEARANCE.preset;
   return {
     preset,
+    showScheduleSourceBadge: typeof value?.showScheduleSourceBadge === "boolean"
+      ? value.showScheduleSourceBadge
+      : DEFAULT_APPEARANCE.showScheduleSourceBadge,
+    showScheduleRoomOwnerBadge: typeof value?.showScheduleRoomOwnerBadge === "boolean"
+      ? value.showScheduleRoomOwnerBadge
+      : DEFAULT_APPEARANCE.showScheduleRoomOwnerBadge,
     custom: {
       primary: normalizeHex(value?.custom?.primary ?? "", DEFAULT_APPEARANCE.custom.primary),
       background: normalizeHex(value?.custom?.background ?? "", DEFAULT_APPEARANCE.custom.background),
@@ -387,18 +397,12 @@ export function readAppearanceSettings(): AppearanceSettings {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      return {
-        preset: DEFAULT_APPEARANCE.preset,
-        custom: { ...DEFAULT_APPEARANCE.custom },
-      };
+      return normalizeAppearanceSettings(DEFAULT_APPEARANCE);
     }
     const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
     return normalizeAppearanceSettings(parsed);
   } catch {
-    return {
-      preset: DEFAULT_APPEARANCE.preset,
-      custom: { ...DEFAULT_APPEARANCE.custom },
-    };
+    return normalizeAppearanceSettings(DEFAULT_APPEARANCE);
   }
 }
 

@@ -46,16 +46,16 @@ export function matchLiveSchedules(
   }
 
   const matchedScheduleIds = new Set<number>();
-  for (const [streamerId, candidates] of schedulesByStreamer) {
-    const live = activeByStreamer.get(streamerId);
-    if (!live) continue;
+  for (const [streamerId, live] of activeByStreamer) {
     // Null plus scheduleKnown means the upgraded server deliberately has no
     // binding. Legacy payloads omit both and keep bounded time matching.
     if (live.scheduleKnown === true || live.scheduleId !== undefined) {
-      const bound = candidates.find((schedule) => schedule.id === live.scheduleId);
+      // The server binds by room; a group announcement may belong to another account.
+      const bound = schedules.find((schedule) => schedule.id === live.scheduleId && !schedule.cancelled);
       if (bound) matchedScheduleIds.add(bound.id);
       continue;
     }
+    const candidates = schedulesByStreamer.get(streamerId) ?? [];
     const referenceTime = liveReferenceTime(live, fallbackNow);
     let bestSchedule: LiveScheduleCandidate | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;

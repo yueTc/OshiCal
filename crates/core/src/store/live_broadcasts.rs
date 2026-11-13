@@ -20,12 +20,21 @@ pub struct LiveBroadcast {
     pub segment_count: i64,
 }
 
-fn room_matches(room_url: Option<&str>, owner: Option<&str>, mid: &str, room: &str) -> bool {
+pub(super) fn room_matches(
+    room_url: Option<&str>,
+    owner: Option<&str>,
+    mid: &str,
+    room: &str,
+) -> bool {
     if let Some(owner) = owner {
         return owner == mid;
     }
     room_url.is_none_or(|value| {
-        url::Url::parse(value).is_ok_and(|url| url.path().trim_matches('/') == room)
+        url::Url::parse(value).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str() == Some("live.bilibili.com")
+                && url.path().trim_matches('/') == room
+        })
     })
 }
 
@@ -131,13 +140,14 @@ impl SqliteStore {
         if enabled && !broadcast.schedule_decided {
             let start = parse_ts(&broadcast.started_at)?;
             let rows = sqlx::query(
-                "SELECT id, room_url, room_owner_mid FROM schedules s
-                 WHERE streamer_id = ? AND cancelled = 0
+                "SELECT id, streamer_id, room_url, room_owner_mid FROM schedules s
+                 WHERE cancelled = 0 AND (streamer_id = ? OR room_owner_mid = ? OR room_url IS NOT NULL)
                    AND ABS((julianday(start_at) - julianday(?)) * 86400.0) <= ? + 0.0001
                    AND NOT EXISTS (SELECT 1 FROM live_broadcasts b WHERE b.schedule_id = s.id)
                  ORDER BY ABS(julianday(start_at) - julianday(?)), julianday(start_at), id",
             )
             .bind(streamer_id)
+            .bind(&mid)
             .bind(&broadcast.started_at)
             .bind(LIVE_SCHEDULE_WINDOW_SECONDS)
             .bind(&broadcast.started_at)
@@ -146,7 +156,10 @@ impl SqliteStore {
             for row in rows {
                 let url: Option<String> = row.try_get("room_url")?;
                 let owner: Option<String> = row.try_get("room_owner_mid")?;
-                if room_matches(url.as_deref(), owner.as_deref(), &mid, &room) {
+                let own_schedule = row.try_get::<i64, _>("streamer_id")? == streamer_id;
+                if (own_schedule || owner.is_some() || url.is_some())
+                    && room_matches(url.as_deref(), owner.as_deref(), &mid, &room)
+                {
                     broadcast.schedule_id = Some(row.try_get("id")?);
                     break;
                 }
@@ -231,11 +244,13 @@ impl SqliteStore {
         let rows = sqlx::query(
             "SELECT s.id, st.mid, b.room_id FROM live_broadcasts b
              JOIN schedules s ON s.id=b.schedule_id JOIN streamers st ON st.id=b.streamer_id
-             WHERE b.streamer_id=? AND s.source_kind='live' AND s.cancelled=0
+             WHERE (b.streamer_id=? OR st.mid=? OR s.room_url=?) AND s.source_kind='live' AND s.cancelled=0
                AND ABS((julianday(b.started_at)-julianday(?)) * 86400.0) <= ? + 0.0001
              ORDER BY ABS(julianday(b.started_at)-julianday(?)), julianday(b.started_at), s.id",
         )
         .bind(input.streamer_id)
+        .bind(&input.room_owner_mid)
+        .bind(&input.room_url)
         .bind(input.start_at.to_rfc3339())
         .bind(LIVE_SCHEDULE_WINDOW_SECONDS)
         .bind(input.start_at.to_rfc3339())
@@ -517,6 +532,105 @@ mod tests {
     }
     async fn status(store: &SqliteStore) -> LiveStatus {
         store.list_live_statuses().await.unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn room_owner_binds_announcement_published_under_another_account() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        // A second subscribed account publishes the joint announcement.
+        let publisher_input = AddSubscription {
+            mid: "200".into(),
+            name: Some("转发账号".into()),
+            room_id: Some("67890".into()),
+            platform: Platform::Bilibili,
+            handle: None,
+            profile_url: None,
+            uploads_playlist_id: None,
+            avatar_url: None,
+            aliases: None,
+            schedule_enabled: true,
+            live_notify_enabled: false,
+            live_stats_enabled: false,
+        };
+        let publisher = store.add_subscription(&publisher_input).await.unwrap();
+        let mut input = schedule(publisher.id, time() + Duration::minutes(10));
+        input.room_owner_mid = Some(owner.mid.clone());
+        input.room_url = Some("https://live.bilibili.com/12345?from=repost".into());
+        let announcement = store.upsert_schedule(&input).await.unwrap().0;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        assert_eq!(status(&store).await.schedule_id, Some(announcement.id));
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 1);
+        let data = exported(&store).await;
+        let target = SqliteStore::in_memory().await.unwrap();
+        target
+            .import_snapshot(&data, "server", "https://fixture.invalid")
+            .await
+            .unwrap();
+        let imported = target.list_live_broadcasts().await.unwrap();
+        assert!(imported[0].schedule_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_merge_preserves_broadcast_status_and_statistics_ownership() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let duplicate_id = status(&store).await.schedule_id.unwrap();
+        let session = store
+            .ensure_broadcast_live_session(owner.id, "直播", None, time())
+            .await
+            .unwrap();
+        let mut input = schedule(owner.id, time() + Duration::minutes(10));
+        input.title = "团播预告".into();
+        let canonical = store.upsert_schedule(&input).await.unwrap().0;
+        let duplicate = store.get_schedule(duplicate_id).await.unwrap();
+        assert!(store
+            .merge_and_delete_schedule_duplicate(
+                canonical.id,
+                canonical.revision,
+                duplicate.id,
+                duplicate.revision,
+                Some(&input),
+            )
+            .await
+            .unwrap());
+        assert_eq!(status(&store).await.schedule_id, Some(canonical.id));
+        assert_eq!(
+            store.list_live_broadcasts().await.unwrap()[0].schedule_id,
+            Some(canonical.id)
+        );
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .await
+                .unwrap()
+                .schedule_id,
+            Some(canonical.id)
+        );
+        assert!(store.get_schedule(duplicate_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn late_cross_account_announcement_attaches_to_existing_live_room() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let owner = owner(&store).await;
+        store
+            .set_live_status(owner.id, &snapshot(Some(time()), time(), true))
+            .await
+            .unwrap();
+        let mut input = schedule(owner.id + 100, time() + Duration::minutes(10));
+        // Room ownership, not the publishing account ID, selects the live card.
+        input.room_owner_mid = Some(owner.mid.clone());
+        input.source_identity = Some("reserve:cross-account".into());
+        assert!(store.merge_late_live_schedule(&input).await.unwrap());
+        assert_eq!(store.list_all_schedules().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -163,6 +163,16 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
         schedule_owners.insert(schedule.id, schedule.streamer_id);
     }
 
+    let schedules_by_id: HashMap<_, _> = snapshot
+        .schedules
+        .iter()
+        .map(|item| (item.id, item))
+        .collect();
+    let streamers_by_id: HashMap<_, _> = snapshot
+        .subscriptions
+        .iter()
+        .map(|item| (item.id, item))
+        .collect();
     let mut broadcast_ids = HashSet::new();
     let mut broadcast_schedules = HashSet::new();
     for broadcast in &snapshot.live_broadcasts {
@@ -185,10 +195,20 @@ fn validate_snapshot(snapshot: &ServerSnapshot) -> AppResult<()> {
             return Err(AppError::validation("直播场次观测时间无效"));
         }
         if let Some(id) = broadcast.schedule_id {
-            if schedule_owners.get(&id) != Some(&broadcast.streamer_id)
-                || !broadcast_schedules.insert(id)
-                || !broadcast.schedule_decided
-            {
+            let schedule = schedules_by_id.get(&id);
+            let streamer = streamers_by_id.get(&broadcast.streamer_id);
+            let valid_owner = schedule.zip(streamer).is_some_and(|(schedule, streamer)| {
+                schedule.streamer_id == broadcast.streamer_id
+                    || (streamer_platforms.get(&schedule.streamer_id) == Some(&streamer.platform)
+                        && (schedule.room_owner_mid.is_some() || schedule.room_url.is_some())
+                        && super::live_broadcasts::room_matches(
+                            schedule.room_url.as_deref(),
+                            schedule.room_owner_mid.as_deref(),
+                            &streamer.mid,
+                            &broadcast.room_id,
+                        ))
+            });
+            if !valid_owner || !broadcast_schedules.insert(id) || !broadcast.schedule_decided {
                 return Err(AppError::validation("直播卡片归属缺失或重复绑定"));
             }
         }

@@ -2549,8 +2549,8 @@ impl AppService {
                     .insert(format!("post:{}", post.id), None);
             }
             if let Some(analyzer) = llm.filter(|_| has_content) {
-                // v4 只识别前两图，不复用旧多图结果；历史日程继续保留。
-                let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
+                // v5 区分转发者与原作者，不复用缺少转发上下文的结果。
+                let prompt_version = format!("{}-post-v5", settings.llm_prompt_version);
                 // 取一个并发许可：同一时刻最多 llm_parallelism 个请求在跑。
                 let config = LlmConfig {
                     base_url: analyzer.config.base_url.clone(),
@@ -3412,7 +3412,11 @@ impl AppService {
             if self.store.merge_late_live_schedule(&input).await? {
                 return Ok(false);
             }
-            if participants.len() > 1 || source_kind == "reserve" {
+            if !participants.is_empty()
+                || room_owner_mid.is_some()
+                || room_url.is_some()
+                || source_kind == "reserve"
+            {
                 let candidates = self
                     .store
                     .list_schedules_near_all(schedule.start_at, 10)
@@ -3423,7 +3427,6 @@ impl AppService {
                     participants,
                     room_owner_mid,
                     room_url,
-                    source_kind,
                 );
                 if !duplicates.is_empty() {
                     duplicates.sort_by_key(|schedule| (!schedule.manual_locked, schedule.id));
@@ -4249,7 +4252,7 @@ fn event_source_identity(
 }
 
 /// 同一条动态里，文字通道与图片通道给出的两个事件是否指向同一场直播。
-/// 只看时间槽与参与者：标题由两条通道各自描述，措辞不同不代表是两场。
+/// 优先看时间槽与直播间，缺少房间证据时再看参与者；标题措辞不同不代表是两场。
 fn llm_events_equivalent(left: &LlmEvent, right: &LlmEvent) -> bool {
     if left.action != right.action {
         return false;
@@ -4262,6 +4265,14 @@ fn llm_events_equivalent(left: &LlmEvent, right: &LlmEvent) -> bool {
         }
         (None, None) => {}
         _ => return false,
+    }
+    if let Some(same) = same_schedule_room(
+        left.room_owner_mid.as_deref(),
+        left.room_url.as_deref(),
+        right.room_owner_mid.as_deref(),
+        right.room_url.as_deref(),
+    ) {
+        return same;
     }
     let left_names: Vec<String> = left
         .participant_names()
@@ -4285,12 +4296,64 @@ fn llm_events_equivalent(left: &LlmEvent, right: &LlmEvent) -> bool {
     shared >= 1 && shared * 2 >= min_participants
 }
 
-/// 同一场直播在重试或多来源抓取后可能以不同标题落成多条。
-/// 同槽且参与者有强重合，或同一直播间且至少一人重合时，视为同一场。
+/// Room identity is stronger than participant spelling. Bilibili short/full room
+/// URLs may differ, so a confirmed owner MID can also establish the same room.
+/// Explicitly different rooms must not merge merely because the cast overlaps.
+fn same_schedule_room(
+    left_owner: Option<&str>,
+    left_url: Option<&str>,
+    right_owner: Option<&str>,
+    right_url: Option<&str>,
+) -> Option<bool> {
+    let left_owner = left_owner.filter(|value| !value.trim().is_empty());
+    let right_owner = right_owner.filter(|value| !value.trim().is_empty());
+    if let (Some(left), Some(right)) = (left_owner, right_owner) {
+        if left != right {
+            return Some(false);
+        }
+    }
+    let room_key = |value: &str| {
+        let mut url = url::Url::parse(value).ok()?;
+        if url.host_str() == Some("live.bilibili.com") {
+            let room = url.path().trim_matches('/');
+            if room.is_empty() || !room.chars().all(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            return Some(format!("bilibili:{room}"));
+        }
+        url.set_fragment(None);
+        Some(url.to_string())
+    };
+    if let (Some(left), Some(right)) = (left_url.and_then(room_key), right_url.and_then(room_key)) {
+        if left == right {
+            return Some(true);
+        }
+        // Do not collapse different YouTube video URLs under the same channel.
+        if !(left.starts_with("bilibili:") && right.starts_with("bilibili:")) {
+            return Some(false);
+        }
+        return Some(left_owner.is_some() && left_owner == right_owner);
+    }
+    left_owner
+        .zip(right_owner)
+        .map(|(left, right)| left == right)
+}
+
+/// Same room and bounded start time identify a slot even with missing participants.
 fn schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
-    let minutes = (left.start_at - right.start_at).num_minutes().abs();
-    if minutes > 10 {
+    if (left.start_at - right.start_at).abs() > Duration::minutes(10) {
         return false;
+    }
+    if left.cancelled || right.cancelled {
+        return false;
+    }
+    if let Some(same) = same_schedule_room(
+        left.room_owner_mid.as_deref(),
+        left.room_url.as_deref(),
+        right.room_owner_mid.as_deref(),
+        right.room_url.as_deref(),
+    ) {
+        return same;
     }
     let left_names: Vec<String> = left
         .participants
@@ -4307,11 +4370,7 @@ fn schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
         .filter(|name| right_names.iter().any(|other| other == *name))
         .count();
     let min_participants = left_names.len().min(right_names.len());
-    let strong_overlap = shared >= 2 && shared * 2 >= min_participants;
-    let same_room_owner =
-        left.room_owner_mid.is_some() && left.room_owner_mid == right.room_owner_mid;
-    let same_room_url = left.room_url.is_some() && left.room_url == right.room_url;
-    strong_overlap || ((same_room_owner || same_room_url) && shared >= 1)
+    shared >= 2 && shared * 2 >= min_participants
 }
 
 fn group_duplicates<'a>(
@@ -4320,7 +4379,6 @@ fn group_duplicates<'a>(
     participants: &[String],
     room_owner_mid: Option<&str>,
     room_url: Option<&str>,
-    incoming_source_kind: &str,
 ) -> Vec<&'a Schedule> {
     let incoming_names: Vec<String> = participants
         .iter()
@@ -4329,9 +4387,18 @@ fn group_duplicates<'a>(
     candidates
         .iter()
         .filter(|candidate| {
-            let minutes = (candidate.start_at - incoming.start_at).num_minutes().abs();
-            if minutes > 10 {
+            if candidate.cancelled
+                || (candidate.start_at - incoming.start_at).abs() > Duration::minutes(10)
+            {
                 return false;
+            }
+            if let Some(same) = same_schedule_room(
+                candidate.room_owner_mid.as_deref(),
+                candidate.room_url.as_deref(),
+                room_owner_mid,
+                room_url,
+            ) {
+                return same;
             }
             let existing_names: Vec<String> = candidate
                 .participants
@@ -4343,20 +4410,7 @@ fn group_duplicates<'a>(
                 .filter(|name| existing_names.iter().any(|existing| existing == *name))
                 .count();
             let min_participants = incoming_names.len().min(existing_names.len());
-            let strong_overlap = shared >= 2 && shared * 2 >= min_participants;
-            let same_room_owner =
-                room_owner_mid.is_some_and(|mid| candidate.room_owner_mid.as_deref() == Some(mid));
-            let same_room_url =
-                room_url.is_some_and(|url| candidate.room_url.as_deref() == Some(url));
-            let same_room = same_room_owner || same_room_url;
-            // A reservation often has no participant list, while the same live can
-            // later be announced as a group text by another account. Same room and
-            // an almost identical start time are the strong signal in that case.
-            let reservation_same_room = (candidate.source_kind == "reserve"
-                || incoming_source_kind == "reserve")
-                && same_room
-                && minutes <= 1;
-            strong_overlap || (same_room && shared >= 1) || reservation_same_room
+            shared >= 2 && shared * 2 >= min_participants
         })
         .collect()
 }
@@ -4393,13 +4447,15 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
             participants.push(participant.clone());
         }
     }
-    let keep_existing_reserve =
-        existing.source_kind == "reserve" && incoming.source_kind != "reserve";
+    let keep_existing_source = (existing.source_kind == "reserve"
+        && incoming.source_kind != "reserve")
+        || (existing.source_kind != "live" && incoming.source_kind == "live");
     let incoming_reserve = incoming.source_kind == "reserve" && existing.source_kind != "reserve";
-    let use_incoming_title = !keep_existing_reserve
+    let use_incoming_title = !keep_existing_source
         && !schedule_title_is_placeholder(&incoming.title)
         && (schedule_title_is_placeholder(&existing.title)
             || incoming_reserve
+            || (existing.source_kind == "live" && incoming.source_kind != "live")
             || incoming.title.chars().count() > existing.title.chars().count());
     let title = if use_incoming_title {
         incoming.title.clone()
@@ -4419,7 +4475,9 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
         streamer_id: existing.streamer_id,
         participants,
         title,
-        start_at: if incoming_wins {
+        start_at: if incoming.source_kind == "live" && existing.source_kind != "live" {
+            existing.start_at
+        } else if incoming_wins {
             incoming.start_at
         } else {
             existing.start_at
@@ -4462,37 +4520,37 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
                 .clone()
                 .or_else(|| incoming.room_owner_name.clone())
         },
-        source_kind: if keep_existing_reserve {
+        source_kind: if keep_existing_source {
             existing.source_kind.clone()
         } else {
             incoming.source_kind.clone()
         },
-        source_post_id: if keep_existing_reserve {
+        source_post_id: if keep_existing_source {
             existing.source_post_id.clone()
         } else {
             incoming.source_post_id.clone()
         },
-        source_image_url: if keep_existing_reserve {
+        source_image_url: if keep_existing_source {
             existing.source_image_url.clone()
         } else {
             incoming.source_image_url.clone()
         },
-        source_author_mid: if keep_existing_reserve {
+        source_author_mid: if keep_existing_source {
             existing.source_author_mid.clone()
         } else {
             incoming.source_author_mid.clone()
         },
-        source_fingerprint: if keep_existing_reserve {
+        source_fingerprint: if keep_existing_source {
             existing.source_fingerprint.clone()
         } else {
             incoming.source_fingerprint.clone()
         },
-        source_identity: if keep_existing_reserve {
+        source_identity: if keep_existing_source {
             existing.source_identity.clone()
         } else {
             incoming.source_identity.clone()
         },
-        source_published_at: if keep_existing_reserve {
+        source_published_at: if keep_existing_source {
             existing.source_published_at
         } else {
             source_published_at
@@ -6330,6 +6388,120 @@ mod tests {
                 .manual_locked
         );
         assert!(store.get_schedule(automatic.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn room_slot_dedupe_ignores_missing_cast_but_preserves_other_rooms_and_sessions() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let publisher = store
+            .add_subscription(&subscription("1001", "公告账号"))
+            .await
+            .unwrap();
+        let live_owner = store
+            .add_subscription(&subscription("1002", "贝拉kira"))
+            .await
+            .unwrap();
+        let start: DateTime<Utc> = "2026-11-13T11:50:00Z".parse().unwrap();
+        let make = |streamer_id, title: &str, start_at, room: &str, participants| NewSchedule {
+            streamer_id,
+            title: title.into(),
+            start_at,
+            participants,
+            end_at: None,
+            room_url: Some(room.into()),
+            room_owner_mid: None,
+            room_owner_name: None,
+            source_kind: "image".into(),
+            source_post_id: None,
+            source_image_url: None,
+            source_author_mid: None,
+            source_fingerprint: None,
+            source_identity: None,
+            source_published_at: None,
+            confidence: 0.95,
+        };
+        let announced = store
+            .upsert_schedule(&make(
+                publisher.id,
+                "默契加倍中",
+                start + Duration::minutes(10),
+                "https://live.bilibili.com/12345?from=post",
+                vec!["嘉然".into(), "贝拉".into()],
+            ))
+            .await
+            .unwrap()
+            .0;
+        let mut live_input = make(
+            live_owner.id,
+            "【3D】默契加倍中",
+            start,
+            "http://live.bilibili.com/12345/",
+            Vec::new(),
+        );
+        live_input.source_kind = "live".into();
+        let live_card = store.upsert_schedule(&live_input).await.unwrap().0;
+        assert!(schedules_equivalent(&announced, &live_card));
+        let candidates = vec![announced.clone()];
+        let incoming = ParsedSchedule {
+            title: live_input.title.clone(),
+            start_at: start,
+            end_at: None,
+            confidence: 0.95,
+        };
+        assert_eq!(
+            group_duplicates(
+                &candidates,
+                &incoming,
+                &[],
+                None,
+                live_input.room_url.as_deref()
+            )
+            .len(),
+            1
+        );
+        let mut other = live_card.clone();
+        other.room_url = Some("https://live.bilibili.com/67890".into());
+        other.participants = announced.participants.clone();
+        assert!(!schedules_equivalent(&announced, &other));
+        other = live_card.clone();
+        other.start_at = announced.start_at + Duration::minutes(10) + Duration::milliseconds(1);
+        assert!(!schedules_equivalent(&announced, &other));
+        other = live_card.clone();
+        other.cancelled = true;
+        assert!(!schedules_equivalent(&announced, &other));
+        let service = AppService::new(store.clone(), RuntimeSecrets::default()).unwrap();
+        assert_eq!(service.dedupe_schedule_duplicates().await.unwrap(), 1);
+        let remaining = store.list_all_schedules().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].title, "默契加倍中");
+        assert_eq!(remaining[0].start_at, announced.start_at);
+    }
+
+    #[test]
+    fn room_identity_handles_owner_aliases_and_distinct_youtube_videos() {
+        assert_eq!(
+            same_schedule_room(
+                Some("100"),
+                Some("https://live.bilibili.com/1"),
+                Some("100"),
+                Some("https://live.bilibili.com/12345")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_schedule_room(Some("100"), None, Some("200"), None),
+            Some(false)
+        );
+        assert_eq!(same_schedule_room(None, None, None, None), None);
+        assert_eq!(
+            same_schedule_room(
+                Some("channel"),
+                Some("https://www.youtube.com/watch?v=a"),
+                Some("channel"),
+                Some("https://www.youtube.com/watch?v=b")
+            ),
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -8182,7 +8354,7 @@ mod tests {
             assert_eq!(analyzer.call_count(), 1);
             assert_eq!(analyzer.last_call().input.published_at, post.published_at);
             let new_key = format!(
-                "{}:{content_digest}:fixture-model:{}-post-v4",
+                "{}:{content_digest}:fixture-model:{}-post-v5",
                 post.id, settings.llm_prompt_version
             );
             assert_eq!(
@@ -8223,7 +8395,7 @@ mod tests {
         let text_hash = text_digest(&text_analysis_context(&post));
         let reserve = reserve_summary(&post);
         let content_digest = content_digest_of(&text_hash, reserve.as_deref(), &post.images);
-        let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v5", settings.llm_prompt_version);
         let cache_key = format!("{}:{content_digest}:{model}:{prompt_version}", post.id);
         store
             .save_post_analysis(
@@ -8332,6 +8504,20 @@ mod tests {
     }
 
     #[test]
+    fn model_event_dedupe_prefers_room_over_participant_spelling() {
+        let time = Utc::now();
+        let mut left = schedule_event("团播", Some(time), "贝拉");
+        left.room_url = Some("https://live.bilibili.com/12345?from=post".into());
+        let mut right = schedule_event("团播", Some(time), "贝拉kira");
+        right.room_url = Some("https://live.bilibili.com/12345/".into());
+        assert!(llm_events_equivalent(&left, &right));
+        right.room_url = Some("https://live.bilibili.com/67890".into());
+        right.participants = left.participants.clone();
+        right.performer = left.performer.clone();
+        assert!(!llm_events_equivalent(&left, &right));
+    }
+
+    #[test]
     fn llm_events_equivalent_matches_slot_and_participants() {
         let base = Utc::now() + Duration::days(2);
         let make = |title: &str, start_at: DateTime<Utc>, participants: Vec<String>| LlmEvent {
@@ -8430,6 +8616,42 @@ mod tests {
         .fetch_all(store.pool())
         .await
         .expect("source identities")
+    }
+
+    #[tokio::test]
+    async fn repost_attribution_reaches_analyzer_and_invalidates_cache_when_original_changes() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let streamer = store
+            .add_subscription(&subscription("9501", "转发者"))
+            .await
+            .unwrap();
+        let analyzer = Arc::new(CountingAnalyzer::new(Vec::new(), Vec::new()));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .unwrap();
+        let mut post = dynamic_post("repost-context", &streamer.mid, &streamer.name, Utc::now(),
+            "转发附言：支持一下\n原动态发起人：原主播（MID：200）\n原动态发布时间：2026-11-12 20:00:00（北京时间）\n原动态正文：明晚八点见", Vec::new());
+        let settings = AppSettings::default();
+        for changed in [false, true] {
+            if changed {
+                post.text = post.text.replace("MID：200", "MID：201");
+            }
+            service
+                .process_source_posts(
+                    &streamer.mid,
+                    std::slice::from_ref(&streamer),
+                    std::slice::from_ref(&post),
+                    &settings,
+                    Some(&test_pool("fixture")),
+                )
+                .await
+                .unwrap();
+            let call = analyzer.last_call();
+            assert_eq!(call.input.author, "转发者");
+            assert_eq!(call.input.text, post.text);
+            assert!(call.input.text.contains("原动态发起人"));
+        }
+        assert_eq!(analyzer.call_count(), 2);
     }
 
     #[tokio::test]
@@ -8977,7 +9199,7 @@ mod tests {
         let settings = AppSettings::default();
         let text_hash = text_digest(&text_analysis_context(&post));
         let content_digest = content_digest_of(&text_hash, None, &post.images);
-        let prompt_version = format!("{}-post-v4", settings.llm_prompt_version);
+        let prompt_version = format!("{}-post-v5", settings.llm_prompt_version);
         let cache_key = format!(
             "{}:{content_digest}:fixture-model:{prompt_version}",
             post.id

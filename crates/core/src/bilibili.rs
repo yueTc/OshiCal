@@ -1253,6 +1253,11 @@ fn parse_bili_time(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn parse_dynamic_item(item: &Value) -> Option<DynamicPost> {
+    parse_dynamic_item_with_depth(item, 0)
+}
+
+// Bound nested reposts; deleted/unavailable originals must not discard the outer post.
+fn parse_dynamic_item_with_depth(item: &Value, depth: usize) -> Option<DynamicPost> {
     let id = item.get("id_str").and_then(Value::as_str)?.to_owned();
     let modules = item.get("modules")?;
     let author = modules.get("module_author")?;
@@ -1333,7 +1338,7 @@ fn parse_dynamic_item(item: &Value) -> Option<DynamicPost> {
         .and_then(|value| value.get("jump_url"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
-    let reserve = reserve_value.map(|reserve| ReserveCard {
+    let mut reserve = reserve_value.map(|reserve| ReserveCard {
         title: reserve
             .get("title")
             .and_then(Value::as_str)
@@ -1350,6 +1355,41 @@ fn parse_dynamic_item(item: &Value) -> Option<DynamicPost> {
         jump_url: reserve_jump_url.map(ToOwned::to_owned),
         stype: reserve.get("stype").and_then(Value::as_i64),
     });
+
+    if depth < 4 {
+        if let Some(original) = item
+            .get("orig")
+            .and_then(|original| parse_dynamic_item_with_depth(original, depth + 1))
+        {
+            // Keep publisher and original author distinct. This text also enters the
+            // analysis digest, so a changed original invalidates the cached result.
+            let china = FixedOffset::east_opt(8 * 3600).expect("china offset");
+            let original_reserve = original.reserve.as_ref().map_or_else(String::new, |card| {
+                format!(
+                    "\n原动态预约卡：{}\n{}\n原动态预约链接：{}",
+                    card.title,
+                    card.description,
+                    card.jump_url.as_deref().unwrap_or_default()
+                )
+            });
+            text = format!(
+                "转发者：{author_name}（MID：{author_mid}）\n转发附言：\n{text}\n\n[被转发动态]\n原动态发起人：{}（MID：{}）\n原动态编号：{}\n原动态链接：{}\n原动态发布时间：{}（北京时间）\n原动态正文：\n{}{original_reserve}\n[/被转发动态]",
+                original.author_name,
+                original.author_mid,
+                original.id,
+                original.source_url,
+                original.published_at.with_timezone(&china).format("%Y-%m-%d %H:%M:%S"),
+                original.text,
+            );
+            for image in original.images {
+                if !images.contains(&image) {
+                    images.push(image);
+                }
+            }
+            images.truncate(9);
+            reserve = reserve.or(original.reserve);
+        }
+    }
 
     if text.is_empty() && images.is_empty() && reserve.is_none() {
         return None;
@@ -1465,6 +1505,72 @@ mod tests {
         );
         assert_eq!(reserve.stype, Some(2));
         assert!(reserve.is_live());
+    }
+
+    #[test]
+    fn repost_keeps_original_author_content_images_and_reservation() {
+        let original = json!({
+            "id_str": "original-1", "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {
+                "module_author": {"mid": 200, "name": "原主播", "pub_ts": 1794499200},
+                "module_dynamic": {
+                    "desc": {"text": "明晚八点在我的直播间见"},
+                    "major": {"draw": {"items": [{"src": "//i0.hdslb.com/bfs/original.jpg"}]}},
+                    "additional": {"reserve": {
+                        "title": "原主播歌回", "desc1": {"text": "直播预约"},
+                        "jump_url": "https://live.bilibili.com/12345", "stype": 2
+                    }}
+                }
+            }
+        });
+        let item = json!({
+            "id_str": "repost-1", "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {
+                "module_author": {"mid": 100, "name": "转发者", "pub_ts": 1794585600},
+                "module_dynamic": {"desc": {"text": "来支持一下"}}
+            },
+            "orig": original
+        });
+        let post = parse_dynamic_item(&item).unwrap();
+        assert_eq!(post.author_mid, "100");
+        assert_eq!(post.author_name, "转发者");
+        assert!(post.text.contains("原动态发起人：原主播（MID：200）"));
+        assert!(post.text.contains("原动态编号：original-1"));
+        assert!(post.text.contains("https://t.bilibili.com/original-1"));
+        assert!(post.text.contains("原动态发布时间："));
+        assert!(post.text.contains("明晚八点在我的直播间见"));
+        assert!(post.text.contains("转发附言：\n来支持一下"));
+        assert_eq!(post.images, vec!["https://i0.hdslb.com/bfs/original.jpg"]);
+        assert_eq!(
+            post.reserve.unwrap().live_room_id().as_deref(),
+            Some("12345")
+        );
+
+        let mut changed = item.clone();
+        changed["orig"]["modules"]["module_author"]["name"] = json!("原主播新昵称");
+        assert_ne!(post.text, parse_dynamic_item(&changed).unwrap().text);
+        changed["modules"]["module_dynamic"]["desc"]["text"] = json!("");
+        assert!(parse_dynamic_item(&changed).is_some(), "纯转发仍保留原文");
+    }
+
+    #[test]
+    fn deleted_original_keeps_repost_comment_and_nested_reposts_are_bounded() {
+        let mut item = json!({
+            "id_str": "outer", "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {
+                "module_author": {"mid": 100, "name": "转发者", "pub_ts": 1794585600},
+                "module_dynamic": {"desc": {"text": "附言"}}
+            },
+            "orig": {"type": "DYNAMIC_TYPE_NONE"}
+        });
+        assert_eq!(parse_dynamic_item(&item).unwrap().text, "附言");
+        for _ in 0..8 {
+            let mut outer = item.clone();
+            outer["orig"] = item;
+            item = outer;
+        }
+        let post = parse_dynamic_item(&item).unwrap();
+        assert_eq!(post.text.matches("[被转发动态]").count(), 4);
     }
 
     #[test]

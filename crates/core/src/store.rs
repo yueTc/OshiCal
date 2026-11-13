@@ -2019,6 +2019,19 @@ impl SqliteStore {
             return Ok(false);
         }
 
+        // Distinct broadcast identities are distinct sessions even when starts
+        // happen to be close. Never violate the unique schedule ownership index.
+        let bound_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM live_broadcasts WHERE schedule_id IN (?, ?)")
+                .bind(canonical_id)
+                .bind(duplicate_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if bound_count > 1 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
         if let Some(merge_input) = merge_input {
             let updated = sqlx::query(
                 "UPDATE schedules SET participants_json = ?, title = ?, start_at = ?, end_at = ?,
@@ -2094,6 +2107,41 @@ impl SqliteStore {
             .fetch_one(&mut *tx)
             .await?;
             self.emit_schedule_source_change(&mut tx, source_id, "upsert", SyncActor::collector())
+                .await?;
+        }
+
+        // Repoint ownership before deleting; ON DELETE SET NULL would otherwise
+        // remove the live badge and detach statistics from the surviving card.
+        sqlx::query("UPDATE live_broadcasts SET schedule_id=? WHERE schedule_id=?")
+            .bind(canonical_id)
+            .bind(duplicate_id)
+            .execute(&mut *tx)
+            .await?;
+        let live_owners: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM streamers WHERE live_schedule_id=?")
+                .bind(duplicate_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        sqlx::query("UPDATE streamers SET live_schedule_id=?, live_revision=live_revision+1 WHERE live_schedule_id=?")
+            .bind(canonical_id).bind(duplicate_id).execute(&mut *tx).await?;
+        for owner in live_owners {
+            self.emit_live_status_change(&mut tx, owner, SyncActor::collector())
+                .await?;
+        }
+        let sessions: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM live_sessions WHERE schedule_id=?")
+                .bind(duplicate_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        sqlx::query(
+            "UPDATE live_sessions SET schedule_id=?, revision=revision+1 WHERE schedule_id=?",
+        )
+        .bind(canonical_id)
+        .bind(duplicate_id)
+        .execute(&mut *tx)
+        .await?;
+        for session in sessions {
+            self.emit_live_session_change(&mut tx, session, "upsert", SyncActor::collector())
                 .await?;
         }
 

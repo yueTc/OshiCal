@@ -2924,6 +2924,8 @@ export default function App() {
           <ScheduleView
             key={`schedule-source:${isTauri ? settings.dataMode : "server"}:${isTauri ? settings.serverUrl : window.location.origin}`}
             active={page === "schedule"}
+            showSourceBadge={appearance.showScheduleSourceBadge}
+            showRoomOwnerBadge={appearance.showScheduleRoomOwnerBadge}
             subscriptions={visibleSubscriptions}
             liveStatuses={visibleLiveStatuses}
             actions={scheduleActions}

@@ -178,6 +178,8 @@ function emptyDraft(subscriptions: Streamer[]): Draft {
 
 export default function ScheduleView({
   active,
+  showSourceBadge,
+  showRoomOwnerBadge,
   subscriptions,
   liveStatuses,
   actions,
@@ -185,6 +187,8 @@ export default function ScheduleView({
   onError,
 }: {
   active: boolean;
+  showSourceBadge: boolean;
+  showRoomOwnerBadge: boolean;
   subscriptions: Streamer[];
   liveStatuses: LiveStatus[];
   actions: ScheduleActions;
@@ -1229,6 +1233,8 @@ export default function ScheduleView({
     const participants = schedule.participants ?? [];
     const isGroup = participants.length > 1;
     const displayName = isGroup ? participants.join(" × ") : schedule.streamerName;
+    const showRoomOwner = showRoomOwnerBadge && Boolean(schedule.roomOwnerName);
+    const showMetadata = showSourceBadge || showRoomOwner || schedule.manualLocked || schedule.sourceChanged;
     return (
       <article
         key={schedule.id}
@@ -1298,18 +1304,22 @@ export default function ScheduleView({
             ) : null}
             <h3>{schedule.title}</h3>
           </div>
-          <div className="schedule-meta">
-            <span className={`source-badge ${SOURCE_CLASS[schedule.sourceKind]}`}>
-              {SOURCE_LABELS[schedule.sourceKind] ?? schedule.sourceKind}
-            </span>
-            {schedule.roomOwnerName ? (
-              <span className="tiny-badge room-owner" title="直播间所属账号">
-                直播间：{schedule.roomOwnerName}
-              </span>
-            ) : null}
-            {schedule.manualLocked ? <span className="tiny-badge">手动锁定</span> : null}
-            {schedule.sourceChanged ? <span className="tiny-badge warning">来源有变化</span> : null}
-          </div>
+          {showMetadata ? (
+            <div className="schedule-meta">
+              {showSourceBadge ? (
+                <span className={`source-badge ${SOURCE_CLASS[schedule.sourceKind]}`}>
+                  {SOURCE_LABELS[schedule.sourceKind] ?? schedule.sourceKind}
+                </span>
+              ) : null}
+              {showRoomOwner ? (
+                <span className="tiny-badge room-owner" title="直播间所属账号">
+                  直播间：{schedule.roomOwnerName}
+                </span>
+              ) : null}
+              {schedule.manualLocked ? <span className="tiny-badge">手动锁定</span> : null}
+              {schedule.sourceChanged ? <span className="tiny-badge warning">来源有变化</span> : null}
+            </div>
+          ) : null}
         </div>
         <button
           className="icon-button card-more"

@@ -1483,6 +1483,18 @@ export default function CreatorsView({
     }
   }
 
+  async function openStreamerProfile(streamer: Streamer) {
+    const accountId = encodeURIComponent(streamer.mid);
+    const profileUrl = streamerPlatform(streamer) === "youtube"
+      ? `https://www.youtube.com/channel/${accountId}`
+      : `https://space.bilibili.com/${accountId}`;
+    try {
+      await openExternalUrl(profileUrl);
+    } catch (error) {
+      onError(explainError(error));
+    }
+  }
+
   async function openFertilitySource() {
     try {
       await openExternalUrl("https://laplace.live/ovu");
@@ -1733,6 +1745,11 @@ export default function CreatorsView({
             closeMoreMenu(true);
             setRecentTarget(target);
           }}><History size={16} />查看最近直播</button>
+          <button type="button" role="menuitem" onClick={() => {
+            const target = moreMenu.streamer;
+            closeMoreMenu(true);
+            void openStreamerProfile(target);
+          }}><ExternalLink size={16} />进入个人主页</button>
         </div>
       ) : null}
       {recentTarget && (youtubeEnabled || streamerPlatform(recentTarget) === "bilibili") ? (
@@ -1996,7 +2013,7 @@ export default function CreatorsView({
       )}
 
       {fanTarget && (youtubeEnabled || streamerPlatform(fanTarget) === "bilibili") ? (
-        <Modal title={`${fanTargetLabel}变化 · ${fanTarget.name}`} onClose={closeFanHistory} wide>
+        <Modal title={`${fanTargetLabel}变化 · ${fanTarget.name}`} onClose={closeFanHistory} wide className="fan-history-modal">
           <div className="fan-modal">
             <div className="fan-modal-note">
               <Clock3 size={15} />
