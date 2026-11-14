@@ -19,13 +19,13 @@
 
 ## 适用产物与渠道
 
-- 版本与标签：`0.3.31-beta.3` / `server-v0.3.31-beta.3`。计划适用 GitHub Actions 生成的 Linux x86_64、Windows x86_64 二进制及 `ghcr.io/yuetc/oshical-server:0.3.31-beta.3` 镜像，实际产物以完成验证的 Release 为准。
+- 版本与标签：`0.3.31-beta.3` / `server-v0.3.31-beta.3`。适用 GitHub Actions 生成的 Linux x86_64、Windows x86_64 二进制及 `ghcr.io/yuetc/oshical-server:0.3.31-beta.3` 镜像，实际产物以完成验证的 Release 为准。
 - Release 必须标记 prerelease，只维护 `server-beta`；不得移动 `server-latest`、Docker `latest` 或正式版清单。
 - 构建、测试、镜像生成和产物验证一律通过 GitHub Actions 或用户指定的外部构建机。
 
 ## 验证状态、限制与回退
 
-- 已补充纯转发不落库、参与者冲突、真实联动与缓存复用回归用例；本次仅完成源码静态检查，Rust 测试与产物验证尚待 CI，未发布产物。
+- 发布前 GitHub Actions CI 已通过：前端类型检查、Rust 格式与 lint、前端测试、492 项 Rust 测试、前端生产构建及 17 组真实浏览器交互；7 项需要真实网络或平台环境的测试保持忽略。回归覆盖纯转发不落库、参与者冲突、真实联动、缓存复用及预约卡兜底。CI 记录：`43598398392`；未宣称已验证真实 B 站采集、Windows 安装交互或生产环境升级。
 - 模型本身仍可能误判参与者，本版不宣称完全消除模型识别错误。
 - 需要回退时使用旧镜像或二进制及必要的数据备份；回退程序不会恢复手动删除的记录。
 - 正式版须在 beta 验证后另行确认；产品发布时将本文写入对应 GitHub Release 正文。
