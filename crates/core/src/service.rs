@@ -2724,6 +2724,13 @@ impl AppService {
                         continue;
                     }
                     applied_events.push(event.clone());
+                    // 未匹配参与者的事件不能占用预约时段，否则它被跳过后，
+                    // 正常预约卡也会因为“模型已覆盖”而漏收。
+                    let Some(target) =
+                        match_event_target_for_post(&event, targets, &post.author_mid)
+                    else {
+                        continue;
+                    };
                     if let Some(reserve_start) = reserve_start {
                         if event.start_at.is_some_and(|start_at| {
                             same_schedule_slot(
@@ -2735,11 +2742,6 @@ impl AppService {
                             card_slot_covered = true;
                         }
                     }
-                    let Some(target) =
-                        match_event_target_for_post(&event, targets, &post.author_mid)
-                    else {
-                        continue;
-                    };
                     if event.action == LlmEventAction::Cancel {
                         event_state.cancellations.push(PendingCancellation {
                             target,
@@ -4076,18 +4078,19 @@ fn match_event_target_for_post(
         .map(|value| normalize_alias(value))
         .filter(|value| !value.is_empty())
         .collect();
-    if event_identity_matches_target(&event_names, author) {
+    let participant_names: Vec<String> = event
+        .participant_names()
+        .iter()
+        .map(|value| normalize_alias(value))
+        .collect();
+    if event_identity_matches_target(&event_names, author)
+        && event_identity_matches_target(&participant_names, author)
+    {
         return Some(author.clone());
     }
-    // 单条日程、置信度够、作者本人就是订阅主播，但模型把参与者写成了搭档或
-    // 陌生称呼（例如“心宜”），名字对不上任何订阅目标。这种情况归给动态的
-    // 发布者，宁可多给一场也不要整场丢掉；多人事件仍然要求显式匹配。
-    tracing::debug!(
-        author = %author.name,
-        performer = %event.performer,
-        "event target falls back to the post author"
-    );
-    Some(author.clone())
+    // 发布或转发预告不等于参与直播。身份匹配失败时不能用作者兜底，
+    // 即使模型置信度很高、直播间属于其他人，也必须保留“不匹配”的结果。
+    None
 }
 
 fn event_identity_matches_target(event_names: &[String], target: &Streamer) -> bool {
@@ -4117,11 +4120,20 @@ fn text_looks_like_schedule_time_change(text: &str) -> bool {
 fn match_event_target(event: &LlmEvent, targets: &[Streamer]) -> Option<Streamer> {
     let participants = event.participant_names();
     if participants.len() <= 1 {
-        let event_names: Vec<String> = std::iter::once(&event.performer)
-            .chain(event.aliases.iter())
-            .map(|value| normalize_alias(value))
-            .filter(|value| !value.is_empty())
-            .collect();
+        // 显式参与者比 performer/aliases 更具体；不能把未参与的发布者
+        // 当作个人场的主播。没有参与者字段时仍兼容旧模型的别名输出。
+        let event_names: Vec<String> = if event.participants.is_empty() {
+            std::iter::once(&event.performer)
+                .chain(event.aliases.iter())
+                .map(|value| normalize_alias(value))
+                .filter(|value| !value.is_empty())
+                .collect()
+        } else {
+            participants
+                .iter()
+                .map(|value| normalize_alias(value))
+                .collect()
+        };
         return single_matching_target(&event_names, event.confidence, targets);
     }
 
@@ -7315,7 +7327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_target_falls_back_to_the_post_author() {
+    async fn unrelated_solo_event_does_not_fall_back_to_the_post_author() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("3537115310721781", "思诺snow"))
@@ -7338,13 +7350,113 @@ mod tests {
             &event,
             std::slice::from_ref(&streamer),
             "3537115310721781",
-        )
-        .expect("target");
-        assert_eq!(matched.id, streamer.id);
+        );
+        assert!(
+            matched.is_none(),
+            "unrelated performer must not be credited to the author"
+        );
     }
 
     #[tokio::test]
-    async fn reserved_card_event_is_credited_to_the_post_author() {
+    async fn explicit_solo_participant_overrides_author_performer_and_aliases() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let author = store
+            .add_subscription(&subscription("9501", "栞栞Shiori"))
+            .await
+            .expect("author");
+        let guest = store
+            .add_subscription(&subscription("9502", "罗己sui"))
+            .await
+            .expect("guest");
+        let mut event = schedule_event(
+            "新衣回",
+            Some(Utc::now() + Duration::hours(2)),
+            &author.name,
+        );
+        event.aliases = vec![author.name.clone()];
+        event.participants = vec![guest.name.clone()];
+        let author_only = std::slice::from_ref(&author);
+        assert!(match_event_target_for_post(&event, author_only, &author.mid).is_none());
+        let targets = [author.clone(), guest.clone()];
+        let canonical = canonicalize_event_participants(&event, &targets);
+        let matched =
+            match_event_target_for_post(&canonical, &targets, &author.mid).expect("guest");
+        assert_eq!(matched.id, guest.id);
+        event.participants = vec![author.name.clone(), guest.name.clone()];
+        assert!(match_event_target_for_post(&event, author_only, &author.mid).is_some());
+    }
+
+    #[tokio::test]
+    async fn reposted_solo_schedule_requires_author_participation_before_writing() {
+        for participates in [false, true] {
+            let store = SqliteStore::in_memory().await.expect("db");
+            let author = store
+                .add_subscription(&subscription("9501", "栞栞Shiori"))
+                .await
+                .expect("author");
+            let now = Utc::now();
+            let mut event = schedule_event("新衣回", Some(now + Duration::hours(2)), "罗己sui");
+            event.room_url = Some("https://live.bilibili.com/9502".to_owned());
+            event.room_owner = Some("罗己sui".to_owned());
+            event.room_owner_mid = Some("9502".to_owned());
+            if participates {
+                event.participants.push(author.name.clone());
+            }
+            let analyzer = Arc::new(CountingAnalyzer::new(vec![event], Vec::new()));
+            let service = AppService::with_analyzer(
+                store.clone(),
+                RuntimeSecrets::default(),
+                analyzer.clone(),
+            )
+            .expect("service");
+            let post = dynamic_post(
+                "reposted-solo",
+                &author.mid,
+                &author.name,
+                now,
+                if participates {
+                    "转发附言：我也参加新衣回联动"
+                } else {
+                    "转发附言：支持一下新衣回"
+                },
+                Vec::new(),
+            );
+            // 第二轮复用模型缓存，也必须走相同的参与者归属校验。
+            for _ in 0..2 {
+                service
+                    .process_source_posts(
+                        &author.mid,
+                        std::slice::from_ref(&author),
+                        std::slice::from_ref(&post),
+                        &AppSettings::default(),
+                        Some(&test_pool("fixture")),
+                    )
+                    .await
+                    .expect("process");
+                let schedules = store.list_all_schedules().await.expect("schedules");
+                if participates {
+                    assert_eq!(schedules.len(), 1);
+                    assert_eq!(schedules[0].streamer_id, author.id);
+                    assert_eq!(schedules[0].room_owner_name.as_deref(), Some("罗己sui"));
+                    assert!(schedules[0].participants.contains(&author.name));
+                } else {
+                    assert!(
+                        schedules.is_empty(),
+                        "a pure repost must not create a schedule"
+                    );
+                    assert!(source_identities(&store, &post.id).await.is_empty());
+                }
+            }
+            assert_eq!(
+                analyzer.call_count(),
+                1,
+                "second refresh must use the cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_model_event_preserves_authored_reservation_fallback() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("3537115310721781", "思诺snow"))
@@ -7369,9 +7481,9 @@ mod tests {
             raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
             reserve: Some(reserve.clone()),
         };
-        let card_start = parse_reserve_schedule(&reserve, post.published_at, now)
-            .expect("card schedule")
-            .start_at;
+        let card_schedule =
+            parse_reserve_schedule(&reserve, post.published_at, now).expect("card schedule");
+        let card_start = card_schedule.start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
             captured: std::sync::Mutex::new(Vec::new()),
@@ -7409,9 +7521,10 @@ mod tests {
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].streamer_id, streamer.id);
-        assert_eq!(schedules[0].title, "2D鸣潮 2.6下");
+        assert_eq!(schedules[0].title, card_schedule.title);
         assert_eq!(schedules[0].start_at, card_start);
-        assert_eq!(schedules[0].source_kind, "text");
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(schedules[0].participants, vec![streamer.name.clone()]);
     }
 
     #[tokio::test]
