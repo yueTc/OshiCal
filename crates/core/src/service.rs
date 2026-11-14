@@ -2724,6 +2724,13 @@ impl AppService {
                         continue;
                     }
                     applied_events.push(event.clone());
+                    // 未匹配参与者的事件不能占用预约时段，否则它被跳过后，
+                    // 正常预约卡也会因为“模型已覆盖”而漏收。
+                    let Some(target) =
+                        match_event_target_for_post(&event, targets, &post.author_mid)
+                    else {
+                        continue;
+                    };
                     if let Some(reserve_start) = reserve_start {
                         if event.start_at.is_some_and(|start_at| {
                             same_schedule_slot(
@@ -2735,11 +2742,6 @@ impl AppService {
                             card_slot_covered = true;
                         }
                     }
-                    let Some(target) =
-                        match_event_target_for_post(&event, targets, &post.author_mid)
-                    else {
-                        continue;
-                    };
                     if event.action == LlmEventAction::Cancel {
                         event_state.cancellations.push(PendingCancellation {
                             target,
@@ -7454,7 +7456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_card_event_is_credited_to_the_post_author() {
+    async fn unmatched_model_event_preserves_authored_reservation_fallback() {
         let store = SqliteStore::in_memory().await.expect("db");
         let streamer = store
             .add_subscription(&subscription("3537115310721781", "思诺snow"))
@@ -7479,9 +7481,9 @@ mod tests {
             raw_kind: "DYNAMIC_TYPE_WORD".to_owned(),
             reserve: Some(reserve.clone()),
         };
-        let card_start = parse_reserve_schedule(&reserve, post.published_at, now)
-            .expect("card schedule")
-            .start_at;
+        let card_schedule =
+            parse_reserve_schedule(&reserve, post.published_at, now).expect("card schedule");
+        let card_start = card_schedule.start_at;
         let analyzer = Arc::new(CountingAnalyzer {
             calls: AtomicUsize::new(0),
             captured: std::sync::Mutex::new(Vec::new()),
@@ -7519,9 +7521,10 @@ mod tests {
         let schedules = store.list_all_schedules().await.expect("schedules");
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].streamer_id, streamer.id);
-        assert_eq!(schedules[0].title, "2D鸣潮 2.6下");
+        assert_eq!(schedules[0].title, card_schedule.title);
         assert_eq!(schedules[0].start_at, card_start);
-        assert_eq!(schedules[0].source_kind, "text");
+        assert_eq!(schedules[0].source_kind, "reserve");
+        assert_eq!(schedules[0].participants, vec![streamer.name.clone()]);
     }
 
     #[tokio::test]
