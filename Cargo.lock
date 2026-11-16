@@ -3139,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "oshical-server"
-version = "0.3.31-beta.3"
+version = "0.3.31-beta.4"
 dependencies = [
  "aes-gcm",
  "axum",
