@@ -29,6 +29,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=rust /tmp/oshical-server /usr/local/bin/oshical-server
 COPY --from=web /src/dist /app/dist
+# 图片处理会产生大块临时分配；限制 glibc arena，避免释放后长期滞留 RSS。
+ENV MALLOC_ARENA_MAX=2
 ENV OSHICAL_BIND=0.0.0.0:8787
 ENV OSHICAL_DB_PATH=/app/data/oshical.db
 ENV OSHICAL_WEB_DIR=/app/dist
