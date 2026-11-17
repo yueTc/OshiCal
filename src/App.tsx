@@ -1677,15 +1677,33 @@ export default function App() {
       const validationApi = new ServerApi({ baseUrl: draft.serverUrl, token });
       await Promise.all([validationApi.subscriptions(), validationApi.liveStatuses()]);
       const remoteSettings = await validationApi.settings();
+      const targetServerUrl = normalizeServerIdentity(draft.serverUrl);
+      const activeServerUrl = serverApiRef.current
+        ? normalizeServerIdentity(resolveHttpBase(serverApiRef.current))
+        : "";
+      const connectingToExistingServer =
+        settingsRef.current.dataMode !== "server" ||
+        !serverApiRef.current ||
+        connectionRef.current !== "connected" ||
+        !targetServerUrl ||
+        targetServerUrl !== activeServerUrl;
+      const submittedLlmApiKey = secretInput.llmApiKey?.trim() ?? "";
       await applyAutostart(autoLaunch);
       setAutostart(autoLaunch);
-      if (secretInput.llmApiKey?.trim()) {
-        await validationApi.saveLlmSecret(secretInput.llmApiKey.trim(), draft.llmBaseUrl);
-        setLlmApiKeyHint(maskLlmApiKey(secretInput.llmApiKey));
+      let savedServerSettings: AppSettings = remoteSettings;
+      // First contact with an existing server must not push the local draft.
+      // Its model URL can still be a local default and is unrelated to the API
+      // key already encrypted on the server. Adopt the server settings first;
+      // users can edit server-scoped fields on the next save.
+      if (!connectingToExistingServer || submittedLlmApiKey) {
+        if (submittedLlmApiKey) {
+          await validationApi.saveLlmSecret(submittedLlmApiKey, draft.llmBaseUrl);
+          setLlmApiKeyHint(maskLlmApiKey(submittedLlmApiKey));
+        }
+        savedServerSettings = await validationApi.saveSettings(
+          serverSettingsForSave(draft, remoteSettings),
+        );
       }
-      const savedServerSettings = await validationApi.saveSettings(
-        serverSettingsForSave(draft, remoteSettings),
-      );
       const merged = mergeServerSettings(
         { ...draft, dataMode: "server" },
         savedServerSettings,
@@ -1876,7 +1894,9 @@ export default function App() {
     }
     const effectiveToken = token.trim() || serverTokenRef.current;
     const api = new ServerApi({ baseUrl: url, token: effectiveToken });
-    const health = await api.health();
+    // /api/health is public, so health alone cannot validate the bearer token.
+    // Probe an authenticated endpoint before reporting success.
+    const [health] = await Promise.all([api.health(), api.subscriptions()]);
     return `已连接 v${health.version}`;
   }
 
