@@ -7,6 +7,7 @@ services:
     ports:
       - "${OSHICAL_PORT:-8787}:8787"
     environment:
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
       OSHICAL_API_TOKEN: ${OSHICAL_API_TOKEN:?set a strong token}
       OSHICAL_BILI_COOKIE: ${OSHICAL_BILI_COOKIE:-}
       OSHICAL_LLM_BASE_URL: ${OSHICAL_LLM_BASE_URL:-https://api.openai.com/v1}

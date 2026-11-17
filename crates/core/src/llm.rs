@@ -39,6 +39,9 @@ const IMAGE_MIN_SHORT_SIDE: u32 = 512;
 // 256 MiB ≈ 6700 万像素，够 1080×20000（86 MB）与 4096×8192（134 MB），又不至于把后台任务撑爆。
 const IMAGE_MAX_DECODE_SIDE: u32 = 24576;
 const IMAGE_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+/// 图片解码、缩放和编码都属于大块临时分配。即使 `llm_parallelism` 更高，
+/// 也最多同时处理两张图，避免多张 4K/8K 原图把峰值放大数倍。
+const IMAGE_PREPARE_PARALLELISM: usize = 2;
 // 编译期不变量：解码门槛必须不低于缩放目标（缩小发生在 decode 之后），
 // 体积兜底的短边下限必须小于常规长边下限。改常量时若破坏它们，编译直接失败。
 const _: () = assert!(IMAGE_MAX_DECODE_SIDE >= IMAGE_MAX_SIDE);
@@ -756,6 +759,7 @@ pub trait ContentAnalyzer: Send + Sync {
 
 pub struct LlmClient {
     http: Client,
+    image_prepare_permits: Arc<Semaphore>,
 }
 
 impl LlmClient {
@@ -774,7 +778,10 @@ impl LlmClient {
             .user_agent(USER_AGENT_VALUE)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            image_prepare_permits: Arc::new(Semaphore::new(IMAGE_PREPARE_PARALLELISM)),
+        })
     }
 
     /// 一条动态只调用一次模型：正文（含预约卡）与原顺序前两图在同一次请求里提交。
@@ -897,19 +904,21 @@ impl LlmClient {
         Ok(Some(
             measure(
                 "image_prepare",
-                Self::encode_image_data_url_with_budget(&bytes, byte_limit),
+                self.encode_image_data_url_with_budget(bytes, byte_limit),
             )
             .await?,
         ))
     }
 
     /// 原始图片字节 → 压缩后的 JPEG data URL；超过模型请求上限时报错由调用方跳过。
-    async fn encode_image_data_url(bytes: &[u8]) -> AppResult<DataUrl> {
-        Self::encode_image_data_url_with_budget(bytes, IMAGE_UPLOAD_JPEG_BYTES).await
+    async fn encode_image_data_url(&self, bytes: Vec<u8>) -> AppResult<DataUrl> {
+        self.encode_image_data_url_with_budget(bytes, IMAGE_UPLOAD_JPEG_BYTES)
+            .await
     }
 
     async fn encode_image_data_url_with_budget(
-        bytes: &[u8],
+        &self,
+        bytes: Vec<u8>,
         byte_limit: usize,
     ) -> AppResult<DataUrl> {
         if bytes.is_empty() {
@@ -918,10 +927,14 @@ impl LlmClient {
         if bytes.len() > IMAGE_DOWNLOAD_LIMIT_BYTES {
             return Err(AppError::validation("源图片超过 32 MiB 限制"));
         }
-        let source_bytes = bytes.to_vec();
+        let _permit = self
+            .image_prepare_permits
+            .acquire()
+            .await
+            .expect("图片处理并发信号量不会在客户端存活期间关闭");
         let max_side = max_side_for_budget(byte_limit);
         let upload_bytes = tokio::task::spawn_blocking(move || {
-            prepare_image_for_llm_with_limits(&source_bytes, byte_limit, max_side)
+            prepare_image_for_llm_with_limits(&bytes, byte_limit, max_side)
         })
         .await
         .map_err(|error| AppError::validation(format!("图片处理任务失败: {error}")))??;
@@ -1052,7 +1065,10 @@ impl LlmClient {
             .expect("fixed fixture timestamp")
             .with_timezone(&Utc);
         let started = Instant::now();
-        let analysis = match Self::encode_image_data_url(CALENDAR_TEST_IMAGE).await {
+        let analysis = match self
+            .encode_image_data_url(CALENDAR_TEST_IMAGE.to_vec())
+            .await
+        {
             Ok(data_url) => {
                 self.request_analysis(
                     config,
@@ -1257,26 +1273,30 @@ fn prepare_image_for_llm_with_budget(
     })?;
     image = fit_within(image, max_image_side, max_image_pixels);
 
-    let mut quality = RESIZED_JPEG_QUALITY;
+    let mut encoded = Vec::new();
     loop {
+        // 同一尺寸下先逐档降质量，避免每次尝试都重新复制一份 RGB 缓冲。
         let rgb = flatten_to_rgb(&image);
-        let mut encoded = Vec::new();
-        JpegEncoder::new_with_quality(&mut encoded, quality)
-            .encode_image(&rgb)
-            .map_err(|_| AppError::validation("图片转换为 JPEG 失败"))?;
-        if encoded.len() <= byte_limit {
-            return Ok(encoded);
-        }
-        if quality > 65 {
-            quality -= 5;
-            continue;
+        let mut quality = RESIZED_JPEG_QUALITY;
+        loop {
+            encoded.clear();
+            JpegEncoder::new_with_quality(&mut encoded, quality)
+                .encode_image(&rgb)
+                .map_err(|_| AppError::validation("图片转换为 JPEG 失败"))?;
+            if encoded.len() <= byte_limit {
+                return Ok(encoded);
+            }
+            if quality > 65 {
+                quality -= 5;
+                continue;
+            }
+            break;
         }
         let long_side = image.width().max(image.height());
         let short_side = image.width().min(image.height());
         if long_side > IMAGE_MIN_SIDE && short_side > IMAGE_MIN_SHORT_SIDE {
             let next_side = ((long_side as u64 * 4 / 5) as u32).max(IMAGE_MIN_SIDE);
             image = image.resize(next_side, next_side, FilterType::Lanczos3);
-            quality = RESIZED_JPEG_QUALITY;
             continue;
         }
         return Err(AppError::validation(
@@ -2161,10 +2181,12 @@ mod regression_tests {
             .parse::<DateTime<Utc>>()
             .unwrap();
         let client = LlmClient::new().unwrap();
-        let first = LlmClient::encode_image_data_url(&png_bytes(16, 16))
+        let first = client
+            .encode_image_data_url(png_bytes(16, 16))
             .await
             .expect("first data url");
-        let second = LlmClient::encode_image_data_url(&png_bytes(24, 24))
+        let second = client
+            .encode_image_data_url(png_bytes(24, 24))
             .await
             .expect("second data url");
         let result = client
