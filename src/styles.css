@@ -1717,8 +1717,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .creator-main > .creator-title { grid-column: 1; grid-row: 1; align-self: center; }
 .creator-main > .creator-actions { grid-column: 2; grid-row: 1; }
 .creator-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.creator-title h3 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; }
-.creator-title > span { flex-shrink: 0; }
+.creator-title h3 { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; }
+.creator-title > .live-label { flex-shrink: 0; }
 .creator-title > span:not(.live-label) { color: var(--faint); font-size: 11px; }
 .creator-toggles { display: flex; gap: 18px; margin-top: 12px; min-width: 0; flex-wrap: nowrap; overflow-x: auto; }
 .creator-toggles > .toggle { flex-shrink: 0; white-space: nowrap; }
@@ -2844,14 +2844,19 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 .platform-badge.bilibili { color: #1677a8; background: #e8f6fd; }
 .platform-badge.youtube { color: #b42318; background: #fff0ee; }
-.creator-title > .platform-badge { flex-shrink: 0; }
+/* Collapse the platform badge and UID before the creator name starts truncating. */
+.creator-title > .platform-badge,
 .creator-title > .creator-channel-id {
+  flex: 0 1000 auto;
   min-width: 0;
   overflow: hidden;
+  white-space: nowrap;
+}
+.creator-title > .platform-badge { text-overflow: ellipsis; }
+.creator-title > .creator-channel-id {
   color: var(--faint);
   font-size: 11px;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .creator-card.youtube.is-live { border-color: rgba(220, 38, 38, .28); }
 .search-result-title {

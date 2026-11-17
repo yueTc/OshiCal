@@ -93,7 +93,16 @@ function looksLikeYoutubeAccountInput(value: string): boolean {
   }
 }
 
-function PlatformBadge({ platform }: { platform: Platform }) {
+function PlatformBadge({
+  platform,
+  showBilibili = true,
+}: {
+  platform: Platform;
+  showBilibili?: boolean;
+}) {
+  if (platform === "bilibili" && !showBilibili) {
+    return null;
+  }
   return (
     <span className={`platform-badge ${platform}`}>
       {platform === "youtube" ? "YouTube" : "Bilibili"}
@@ -1690,7 +1699,7 @@ export default function CreatorsView({
                 <article className={`search-result ${resultPlatform}`} key={busyKey}>
                   <Avatar url={account.avatarUrl} name={account.name} size="lg" live={account.isLive} />
                   <div>
-                    <div className="search-result-title"><h3>{account.name}</h3><PlatformBadge platform={resultPlatform} /></div>
+                    <div className="search-result-title"><h3>{account.name}</h3><PlatformBadge platform={resultPlatform} showBilibili={youtubeEnabled} /></div>
                     <p>
                       {resultPlatform === "youtube"
                         ? `${handle || account.mid} · ${account.fans.toLocaleString()} 订阅者`
@@ -1836,7 +1845,7 @@ export default function CreatorsView({
               <div className="creator-main">
                 <div className="creator-title">
                   <h3>{streamer.name}</h3>
-                  <PlatformBadge platform={cardPlatform} />
+                  <PlatformBadge platform={cardPlatform} showBilibili={youtubeEnabled} />
                   <span className="creator-channel-id">{channelLabel}</span>
                   {streamer.isLive ? <span className="live-label">直播中</span> : null}
                 </div>
@@ -2244,7 +2253,7 @@ export default function CreatorsView({
                 <div className="modal-list-row youtube-link-row" key={accountKey(resultPlatform, account.mid)}>
                   <Avatar url={account.avatarUrl} name={account.name} />
                   <div>
-                    <div className="search-result-title"><strong>{account.name}</strong><PlatformBadge platform={resultPlatform} /></div>
+                    <div className="search-result-title"><strong>{account.name}</strong><PlatformBadge platform={resultPlatform} showBilibili={youtubeEnabled} /></div>
                     <span>{resultPlatform === "youtube" ? account.handle || account.mid : `UID ${account.mid}`}</span>
                   </div>
                   <button
