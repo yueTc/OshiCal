@@ -214,7 +214,7 @@ try {
   assert.deepEqual(pageErrors, []);
   results.push("绑定卡片删除/未加载时不高亮昨天或其他卡片；页面无异常");
   // The creator-library entry must use the real session, not a nearby schedule lookup.
-  await page.getByRole("button", { name: /^主播库\d*$/ }).click();
+  await page.getByRole("button", { name: /主播库/ }).click();
   const more = page.getByRole("button", { name: `${streamer.name} 的更多操作`, exact: true });
   const moreMenu = page.getByRole("menu", { name: `${streamer.name} 的更多操作`, exact: true });
   await more.waitFor();
