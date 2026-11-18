@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>推历 OshiCal · 封面</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+import { stageSize, setupCanvas, loadFonts, loadImage } from './motion.js';
+
+const { W, H } = stageSize();
+const ctx = setupCanvas(document.getElementById('c'), W, H);
+
+const FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif';
+const C = {
+  pink: '#E94F88', pinkStrong: '#B83263', pinkSoft: '#FFE3EE',
+  ink: '#241820', muted: '#75636D', faint: '#A3909A', live: '#16A46B',
+};
+// 设计空间固定 1920×1080，按宽度等比缩放；比 16:9 更方/更窄的画布上下居中，多出的高度由背景吃掉
+const S = W / 1920;
+const Hd = 1080 * S;
+const yOff = (H - Hd) / 2;
+const M = S;
+const u = v => v * M;
+const y = v => yOff + Hd * v;
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, Math.max(1, w), Math.max(1, h), Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2)));
+}
+function setFont(size, weight) { ctx.font = `${weight} ${u(size)}px ${FONT}`; }
+function measure(s, size, weight = 700) {
+  ctx.save(); setFont(size, weight); const w = ctx.measureText(s).width; ctx.restore(); return w;
+}
+function text(s, x, y, { size = 32, weight = 700, color = C.ink, align = 'left', baseline = 'middle' } = {}) {
+  ctx.save(); setFont(size, weight); ctx.fillStyle = color;
+  ctx.textAlign = align; ctx.textBaseline = baseline; ctx.fillText(s, x, y); ctx.restore();
+}
+function card(x, y, w, h, r, fill, { shadow = 0, stroke = null } = {}) {
+  ctx.save();
+  rr(x, y, w, h, u(r));
+  if (shadow) {
+    ctx.shadowColor = `rgba(90,34,58,${0.32 * shadow})`;
+    ctx.shadowBlur = u(64) * (0.6 + shadow);
+    ctx.shadowOffsetY = u(22) * shadow;
+  }
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.shadowColor = 'transparent';
+  if (stroke) { ctx.lineWidth = u(2); ctx.strokeStyle = stroke; ctx.stroke(); }
+  ctx.restore();
+}
+
+let A = null;
+
+function draw() {
+  const { timeline, grid, library, settings, icon } = A;
+
+  // ── 背景
+  const g = ctx.createLinearGradient(0, 0, W * 0.5, H);
+  g.addColorStop(0, '#FFFBFD'); g.addColorStop(0.45, '#FFF1F7'); g.addColorStop(1, '#FBE2ED');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const blob = (bx, by, r, a) => {
+    const rg = ctx.createRadialGradient(bx, by, 0, bx, by, r);
+    rg.addColorStop(0, `rgba(233,79,136,${a})`); rg.addColorStop(1, 'rgba(233,79,136,0)');
+    ctx.fillStyle = rg; ctx.fillRect(bx - r, by - r, r * 2, r * 2);
+  };
+  blob(W * 0.02, H * -0.05, u(1050), 0.15);
+  blob(W * 1.05, H * 1.05, u(1050), 0.14);
+  ctx.save(); ctx.globalAlpha = 0.13; ctx.strokeStyle = C.pink; ctx.lineWidth = u(2);
+  [420, 650, 880].forEach(r => { ctx.beginPath(); ctx.arc(W * 0.80, H * 0.52, u(r), 0, Math.PI * 2); ctx.stroke(); });
+  ctx.restore();
+
+  // ── 右侧：四格功能拼贴（整体微倾）
+  const gx0 = W * 0.468, gx1 = W * 1.028, gap = u(26);
+  const colW = (gx1 - gx0 - gap) / 2;
+  const ratio = timeline.height / timeline.width;
+  const cardH = colW * ratio;
+  const gy0 = y(0.098);
+  ctx.save();
+  ctx.translate((gx0 + gx1) / 2, gy0 + cardH + gap / 2);
+  ctx.rotate(-0.028);
+  ctx.translate(-((gx0 + gx1) / 2), -(gy0 + cardH + gap / 2));
+
+  const feats = [
+    [timeline, '时间线', 0, 0, 1.06, 0.42, 0.02], [grid, '日历网格', 1, 0, 1.40, 0.30, 0.36],
+    [library, '主播库', 0, 1, 1.12, 0.46, 0.16], [settings, '设置 · 多端同步', 1, 1, 1.0, 0.5, 0.5],
+  ];
+  for (const [img, label, col, row, zoom, ax, ay] of feats) {
+    const x = gx0 + col * (colW + gap);
+    const y = gy0 + row * (cardH + gap);
+    const h = col === 1 && row === 1 ? cardH : cardH;   // 统一比例
+    ctx.save();
+    rr(x, y, colW, h, u(18));
+    ctx.shadowColor = 'rgba(90,34,58,.26)'; ctx.shadowBlur = u(56); ctx.shadowOffsetY = u(18);
+    ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.restore();
+    ctx.save(); rr(x, y, colW, h, u(18)); ctx.clip();
+    // 同步卡片是宽条，等比铺满
+    const sc = Math.max(colW / img.width, h / img.height) * zoom;
+    const dw = img.width * sc, dh = img.height * sc;
+    ctx.drawImage(img, x + (colW - dw) * ax, y + (h - dh) * ay, dw, dh);
+    ctx.restore();
+    rr(x, y, colW, h, u(18)); ctx.lineWidth = u(2); ctx.strokeStyle = 'rgba(226,196,210,.95)'; ctx.stroke();
+    // 标签
+    const lw = measure(label, 19, 700) + u(34);
+    card(x + u(16), y + u(16), lw, u(38), 19, 'rgba(255,255,255,.94)', { shadow: 0.25, stroke: 'rgba(233,79,136,.28)' });
+    text(label, x + u(16) + lw / 2, y + u(16) + u(19), { size: 19, weight: 700, color: C.pinkStrong, align: 'center' });
+  }
+  ctx.restore();
+
+  // ── 浮层：开播通知
+  {
+    const tw = u(520), th = u(124), tx = W * 0.545, ty = y(0.775);
+    card(tx, ty, tw, th, 22, '#FFFFFF', { shadow: 0.85, stroke: 'rgba(226,196,210,.9)' });
+    ctx.save(); rr(tx + u(22), ty + th / 2 - u(34), u(68), u(68), u(18)); ctx.clip();
+    ctx.drawImage(icon, tx + u(22), ty + th / 2 - u(34), u(68), u(68)); ctx.restore();
+    text('乃琳Queen 开播了', tx + u(112), ty + u(46), { size: 29, weight: 700 });
+    text('点击直接进直播间', tx + u(112), ty + u(86), { size: 20, weight: 500, color: C.muted });
+    ctx.beginPath(); ctx.arc(tx + tw - u(38), ty + u(34), u(6.5), 0, Math.PI * 2); ctx.fillStyle = C.live; ctx.fill();
+    ctx.restore();
+  }
+
+  // ── 左侧文案
+  const lx = W * 0.058;
+
+  const ebTxt = 'B 站虚拟主播 · 直播日程工具';
+  const ebW = measure(ebTxt, 21, 700) + u(56);
+  card(lx, y(0.122), ebW, u(52), 26, C.pinkSoft, { stroke: 'rgba(233,79,136,.25)' });
+  text(ebTxt, lx + ebW / 2, y(0.122) + u(26), { size: 21, weight: 700, color: C.pinkStrong, align: 'center' });
+
+  const h1 = 118, y1 = y(0.285), y2 = y1 + u(h1) * 1.17;
+  text('不再错过', lx, y1, { size: h1, weight: 700 });
+  text('你推的每一场', lx, y2, { size: h1, weight: 700 });
+
+  text('动态里的日程图，自动变成日程', lx, y(0.512), { size: 34, weight: 500, color: C.muted });
+  text('开播那一刻，桌面先提醒你', lx, y(0.566), { size: 34, weight: 500, color: C.muted });
+
+  let cx = lx;
+  ['自动解析', '时间线 / 日历', '提醒 · 同步'].forEach(s => {
+    const cw = measure(s, 22, 700) + u(50), ch = u(54);
+    card(cx, y(0.635), cw, ch, ch / 2, '#FFFFFF', { shadow: 0.24, stroke: 'rgba(228,200,213,.95)' });
+    text(s, cx + cw / 2, y(0.635) + ch / 2, { size: 22, weight: 700, color: C.pinkStrong, align: 'center' });
+    cx += cw + u(16);
+  });
+
+  const by = y(0.845);
+  ctx.save(); rr(lx, by - u(44), u(88), u(88), u(23)); ctx.clip();
+  ctx.drawImage(icon, lx, by - u(44), u(88), u(88)); ctx.restore();
+  text('推历', lx + u(106), by - u(6), { size: 40, weight: 700 });
+  const wn = measure('推历', 40, 700);
+  text('OshiCal', lx + u(106) + wn + u(14), by - u(6), { size: 40, weight: 400, color: C.pinkStrong });
+  text('Windows 桌面端 · 服务端 · Apache-2.0 开源 · github.com/yueTc/OshiCal',
+       lx + u(106), by + u(44), { size: 19, weight: 500, color: C.faint });
+}
+
+Promise.all([
+  loadFonts(['700 118px "Microsoft YaHei UI"', '500 34px "Microsoft YaHei UI"', '400 40px "Microsoft YaHei UI"']),
+  loadImage('assets/ui-timeline.png'),
+  loadImage('assets/ui-grid.png'),
+  loadImage('assets/ui-library.png'),
+  loadImage('assets/ui-settings.png'),
+  loadImage('assets/app-icon.png'),
+]).then(([_, timeline, grid, library, settings, icon]) => {
+  A = { timeline, grid, library, settings, icon };
+  draw();
+  ctx.getImageData(0, 0, 1, 1);
+  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 150))));
+}).then(() => {
+  window.DUR = 1;
+  window.render = () => { draw(); };
+  window.READY = true;
+
+  // 免工具导出：?save=1 打开即下载 PNG（渲染取帧时不出现按钮）
+  const wantSave = new URLSearchParams(location.search).get('save') === '1';
+  if (wantSave) {
+    const canvas = document.getElementById('c');
+    const save = () => {
+      canvas.toBlob(b => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(b);
+        a.download = `oshical-cover-${W}x${H}.png`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      }, 'image/png');
+    };
+    const btn = document.createElement('button');
+    btn.textContent = '下载封面 PNG';
+    btn.style.cssText = 'position:fixed;right:16px;top:16px;z-index:9;padding:10px 16px;border:1px solid #eedde5;'
+      + 'border-radius:10px;background:rgba(255,255,255,.92);color:#b83263;font:600 14px "Microsoft YaHei UI",sans-serif;cursor:pointer';
+    btn.onclick = save;
+    document.body.appendChild(btn);
+    setTimeout(save, 400);
+  }
+});
+</script>
+</body>
+</html>

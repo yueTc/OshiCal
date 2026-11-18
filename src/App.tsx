@@ -2652,6 +2652,14 @@ export default function App() {
     }
   }
 
+  async function openCreatorShortcut(streamer: Streamer) {
+    if (streamer.isLive) {
+      await openCreatorLiveRoom(streamer);
+      return;
+    }
+    await openCreatorHomepage(streamer);
+  }
+
   async function refreshSidebarCreator(streamer: Streamer) {
     setCreatorMenu(null);
     if (sidebarRefreshingId !== null) {
@@ -2814,22 +2822,21 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><BrandMark size={27} /></div>
-          <div><strong>推历</strong><span>OshiCal · 直播日程</span></div>
+          <div><strong>推历</strong><span title="OshiCal · 直播日程">OshiCal · 直播日程</span></div>
         </div>
         <nav className="nav-list">
-          <button className={page === "schedule" ? "active" : ""} onClick={() => void navigateToPage("schedule")}><CalendarRange size={19} />日程<span>{visibleSubscriptions.length}</span></button>
-          <button className={page === "creators" ? "active" : ""} onClick={() => void navigateToPage("creators")}><UsersRound size={19} />主播库</button>
+          <button className={page === "schedule" ? "active" : ""} onClick={() => void navigateToPage("schedule")}><CalendarRange size={19} />日程</button>
+          <button className={page === "creators" ? "active" : ""} onClick={() => void navigateToPage("creators")}><UsersRound size={19} />主播库<span>{visibleSubscriptions.length}</span></button>
           <button className={page === "settings" ? "active" : ""} onClick={() => void navigateToPage("settings")}><SettingsIcon size={19} />设置</button>
         </nav>
         <div className="sidebar-creators">
-          <p>我的主播</p>
           {visibleSubscriptions.map((streamer) => {
             const menuOpen = creatorMenu?.streamer.id === streamer.id;
             const refreshing = sidebarRefreshingId === streamer.id;
             const platform = streamer.platform === "youtube" ? "youtube" : "bilibili";
-            const openLabel = platform === "youtube"
-              ? streamer.isLive && streamer.liveUrl ? "双击进入直播间" : "双击打开频道"
-              : "双击进入直播间";
+            const openLabel = streamer.isLive
+              ? "双击进入直播间"
+              : platform === "youtube" ? "双击打开频道" : "双击打开个人主页";
             return (
               <div
                 className={`mini-creator ${menuOpen ? "is-menu-open" : ""}`}
@@ -2843,7 +2850,7 @@ export default function App() {
                   if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) {
                     return;
                   }
-                  void openCreatorLiveRoom(streamer);
+                  void openCreatorShortcut(streamer);
                 }}
                 onContextMenu={(event) => {
                   event.preventDefault();
@@ -2852,7 +2859,7 @@ export default function App() {
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && event.target === event.currentTarget) {
                     event.preventDefault();
-                    void openCreatorLiveRoom(streamer);
+                    void openCreatorShortcut(streamer);
                     return;
                   }
                   showCreatorMenuFromKeyboard(event, streamer);

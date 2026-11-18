@@ -253,6 +253,8 @@ h3 {
   padding: 4px 8px 22px;
 }
 
+.brand > div:last-child { min-width: 0; flex: 1; }
+
 .brand strong {
   display: block;
   font-size: 18px;
@@ -261,6 +263,10 @@ h3 {
 
 .brand span {
   display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--muted);
   margin-top: 2px;
@@ -335,8 +341,8 @@ h3 {
 .sidebar-creators {
   flex: 1 1 auto;
   min-height: 0;
-  margin-top: 26px;
-  padding: 18px 3px 4px 0;
+  margin-top: 12px;
+  padding: 10px 3px 4px 0;
   border-top: 1px solid var(--border);
   overflow-x: hidden;
   overflow-y: auto;
@@ -350,13 +356,6 @@ h3 {
   height: 0;
 }
 
-.sidebar-creators > p {
-  padding: 0 9px 9px;
-  color: var(--faint);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-}
 
 .mini-creator {
   display: flex;
@@ -1631,7 +1630,11 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .sticky-page-header::before {
   content: "";
   position: absolute;
-  inset: -2px -6px 0;
+  top: -2px;
+  bottom: 0;
+  left: 50%;
+  width: calc(100vw - var(--sidebar-width));
+  transform: translateX(-50%);
   z-index: -1;
   background: var(--bg);
   border-radius: 0 0 var(--radius) var(--radius);
@@ -2440,9 +2443,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .device-job-progress i { display: block; height: 100%; background: var(--primary); border-radius: inherit; }
 .device-job-row.is-failed .device-job-progress i { background: var(--danger); }
 .device-job-row.is-done .device-job-progress i { background: #16a46b; }
-.proxy-grid { align-items: end; }
-.proxy-test-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-.proxy-test-actions .form-hint { margin: 0; }
+.proxy-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; }
+.proxy-test-button { white-space: nowrap; }
 .proxy-test-result {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -2467,7 +2469,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-bottom: 16px; min-width: 0; }
 .mode-card {
   display: grid;
-  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 10px;
   padding: 16px;
   color: var(--muted);
   background: var(--surface-soft);
@@ -2475,11 +2479,69 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   border-radius: 14px;
   text-align: left;
 }
-.mode-card strong { color: var(--text); font-size: 14px; }
-.mode-card span { font-size: 11px; line-height: 1.55; }
+.mode-card strong { grid-column: 2; color: var(--text); font-size: 14px; }
+.mode-card span { grid-column: 1 / -1; font-size: 11px; line-height: 1.55; }
 .mode-card.active { color: var(--primary-strong); background: var(--primary-soft); border-color: rgba(var(--primary-rgb), .25); }
 .browser-mode-note { display: flex; align-items: center; gap: 9px; padding: 14px; color: var(--primary-strong); background: var(--primary-soft); border-radius: 12px; font-size: 12px; }
 .secret-state { display: flex; align-items: center; gap: 7px; padding: 10px 12px; color: var(--muted); background: var(--surface-soft); border-radius: 11px; font-size: 11px; }
+.settings-card header .bili-account-help {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  color: var(--warning);
+  border-radius: 50%;
+  cursor: help;
+  outline: none;
+}
+.settings-card header .bili-account-help:hover,
+.settings-card header .bili-account-help:focus-visible {
+  background: var(--warning-soft);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warning) 26%, transparent);
+}
+.settings-card header .bili-account-help svg { display: block; }
+.settings-card header .bili-account-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: min(300px, calc(100vw - 72px));
+  padding: 9px 11px;
+  color: #fff;
+  background: #33242c;
+  border-radius: 10px;
+  box-shadow: var(--shadow-soft);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.55;
+  text-align: left;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-3px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+  pointer-events: none;
+}
+.settings-card header .bili-account-tooltip::before {
+  content: "";
+  position: absolute;
+  right: 8px;
+  bottom: 100%;
+  border: 5px solid transparent;
+  border-bottom-color: #33242c;
+}
+.settings-card header .bili-account-help:hover .bili-account-tooltip,
+.settings-card header .bili-account-help:focus-visible .bili-account-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
 .bili-login-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 12px; }
 .login-hint { margin: 0 0 15px; color: var(--primary-strong); }
 .qr-login-panel { display: grid; place-items: center; gap: 12px; text-align: center; }
@@ -2558,6 +2620,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .nav-list button svg { width: 22px; height: 22px; }
   .main-content { margin-left: 0; padding: calc(18px + var(--window-chrome-offset)) 12px; padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
   .sticky-page-header { margin-inline: -8px; margin-bottom: 10px; padding-inline: 8px; padding-bottom: 12px; }
+  .sticky-page-header::before { width: 100vw; }
   .sticky-page-header .page-subtitle { margin-top: 4px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sticky-page-header .page-header { margin-bottom: 10px; }
   .creators-sticky .search-panel { padding: 12px; border-radius: var(--radius); }

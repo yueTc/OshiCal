@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>推历 OshiCal · 封面</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+import { stageSize, setupCanvas, loadFonts, loadImage } from './motion.js';
+
+const { W, H } = stageSize();
+const ctx = setupCanvas(document.getElementById('c'), W, H);
+
+const FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif';
+const C = {
+  pink: '#E94F88', pinkStrong: '#B83263', pinkSoft: '#FFE3EE',
+  ink: '#241820', muted: '#75636D', faint: '#A3909A',
+  border: '#EEDDE5', live: '#16A46B',
+};
+
+// 版面：横向按 W/1920、纵向按 H/1080，字号按较小者，16:9 与 16:10 都不会挤
+const S = W / 1920, Y = H / 1080, M = Math.min(S, Y);
+const u = v => v * M;
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, Math.max(1, w), Math.max(1, h), Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2)));
+}
+function setFont(size, weight) { ctx.font = `${weight} ${u(size)}px ${FONT}`; }
+function measure(s, size, weight = 700, spacing = 0) {
+  ctx.save(); setFont(size, weight); if (spacing) ctx.letterSpacing = `${u(spacing)}px`;
+  const w = ctx.measureText(s).width; ctx.restore(); return w;
+}
+function text(s, x, y, { size = 32, weight = 700, color = C.ink, align = 'left',
+                         baseline = 'middle', alpha = 1, spacing = 0 } = {}) {
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  setFont(size, weight);
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = baseline;
+  if (spacing) ctx.letterSpacing = `${u(spacing)}px`;
+  ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function card(x, y, w, h, r, fill, { shadow = 0, stroke = null, angle = 0 } = {}) {
+  ctx.save();
+  if (angle) { ctx.translate(x + w / 2, y + h / 2); ctx.rotate(angle); ctx.translate(-(x + w / 2), -(y + h / 2)); }
+  rr(x, y, w, h, u(r));
+  if (shadow) {
+    ctx.shadowColor = `rgba(90,34,58,${0.34 * shadow})`;
+    ctx.shadowBlur = u(90) * (0.55 + shadow);
+    ctx.shadowOffsetY = u(34) * shadow;
+  }
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.shadowColor = 'transparent';
+  if (stroke) { ctx.lineWidth = u(2); ctx.strokeStyle = stroke; ctx.stroke(); }
+  ctx.restore();
+}
+function shot(img, x, y, w, h, r, { angle = 0, shadow = 0.8 } = {}) {
+  card(x, y, w, h, r, '#fff', { shadow, angle, stroke: 'rgba(228,200,213,.95)' });
+  ctx.save();
+  if (angle) { ctx.translate(x + w / 2, y + h / 2); ctx.rotate(angle); ctx.translate(-(x + w / 2), -(y + h / 2)); }
+  rr(x, y, w, h, u(r)); ctx.clip();
+  ctx.drawImage(img, x, y, w, h);
+  ctx.restore();
+}
+
+let A = null;
+
+function draw() {
+  const { timeline, library, icon } = A;
+
+  // ── 背景
+  const g = ctx.createLinearGradient(0, 0, W * 0.45, H);
+  g.addColorStop(0, '#FFFBFD'); g.addColorStop(0.5, '#FFF1F7'); g.addColorStop(1, '#FBE3EE');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  const blob = (bx, by, r, a) => {
+    const rg = ctx.createRadialGradient(bx, by, 0, bx, by, r);
+    rg.addColorStop(0, `rgba(233,79,136,${a})`); rg.addColorStop(1, 'rgba(233,79,136,0)');
+    ctx.fillStyle = rg; ctx.fillRect(bx - r, by - r, r * 2, r * 2);
+  };
+  blob(W * 0.06, H * 0.02, u(1000), 0.16);
+  blob(W * 1.02, H * 1.0, u(1000), 0.15);
+
+  ctx.save();
+  ctx.globalAlpha = 0.14; ctx.strokeStyle = C.pink; ctx.lineWidth = u(2);
+  [430, 660, 890].forEach(r => { ctx.beginPath(); ctx.arc(W * 0.80, H * 0.50, u(r), 0, Math.PI * 2); ctx.stroke(); });
+  ctx.restore();
+
+  // ── 右侧：主播库（小，压在后面）
+  {
+    const w = W * 0.40, h = w * library.height / library.width;
+    shot(library, W * 0.545, H * 0.60, w, h, 20, { angle: 0.028, shadow: 0.55 });
+  }
+  // ── 右侧：时间线（大，主体）
+  {
+    const w = W * 0.60, h = w * timeline.height / timeline.width;
+    shot(timeline, W * 0.455, -h * 0.055, w, h, 26, { angle: -0.062, shadow: 0.95 });
+  }
+
+  // ── 浮层：开播通知
+  {
+    const tw = u(560), th = u(138), tx = W * 0.505, ty = H * 0.655;
+    card(tx, ty, tw, th, 24, '#FFFFFF', { shadow: 0.75, angle: -0.028 });
+    ctx.save();
+    ctx.translate(tx + tw / 2, ty + th / 2); ctx.rotate(-0.028); ctx.translate(-(tx + tw / 2), -(ty + th / 2));
+    ctx.save(); rr(tx + u(26), ty + th / 2 - u(38), u(76), u(76), u(20)); ctx.clip();
+    ctx.drawImage(icon, tx + u(26), ty + th / 2 - u(38), u(76), u(76)); ctx.restore();
+    text('乃琳Queen 开播了', tx + u(126), ty + u(52), { size: 31, weight: 700, color: C.ink });
+    text('点击进入直播间', tx + u(126), ty + u(96), { size: 21, weight: 500, color: C.muted });
+    ctx.beginPath(); ctx.arc(tx + tw - u(42), ty + u(38), u(7), 0, Math.PI * 2);
+    ctx.fillStyle = C.live; ctx.fill();
+    ctx.restore();
+  }
+
+  // ── 左侧文案
+  const lx = W * 0.062;
+
+  const ebTxt = 'B 站虚拟主播 · 直播日程工具';
+  const ebW = measure(ebTxt, 22, 700) + u(60);
+  card(lx, H * 0.135, ebW, u(54), 27, C.pinkSoft, { stroke: 'rgba(233,79,136,.22)' });
+  text(ebTxt, lx + ebW / 2, H * 0.135 + u(27), { size: 22, weight: 700, color: C.pinkStrong, align: 'center' });
+
+  const h1 = 122, l1 = '不再错过', l2 = '你推的每一场';
+  const y1 = H * 0.305, y2 = y1 + u(h1) * 1.18;
+  text(l1, lx, y1, { size: h1, weight: 700, color: C.ink });
+  text(l2, lx, y2, { size: h1, weight: 700, color: C.ink });
+  // 第二行末尾一个粉色高亮块（视觉锚点）
+  const w2 = measure(l2, h1, 700);
+  ctx.save();
+  ctx.translate(lx + w2 + u(26), y2 + u(16));
+  ctx.rotate(-0.12);
+  ctx.fillStyle = C.pink;
+  ctx.fillRect(-u(9), -u(9), u(18), u(18));
+  ctx.restore();
+
+  text('动态里的日程图，自动变成日程；开播那一刻，桌面先提醒你',
+       lx, H * 0.545, { size: 35, weight: 500, color: C.muted });
+
+  // 能力点
+  let cx = lx;
+  const chips = ['动态自动解析', '时间线 / 日历', '开播提醒 · 多端同步'];
+  chips.forEach(s => {
+    const cw = measure(s, 23, 700) + u(52), ch = u(56);
+    card(cx, H * 0.605, cw, ch, ch / 2, '#FFFFFF', { shadow: 0.22, stroke: 'rgba(228,200,213,.95)' });
+    text(s, cx + cw / 2, H * 0.605 + ch / 2, { size: 23, weight: 700, color: C.pinkStrong, align: 'center' });
+    cx += cw + u(18);
+  });
+
+  // ── 左下品牌
+  const by = H * 0.845;
+  ctx.save(); rr(lx, by - u(46), u(92), u(92), u(24)); ctx.clip();
+  ctx.drawImage(icon, lx, by - u(46), u(92), u(92)); ctx.restore();
+  text('推历', lx + u(112), by - u(8), { size: 42, weight: 700, color: C.ink });
+  const wn = measure('推历', 42, 700);
+  text('OshiCal', lx + u(112) + wn + u(16), by - u(8), { size: 42, weight: 400, color: C.pinkStrong });
+  text('Windows 桌面端 · 服务端 · Apache-2.0 开源 · github.com/yueTc/OshiCal',
+       lx + u(112), by + u(46), { size: 20, weight: 500, color: C.faint });
+}
+
+Promise.all([
+  loadFonts(['700 122px "Microsoft YaHei UI"', '500 35px "Microsoft YaHei UI"', '400 42px "Microsoft YaHei UI"']),
+  loadImage('assets/ui-timeline.png'),
+  loadImage('assets/ui-library.png'),
+  loadImage('assets/app-icon.png'),
+]).then(([_, timeline, library, icon]) => {
+  A = { timeline, library, icon };
+  draw();
+  ctx.getImageData(0, 0, 1, 1);
+  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 120))));
+}).then(() => {
+  window.DUR = 1;
+  window.render = () => { draw(); };
+  window.READY = true;
+});
+</script>
+</body>
+</html>

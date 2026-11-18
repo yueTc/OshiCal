@@ -334,7 +334,7 @@ export default function YouTubeSettingsPanel({
         <Globe2 size={19} />
         <h2>YouTube 功能</h2>
         <span className={`setting-scope ${serverMode ? "server" : "local"}`}>
-          {serverMode ? "服务器" : "仅本设备"}
+          {serverMode ? "服务器" : "桌面端"}
         </span>
         <span className="youtube-header-toggle">
           <Toggle

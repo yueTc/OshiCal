@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import QRCode from "qrcode";
 import {
   Activity,
+  CircleAlert,
   CheckCircle2,
   Clock3,
   Cloud,
@@ -1620,22 +1621,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 <option value="google">Google（www.google.com）</option>
               </select>
             </label>
-            <div className="proxy-test-actions span-2">
-              <button
-                className="button secondary"
-                type="button"
-                onClick={() => void testProxy()}
-                disabled={proxyTesting}
-              >
-                {proxyTesting ? <LoaderCircle className="spin" size={16} /> : <Globe2 size={16} />}
-                {proxyTesting ? "正在测试 Google…" : "测试代理"}
-              </button>
-              {draft.proxyPort ? (
-                <span className="form-hint">
-                  {`请求将由${!tauri || draft.dataMode === "server" ? "服务器" : "本机"}发起，代理地址为 127.0.0.1:${draft.proxyPort}。`}
-                </span>
-              ) : null}
-            </div>
+            <button
+              className="button secondary proxy-test-button"
+              type="button"
+              onClick={() => void testProxy()}
+              disabled={proxyTesting}
+            >
+              {proxyTesting ? <LoaderCircle className="spin" size={16} /> : <Globe2 size={16} />}
+              {proxyTesting ? "正在测试 Google…" : "测试代理"}
+            </button>
           </div>
           {proxyReport ? (
             <div className={`proxy-test-result ${proxyReport.connected ? "is-connected" : "is-failed"}`} role="status">
@@ -1732,7 +1726,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <AppearanceSettingsPanel value={appearance} onChange={onAppearanceChange} />
 
         <section className="settings-card device-local-settings">
-          <header><h2>日程卡片</h2><span className="setting-scope local">仅本设备</span></header>
+          <header><h2>日程卡片</h2><span className="setting-scope local">桌面端</span></header>
           <div className="settings-stack">
             <Toggle
               checked={appearance.showScheduleSourceBadge}
@@ -1744,12 +1738,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               onChange={(showScheduleRoomOwnerBadge) => onAppearanceChange({ ...appearance, showScheduleRoomOwnerBadge })}
               label="显示直播间归属胶囊"
             />
-            <p className="form-hint">立即生效并自动保存，适用于时间线和日历视图。</p>
           </div>
         </section>
 
         <section className="settings-card device-local-settings">
-          <header><h2>提醒与运行</h2><span className="setting-scope local">仅本设备</span></header>
+          <header><h2>提醒与运行</h2><span className="setting-scope local">桌面端</span></header>
           <div className="settings-stack">
             <Toggle checked={draft.notificationsEnabled} onChange={(value) => setDraft((current) => ({ ...current, notificationsEnabled: value }))} label="Windows 开播通知" />
             {tauri ? <Toggle checked={autoLaunch} onChange={setAutoLaunch} label="开机自启" /> : null}
@@ -1765,7 +1758,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <section className="settings-card span-2 software-update-card">
             <header>
               <h2>软件更新</h2>
-              <span className="setting-scope local">仅桌面端</span>
+              <span className="setting-scope local">桌面端</span>
               <div className="update-channel-control">
                 <div className="segmented" role="group" aria-label="桌面端更新渠道">
                   <button
@@ -1789,7 +1782,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </header>
             <div className="update-version-row">
               <div className="update-version">
-                <span>当前版本 · {updateChannel === "beta" ? "测试版渠道" : "正式版渠道"}</span>
                 <strong>{appVersion ? `v${appVersion}` : "读取中…"}</strong>
               </div>
               <button className="button secondary" onClick={() => void checkUpdates()} disabled={updateChecking || updateInstalling}>
@@ -1996,7 +1988,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <header>
               <h2>B 站登录与 Cookie</h2>
               <span className={`setting-scope ${serverMode ? "server" : "local"}`}>
-                {serverMode ? "服务器" : "仅本设备"}
+                {serverMode ? "服务器" : "桌面端"}
               </span>
               {serverMode ? (
                 <span className={`server-login-pill ${biliConfigured ? "is-online" : "is-offline"}`}>
@@ -2005,6 +1997,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               ) : (
                 <span>登录后自动保存到 Windows 凭据管理器。</span>
               )}
+              <span
+                className="bili-account-help"
+                tabIndex={0}
+                aria-label="账号风控提示"
+                aria-describedby="bili-account-risk-tip"
+              >
+                <CircleAlert size={17} aria-hidden="true" />
+                <span id="bili-account-risk-tip" className="bili-account-tooltip" role="tooltip">
+                  为降低账号风控对日常使用的影响，建议尽量不要使用日常主力 B 站账号登录。
+                </span>
+              </span>
             </header>
             <div className="bili-login-actions">
               {!serverMode && tauri ? (

@@ -1,5 +1,7 @@
-# 抓取推历 OshiCal 窗口（PrintWindow，不打扰前台）
-param([string]$Out = "D:\work\guanrenchi\video\oshical-promo\qa\capture\app.png")
+param(
+  [string]$Out = "D:\work\guanrenchi\video\oshical-promo\qa\_tmp\now.png",
+  [switch]$Foreground
+)
 
 Add-Type -AssemblyName System.Drawing
 $sig = @'
@@ -12,6 +14,8 @@ public class W {
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT p);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int n);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
   public struct RECT { public int Left, Top, Right, Bottom; }
   public struct POINT { public int X, Y; }
 }
@@ -20,6 +24,8 @@ Add-Type -TypeDefinition $sig
 
 $p = Get-Process oshical -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 $h = $p.MainWindowHandle
+if ($Foreground) { [void][W]::ShowWindow($h, 9); [void][W]::SetForegroundWindow($h); Start-Sleep -Milliseconds 400 }
+
 $r = New-Object W+RECT
 [void][W]::GetWindowRect($h, [ref]$r)
 $w = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
@@ -35,9 +41,8 @@ New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 
-# 客户区原点（屏幕坐标），点击时用
 $cp = New-Object W+POINT
 [void][W]::ClientToScreen($h, [ref]$cp)
 $cr = New-Object W+RECT
 [void][W]::GetClientRect($h, [ref]$cr)
-"rect=$($r.Left),$($r.Top),$w,$ht clientOrigin=$($cp.X),$($cp.Y) client=$($cr.Right)x$($cr.Bottom) out=$Out"
+"rect=$($r.Left),$($r.Top),$w,$ht clientOrigin=$($cp.X),$($cp.Y) client=$($cr.Right)x$($cr.Bottom) title=$($p.MainWindowTitle) out=$Out"
