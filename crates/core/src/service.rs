@@ -6341,12 +6341,16 @@ mod tests {
         };
 
         assert_eq!(
-            select_provenance_cancellation_candidates(&[schedule.clone()], &event, "official")
-                .len(),
+            select_provenance_cancellation_candidates(
+                std::slice::from_ref(&schedule),
+                &event,
+                "official"
+            )
+            .len(),
             1
         );
         assert!(select_provenance_cancellation_candidates(
-            &[schedule.clone()],
+            std::slice::from_ref(&schedule),
             &event,
             "different-official"
         )
@@ -6355,7 +6359,7 @@ mod tests {
         let mut no_time = event.clone();
         no_time.start_at = None;
         assert!(select_provenance_cancellation_candidates(
-            &[schedule.clone()],
+            std::slice::from_ref(&schedule),
             &no_time,
             "official"
         )
