@@ -37,6 +37,8 @@ concurrency:
 env:
   # 与 docs/22-android-client.md 记录的 NDK 版本保持一致；改这里要同步改文档。
   NDK_VERSION: "27.0.12077973"
+  # 名称含 side-by-side 的测试标签使用独立包名，可与正式安装并存且不触碰其数据。
+  OSHICAL_ANDROID_APPLICATION_ID: ${{ contains(github.ref_name, '-side-by-side-') && 'com.oshical.desktop.phonefix' || 'com.oshical.desktop' }}
 
 jobs:
   android:

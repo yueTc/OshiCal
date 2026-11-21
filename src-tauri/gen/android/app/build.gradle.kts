@@ -23,13 +23,17 @@ val keystoreProperties = Properties().apply {
     }
 }
 val hasReleaseKeystore = keystoreProperties.getProperty("storeFile")?.isNotBlank() == true
+// CI 可用独立 applicationId 产出并行安装包，避免覆盖测试破坏用户现有安装与数据。
+val androidApplicationId = System.getenv("OSHICAL_ANDROID_APPLICATION_ID")
+    ?.takeIf { it.isNotBlank() }
+    ?: "com.oshical.desktop"
 
 android {
     compileSdk = 37
     namespace = "com.oshical.desktop"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.oshical.desktop"
+        applicationId = androidApplicationId
         minSdk = 24
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
