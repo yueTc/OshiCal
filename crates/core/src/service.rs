@@ -6,7 +6,7 @@ use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::Instrument;
 
 use crate::analysis_retry;
@@ -2300,6 +2300,7 @@ impl AppService {
                 let mut local_state = RefreshEventState {
                     cancellations: Vec::new(),
                     written_identities: event_state.written_identities.clone(),
+                    room_owners: event_state.room_owners.clone(),
                 };
                 let source_progress = &source_progress;
                 let next_fetch_start = &next_fetch_start;
@@ -2762,10 +2763,24 @@ impl AppService {
                     );
                     // 多张图只发一次请求，日程卡片沿用第一张图当封面。
                     let image_url = post.images.first().map(String::as_str).unwrap_or_default();
+                    // Room ownership may be outside this source's participant targets.
+                    let room_owners = if target.platform == Platform::Bilibili
+                        && (event.room_owner.is_some()
+                            || event.room_owner_mid.is_some()
+                            || event.room_url.is_some())
+                    {
+                        event_state
+                            .room_owners
+                            .get_or_try_init(|| self.store.list_streamers())
+                            .await?
+                            .as_slice()
+                    } else {
+                        &[]
+                    };
                     let (inserted, cancelled) = self
                         .apply_llm_event(
                             &target,
-                            targets,
+                            room_owners,
                             &event,
                             source_kind,
                             post,
@@ -2967,7 +2982,7 @@ impl AppService {
     async fn apply_llm_event(
         &self,
         target: &Streamer,
-        targets: &[Streamer],
+        room_owners: &[Streamer],
         event: &LlmEvent,
         source_kind: &str,
         post: &DynamicPost,
@@ -2998,9 +3013,7 @@ impl AppService {
             confidence: event.confidence,
         };
         let participants = event.participant_names();
-        let resolved_room = self
-            .resolve_event_room(event, target, targets, &post.author_mid)
-            .await;
+        let resolved_room = self.resolve_event_room(event, target, room_owners).await;
         let inserted = self
             .upsert_candidate(
                 target,
@@ -3023,8 +3036,7 @@ impl AppService {
         &self,
         event: &LlmEvent,
         target: &Streamer,
-        targets: &[Streamer],
-        source_mid: &str,
+        room_owners: &[Streamer],
     ) -> ResolvedRoom {
         if target.platform == Platform::Youtube {
             let event_url = event
@@ -3038,122 +3050,26 @@ impl AppService {
                 .unwrap_or_default();
             return ResolvedRoom::from_target(
                 event_url.map_or(fallback, ToOwned::to_owned),
-                target.clone(),
+                target,
             );
         }
-        let participants = event.participant_names();
-        let owner_hint = event
-            .room_owner
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let owner_mid_hint = event
-            .room_owner_mid
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        if let Some(owner_mid) = owner_mid_hint {
-            if let Some(owner) = targets.iter().find(|candidate| candidate.mid == owner_mid) {
-                if let Some(room_url) = event
-                    .room_url
-                    .as_deref()
-                    .filter(|value| valid_live_room_url(value))
-                {
-                    return ResolvedRoom::from_target(room_url.to_owned(), owner.clone());
-                }
-                return ResolvedRoom::from_target(
-                    owner.live_url.clone().unwrap_or_default(),
-                    owner.clone(),
-                );
-            }
-            if event.room_url.is_none() {
-                if let Ok(Some(room_id)) = self.bili_client().resolve_room_id(owner_mid).await {
-                    let url = format!("https://live.bilibili.com/{room_id}");
-                    if let Ok(Some(owner)) = self.bili_client().fetch_room_owner(&room_id).await {
-                        return ResolvedRoom {
-                            url: Some(url),
-                            owner_mid: Some(owner.mid),
-                            owner_name: Some(owner.name),
-                        };
-                    }
-                    return ResolvedRoom {
-                        url: Some(url),
-                        owner_mid: Some(owner_mid.to_owned()),
-                        owner_name: owner_hint.map(ToOwned::to_owned),
-                    };
-                }
-            }
-        }
-
-        if let Some(room_url) = event
-            .room_url
-            .as_deref()
-            .filter(|value| valid_live_room_url(value))
-        {
-            if let Some(room_id) = live_room_id(room_url) {
-                if let Some(owner) = target_for_room_id(targets, &room_id) {
-                    return ResolvedRoom::from_target(room_url.to_owned(), owner.clone());
-                }
-                if owner_hint.is_none() {
-                    if let Ok(Some(owner)) = self.bili_client().fetch_room_owner(&room_id).await {
-                        return ResolvedRoom {
-                            url: Some(room_url.to_owned()),
-                            owner_mid: Some(owner.mid),
-                            owner_name: Some(owner.name),
-                        };
+        let mut room = resolve_bilibili_event_room(event, target, room_owners, |mid| async move {
+            self.bili_client().resolve_room_id(&mid).await
+        })
+        .await;
+        // Preserve public owner enrichment for room-only links without using the
+        // posting account or the schedule's subscriber as a substitute.
+        if room.owner_name.is_none() {
+            if let Some(room_id) = room.url.as_deref().and_then(live_room_id) {
+                if let Ok(Some(owner)) = self.bili_client().fetch_room_owner(&room_id).await {
+                    if room.owner_mid.as_ref().is_none_or(|mid| *mid == owner.mid) {
+                        room.owner_mid = Some(owner.mid);
+                        room.owner_name = Some(owner.name);
                     }
                 }
             }
-            if let Some(hint) = owner_hint {
-                let owner =
-                    single_matching_target(&[normalize_alias(hint)], event.confidence, targets);
-                return ResolvedRoom {
-                    url: Some(room_url.to_owned()),
-                    owner_mid: owner.as_ref().map(|value| value.mid.clone()),
-                    owner_name: Some(owner.map_or_else(|| hint.to_owned(), |value| value.name)),
-                };
-            }
-            return ResolvedRoom {
-                url: Some(room_url.to_owned()),
-                owner_mid: None,
-                owner_name: None,
-            };
         }
-
-        if let Some(hint) = owner_hint {
-            if let Some(owner) =
-                single_matching_target(&[normalize_alias(hint)], event.confidence, targets)
-            {
-                return ResolvedRoom::from_target(
-                    owner.live_url.clone().unwrap_or_default(),
-                    owner,
-                );
-            }
-        }
-
-        if let Some(source_target) = targets.iter().find(|candidate| candidate.mid == source_mid) {
-            if participants.iter().any(|participant| {
-                normalize_alias(participant) == normalize_alias(&source_target.name)
-            }) {
-                return ResolvedRoom::from_target(
-                    source_target.live_url.clone().unwrap_or_default(),
-                    source_target.clone(),
-                );
-            }
-        }
-
-        if !event.is_group() {
-            return ResolvedRoom::from_target(
-                target.live_url.clone().unwrap_or_default(),
-                target.clone(),
-            );
-        }
-        ResolvedRoom {
-            url: None,
-            owner_mid: None,
-            owner_name: owner_hint.map(ToOwned::to_owned),
-        }
+        room
     }
 
     async fn remove_stale_non_live_reserve_schedule(&self, post: &DynamicPost) -> AppResult<usize> {
@@ -3411,9 +3327,9 @@ impl AppService {
                 title: schedule.title.clone(),
                 start_at: schedule.start_at,
                 end_at: schedule.end_at,
-                room_url: room_url
-                    .map(ToOwned::to_owned)
-                    .or_else(|| target.live_url.clone()),
+                // Callers have already resolved the room. None is intentional for
+                // collaborations without a confirmed address.
+                room_url: room_url.map(ToOwned::to_owned),
                 room_owner_mid: room_owner_mid.map(ToOwned::to_owned),
                 room_owner_name: room_owner_name.map(ToOwned::to_owned),
                 source_kind: source_kind.to_owned(),
@@ -3427,7 +3343,16 @@ impl AppService {
                 source_published_at: Some(post.published_at),
                 confidence: schedule.confidence,
             };
-            if self.store.merge_late_live_schedule(&input).await? {
+            let unresolved_room = requires_room_evidence(
+                target,
+                participants,
+                room_owner_mid,
+                room_owner_name,
+                room_url,
+            );
+            if (!unresolved_room || room_owner_mid.is_some())
+                && self.store.merge_late_live_schedule(&input).await?
+            {
                 return Ok(false);
             }
             if !participants.is_empty()
@@ -3444,6 +3369,7 @@ impl AppService {
                     schedule,
                     participants,
                     room_owner_mid,
+                    room_owner_name,
                     room_url,
                 );
                 if !duplicates.is_empty() {
@@ -3451,6 +3377,9 @@ impl AppService {
                     let existing = duplicates.remove(0);
                     let mut base = existing.clone();
                     for duplicate in duplicates {
+                        if !schedules_equivalent(&base, duplicate) {
+                            continue;
+                        }
                         let duplicate_input = schedule_to_new_input(duplicate);
                         let merged = (!base.manual_locked)
                             .then(|| merge_group_schedule(&base, &duplicate_input));
@@ -3478,7 +3407,7 @@ impl AppService {
             }
             // 单次分析后图片来源与文字来源等价：带图动态的正文里常写“明天八点改到九点”，
             // 这类时间变更必须同样能改到预约卡对应的日程上。
-            if is_post_analysis_source(source_kind) && post.reserve.is_none() {
+            if !unresolved_room && is_post_analysis_source(source_kind) && post.reserve.is_none() {
                 if let Some(existing) = self
                     .find_reservation_time_change_candidate(target, schedule.start_at, post)
                     .await?
@@ -3498,7 +3427,16 @@ impl AppService {
                 .find_schedule_near(target.id, schedule.start_at, 10)
                 .await?
             {
-                if existing.source_identity.as_deref() != Some(source_identity) {
+                if !unresolved_room
+                    && !requires_room_evidence(
+                        target,
+                        &existing.participants,
+                        existing.room_owner_mid.as_deref(),
+                        existing.room_owner_name.as_deref(),
+                        existing.room_url.as_deref(),
+                    )
+                    && existing.source_identity.as_deref() != Some(source_identity)
+                {
                     // 预约卡与模型事件同槽但标题对不上时默认保留两条；
                     // 只有同一直播间且同槽时，才视为同一场合并。
                     let same_room = room_owner_mid
@@ -3618,6 +3556,7 @@ struct PendingCancellation {
 #[derive(Debug, Default)]
 struct RefreshEventState {
     cancellations: Vec<PendingCancellation>,
+    room_owners: Arc<OnceCell<Vec<Streamer>>>,
     /// 本轮已经由某条来源写入过的 schedule source identity，按动态 id 汇总。
     /// 同一条动态可能走多遍分析（主播本人 + 官号），清理 stale source 时
     /// 要用整轮的并集，不能用单遍的结果。
@@ -4219,25 +4158,146 @@ fn valid_youtube_room_url(value: &str) -> bool {
     })
 }
 
-fn valid_live_room_url(value: &str) -> bool {
-    url::Url::parse(value)
-        .ok()
-        .is_some_and(|url| url.scheme() == "https" && url.host_str() == Some("live.bilibili.com"))
+fn valid_room_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|ch| ch.is_ascii_digit())
+        && value.bytes().any(|ch| ch != b'0')
 }
 
 fn live_room_id(value: &str) -> Option<String> {
-    url::Url::parse(value)
-        .ok()?
-        .path_segments()?
-        .find(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit()))
-        .map(ToOwned::to_owned)
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("live.bilibili.com") {
+        return None;
+    }
+    let path = url.path().trim_matches('/');
+    let room_id = path.strip_prefix("blanc/").unwrap_or(path);
+    valid_room_number(room_id).then(|| room_id.to_owned())
 }
 
-fn target_for_room_id<'a>(targets: &'a [Streamer], room_id: &str) -> Option<&'a Streamer> {
-    targets.iter().find(|target| {
-        target.room_id.as_deref() == Some(room_id)
-            || target.live_url.as_deref().and_then(live_room_id).as_deref() == Some(room_id)
-    })
+fn bili_target_room_url(target: &Streamer) -> Option<String> {
+    target
+        .live_url
+        .as_deref()
+        .and_then(live_room_id)
+        .or_else(|| target.room_id.clone().filter(|id| valid_room_number(id)))
+        .map(|id| format!("https://live.bilibili.com/{id}"))
+}
+
+fn normalized_room_owner_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(['@', '＠'])
+        .trim()
+        .to_lowercase()
+}
+
+fn room_owner_name_matches(hint: &str, target: &Streamer) -> bool {
+    let hint = normalized_room_owner_name(hint);
+    !hint.is_empty()
+        && std::iter::once(&target.name)
+            .chain(target.aliases.iter())
+            .any(|name| normalized_room_owner_name(name) == hint)
+}
+
+fn requires_room_evidence(
+    target: &Streamer,
+    participants: &[String],
+    room_owner_mid: Option<&str>,
+    room_owner_name: Option<&str>,
+    room_url: Option<&str>,
+) -> bool {
+    room_url.is_none()
+        && (participants.len() > 1
+            || room_owner_mid.is_some_and(|mid| mid != target.mid)
+            || room_owner_name.is_some_and(|name| !room_owner_name_matches(name, target)))
+}
+
+async fn resolve_bilibili_event_room<F, Fut>(
+    event: &LlmEvent,
+    target: &Streamer,
+    room_owners: &[Streamer],
+    lookup_room_id: F,
+) -> ResolvedRoom
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = AppResult<Option<String>>>,
+{
+    let owner_name = event
+        .room_owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let owner_mid = event
+        .room_owner_mid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| valid_room_number(value));
+    let bili_owners = || {
+        room_owners
+            .iter()
+            .filter(|owner| owner.platform == Platform::Bilibili)
+    };
+    let known_owner = if let Some(mid) = owner_mid {
+        bili_owners().find(|owner| owner.mid == mid)
+    } else {
+        owner_name.and_then(|hint| {
+            // Exact canonical name or alias only. A substring or an ambiguous
+            // alias is not enough to send the user to another person's room.
+            let mut matches = bili_owners().filter(|owner| room_owner_name_matches(hint, owner));
+            let owner = matches.next()?;
+            matches.next().is_none().then_some(owner)
+        })
+    };
+
+    if let Some(room_id) = event.room_url.as_deref().and_then(live_room_id) {
+        let url = format!("https://live.bilibili.com/{room_id}");
+        // An explicit room link takes priority over hints from the model.
+        if let Some(owner) = bili_owners().find(|owner| {
+            owner.room_id.as_deref() == Some(room_id.as_str())
+                || owner.live_url.as_deref().and_then(live_room_id).as_deref()
+                    == Some(room_id.as_str())
+        }) {
+            return ResolvedRoom::from_target(url, owner);
+        }
+        return ResolvedRoom {
+            url: Some(url),
+            owner_mid: None,
+            owner_name: owner_name.map(ToOwned::to_owned),
+        };
+    }
+
+    if let Some(owner) = known_owner {
+        if let Some(url) = bili_target_room_url(owner) {
+            return ResolvedRoom::from_target(url, owner);
+        }
+    }
+    let owner_mid = owner_mid.or_else(|| known_owner.map(|owner| owner.mid.as_str()));
+    let owner_name = known_owner.map(|owner| owner.name.as_str()).or(owner_name);
+    if let Some(mid) = owner_mid {
+        // A UID is a lookup key, never a room number. This also works for a
+        // collaborator who is not subscribed, without adding a subscription.
+        let url = lookup_room_id(mid.to_owned())
+            .await
+            .ok()
+            .flatten()
+            .filter(|id| valid_room_number(id))
+            .map(|id| format!("https://live.bilibili.com/{id}"));
+        return ResolvedRoom {
+            url,
+            owner_mid: Some(mid.to_owned()),
+            owner_name: owner_name.map(ToOwned::to_owned),
+        };
+    }
+
+    if !event.is_group() && owner_name.is_none() {
+        return ResolvedRoom::from_target(bili_target_room_url(target).unwrap_or_default(), target);
+    }
+    ResolvedRoom {
+        url: None,
+        owner_mid: None,
+        owner_name: owner_name.map(ToOwned::to_owned),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4248,11 +4308,11 @@ struct ResolvedRoom {
 }
 
 impl ResolvedRoom {
-    fn from_target(url: String, target: Streamer) -> Self {
+    fn from_target(url: String, target: &Streamer) -> Self {
         Self {
             url: (!url.is_empty()).then_some(url),
-            owner_mid: Some(target.mid),
-            owner_name: Some(target.name),
+            owner_mid: Some(target.mid.clone()),
+            owner_name: Some(target.name.clone()),
         }
     }
 }
@@ -4384,22 +4444,44 @@ fn schedules_equivalent(left: &Schedule, right: &Schedule) -> bool {
     ) {
         return same;
     }
-    let left_names: Vec<String> = left
-        .participants
+    unresolved_groups_match(
+        left.room_owner_name.as_deref(),
+        left.room_url.as_deref(),
+        &left.participants,
+        right.room_owner_name.as_deref(),
+        right.room_url.as_deref(),
+        &right.participants,
+    )
+}
+
+fn unresolved_groups_match(
+    left_name: Option<&str>,
+    left_url: Option<&str>,
+    left_participants: &[String],
+    right_name: Option<&str>,
+    right_url: Option<&str>,
+    right_participants: &[String],
+) -> bool {
+    // With no matching room or UID, shared participants cannot link an
+    // unresolved announcement to a confirmed room, or override a named host.
+    if left_url.is_some()
+        || right_url.is_some()
+        || left_name.zip(right_name).is_some_and(|(left, right)| {
+            normalized_room_owner_name(left) != normalized_room_owner_name(right)
+        })
+    {
+        return false;
+    }
+    let left_names: HashSet<_> = left_participants
         .iter()
         .map(|name| normalize_alias(name))
         .collect();
-    let right_names: Vec<String> = right
-        .participants
+    let right_names: HashSet<_> = right_participants
         .iter()
         .map(|name| normalize_alias(name))
         .collect();
-    let shared = left_names
-        .iter()
-        .filter(|name| right_names.iter().any(|other| other == *name))
-        .count();
-    let min_participants = left_names.len().min(right_names.len());
-    shared >= 2 && shared * 2 >= min_participants
+    let shared = left_names.intersection(&right_names).count();
+    shared >= 2 && shared * 2 >= left_names.len().min(right_names.len())
 }
 
 fn group_duplicates<'a>(
@@ -4407,12 +4489,9 @@ fn group_duplicates<'a>(
     incoming: &ParsedSchedule,
     participants: &[String],
     room_owner_mid: Option<&str>,
+    room_owner_name: Option<&str>,
     room_url: Option<&str>,
 ) -> Vec<&'a Schedule> {
-    let incoming_names: Vec<String> = participants
-        .iter()
-        .map(|name| normalize_alias(name))
-        .collect();
     candidates
         .iter()
         .filter(|candidate| {
@@ -4429,17 +4508,14 @@ fn group_duplicates<'a>(
             ) {
                 return same;
             }
-            let existing_names: Vec<String> = candidate
-                .participants
-                .iter()
-                .map(|name| normalize_alias(name))
-                .collect();
-            let shared = incoming_names
-                .iter()
-                .filter(|name| existing_names.iter().any(|existing| existing == *name))
-                .count();
-            let min_participants = incoming_names.len().min(existing_names.len());
-            shared >= 2 && shared * 2 >= min_participants
+            unresolved_groups_match(
+                candidate.room_owner_name.as_deref(),
+                candidate.room_url.as_deref(),
+                &candidate.participants,
+                room_owner_name,
+                room_url,
+                participants,
+            )
         })
         .collect()
 }
@@ -4500,6 +4576,24 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
         (None, Some(_)) => true,
         _ => false,
     };
+    let existing_room = (
+        &existing.room_url,
+        &existing.room_owner_mid,
+        &existing.room_owner_name,
+    );
+    let incoming_room = (
+        &incoming.room_url,
+        &incoming.room_owner_mid,
+        &incoming.room_owner_name,
+    );
+    let (preferred_room, secondary_room) = match (&existing.room_url, &incoming.room_url) {
+        (Some(_), None) => (existing_room, None),
+        (None, Some(_)) => (incoming_room, None),
+        _ if incoming_wins => (incoming_room, Some(existing_room)),
+        _ => (existing_room, Some(incoming_room)),
+    };
+    // Never copy an unverified host hint onto a room from a different source.
+    let (room_url, room_owner_mid, room_owner_name) = preferred_room;
     NewSchedule {
         streamer_id: existing.streamer_id,
         participants,
@@ -4516,39 +4610,13 @@ fn merge_group_schedule(existing: &Schedule, incoming: &NewSchedule) -> NewSched
         } else {
             existing.end_at.or(incoming.end_at)
         },
-        room_url: if incoming_wins {
-            incoming
-                .room_url
-                .clone()
-                .or_else(|| existing.room_url.clone())
-        } else {
-            existing
-                .room_url
-                .clone()
-                .or_else(|| incoming.room_url.clone())
-        },
-        room_owner_mid: if incoming_wins {
-            incoming
-                .room_owner_mid
-                .clone()
-                .or_else(|| existing.room_owner_mid.clone())
-        } else {
-            existing
-                .room_owner_mid
-                .clone()
-                .or_else(|| incoming.room_owner_mid.clone())
-        },
-        room_owner_name: if incoming_wins {
-            incoming
-                .room_owner_name
-                .clone()
-                .or_else(|| existing.room_owner_name.clone())
-        } else {
-            existing
-                .room_owner_name
-                .clone()
-                .or_else(|| incoming.room_owner_name.clone())
-        },
+        room_url: room_url.clone(),
+        room_owner_mid: room_owner_mid
+            .clone()
+            .or_else(|| secondary_room.and_then(|room| room.1.clone())),
+        room_owner_name: room_owner_name
+            .clone()
+            .or_else(|| secondary_room.and_then(|room| room.2.clone())),
         source_kind: if keep_existing_source {
             existing.source_kind.clone()
         } else {
@@ -5615,10 +5683,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_event_creates_one_shared_schedule_with_external_room() {
+    async fn group_event_creates_one_shared_schedule_with_explicit_room() {
         let store = SqliteStore::in_memory().await.expect("db");
         let first = store
-            .add_subscription(&subscription("100", "嘉然今天吃什么"))
+            .add_subscription(&AddSubscription {
+                room_id: Some("987654".to_owned()),
+                ..subscription("100", "嘉然今天吃什么")
+            })
             .await
             .expect("first");
         let second = store
@@ -6754,6 +6825,7 @@ mod tests {
                 &incoming,
                 &[],
                 None,
+                None,
                 live_input.room_url.as_deref()
             )
             .len(),
@@ -6763,6 +6835,19 @@ mod tests {
         other.room_url = Some("https://live.bilibili.com/67890".into());
         other.participants = announced.participants.clone();
         assert!(!schedules_equivalent(&announced, &other));
+        // Having the same cast is also insufficient when one post has no confirmed room.
+        other.room_url = None;
+        other.room_owner_name = Some("未核实的主播".to_owned());
+        assert!(!schedules_equivalent(&announced, &other));
+        assert!(group_duplicates(
+            std::slice::from_ref(&announced),
+            &incoming,
+            &other.participants,
+            None,
+            other.room_owner_name.as_deref(),
+            None,
+        )
+        .is_empty());
         other = live_card.clone();
         other.start_at = announced.start_at + Duration::minutes(10) + Duration::milliseconds(1);
         assert!(!schedules_equivalent(&announced, &other));
@@ -7728,6 +7813,225 @@ mod tests {
                 "second refresh must use the cache"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn group_repost_resolves_host_outside_the_source_targets_and_merges_with_announcement() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let sn = store
+            .add_subscription(&AddSubscription {
+                room_id: Some("30858592".to_owned()),
+                ..subscription("3537115310721781", "思诺snow")
+            })
+            .await
+            .expect("reposter");
+        let xy = store
+            .add_subscription(&AddSubscription {
+                room_id: Some("30849777".to_owned()),
+                schedule_enabled: false,
+                ..subscription("3537115310721181", "心宜不是心仪")
+            })
+            .await
+            .expect("host");
+        let now = Utc::now();
+        let mut event =
+            schedule_event("心宜思诺的聊天室", Some(now + Duration::hours(2)), &xy.name);
+        event.participants.push(sn.name.clone());
+        event.room_owner = Some(format!("@{}", xy.name));
+        let analyzer = Arc::new(CountingAnalyzer::new(vec![event], Vec::new()));
+        let service =
+            AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer.clone())
+                .expect("service");
+        let mut repost = dynamic_post(
+            "1271523015028375569",
+            &sn.mid,
+            &sn.name,
+            now,
+            "转发附言：今晚一起聊天！\n原动态发起人：枝江娱乐（MID：703007996）\n原动态正文：心宜思诺的聊天室，在心宜不是心仪的直播间",
+            Vec::new(),
+        );
+        repost.raw_kind = "DYNAMIC_TYPE_FORWARD".to_owned();
+        let official = dynamic_post(
+            "1271152266996350993",
+            "703007996",
+            "枝江娱乐",
+            now - Duration::hours(1),
+            "心宜思诺的聊天室：在心宜不是心仪的直播间",
+            Vec::new(),
+        );
+        let targets = std::slice::from_ref(&sn);
+        let settings = AppSettings::default();
+        let pool = test_pool("fixture");
+        for post in [&repost, &official, &repost] {
+            service
+                .process_source_posts(
+                    &post.author_mid,
+                    targets,
+                    std::slice::from_ref(post),
+                    &settings,
+                    Some(&pool),
+                )
+                .await
+                .expect("process");
+        }
+
+        let schedules = store.list_all_schedules().await.expect("schedules");
+        assert_eq!(schedules.len(), 1);
+        let card = &schedules[0];
+        assert_eq!(
+            card.streamer_id, sn.id,
+            "the room directory is not a target list"
+        );
+        assert_eq!(card.room_owner_mid.as_deref(), Some(xy.mid.as_str()));
+        assert_eq!(card.room_owner_name.as_deref(), Some(xy.name.as_str()));
+        assert_eq!(
+            card.room_url.as_deref(),
+            Some("https://live.bilibili.com/30849777")
+        );
+        assert_eq!(
+            analyzer.call_count(),
+            2,
+            "the repost is replayed from cache"
+        );
+        assert_eq!(source_identities(&store, &repost.id).await.len(), 1);
+        assert_eq!(source_identities(&store, &official.id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_with_an_unsubscribed_host_is_saved_without_guessing_the_room() {
+        for hint in [Some("外部嘉宾"), None] {
+            let store = SqliteStore::in_memory().await.expect("db");
+            let author = store
+                .add_subscription(&subscription("100", "我的主播"))
+                .await
+                .expect("author");
+            assert!(author.live_url.is_some());
+            let now = Utc::now();
+            let mut event =
+                schedule_event("联动歌回", Some(now + Duration::hours(2)), &author.name);
+            event.participants.push("外部嘉宾".to_owned());
+            event.room_owner = hint.map(ToOwned::to_owned);
+            let service = AppService::with_analyzer(
+                store.clone(),
+                RuntimeSecrets::default(),
+                Arc::new(CountingAnalyzer::new(vec![event], Vec::new())),
+            )
+            .expect("service");
+            let post = dynamic_post(
+                "group-repost",
+                &author.mid,
+                &author.name,
+                now,
+                "今晚联动",
+                Vec::new(),
+            );
+            service
+                .process_source_posts(
+                    &author.mid,
+                    std::slice::from_ref(&author),
+                    &[post],
+                    &AppSettings::default(),
+                    Some(&test_pool("fixture")),
+                )
+                .await
+                .expect("process");
+            let schedules = store.list_all_schedules().await.expect("schedules");
+            assert_eq!(schedules.len(), 1);
+            let card = &schedules[0];
+            assert_eq!(card.streamer_id, author.id);
+            assert_eq!(card.room_owner_name.as_deref(), hint);
+            assert!(card.room_owner_mid.is_none());
+            assert!(card.room_url.is_none(), "must not save the reposter's room");
+            assert_eq!(
+                store.list_streamers().await.expect("subscriptions").len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn group_room_resolver_uses_external_link_or_looks_up_uid_without_subscribing() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let author = store
+            .add_subscription(&subscription("100", "我的主播"))
+            .await
+            .expect("author");
+        let owners = std::slice::from_ref(&author);
+        let mut event = schedule_event("联动歌回", None, &author.name);
+        event.participants.push("外部嘉宾".to_owned());
+        event.room_owner = Some("外部嘉宾".to_owned());
+        event.room_url = Some("https://live.bilibili.com/30849777".to_owned());
+        let linked = resolve_bilibili_event_room(&event, &author, owners, |_| async {
+            panic!("a direct room link does not need a UID lookup")
+        })
+        .await;
+        assert_eq!(
+            linked.url.as_deref(),
+            Some("https://live.bilibili.com/30849777")
+        );
+        assert_eq!(linked.owner_name.as_deref(), Some("外部嘉宾"));
+        assert!(linked.owner_mid.is_none());
+
+        event.room_url = None;
+        event.room_owner_mid = Some("3537115310721181".to_owned());
+        let resolved = resolve_bilibili_event_room(&event, &author, owners, |mid| async move {
+            assert_eq!(mid, "3537115310721181");
+            Ok(Some("30849777".to_owned()))
+        })
+        .await;
+        assert_eq!(resolved.url, linked.url);
+        assert_eq!(resolved.owner_mid, event.room_owner_mid);
+        let unresolved = resolve_bilibili_event_room(&event, &author, owners, |_| async {
+            Err(AppError::validation("fixture lookup failure"))
+        })
+        .await;
+        assert!(unresolved.url.is_none());
+        assert_eq!(unresolved.owner_name, linked.owner_name);
+        assert_eq!(
+            store.list_streamers().await.expect("subscriptions").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn group_room_name_must_match_one_bilibili_account_exactly() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let author = store
+            .add_subscription(&subscription("100", "我的主播"))
+            .await
+            .expect("author");
+        let first = store
+            .add_subscription(&AddSubscription {
+                aliases: Some(vec!["同名".to_owned()]),
+                ..subscription("200", "嘉宾甲")
+            })
+            .await
+            .expect("first guest");
+        let second = store
+            .add_subscription(&AddSubscription {
+                aliases: Some(vec!["同名".to_owned()]),
+                ..subscription("300", "嘉宾乙")
+            })
+            .await
+            .expect("second guest");
+        let owners = [author.clone(), first, second];
+        let mut event = schedule_event("联动歌回", None, &author.name);
+        event.participants.push("外部嘉宾".to_owned());
+        for hint in ["嘉宾", "同名"] {
+            event.room_owner = Some(hint.to_owned());
+            let room = resolve_bilibili_event_room(&event, &author, &owners, |_| async {
+                panic!("ambiguous names must never cause a lookup")
+            })
+            .await;
+            assert!(room.url.is_none());
+            assert_eq!(room.owner_name.as_deref(), Some(hint));
+        }
+        let solo = schedule_event("个人直播", None, &author.name);
+        let room = resolve_bilibili_event_room(&solo, &author, &owners, |_| async {
+            panic!("a solo broadcast with a configured URL does not need a lookup")
+        })
+        .await;
+        assert_eq!(room.url, author.live_url);
     }
 
     #[tokio::test]
