@@ -34,6 +34,7 @@ import type {
 } from "../types";
 import { addDays, eventDayKey, inputDateTime, localDateKey, rangeAroundDays, rollingDays, timeLabel } from "../lib/dates";
 import { explainError, openExternalUrl } from "../lib/api";
+import { createUuid } from "../lib/uuid";
 import { matchLiveSchedules } from "../lib/live-schedule";
 import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
 import { Avatar, EmptyState, ErrorBanner, Modal, SubscriptionSelect } from "./ui";
@@ -207,9 +208,7 @@ const SOURCE_CLASS: Record<SourceKind, string> = {
 };
 
 function createManualSourceIdentity(): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return `manual:${random}`;
+  return `manual:${createUuid()}`;
 }
 
 function readLocalPreference(key: string): string | null {
@@ -1491,6 +1490,13 @@ export default function ScheduleView({
           if (event.target === event.currentTarget) setViewEnterAnimation(false);
         }}
       >
+      {!loading && viewMode === "timeline" && visibleScheduleCount === 0 ? (
+        <div className="timeline-mobile-empty" role="status">
+          <strong>{displayDays.length === 1 ? "这一天还没有日程" : `这 ${displayDays.length} 天还没有日程`}</strong>
+          <span>{subscriptions.length ? "可以刷新订阅，或手动新增一条日程。" : "先搜索并订阅一位主播。"}</span>
+          {!subscriptions.length ? <span>前往“主播库”添加订阅。</span> : null}
+        </div>
+      ) : null}
       <div className="day-navigator">
         <button className="icon-button" onClick={() => shiftAnchor(-1)} aria-label="前移一天">
           <ChevronLeft size={19} />

@@ -49,6 +49,7 @@ import {
   notifyLive,
 } from "./lib/notifications";
 import { isMobileShell } from "./lib/platform";
+import { createUuid } from "./lib/uuid";
 import type { SecretInput } from "./lib/secret-types";
 import { checkForUpdate } from "./lib/updater";
 import {
@@ -1747,7 +1748,7 @@ export default function App() {
         preview,
         api: setup.api,
         deviceId: setup.deviceId,
-        migrationId: crypto.randomUUID(),
+        migrationId: createUuid(),
       });
       setPendingServerSetup(null);
     } catch (error) {
@@ -1812,7 +1813,7 @@ export default function App() {
           setPendingClientMigration({
             ...migration,
             preview,
-            migrationId: crypto.randomUUID(),
+            migrationId: createUuid(),
           });
           showToast("服务器数据已变化，已重新生成迁移预览，请重新确认");
         } catch (refreshError) {
@@ -1982,7 +1983,7 @@ export default function App() {
         throw new Error("本地缓存不可用");
       }
       const mutation: SyncMutation = {
-        mutationId: crypto.randomUUID(),
+        mutationId: createUuid(),
         operation: "create",
         entity: "schedule",
         payload: { ...input, streamerId: input.streamerId },
@@ -2095,7 +2096,7 @@ export default function App() {
           if (isTauri && localApi && isRemoteUncertain(error)) {
             setConnection("offline");
             await localApi.enqueueMutation({
-              mutationId: crypto.randomUUID(),
+              mutationId: createUuid(),
               operation: "update",
               entity: "schedule",
               payload: { id: remoteId, update },
@@ -2158,7 +2159,7 @@ export default function App() {
           if (isTauri && isRemoteUncertain(error)) {
             setConnection("offline");
             await localApi.enqueueMutation({
-              mutationId: crypto.randomUUID(),
+              mutationId: createUuid(),
               operation: "delete",
               entity: "schedule",
               payload: { id: remoteId },

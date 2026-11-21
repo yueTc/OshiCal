@@ -8,6 +8,7 @@ import {
 } from "./syncStorage";
 import type { WebSyncCacheWriteResult } from "./syncStorage";
 import { httpBaseFromWebSocketUrl } from "./server-url";
+import { createUuid } from "./uuid";
 import type {
   AppSettings,
   DeviceInfo,
@@ -274,11 +275,11 @@ export async function resolveSyncDeviceId(): Promise<string> {
     if (existing?.trim()) {
       return existing.trim();
     }
-    const created = crypto.randomUUID();
+    const created = createUuid();
     window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
     return created;
   } catch {
-    return crypto.randomUUID();
+    return createUuid();
   }
 }
 

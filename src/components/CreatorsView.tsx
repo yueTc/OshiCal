@@ -45,6 +45,7 @@ import {
   formatNextPeriod,
 } from "../lib/fertility";
 import { localDateKey } from "../lib/dates";
+import { createUuid } from "../lib/uuid";
 import { Avatar, EmptyState, ErrorBanner, Modal, Toggle } from "./ui";
 
 const A_SOUL_OFFICIAL_MID = "703007996";
@@ -100,8 +101,7 @@ function formatFanCount(value: number | null | undefined): string {
 }
 
 function createRuleKey(): string {
-  return globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return createUuid();
 }
 
 function toggleKey(id: number, update: UpdateSubscriptionInput): string {
@@ -433,7 +433,7 @@ export default function CreatorsView({
     ),
     [fanGranularity, fanHistory],
   );
-  const fanLatest = fanBuckets.at(-1)?.fans
+  const fanLatest = fanBuckets[fanBuckets.length - 1]?.fans
     ?? fanHistory?.currentFans
     ?? fanTarget?.fans
     ?? null;
