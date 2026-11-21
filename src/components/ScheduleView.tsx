@@ -36,6 +36,7 @@ import type {
 import { addDays, eventDayKey, inputDateTime, localDateKey, rangeAroundDays, rollingDays, timeLabel } from "../lib/dates";
 import { explainError, openExternalUrl } from "../lib/api";
 import { matchLiveSchedules } from "../lib/live-schedule";
+import { resolveScheduleRoomUrl } from "../lib/schedule-room";
 import { useStickyHeader } from "../lib/sticky-header";
 import { captureMenuScroll } from "../lib/menu-scroll";
 import { timelineAnchorCompensation, timelineDragScrollTop, visibleTimelineDayKeys } from "../lib/timeline-layout";
@@ -896,18 +897,12 @@ export default function ScheduleView({
     }
   }
 
-  // @decision LIVE-ROOM-1 进入直播间统一按 日程直播间地址 → 主播直播间地址 → 主播房间号 解析，
-  // 点击卡片和右键菜单共用同一个目标，避免两条入口落到不同房间。
+  // Both the card and its context menu use the same room-resolution policy.
   function resolveRoomUrl(schedule: Schedule): string | null {
-    if (schedule.roomUrl) {
-      return schedule.roomUrl;
-    }
-    const streamer = subscriptions.find((value) => value.id === schedule.streamerId);
-    if (streamer?.liveUrl) {
-      return streamer.liveUrl;
-    }
-    const roomId = streamer?.roomId ?? schedule.roomOwnerMid;
-    return roomId ? `https://live.bilibili.com/${roomId}` : null;
+    return resolveScheduleRoomUrl(
+      schedule,
+      subscriptions.find((value) => value.id === schedule.streamerId),
+    );
   }
 
   async function enterLiveRoom(schedule: Schedule) {
