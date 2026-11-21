@@ -187,3 +187,41 @@ jobs:
 # 后续若要像 release.yml 那样把 APK 挂到 Release，再加一个 publish job，
 # 复用 "release" 环境需要的 contents: write，并把上面 job 的 artifact 下载后
 # 用 gh release upload 上传；本次只保证 APK 能被下载。
+
+  # 测试标签构建完成后把 APK 挂到同名预发布，便于真机/模拟器直接下载验收。
+  # 正式发布流程仍由 release.yml 管理；这里只发布 android-v* 测试标签。
+  publish-test-apk:
+    name: 发布测试 APK
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    needs: android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载构建产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name oshical-android-apk \
+            --dir dist
+          find dist -type f -name '*.apk' -print
+
+      - name: 发布预发布 APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find dist -type f -name '*.apk' -print0)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "没有找到 APK，无法发布" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Android test ${GITHUB_REF_NAME}" \
+            --notes "自动构建的手机兼容性测试 APK（源码 ${GITHUB_SHA}）。" \
+            --prerelease
