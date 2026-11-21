@@ -2747,6 +2747,7 @@ impl AppService {
                             target,
                             event: event.clone(),
                             source_post_id: post.id.clone(),
+                            source_author_mid: post.author_mid.clone(),
                             published_at: post.published_at,
                         });
                         continue;
@@ -2954,6 +2955,7 @@ impl AppService {
                     &pending.target,
                     &pending.event,
                     &pending.source_post_id,
+                    &pending.source_author_mid,
                     pending.published_at,
                 )
                 .await?;
@@ -2975,7 +2977,13 @@ impl AppService {
     ) -> AppResult<(bool, bool)> {
         if event.action == LlmEventAction::Cancel {
             let cancelled = self
-                .cancel_schedule_from_event(target, event, &post.id, post.published_at)
+                .cancel_schedule_from_event(
+                    target,
+                    event,
+                    &post.id,
+                    &post.author_mid,
+                    post.published_at,
+                )
                 .await?
                 > 0;
             return Ok((false, cancelled));
@@ -3249,6 +3257,7 @@ impl AppService {
         target: &Streamer,
         event: &LlmEvent,
         source_post_id: &str,
+        source_author_mid: &str,
         published_at: DateTime<Utc>,
     ) -> AppResult<usize> {
         let mut candidates = if let Some(start_at) = event.start_at {
@@ -3277,6 +3286,13 @@ impl AppService {
                 .into_iter()
                 .map(|schedule| schedule.id)
                 .collect();
+            if selected.is_empty() {
+                selected =
+                    select_provenance_cancellation_candidates(&fallback, event, source_author_mid)
+                        .into_iter()
+                        .map(|schedule| schedule.id)
+                        .collect();
+            }
         }
         for schedule_id in &selected {
             self.store.delete_schedule(*schedule_id).await?;
@@ -3595,6 +3611,7 @@ struct PendingCancellation {
     target: Streamer,
     event: LlmEvent,
     source_post_id: String,
+    source_author_mid: String,
     published_at: DateTime<Utc>,
 }
 
@@ -4659,6 +4676,51 @@ fn split_cancellation_title(title: &str) -> Vec<String> {
         .map(normalize_alias)
         .filter(|part| part.chars().count() >= 2)
         .filter(|part| !["直播", "取消直播", "直播取消", "原定直播"].contains(&part.as_str()))
+        .collect()
+}
+
+fn select_provenance_cancellation_candidates<'a>(
+    candidates: &'a [Schedule],
+    event: &LlmEvent,
+    source_author_mid: &str,
+) -> Vec<&'a Schedule> {
+    let Some(start_at) = event.start_at else {
+        return Vec::new();
+    };
+    if source_author_mid.trim().is_empty() {
+        return Vec::new();
+    }
+    // 分类名与节目标题可能不同。仅为显式多人名单、同来源和原时段的唯一场次兜底。
+    let requested_participants = normalized_cancellation_participants(&event.participants);
+    if requested_participants.len() < 2 {
+        return Vec::new();
+    }
+
+    let matches: Vec<&Schedule> = candidates
+        .iter()
+        .filter(|schedule| {
+            if schedule.source_author_mid.as_deref() != Some(source_author_mid)
+                || !same_schedule_slot(schedule.start_at, start_at, 10)
+            {
+                return false;
+            }
+            let scheduled_participants =
+                normalized_cancellation_participants(&schedule.participants);
+            scheduled_participants.len() >= 2 && scheduled_participants == requested_participants
+        })
+        .collect();
+    if matches.len() == 1 {
+        matches
+    } else {
+        Vec::new()
+    }
+}
+
+fn normalized_cancellation_participants(participants: &[String]) -> HashSet<String> {
+    participants
+        .iter()
+        .map(|participant| normalize_alias(participant))
+        .filter(|participant| !participant.is_empty())
         .collect()
 }
 
@@ -6122,6 +6184,200 @@ mod tests {
             reports.iter().any(|report| report.percent >= 75),
             "{reports:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn group_cancel_uses_unique_source_participant_and_time_match_when_title_changed() {
+        let store = SqliteStore::in_memory().await.expect("db");
+        let members = vec![
+            store
+                .add_subscription(&subscription("672342685", "乃琳Queen"))
+                .await
+                .expect("乃琳"),
+            store
+                .add_subscription(&subscription("672328094", "嘉然今天吃什么"))
+                .await
+                .expect("嘉然"),
+            store
+                .add_subscription(&subscription("672353429", "贝拉kira"))
+                .await
+                .expect("贝拉"),
+        ];
+        let now = Utc::now();
+        let start_at = now + Duration::days(1);
+        let participants = vec![
+            "乃琳Queen".to_owned(),
+            "嘉然今天吃什么".to_owned(),
+            "贝拉kira".to_owned(),
+        ];
+        let (schedule, _) = store
+            .upsert_schedule(&NewSchedule {
+                streamer_id: members[0].id,
+                participants: participants.clone(),
+                title: "解密大师，Trust me!".to_owned(),
+                start_at,
+                end_at: None,
+                room_url: None,
+                room_owner_mid: None,
+                room_owner_name: None,
+                source_kind: "image".to_owned(),
+                source_post_id: Some("old-official-post".to_owned()),
+                source_image_url: None,
+                source_author_mid: Some("703007996".to_owned()),
+                source_fingerprint: Some("old-fingerprint".to_owned()),
+                source_identity: Some("image:old-official-post:0".to_owned()),
+                source_published_at: Some(now - Duration::days(1)),
+                confidence: 0.95,
+            })
+            .await
+            .expect("old group schedule");
+        let mut radio_input = schedule_to_new_input(&schedule);
+        radio_input.title = "团体电台直播".to_owned();
+        radio_input.start_at = start_at - Duration::hours(1);
+        radio_input.source_post_id = Some("new-official-cancel-post".to_owned());
+        radio_input.source_identity = Some("text:new-official-cancel-post:1".to_owned());
+        radio_input.source_fingerprint = Some("new-radio-fingerprint".to_owned());
+        radio_input.source_published_at = Some(now);
+        let (radio, _) = store
+            .upsert_schedule(&radio_input)
+            .await
+            .expect("new radio");
+        let analyzer = Arc::new(CountingAnalyzer {
+            calls: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
+            events: Vec::new(),
+            text_events: vec![LlmEvent {
+                action: LlmEventAction::Cancel,
+                performer: "A-SOUL".to_owned(),
+                aliases: vec!["A-SOUL".to_owned()],
+                participants,
+                room_url: None,
+                room_owner: None,
+                room_owner_mid: None,
+                title: "A-SOUL游戏室".to_owned(),
+                start_at: Some(start_at),
+                end_at: None,
+                confidence: 0.97,
+            }],
+        });
+        let service = AppService::with_analyzer(store.clone(), RuntimeSecrets::default(), analyzer)
+            .expect("service");
+        let post = DynamicPost {
+            id: "new-official-cancel-post".to_owned(),
+            author_mid: "703007996".to_owned(),
+            author_name: "A-SOUL_Official".to_owned(),
+            published_at: now,
+            text: "原定20:00的团播改为电台".to_owned(),
+            images: Vec::new(),
+            source_url: "https://t.bilibili.com/new-official-cancel-post".to_owned(),
+            raw_kind: "dynamic".to_owned(),
+            reserve: None,
+        };
+        let pool = test_pool("fixture-model");
+        let stats = service
+            .process_source_posts(
+                "703007996",
+                &members,
+                &[post],
+                &AppSettings::default(),
+                Some(&pool),
+            )
+            .await
+            .expect("process cancellation post");
+
+        assert_eq!(stats.cancelled_schedules, 1);
+        assert!(store.get_schedule(schedule.id).await.is_err());
+        assert!(store.get_schedule(radio.id).await.is_ok());
+        assert!(store
+            .is_source_suppressed(members[0].id, "old-official-post", "old-fingerprint")
+            .await
+            .expect("old source suppressed"));
+    }
+
+    #[test]
+    fn provenance_cancellation_requires_explicit_unique_matching_group_identity() {
+        let now = Utc::now();
+        let schedule = Schedule {
+            id: 1,
+            streamer_id: 1,
+            streamer_name: "甲".to_owned(),
+            streamer_avatar: String::new(),
+            participants: vec!["甲".to_owned(), "乙".to_owned()],
+            title: "旧节目名".to_owned(),
+            start_at: now,
+            end_at: None,
+            room_url: None,
+            room_owner_mid: None,
+            room_owner_name: None,
+            source_kind: "image".to_owned(),
+            source_post_id: Some("old-post".to_owned()),
+            source_image_url: None,
+            source_author_mid: Some("official".to_owned()),
+            source_fingerprint: Some("fingerprint".to_owned()),
+            source_identity: Some("image:old-post:0".to_owned()),
+            source_published_at: Some(now - Duration::hours(1)),
+            weekly_rule_id: None,
+            weekly_occurrence_date: None,
+            confidence: 0.95,
+            manual_locked: false,
+            source_changed: false,
+            cancelled: false,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let event = LlmEvent {
+            action: LlmEventAction::Cancel,
+            performer: "甲、乙".to_owned(),
+            aliases: Vec::new(),
+            participants: vec!["乙".to_owned(), "甲".to_owned()],
+            room_url: None,
+            room_owner: None,
+            room_owner_mid: None,
+            title: "新公告里的节目名".to_owned(),
+            start_at: Some(now),
+            end_at: None,
+            confidence: 0.95,
+        };
+
+        assert_eq!(
+            select_provenance_cancellation_candidates(&[schedule.clone()], &event, "official")
+                .len(),
+            1
+        );
+        assert!(select_provenance_cancellation_candidates(
+            &[schedule.clone()],
+            &event,
+            "different-official"
+        )
+        .is_empty());
+
+        let mut no_time = event.clone();
+        no_time.start_at = None;
+        assert!(select_provenance_cancellation_candidates(
+            &[schedule.clone()],
+            &no_time,
+            "official"
+        )
+        .is_empty());
+
+        let mut different_participants = schedule.clone();
+        different_participants.participants = vec!["甲".to_owned(), "丙".to_owned()];
+        assert!(select_provenance_cancellation_candidates(
+            &[different_participants],
+            &event,
+            "official"
+        )
+        .is_empty());
+
+        let mut duplicate = schedule.clone();
+        duplicate.id = 2;
+        assert!(select_provenance_cancellation_candidates(
+            &[schedule, duplicate],
+            &event,
+            "official"
+        )
+        .is_empty());
     }
 
     #[tokio::test]
