@@ -2640,7 +2640,7 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell ${desktopShell ? "is-desktop" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
+      className={`app-shell ${desktopShell ? "is-desktop" : ""} ${page === "settings" ? "is-settings" : ""} ${sidebarResizing ? "is-resizing-sidebar" : ""}`}
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
       {desktopWindow ? (
