@@ -565,8 +565,13 @@ export default function ScheduleView({
   const updateTimelineViewportHeight = useCallback(() => {
     const viewport = timelineViewportRef.current;
     if (!viewport) return;
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    const mobileNavHeight = window.matchMedia("(max-width: 620px)").matches
+      ? Math.max(0, sidebar?.getBoundingClientRect().height ?? 0)
+      : 0;
+    const bottomReserve = mobileNavHeight > 0 ? mobileNavHeight + 12 : 24;
     const top = Math.max(0, viewport.getBoundingClientRect().top);
-    const height = Math.min(900, Math.max(240, window.innerHeight - top - 24));
+    const height = Math.min(900, Math.max(240, window.innerHeight - top - bottomReserve));
     setTimelineViewportHeight((current) => Math.abs(current - height) < 0.5 ? current : height);
   }, []);
 
@@ -1350,12 +1355,10 @@ export default function ScheduleView({
             {isLiveSchedule ? <span className="live-label">直播中</span> : null}
           </div>
           <div className={`schedule-title-line ${viewMode === "grid" ? "is-compact" : ""}`}>
-            {viewMode === "grid" ? (
-              <span className="schedule-time-inline">
-                {timeLabel(schedule.startAt)}
-                {schedule.endAt ? <small>{timeLabel(schedule.endAt)}</small> : null}
-              </span>
-            ) : null}
+            <span className="schedule-time-inline">
+              {timeLabel(schedule.startAt)}
+              {schedule.endAt ? <small>{timeLabel(schedule.endAt)}</small> : null}
+            </span>
             <h3>{schedule.title}</h3>
           </div>
           <div className="schedule-meta">
