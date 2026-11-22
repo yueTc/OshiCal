@@ -2437,8 +2437,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 
 @media (max-width: 620px) {
   .app-shell { --mobile-nav-height: 54px; display: block; }
-  .app-shell.is-settings { height: 100vh; height: 100dvh; overflow: hidden; }
-  .app-shell.is-settings .main-content { height: 100%; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  .app-shell.is-settings { height: 100vh; height: 100dvh; }
+  .app-shell.is-settings .main-content { height: 100%; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
   .sidebar { position: fixed; inset: auto 0 0; z-index: 20; width: auto; height: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom)); flex-direction: row; padding: 6px 8px; padding-bottom: max(6px, env(safe-area-inset-bottom)); background: var(--surface); border-right: 0; border-top: 1px solid var(--border); -webkit-backdrop-filter: none; backdrop-filter: none; }
   .brand, .sidebar-creators, .connection-chip { display: none; }
   .nav-list { display: grid; grid-template-columns: repeat(3,1fr); width: 100%; }
