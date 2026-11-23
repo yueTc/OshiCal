@@ -100,13 +100,13 @@ jobs:
           } >> "$GITHUB_ENV"
           printf 'SDK/NDK 已就绪：%s\n' "$ndk_dir"
 
-      # 三个目标对应 Android ABI：aarch64 → arm64-v8a，armv7 → armeabi-v7a，
-      # x86_64 → x86_64（模拟器）。与 docs/22-android-client.md 第 4 节的 ABI 表一致。
+      # 四个目标对应 Android ABI：aarch64 → arm64-v8a，armv7 → armeabi-v7a，
+      # i686 → x86，x86_64 → x86_64。与 docs/22-android-client.md 第 4 节的 ABI 表一致。
       - name: 安装 Rust 工具链与 Android 目标
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
       - name: Rust 缓存
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -171,19 +171,76 @@ jobs:
           fi
           echo "key.properties 已就绪（内容不打印），签名由 app/build.gradle.kts 的 signingConfigs 应用。"
 
-      - name: 构建 APK
+      - name: 构建 APK（按 ABI 拆分）
         shell: bash
         run: |
           set -euo pipefail
-          npx tauri android build --apk
+          # universal APK 会把 arm64-v8a、armeabi-v7a、x86、x86_64 四份原生库
+          # 塞进一个包；按 ABI 拆分后，手机只需下载自己架构的一份。
+          npx tauri android build --apk --split-per-abi \
+            --target aarch64 \
+            --target armv7 \
+            --target i686 \
+            --target x86_64
+
+      - name: 整理 APK、校验和与体积报告
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          output_dir="android-dist"
+          rm -rf "$output_dir"
+          mkdir -p "$output_dir"
+          : > "$output_dir/SHA256SUMS"
+          found=0
+          while IFS= read -r -d '' apk; do
+            mapfile -t abis < <(unzip -Z1 "$apk" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)
+            if [ "${#abis[@]}" -ne 1 ]; then
+              echo "预期每个 APK 只包含一个 ABI，实际为：${abis[*]:-none} ($apk)" >&2
+              exit 1
+            fi
+            abi_label="${abis[0]}"
+            destination="$output_dir/OshiCal-${version}-${abi_label}.apk"
+            if [ -e "$destination" ]; then
+              echo "重复的 ABI 输出：$destination" >&2
+              exit 1
+            fi
+            cp "$apk" "$destination"
+            sha256sum "$destination" >> "$output_dir/SHA256SUMS"
+            found=$((found + 1))
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print0)
+          if [ "$found" -ne 4 ]; then
+            echo "预期产出 4 个按 ABI 拆分的 APK，实际为 $found 个" >&2
+            exit 1
+          fi
+          sort -k2 -o "$output_dir/SHA256SUMS" "$output_dir/SHA256SUMS"
+          {
+            echo "# OshiCal Android APK 体积"
+            echo
+            echo "| ABI | 字节 | MiB |"
+            echo "| --- | ---: | ---: |"
+            for apk in "$output_dir"/*.apk; do
+              bytes="$(stat -c '%s' "$apk")"
+              mib="$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')"
+              abi="$(unzip -Z1 "$apk" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u | paste -sd+ -)"
+              if [ -z "$abi" ]; then
+                abi="no-native"
+              fi
+              echo "| $abi | $bytes | $mib |"
+            done
+          } | tee "$output_dir/APK-SIZES.md"
+          cat "$output_dir/SHA256SUMS"
 
       # 仓库现有 server-binary.yml 也用 @v4；补到 SHA 后替换本行。
       - name: 上传 APK
         uses: actions/upload-artifact@v4 # TODO: 无已核对 SHA，暂用主版本号
         with:
-          name: oshical-android-apk
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
+          name: oshical-android-apks
+          path: |
+            android-dist/*.apk
+            android-dist/SHA256SUMS
+            android-dist/APK-SIZES.md
+          if-no-files-found: error
           retention-days: 14
 
 # 后续若要像 release.yml 那样把 APK 挂到 Release，再加一个 publish job，
@@ -208,22 +265,23 @@ jobs:
           mkdir -p dist
           gh run download "$GITHUB_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name oshical-android-apk \
+            --name oshical-android-apks \
             --dir dist
-          find dist -type f -name '*.apk' -print
+          find dist -type f -print | sort
 
       - name: 发布预发布 APK
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -d '' files < <(find dist -type f -name '*.apk' -print0)
-          if [ "${#files[@]}" -eq 0 ]; then
+          mapfile -d '' files < <(find dist -type f \( -name '*.apk' -o -name 'SHA256SUMS' -o -name 'APK-SIZES.md' \) -print0)
+          apk_count="$(find dist -type f -name '*.apk' | wc -l)"
+          if [ "${#files[@]}" -eq 0 ] || [ "$apk_count" -eq 0 ]; then
             echo "没有找到 APK，无法发布" >&2
             exit 1
           fi
           gh release create "$GITHUB_REF_NAME" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Android test ${GITHUB_REF_NAME}" \
-            --notes "自动构建的手机兼容性测试 APK（源码 ${GITHUB_SHA}）。" \
+            --notes "自动构建的手机兼容性测试 APK（源码 ${GITHUB_SHA}）。按 ABI 拆分；绝大多数现代手机请下载 arm64-v8a 包。" \
             --prerelease

@@ -8,6 +8,11 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["OshiCal contributors"]
 
+# Android 通用包会把四个 ABI 的 .so 全部放进同一 APK；Rust 默认保留的符号表
+# 又会给每个原生库增加近 10 MiB。正式发布不需要这些符号，统一在 release 构建中剥离。
+[profile.release]
+strip = "symbols"
+
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

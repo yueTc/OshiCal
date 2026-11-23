@@ -47,8 +47,9 @@ Android 端的存在理由只有一条：**在手机上查看服务端已经算�
 
 - `src-tauri/gen/android` 工程壳已由 CI 生成并提交（构建产物 `jniLibs`、`build`、`.gradle` 与签名材料都用 `.gitignore` 隔离）。
 - `app/build.gradle.kts` 已接通 `key.properties` 签名（v1 + v2），签名材料缺失时由工作流生成临时密钥。
-- CI 产出 universal release APK 并下载留档：`release/android/OshiCal-0.3.6-universal-release.apk`（110.4 MiB，v1 + v2 签名，可直接侧载）；首发那次（run 42388048567）的未签名包留档为 `OshiCal-0.3.6-universal-unsigned.apk`。
-- 两次构建覆盖 4 个 ABI：`arm64-v8a`、`armeabi-v7a`、`x86`、`x86_64`。
+- CI 现在使用 `tauri android build --apk --split-per-abi` 产出四个按 ABI 拆分的 release APK，不再把四份原生库合并进一个 universal 包；发布页同时附 `SHA256SUMS` 与 `APK-SIZES.md`。
+- 历史留档中的 `release/android/OshiCal-0.3.6-universal-release.apk`（110.4 MiB）和 `OshiCal-0.3.6-universal-unsigned.apk` 仍是旧 universal 构建，不代表当前发布方式。
+- 四个 ABI 为 `arm64-v8a`、`armeabi-v7a`、`x86`、`x86_64`。现代 Android 手机应优先下载 `arm64-v8a`。
 
 尚未做的：
 
@@ -121,11 +122,12 @@ npx tauri android init
 
 | Rust target | Android ABI | 用途 |
 | --- | --- | --- |
-| `aarch64-linux-android` | `arm64-v8a` | 绝大多数真机 |
+| `aarch64-linux-android` | `arm64-v8a` | 绝大多数真机，发布页首选 |
 | `armv7-linux-androideabi` | `armeabi-v7a` | 32 位旧机型 |
-| `x86_64-linux-android` | `x86_64` | 模拟器；x86_64 真机极少 |
+| `i686-linux-android` | `x86` | 32 位模拟器 |
+| `x86_64-linux-android` | `x86_64` | 主流 Android 模拟器；x86_64 真机极少 |
 
-三个目标都在工作流的 `dtolnay/rust-toolchain` 步骤里一次性装好。`tauri android build` 默认构建全部已安装目标；只想要真机包时可后续用 `--target aarch64` 收窄。
+四个目标都在工作流的 `dtolnay/rust-toolchain` 步骤里一次性装好。构建使用 `--split-per-abi`，每个 APK 只包含一个 ABI 的原生库；同时 `Cargo.toml` 的 release profile 设置 `strip = "symbols"`，移除不参与运行的符号表。两者合起来显著降低手机实际下载体积，同时保留原有 ABI 兼容范围。
 
 ### 4.5 签名
 
@@ -207,7 +209,7 @@ CI 产出 APK 之后逐项过；任何一项没过就不要对外说「安卓端
 | Keystore 加密 `secrets.json` | 明文口令文件降级为受系统密钥保护的密文 | 需要引入 Android Keystore 桥接（Rust 侧或 Kotlin 侧），并处理备份/换机解密失败 |
 | FCM 推送 | 应用不在前台也能收开播通知 | 需要 Firebase 项目、服务端接入 FCM、国内网络可用性另说 |
 | AAB 上架 | 商店分发、审核、自动更新 | 需要商店账号、AAB 构建、商店签名与合规材料 |
-| 只构建 arm64 | CI 时间与 artifact 体积减半 | 模拟器与 32 位旧机装不上 |
+| 只发布 arm64 真机包 | 减少 CI 时间和发布文件数量 | 模拟器与 32 位旧机装不上；当前已按 ABI 拆分，因此对单个 arm64 包的体积没有额外收益 |
 | 工程壳入库 + 签名配置 | 构建可复现，签名链路闭环 | 已完成：`gen/android` 入库，`signingConfigs` 读 `key.properties` |
 
 ---
