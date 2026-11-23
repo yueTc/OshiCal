@@ -129,6 +129,19 @@ npx tauri android init
 
 四个目标都在工作流的 `dtolnay/rust-toolchain` 步骤里一次性装好。构建使用 `--split-per-abi`，每个 APK 只包含一个 ABI 的原生库；同时 `Cargo.toml` 的 release profile 设置 `strip = "symbols"`，移除不参与运行的符号表。两者合起来显著降低手机实际下载体积，同时保留原有 ABI 兼容范围。
 
+#### 4.4.1 体积优化实测（2026-11-23）
+
+CI run `45116969801` 构建与发布成功，四个 APK 均只包含一个 ABI，发布哈希与 `SHA256SUMS` 一致。抽查 arm64 原生库已不含 `.symtab`、`.strtab` 或 debug section。
+
+| ABI | APK 体积 |
+| --- | ---: |
+| `arm64-v8a` | 21.30 MiB（22,335,168 字节） |
+| `armeabi-v7a` | 15.50 MiB（16,247,837 字节） |
+| `x86` | 24.64 MiB（25,841,793 字节） |
+| `x86_64` | 23.25 MiB（24,375,697 字节） |
+
+对照旧 universal 包 110.53 MiB（115,895,644 字节），arm64 真机包减少约 **80.7%**。完整体积表随 Release 的 `APK-SIZES.md` 一起发布。
+
 ### 4.5 签名
 
 `app/build.gradle.kts` 读取 `src-tauri/gen/android/key.properties`（rootProject 相对路径），存在 `signingConfigs.release` 时 release 构建就用它签名（v1 + v2）。

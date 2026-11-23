@@ -46,6 +46,7 @@
 ### 安卓端（构建已验证，真机未验证）
 
 - 已验证（2026-11-07）：`.github/workflows/android.yml` 两次构建成功（run 42388048567、42392775626），产出 universal release APK（arm64-v8a / armeabi-v7a / x86 / x86_64），留档 `release/android/OshiCal-0.3.6-universal-release.apk`（v1 + v2 签名，可侧载）与未签名首发包 `OshiCal-0.3.6-universal-unsigned.apk`。同期把 `src-tauri/gen/android` 工程壳固化入库，并给 `app/build.gradle.kts` 补上读取 `key.properties` 的 `signingConfigs`。
+- 已验证（2026-11-23，CI run 45116969801）：Android 构建改为 `--split-per-abi`，并剥离 Rust 原生符号表；产出四个单 ABI APK。arm64-v8a 为 21.30 MiB，较旧 110.53 MiB universal 包减少约 80.7%；发布哈希与 `SHA256SUMS` 一致，arm64 原生库不含 `.symtab`、`.strtab` 或 debug section。
 - 未验证：真机安装与启动、通知点击跳转、扫码登录到 Cookie 落盘、断网补拉。构建只由 `.github/workflows/android.yml` 负责，本工作区按 `AGENTS.md` 不执行任何构建命令。
 - 平台限制：后台进程可能被系统回收，通知可能延迟或丢失；没有 FCM 通道，应用不在前台就没有推送。没有应用内更新，换版本只能侧载覆盖安装，换签名必须先卸载并会清掉本地凭据。Rust 侧 `rustls` 不读系统信任库，服务端使用自签证书时握手失败。服务端为明文 HTTP 时还需要在工程壳里补 `network_security_config`。未上架 Google Play。
 - 缺口类型：无真机与 Android 构建环境（本工作区禁止构建）。

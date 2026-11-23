@@ -78,7 +78,7 @@ docs/                 设计与发布文档
 
 ## Android（预发布）
 
-源码与 CI 构建可用，功能未完成：没有真机安装、通知点击与扫码登录的验证记录，没有后台保活、FCM 推送与应用内更新，通知仅在应用存活期间产生。APK 由 `.github/workflows/android.yml` 按 ABI 拆分构建，发布页同时提供 `arm64-v8a`、`armeabi-v7a`、`x86`、`x86_64` 四个包、`SHA256SUMS` 与 `APK-SIZES.md`；绝大多数现代手机下载 `arm64-v8a` 包。侧载安装，首次启动强制服务器模式。
+源码与 CI 构建可用，功能未完成：没有真机安装、通知点击与扫码登录的验证记录，没有后台保活、FCM 推送与应用内更新，通知仅在应用存活期间产生。APK 由 `.github/workflows/android.yml` 按 ABI 拆分构建，发布页同时提供 `arm64-v8a`、`armeabi-v7a`、`x86`、`x86_64` 四个包、`SHA256SUMS` 与 `APK-SIZES.md`；绝大多数现代手机下载 `arm64-v8a` 包。实测 arm64 包约 21.3 MiB，相比旧的 110.5 MiB universal 包减少约 80.7%。侧载安装，首次启动强制服务器模式。
 
 边界与验收清单见 [docs/22-android-client.md](docs/22-android-client.md)。
 
