@@ -961,6 +961,7 @@ h3 {
 }
 
 .schedule-title-line { min-width: 0; }
+.schedule-mobile-time { display: none; }
 .schedule-title-line.is-compact {
   display: flex;
   align-items: center;
@@ -2436,22 +2437,52 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 
 @media (max-width: 620px) {
-  .app-shell { --mobile-nav-height: 54px; display: block; }
-  .app-shell.is-settings { height: 100vh; height: 100dvh; }
-  .app-shell.is-settings .main-content { height: 100%; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  .app-shell { --mobile-nav-height: 56px; display: block; }
+  /* 设置页把导航栏放进网格的独立行，而不是依赖 fixed 定位。Android WebView 的
+     可视视口在系统栏 inset 后会与 100dvh 不一致，fixed 底栏可能被推到屏幕外。 */
+  .app-shell.is-settings {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) calc(var(--mobile-nav-height) + env(safe-area-inset-bottom));
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
   .sidebar { position: fixed; inset: auto 0 0; z-index: 20; width: auto; height: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom)); flex-direction: row; padding: 6px 8px; padding-bottom: max(6px, env(safe-area-inset-bottom)); background: var(--surface); border-right: 0; border-top: 1px solid var(--border); -webkit-backdrop-filter: none; backdrop-filter: none; }
   .brand, .sidebar-creators, .connection-chip { display: none; }
   .nav-list { display: grid; grid-template-columns: repeat(3,1fr); width: 100%; }
-  .nav-list button { font-size: 0; min-height: 42px; }
-  .nav-list button svg { width: 19px; height: 19px; }
+  .nav-list button { position: relative; flex-direction: column; justify-content: center; gap: 2px; min-height: 42px; padding: 0 6px; font-size: 10px; line-height: 1; }
+  .nav-list button svg { width: 20px; height: 20px; }
+  .nav-list button span { position: absolute; top: 3px; left: calc(50% + 7px); min-width: 15px; margin: 0; padding: 0 4px; font-size: 8px; line-height: 15px; }
   .main-content { margin-left: 0; padding: calc(18px + var(--window-chrome-offset)) 12px; padding-bottom: calc(var(--mobile-nav-height) + 22px + env(safe-area-inset-bottom)); }
+  .app-shell.is-settings .main-content {
+    grid-row: 1;
+    height: auto;
+    min-height: 0;
+    margin: 0;
+    padding: 0 12px 18px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .app-shell.is-settings .sidebar {
+    position: relative;
+    inset: auto;
+    grid-row: 2;
+    align-self: stretch;
+    height: auto;
+    box-shadow: 0 -8px 24px rgba(var(--shadow-rgb), .06);
+  }
   .settings-page .page-header {
     position: sticky;
     top: 0;
     z-index: 9;
+    isolation: isolate;
     flex-direction: row;
     align-items: center;
     gap: 12px;
+    min-height: 58px;
     margin: 0 -12px 14px;
     padding: 10px 12px;
     background: var(--bg);
@@ -2491,15 +2522,20 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .timeline-mobile-empty strong { color: var(--text); font-size: 14px; }
   /* Per-day placeholders carry the empty state on phones; the large overlay would cover them. */
   .timeline-empty-overlay { display: none; }
-  .day-heading { position: static; padding-block: 8px 0; }
-  .day-heading-grip { top: 9px; }
-  .timeline .schedule-card { grid-template-columns: 38px minmax(0, 1fr); gap: 9px; min-height: 82px; padding: 10px; }
+  .timeline-viewport { contain: layout paint style; }
+  .timeline .day-section { content-visibility: auto; contain-intrinsic-size: auto 360px; }
+  .day-heading { position: static; padding-block: 8px 0; touch-action: pan-y; cursor: default; }
+  .day-heading-grip { display: none; }
+  .timeline .schedule-card { grid-template-columns: 38px minmax(0, 1fr); gap: 9px; min-height: 90px; padding: 10px; box-shadow: none; transition: none; touch-action: pan-y; }
+  .timeline .schedule-card:hover { transform: none; border-color: var(--border); box-shadow: none; }
   .card-more { opacity: 1; position: absolute; right: 8px; top: 8px; }
   .schedule-content h3 { padding-right: 32px; }
   .timeline .schedule-time { display: none; }
-  .timeline .schedule-time-inline { display: inline-flex; }
-  .timeline .schedule-title-line { display: flex; align-items: center; gap: 5px; min-width: 0; margin-top: 3px; }
-  .timeline .schedule-title-line h3 { flex: 1 1 auto; min-width: 0; margin-top: 0; }
+  .timeline .schedule-mobile-time { display: inline-flex; align-items: baseline; gap: 2px; width: max-content; margin-top: 3px; color: var(--primary-strong); font-size: 11px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.45; white-space: nowrap; }
+  .timeline .schedule-mobile-time small { color: var(--muted); font-size: 9px; font-weight: 600; }
+  .timeline .schedule-mobile-time small::before { content: "–"; margin-right: 1px; }
+  .timeline .schedule-title-line { display: block; min-width: 0; margin-top: 2px; }
+  .timeline .schedule-title-line h3 { min-width: 0; margin-top: 0; }
   .mode-grid, .import-stats { grid-template-columns: 1fr; }
   .device-sync-header { flex-direction: column; }
   .device-sync-overview { grid-template-columns: 1fr; }

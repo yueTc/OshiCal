@@ -284,6 +284,7 @@ export default function ScheduleView({
   const timelineViewportRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const timelineVisibleFrameRef = useRef<number | null>(null);
+  const timelineScrollTimerRef = useRef<number | null>(null);
   const timelineTopAnchorRef = useRef<{ key: string; offset: number } | null>(null);
   const timelineScrollTargetRef = useRef<string | null>(localDateKey(new Date()));
   const menuRef = useRef<HTMLDivElement>(null);
@@ -562,6 +563,18 @@ export default function ScheduleView({
     });
   }, [readTimelineVisibleDays]);
 
+  // 触屏滚动交给 WebView 原生处理。滚动中的每一帧都查询 35 个日期节点并更新 React 状态
+  // 会抢占主线程，所以只在滚动停下后再同步可见日期与当前锚点。
+  const scheduleTimelineScrollSettlement = useCallback(() => {
+    if (timelineScrollTimerRef.current !== null) {
+      window.clearTimeout(timelineScrollTimerRef.current);
+    }
+    timelineScrollTimerRef.current = window.setTimeout(() => {
+      timelineScrollTimerRef.current = null;
+      scheduleTimelineMeasurement();
+    }, 100);
+  }, [scheduleTimelineMeasurement]);
+
   const updateTimelineViewportHeight = useCallback(() => {
     const viewport = timelineViewportRef.current;
     if (!viewport) return;
@@ -642,10 +655,7 @@ export default function ScheduleView({
     if (!active || viewMode !== "timeline" || loading) return;
     const viewport = timelineViewportRef.current;
     if (!viewport) return;
-    const onScroll = () => {
-      captureTimelineTopAnchor();
-      scheduleTimelineMeasurement();
-    };
+    const onScroll = () => scheduleTimelineScrollSettlement();
     const onWindowScroll = () => {
       scheduleTimelineMeasurement();
     };
@@ -664,10 +674,9 @@ export default function ScheduleView({
     };
   }, [
     active,
-    captureTimelineTopAnchor,
     loading,
     restoreTimelineTopAnchor,
-    scheduleTimelineMeasurement,
+    scheduleTimelineScrollSettlement,
     updateTimelineViewportHeight,
     viewMode,
   ]);
@@ -756,6 +765,10 @@ export default function ScheduleView({
     if (timelineVisibleFrameRef.current !== null) {
       cancelAnimationFrame(timelineVisibleFrameRef.current);
       timelineVisibleFrameRef.current = null;
+    }
+    if (timelineScrollTimerRef.current !== null) {
+      clearTimeout(timelineScrollTimerRef.current);
+      timelineScrollTimerRef.current = null;
     }
   }, []);
 
@@ -1202,6 +1215,10 @@ export default function ScheduleView({
     if (!swipe) return;
     timelineRef.current?.classList.remove("is-dragging");
     if (swipe.moved) suppressCardClickBriefly();
+    if (timelineScrollTimerRef.current !== null) {
+      window.clearTimeout(timelineScrollTimerRef.current);
+      timelineScrollTimerRef.current = null;
+    }
     captureTimelineTopAnchor();
     scheduleTimelineMeasurement();
     const topKey = timelineTopAnchorRef.current?.key;
@@ -1354,11 +1371,19 @@ export default function ScheduleView({
             <span title={displayName}>{displayName}</span>
             {isLiveSchedule ? <span className="live-label">直播中</span> : null}
           </div>
-          <div className={`schedule-title-line ${viewMode === "grid" ? "is-compact" : ""}`}>
-            <span className="schedule-time-inline">
+          {viewMode === "timeline" ? (
+            <div className="schedule-mobile-time">
               {timeLabel(schedule.startAt)}
               {schedule.endAt ? <small>{timeLabel(schedule.endAt)}</small> : null}
-            </span>
+            </div>
+          ) : null}
+          <div className={`schedule-title-line ${viewMode === "grid" ? "is-compact" : ""}`}>
+            {viewMode === "grid" ? (
+              <span className="schedule-time-inline">
+                {timeLabel(schedule.startAt)}
+                {schedule.endAt ? <small>{timeLabel(schedule.endAt)}</small> : null}
+              </span>
+            ) : null}
             <h3>{schedule.title}</h3>
           </div>
           <div className="schedule-meta">
